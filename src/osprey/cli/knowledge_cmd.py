@@ -14,6 +14,8 @@ from pathlib import Path
 
 import click
 
+from .output import fail, note, report, warn
+
 
 @click.group()
 def knowledge() -> None:
@@ -24,8 +26,10 @@ def _resolve_bundle(bundle: Path | None) -> Path:
     """Return *bundle*, or fall back to ``facility_knowledge.bundle_path`` from config.
 
     Commands accept an optional BUNDLE argument; when omitted, the bundle root is
-    read from the ``facility_knowledge.bundle_path`` config key and expanded to an
-    absolute path.  This is the single source of that fallback rule and its error.
+    read from the ``facility_knowledge.bundle_path`` config key and resolved by the
+    shared rule (``~`` expanded, then relative values taken against the config.yml
+    directory) so the CLI opens the same bundle as the MCP server and the OKF panel.
+    This is the single source of that fallback rule and its error.
 
     Raises:
         click.UsageError: When *bundle* is None and the config key is unset.
@@ -33,6 +37,7 @@ def _resolve_bundle(bundle: Path | None) -> Path:
     if bundle is not None:
         return bundle
 
+    from osprey.services.facility_knowledge.bundle_path import resolve_bundle_path
     from osprey.utils.config import get_config_value
 
     raw = get_config_value("facility_knowledge.bundle_path", None)
@@ -40,7 +45,7 @@ def _resolve_bundle(bundle: Path | None) -> Path:
         raise click.UsageError(
             "No bundle path given and facility_knowledge.bundle_path is not set in config."
         )
-    return Path(raw).expanduser().resolve()
+    return resolve_bundle_path(raw)
 
 
 @knowledge.command("regen-index")
@@ -54,12 +59,12 @@ def regen_index(bundle: Path | None) -> None:
     """Regenerate index.md files throughout an OKF bundle.
 
     BUNDLE is the path to the root directory of an OKF bundle.
-    When omitted, ``facility_knowledge.bundle_path`` from the OSPREY
+    When omitted, facility_knowledge.bundle_path from the OSPREY
     config is used.
 
     Processes directories deepest-first so child descriptions propagate
-    to parent indexes.  The bundle-root ``index.md`` receives an
-    ``okf_version`` frontmatter block (OKF §11); all others have none
+    to parent indexes.  The bundle-root index.md receives an
+    okf_version frontmatter block (OKF §11); all others have none
     (OKF §6).  Running the command a second time produces bit-identical
     output (idempotent).
     """
@@ -69,8 +74,8 @@ def regen_index(bundle: Path | None) -> None:
 
     written = regenerate_indexes(bundle)
     for path in written:
-        click.echo(str(path))
-    click.echo(f"Wrote {len(written)} index file(s).")
+        report(str(path))
+    report(f"Wrote {len(written)} index file(s).")
 
 
 @knowledge.command("validate")
@@ -84,16 +89,15 @@ def validate(bundle: Path | None) -> None:
     """Validate all OKF documents in a bundle.
 
     BUNDLE is the path to the root directory of an OKF bundle.
-    When omitted, ``facility_knowledge.bundle_path`` from the OSPREY
+    When omitted, facility_knowledge.bundle_path from the OSPREY
     config is used.
 
-    Every ``*.md`` file is checked:
+    Every *.md file is checked:
 
-    * ``index.md`` files are validated against OKF §6/§11 via
-      ``validate_index``.
-    * All other ``.md`` files are parsed and their frontmatter is
-      validated at the ``"authoring"`` level (requires ``type``,
-      ``title``, and ``description``).
+    \b
+      - index.md files are validated against OKF §6/§11.
+      - All other .md files are parsed and their frontmatter is validated
+        at the 'authoring' level (requires type, title and description).
 
     All files are checked even if earlier failures are found.  A
     per-file report is printed and the command exits non-zero if any
@@ -121,12 +125,13 @@ def validate(bundle: Path | None) -> None:
                 failures.append((md_path, str(exc)))
 
     if not failures:
-        click.echo(f"All files in {bundle} are valid.")
+        report(f"All files in {bundle} are valid.")
         return
 
-    click.echo(f"{len(failures)} file(s) failed validation:", err=True)
-    for path, msg in failures:
-        click.echo(f"  {path}: {msg}", err=True)
+    fail(
+        f"{len(failures)} file(s) failed validation",
+        "\n".join(f"{path}: {msg}" for path, msg in failures),
+    )
     raise SystemExit(1)
 
 
@@ -148,8 +153,8 @@ def seed_from_ttl(ttl: Path, bundle: Path, force: bool) -> None:
     TTL is the path to a Turtle RDF file produced by NARAD or als-ontology.
 
     BUNDLE is the path to the root directory of an OKF bundle.  One stub
-    ``.md`` file is written per device node in the TTL, placed at
-    ``<bundle>/<local-iri-name>.md``.
+    .md file is written per device node in the TTL, placed at
+    <bundle>/<local-iri-name>.md.
 
     Idempotency rules (applied per stub):
 
@@ -159,7 +164,7 @@ def seed_from_ttl(ttl: Path, bundle: Path, force: bool) -> None:
     - File present, diff body, no --force → skip and report "differs, use --force".
     - File present, diff body, --force   → overwrite and report "overwritten".
 
-    The ``knowledge`` extra (rdflib) is required.  A clean error is printed
+    The 'knowledge' extra (rdflib) is required.  A clean error is printed
     when it is absent — no traceback.
     """
     try:
@@ -195,23 +200,20 @@ def seed_from_ttl(ttl: Path, bundle: Path, force: bool) -> None:
         if concept_path.exists():
             existing = concept_path.read_text(encoding="utf-8")
             if existing == stub.body:
-                click.echo(f"  unchanged  {concept_path.name}")
+                note(f"unchanged   {concept_path.name}")
                 skipped_same += 1
                 continue
             if not force:
-                click.echo(
-                    f"  differs    {concept_path.name}  (use --force to overwrite)",
-                    err=True,
-                )
+                note(f"differs     {concept_path.name}")
                 skipped_differs += 1
                 continue
             concept_path.write_text(stub.body, encoding="utf-8")
-            click.echo(f"  overwritten {concept_path.name}")
+            note(f"overwritten {concept_path.name}")
             overwritten += 1
         else:
             concept_path.parent.mkdir(parents=True, exist_ok=True)
             concept_path.write_text(stub.body, encoding="utf-8")
-            click.echo(f"  written    {concept_path.name}")
+            note(f"written     {concept_path.name}")
             written += 1
 
     parts = []
@@ -222,5 +224,13 @@ def seed_from_ttl(ttl: Path, bundle: Path, force: bool) -> None:
     if skipped_same:
         parts.append(f"{skipped_same} unchanged")
     if skipped_differs:
-        parts.append(f"{skipped_differs} skipped (differs; use --force)")
-    click.echo(", ".join(parts) + "." if parts else "Nothing to do.")
+        parts.append(f"{skipped_differs} left alone")
+    report(", ".join(parts) + "." if parts else "Nothing to do.")
+
+    # The one line that asks the operator for a decision, so it is a warning and
+    # not another entry in the per-file record above.
+    if skipped_differs:
+        warn(
+            f"{skipped_differs} file(s) already exist with different content",
+            "They were left as they are. Re-run with --force to overwrite them.",
+        )

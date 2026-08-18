@@ -1,6 +1,6 @@
 """OSPREY Workspace MCP Server.
 
-FastMCP server exposing artifact, data context, and screen capture tools.
+FastMCP server exposing artifact, visualization, and screen capture tools.
 
 Usage:
     python -m osprey.mcp_server.workspace
@@ -32,21 +32,23 @@ def create_server() -> FastMCP:
     # like create_static_plot call execute_code().
     prime_config_builder()
 
-    workspace_root = resolve_workspace_root()
-    logger.info("Workspace root: %s", workspace_root)
-    initialize_workspace_singletons(workspace_root)
+    # Session working root used by other tools at call time; the artifact
+    # store itself is rooted at the shared data root inside
+    # initialize_workspace_singletons().
+    logger.info("Workspace root: %s", resolve_workspace_root())
+    initialize_workspace_singletons()
 
     # Import tool modules (each registers itself via @mcp.tool())
     with startup_timer("tool_imports"):
         from osprey.mcp_server.workspace.tools import (  # noqa: F401
             archiver_downsample,
             artifact_export,
+            artifact_query,
             artifact_save,
             create_dashboard,
             create_document,
             create_interactive_plot,
             create_static_plot,
-            data_context_tools,
             facility_description,
             focus_tools,
             lattice_tools,

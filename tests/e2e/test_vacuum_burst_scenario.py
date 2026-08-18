@@ -21,11 +21,11 @@ shape, no "if any" hedging. The agent must do the discovery work:
      (ground truth: Pearson r ≈ -0.88 against DCCT; max|r| for the
      other 11 sectors ≤ 0.077).
 
-The ground truth now lives in the preset's simulation overlay,
+The ground truth lives in the preset's simulation overlay,
 ``data/simulation/machine.json`` (the ``vacuum-burst`` scenario): the SR07
 pressure spike + coincident DCCT dip are declared as an ``at_time`` event
 anchored daily at 14:32:08. The test activates that scenario after building
-the project via ``activate_scenario(project, "vacuum-burst")``; the mock
+the deployment via ``activate_scenarios(repo, "vacuum-burst")``; the mock
 connectors then route gauge/DCCT reads through the engine instead of the
 flat ``nominal`` default.
 
@@ -56,6 +56,7 @@ import pytest
 from tests.e2e.judge import LLMJudge
 from tests.e2e.sdk_helpers import (
     HAS_SDK,
+    SCENARIO_INTEGRITY_DISALLOWED_TOOLS,
     _default_opus_model,
     activate_scenarios,
     ariel_db_skip_reason,
@@ -73,6 +74,7 @@ from tests.e2e.test_preset_agentic import (
 # on CI runners where the SDK is installed but no system ``claude`` is.
 pytestmark = [
     pytest.mark.e2e,
+    pytest.mark.agentic_benchmark,
     pytest.mark.requires_als_apg,
     pytest.mark.skipif(not HAS_SDK, reason="claude_agent_sdk not installed"),
     # Skipped on CI: needs a running ARIEL logbook postgres (seeded
@@ -125,7 +127,7 @@ async def test_sector7_vacuum_burst_flow(tmp_path: Path) -> None:
     # sufficient tier 2) is used so the discoverable channel set matches the
     # full facility the simulation machine model defines, consistent with the
     # sibling RF scenario.
-    project = init_project(
+    repo = init_project(
         tmp_path,
         "vacuum_burst_demo",
         template="control_assistant",
@@ -139,8 +141,8 @@ async def test_sector7_vacuum_burst_flow(tmp_path: Path) -> None:
     # purges and reseeds ARIEL with the ambient (nominal) logbook so the agent
     # sees a realistic ops log but *no* vacuum-incident narrative to lean on —
     # the diagnosis must come from telemetry (this scenario is telemetry-only).
-    activate_scenarios(project, "vacuum-burst")
-    cf_server = _channel_finder_server_name(project)
+    activate_scenarios(repo, "vacuum-burst")
+    cf_server = _channel_finder_server_name(repo)
     if cf_server is None:
         pytest.skip("control-assistant preset has no channel-finder server")
 
@@ -154,11 +156,17 @@ async def test_sector7_vacuum_burst_flow(tmp_path: Path) -> None:
         "Did the vacuum do anything weird around then?"
     )
     result = await run_sdk_query(
-        project,
+        repo,
         query,
         max_turns=25,
         max_budget_usd=30.0,
-        model=_default_opus_model(project),
+        model=_default_opus_model(repo),
+        # vacuum-burst's own scenario.json states the sector-7 burst and its
+        # 14:32:08 timestamp, and it sits in the agent's cwd. The bundle IS the
+        # live archiver overlay here, so it cannot be deleted; the
+        # filesystem-search surface is closed instead. See
+        # SCENARIO_INTEGRITY_DISALLOWED_TOOLS.
+        disallowed_tools=SCENARIO_INTEGRITY_DISALLOWED_TOOLS,
     )
 
     # --- Tool routing contract -------------------------------------------------

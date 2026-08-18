@@ -1,6 +1,6 @@
 """Contract tests for the ``osprey health`` CLI command.
 
-The command was rebuilt as a thin Click wrapper over the ``osprey.health``
+The command is a thin Click wrapper over the ``osprey.health``
 framework (see ``.claude/plans/configurable-health-system-p1-core-cli/PROPOSAL.md``
 §CLI rebuild). This module pins the *CLI-level contracts* — the observable
 behaviors a caller (human, ``--json`` consumer, or CI) depends on — rather than
@@ -33,20 +33,19 @@ Contracts pinned here
   within the suite deadline with the correct code (the daemon-thread / ``os._exit``
   guarantee). This *must* be a real subprocess — in-process it would kill pytest.
 
-Deliberately dropped from the old 749-line suite
-------------------------------------------------
-The previous file tested a since-deleted ``HealthChecker`` class and its
-``HealthCheckResult`` value object. Those were implementation-detail unit tests of
-a class that no longer exists; the *behaviors* they approximated are now pinned
-either by the contract tests above or by the ``osprey.health.*`` module tests that
-own each check. Consciously dropped assertions, and why:
+Deliberately out of scope here
+------------------------------
+There is no ``HealthChecker`` class and no ``HealthCheckResult`` value object to
+unit-test. The behaviors such tests would approximate are pinned either by the
+contract tests above or by the ``osprey.health.*`` module tests that own each
+check. What this module deliberately does not assert, and why:
 
-* ``HealthCheckResult`` construction/repr/status — deleted type; replaced by
-  ``osprey.health.models.CheckResult`` (owned by the models tests).
+* ``HealthCheckResult`` construction/repr/status — no such type; the value object
+  is ``osprey.health.models.CheckResult`` (owned by the models tests).
 * ``HealthChecker`` init/options/``add_result``/``results``/``config`` state —
-  deleted class; the CLI no longer holds mutable checker state.
+  no such class; the CLI holds no mutable checker state.
 * ``check_configuration`` missing/valid/empty/invalid-YAML unit calls — the
-  configuration *rows* are now pinned here via ``--json`` (``config_file_exists``,
+  configuration *rows* are pinned here via ``--json`` (``config_file_exists``,
   ``yaml_valid``, ``health_config``); row-message internals belong to
   ``core/configuration`` tests.
 * ``check_file_system`` / ``check_python_environment`` per-row unit calls
@@ -63,14 +62,14 @@ own each check. Consciously dropped assertions, and why:
 * ``check_claude_cli_version`` pinned-match/mismatch/npx-missing/unpinned subprocess
   mocking — owned by ``core/claude_cli`` tests; here we pin only the CLI-visible
   unpinned-skip and ``--full`` gating contracts.
-* ``display_results`` all-passing/warnings/errors/verbose calls — rendering is now
-  ``osprey.health.render`` (owned by the render tests); the CLI wires it and we
+* ``display_results`` all-passing/warnings/errors/verbose calls — rendering belongs
+  to ``osprey.health.render`` (owned by the render tests); the CLI wires it and we
   assert the stdout/stderr split, not the glyph layout.
 * ``check_openobserve`` healthz/retention unit calls — owned by
   ``core/openobserve`` tests.
-* The old exit-code tests patched ``HealthChecker`` to inject results; the mapping
-  is now a property of ``CheckReport`` and is pinned here by injecting a report at
-  the ``_run_suite`` boundary.
+* Exit-code mapping is a property of ``CheckReport``, so it is pinned here by
+  injecting a report at the ``_run_suite`` boundary rather than by patching any
+  checker object.
 """
 
 from __future__ import annotations
@@ -98,36 +97,6 @@ from osprey.health.models import CheckReport, CheckResult, Status
 def cli_runner() -> CliRunner:
     """A Click CLI test runner (stdout and stderr are captured separately)."""
     return CliRunner()
-
-
-@pytest.fixture(autouse=True)
-def _restore_environ():
-    """Snapshot and restore ``os.environ`` around every test.
-
-    The command loads the project's ``.env`` into ``os.environ`` with override
-    semantics; run in-process, that would otherwise leak canary variables into
-    sibling tests. This guarantees a pristine environment regardless.
-    """
-    saved = dict(os.environ)
-    try:
-        yield
-    finally:
-        os.environ.clear()
-        os.environ.update(saved)
-
-
-@pytest.fixture(autouse=True)
-def _guard_os_exit():
-    """Force the CLI's normal ``sys.exit`` path for in-process invocations.
-
-    When a sync check is abandoned after a timeout, the command falls back to
-    ``os._exit`` — which, in an in-process ``CliRunner`` test, would terminate the
-    pytest process itself. The daemon-thread / ``os._exit`` guarantee is instead
-    pinned by the real-subprocess no-hang test; every in-process test pins
-    ``abandoned_count`` at 0 so the caught ``SystemExit`` carries the exit code.
-    """
-    with patch("osprey.health.offload.abandoned_count", return_value=0):
-        yield
 
 
 def _write_config(project: Path, body: str) -> Path:
@@ -493,6 +462,161 @@ class TestProjectResolution:
         assert str(project) in config_row["message"]
 
 
+class TestThreeZoneAnchors:
+    """Config and ``.env`` are anchored separately, so either stance answers fully.
+
+    The bug: one directory was resolved for both, so from a repo root the config
+    (in ``build/``) was reported missing, and from the render the ``.env`` (at the
+    repo root, the single secret store) was never loaded — the checks then ran
+    keyless against credentials that were sitting right there.
+    """
+
+    @staticmethod
+    def _repo(tmp_path: Path) -> Path:
+        """A three-zone repo: ``profile.yml`` + ``.env`` at the root, config in ``build/``."""
+        repo = tmp_path / "repo"
+        (repo / "build").mkdir(parents=True)
+        (repo / "profile.yml").write_text("name: canary\n")
+        (repo / "build" / "config.yml").write_text(
+            "project_name: canary\n"
+            "models:\n"
+            "  python_code_generator:\n"
+            "    provider: mock\n"
+            "    model_id: ${OSPREY_HEALTH_ZONE_CANARY}\n"
+        )
+        (repo / ".env").write_text("OSPREY_HEALTH_ZONE_CANARY=resolved-from-repo-root-env\n")
+        return repo
+
+    def _configuration_rows(self, cli_runner, stance: Path) -> list[dict]:
+        with _no_container_runtime():
+            result = cli_runner.invoke(
+                health, ["--project", str(stance), "--json", "--category", "configuration"]
+            )
+        return json.loads(result.stdout)["results"]
+
+    def test_repo_root_stance_finds_the_rendered_config(self, cli_runner, tmp_path):
+        repo = self._repo(tmp_path)
+        assert "OSPREY_HEALTH_ZONE_CANARY" not in os.environ
+
+        rows = self._configuration_rows(cli_runner, repo)
+
+        config_row = _find(rows, "config_file_exists")
+        assert config_row is not None and config_row["status"] == "ok"
+        assert str(repo / "build" / "config.yml") in config_row["message"]
+        env_row = _find(rows, "environment_variables")
+        assert env_row is not None and env_row["status"] == "ok"
+
+    @pytest.mark.parametrize("stance", ["repo", "build"])
+    def test_channel_finder_reads_the_render_not_the_source_zone(
+        self, cli_runner, tmp_path, stance
+    ):
+        """A build-owned database is read from the render, whatever the stance.
+
+        The two categories used to share one anchor. The repo root is right for
+        ``file_system`` and wrong here: a channel database is build output, and
+        the rendered config states its path relative to the config's own
+        directory. Both zones hold a file at the configured relative path here,
+        with DIFFERENT sizes — identical copies would pass under either anchor
+        and prove nothing — so the reported size names which one was read.
+        """
+        repo = tmp_path / "repo"
+        (repo / "build").mkdir(parents=True)
+        (repo / "build" / "config.yml").write_text(
+            "project_name: cf_stance\n"
+            "channel_finder:\n"
+            "  pipeline_mode: hierarchical\n"
+            "  pipelines:\n"
+            "    hierarchical:\n"
+            "      database:\n"
+            "        path: data/channels.json\n"
+        )
+        render_db = repo / "build" / "data" / "channels.json"
+        render_db.parent.mkdir(parents=True)
+        render_db.write_text("r" * 11)  # 11 B — the build's output
+        source_db = repo / "data" / "channels.json"
+        source_db.parent.mkdir(parents=True)
+        source_db.write_text("s" * 999)  # 999 B — the source tree it was built from
+
+        project = repo if stance == "repo" else repo / "build"
+        with _no_container_runtime():
+            result = cli_runner.invoke(
+                health, ["--project", str(project), "--json", "--category", "channel_finder"]
+            )
+        rows = json.loads(result.stdout)["results"]
+
+        db_row = _find(rows, "channel_finder_database")
+        assert db_row is not None and db_row["status"] == "ok", db_row
+        assert db_row["value"] == "11 B", db_row  # the render's file, not the source's
+
+    def test_render_stance_still_reads_the_repo_root_env(self, cli_runner, tmp_path):
+        # Pointing at the render is the stance that used to look for `.env` inside
+        # `build/`, which no build ever writes.
+        repo = self._repo(tmp_path)
+        assert "OSPREY_HEALTH_ZONE_CANARY" not in os.environ
+
+        rows = self._configuration_rows(cli_runner, repo / "build")
+
+        env_row = _find(rows, "environment_variables")
+        assert env_row is not None and env_row["status"] == "ok"
+
+
+class TestSubdirectoryStance:
+    """A subdirectory of a deployment repo is that deployment, not a broken one.
+
+    The bug: with no ``--project`` the stance was literally ``Path.cwd()``, so
+    ``osprey health`` run from ``<repo>/data/raw`` looked for a ``config.yml``
+    there, found none, and exited 2 with a configuration ERROR row — which a CI
+    gate and an operator both read as "this deployment is broken" when the only
+    fault was the working directory. Every other repo-scoped verb walks up.
+    """
+
+    @staticmethod
+    def _repo(tmp_path: Path) -> Path:
+        repo = tmp_path / "repo"
+        (repo / "build").mkdir(parents=True)
+        (repo / "profile.yml").write_text("name: canary\ndata_bundle: hello_world\n")
+        (repo / "build" / "config.yml").write_text(_VALID_CONFIG)
+        return repo
+
+    def _configuration_rows(self, cli_runner) -> list[dict]:
+        with _no_container_runtime():
+            result = cli_runner.invoke(health, ["--json", "--category", "configuration"])
+        return json.loads(result.stdout)["results"]
+
+    def test_subdirectory_stance_finds_the_rendered_config(self, cli_runner, tmp_path, monkeypatch):
+        repo = self._repo(tmp_path)
+        subdir = repo / "data" / "raw"
+        subdir.mkdir(parents=True)
+        monkeypatch.chdir(subdir)
+
+        rows = self._configuration_rows(cli_runner)
+
+        config_row = _find(rows, "config_file_exists")
+        assert config_row is not None, rows
+        assert config_row["status"] == "ok", config_row
+        assert "build" in config_row["message"], config_row
+
+    def test_subdirectory_stance_does_not_exit_2(self, cli_runner, tmp_path, monkeypatch):
+        repo = self._repo(tmp_path)
+        subdir = repo / "data" / "raw"
+        subdir.mkdir(parents=True)
+        monkeypatch.chdir(subdir)
+
+        with _no_container_runtime():
+            result = cli_runner.invoke(health, ["--category", "configuration"])
+        assert result.exit_code != 2, result.output
+
+    def test_short_p_is_not_the_project_flag(self, cli_runner):
+        """``-p`` means ``--port`` on every serving verb; it must not mean this.
+
+        One letter cannot mean "the deployment to report on" here and "the port
+        to bind" on ``osprey web``/``artifacts web``/``ariel``/``theme-lab``.
+        """
+        result = cli_runner.invoke(health, ["--help"])
+        assert "--project" in result.output
+        assert "-p," not in result.output
+
+
 # --------------------------------------------------------------------------- #
 # --json machine-clean wire contract
 # --------------------------------------------------------------------------- #
@@ -542,9 +666,9 @@ class TestJsonOutput:
         assert "\n" not in stripped  # a single compact line
 
     def test_json_clean_despite_config_load_error(self, cli_runner, tmp_path):
-        # Regression: the loader logs bad-YAML failures at ERROR through a
-        # stdout-bound handler. Under --json those logs must be silenced so stdout
-        # stays a single parseable JSON document.
+        # Regression: the loader reports bad-YAML failures at ERROR. Under --json
+        # that chatter must stay off stdout so it remains a single parseable JSON
+        # document, whichever stream the host has logging pointed at.
         project = tmp_path / "proj"
         _write_config(project, "invalid: yaml: content:\n")
         with _no_container_runtime():

@@ -280,6 +280,23 @@ export function openUrl(a) {
 }
 
 /**
+ * Where a deployment keeps its artifacts on disk, relative to the repo root:
+ * the artifacts subtree of the default agent-data root (`agent_data.base_dir`).
+ */
+const ARTIFACTS_DIR = "var/agent_data/artifacts";
+
+/**
+ * Repo-relative path of an artifact's file — the spelling handed to the agent
+ * (drag-to-terminal), shown in the preview header, and copied to the clipboard.
+ * One definition so those three never drift apart.
+ * @param {{filename: string}} a
+ * @returns {string}
+ */
+export function artifactPath(a) {
+  return `${ARTIFACTS_DIR}/${a.filename}`;
+}
+
+/**
  * Whether an artifact was created during the current gallery session.
  * `sessionStart` is passed in explicitly (gallery.js's `_sessionStart`, set
  * once at page load) rather than held here, keeping this module stateless.
@@ -289,21 +306,6 @@ export function openUrl(a) {
  */
 export function isNewThisSession(a, sessionStart) {
   return !!(a.timestamp && a.timestamp >= sessionStart);
-}
-
-/**
- * Forward text to the parent embedder (e.g. a terminal panel) for paste,
- * via postMessage. No-op outside an embedded/iframed context.
- * @param {string} text
- * @returns {void}
- */
-export function sendToTerminal(text) {
-  try {
-    if (window.parent && window.parent !== window) {
-      // Intentional '*' (same-origin contract exception): parent embedder may be cross-origin.
-      window.parent.postMessage({ type: "osprey-paste-to-terminal", text }, "*");
-    }
-  } catch { /* cross-origin */ }
 }
 
 // ---- Color pass: color badges by type ---- //

@@ -51,21 +51,68 @@ A build profile can add rules of its own. Any rule without ``paths`` frontmatter
 loads unconditionally at session start.
 
 
+Test IOC port isolation
+=======================
+
+``test-ioc-safety`` is a packaged rule the ``control-assistant`` preset selects
+by default (it renders only for EPICS-family control systems). For other
+profiles, add it to the ``rules:`` list when the project runs an EPICS soft IOC
+for testing:
+
+.. code-block:: yaml
+
+   rules:
+     - test-ioc-safety   # mandatory port isolation for a test soft IOC
+
+It renders only for EPICS-family control systems (``control_system.type`` of
+``epics`` or ``virtual_accelerator``); selected under any other protocol it
+renders empty and the build drops the file.
+
+The rule exists because EPICS Channel Access broadcasts on UDP by default. A
+``softIoc`` started with no port configuration binds to UDP 5064 (server) and
+5065 (beacon) and beacons to the broadcast address — where every real IOC on the
+network sees it. A test PV whose name collides with a production PV can then
+route a read to the wrong value, or a write to real hardware. The rule tells the
+agent to refuse any test-IOC action that does not satisfy all six of:
+
+#. CAS ports outside the 5064–5076 production range (default ``59064``/``59065``).
+#. **Both** ``EPICS_CAS_SERVER_PORT`` and ``EPICS_CAS_BEACON_PORT`` set —
+   setting one leaves the other on its default.
+#. Every CA client overriding ``EPICS_CA_SERVER_PORT``, stated each time the
+   agent hands over a test PV.
+#. Every test PV carrying the test prefix (default ``OSPREY:TEST:``) — the last
+   line of defense if the ports somehow fail to isolate.
+#. ``softIoc`` launched only through a startup script that exports the ports
+   first, never bare at a shell prompt.
+#. DB files within the EPICS parser's limits — DESC fields at most 39 ASCII
+   characters, no multibyte characters, and no ``$(...)`` even inside comments.
+
+The rule carries the startup-script pattern, the client-side environment, a
+pre-flight validation snippet, and the shutdown sequence, so the agent has a
+concrete correct procedure rather than a prohibition alone.
+
+
 Changing a rule
 ===============
 
 There are two ways to edit a rule.
 
 **Edit the Markdown directly.** Each rule is a file under ``.claude/rules/``.
-``facility.md`` is yours to edit — it is user-owned, and ``osprey claude regen``
+``facility.md`` is yours to edit — it is user-owned, and ``osprey build``
 never overwrites it. The framework-generated rules *are* re-rendered by
-``osprey claude regen``; to keep an edit to one of those, claim it first so it
-becomes user-owned:
+``osprey build``; to keep an edit to one of those, claim it. A claim
+**moves** the rule into the profile the project was built from, which is where
+you then edit it:
 
 .. code-block:: console
 
-   $ osprey scaffold claim rules/safety
-   $ osprey scaffold diff rules/safety     # compare yours vs the framework version
+   $ osprey scaffold claim rules/safety              # moves it to rules/safety.md
+   $ $EDITOR rules/safety.md
+   $ osprey build
+   $ osprey scaffold diff rules/safety               # compare yours vs the framework version
+
+The rebuild copies it back and registers it as yours, so ``osprey build``
+leaves it alone from then on. See :ref:`profile-claim`.
 
 **Through the web terminal.** ``osprey web`` exposes the agent's ``.claude/``
 files in the browser: edit a rule in the setup editor, or use the scaffold
@@ -88,14 +135,14 @@ confidence/scope note — while single reads stay terse.
 Because it ships in framework-generated artifacts, the claimed-artifact caveat
 from `Changing a rule`_ applies. A deployment that has ``osprey scaffold
 claim``ed ``CLAUDE.md`` (``claude-md``) or the ``control-operator`` output-style
-keeps its own copy and will **not** pick up this behavior on ``osprey claude
-regen``. To adopt it, review the framework version and either merge it by hand or
-unclaim and regen:
+keeps its own copy and will **not** pick up this behavior on the next
+``osprey build``. To adopt it, review the framework version and either merge it
+by hand or unclaim and rebuild:
 
 .. code-block:: console
 
    $ osprey scaffold diff output-styles/control-operator     # framework vs. yours
-   $ osprey scaffold unclaim output-styles/control-operator  # then: osprey claude regen
+   $ osprey scaffold unclaim output-styles/control-operator  # then: osprey build
 
 
 .. seealso::
@@ -104,4 +151,4 @@ unclaim and regen:
       How the always-in-context rules relate to the on-demand OKF bundle.
 
    :doc:`build-profiles`
-      How a build profile overlays its own rules into a generated project.
+      How a build profile carries its own rules into a generated project.

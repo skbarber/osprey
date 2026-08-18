@@ -11,6 +11,7 @@ from osprey.errors import ChannelWriteBlockedError
 from osprey.mcp_server.control_system.error_handling import connector_error_handler
 from osprey.mcp_server.control_system.server import mcp
 from osprey.mcp_server.errors import make_error
+from osprey.mcp_server.http import notify_agent_activity_async
 
 logger = logging.getLogger("osprey.mcp_server.tools.channel_write")
 
@@ -200,6 +201,17 @@ async def channel_write(
             )
             raise RuntimeError(
                 f"All {len(results_serialised)} write(s) rejected: {'; '.join(errors)}"
+            )
+
+        # Agent-activity highlight (purely additive, after the fact): name only
+        # the channels whose writes actually executed. Every refusal path —
+        # limits_violation validation, all-blocked, all-failed — returns or
+        # raises before this point, so those emit nothing. notify_agent_activity
+        # never raises; the blocking call runs off the event loop.
+        executed_channels = [r["channel"] for r in results_serialised if r["success"]]
+        if executed_channels:
+            await notify_agent_activity_async(
+                "channel_write", "channel", detail=", ".join(executed_channels)
             )
 
         # Return ephemeral result (no persistent storage for channel writes)

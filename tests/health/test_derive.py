@@ -74,7 +74,7 @@ def _server(
         network["host_url"] = host_url
     if docker_url is not None:
         network["docker_url"] = docker_url
-    entry: dict[str, Any] = {"transport": "http", "url": url, "network": network}
+    entry: dict[str, Any] = {"url": url, "network": network}
     if permissions is not None:
         entry["permissions"] = permissions
     return entry
@@ -144,6 +144,17 @@ def test_host_url_chosen_on_host(monkeypatch):
 def test_docker_url_chosen_via_dockerenv(monkeypatch):
     monkeypatch.delenv("OSPREY_IN_CONTAINER", raising=False)
     monkeypatch.setattr("os.path.exists", lambda p: p == "/.dockerenv")
+    record = derive_mcp_servers(_settings(), _expanded({"matlab": _server()}))
+    check = _only_check(record)
+    assert check.params["url"] == "http://matlab:9000/mcp"
+
+
+def test_docker_url_chosen_via_podman_containerenv(monkeypatch):
+    # Podman writes /run/.containerenv and no /.dockerenv, so a Docker-only
+    # probe read every podman deployment as a host and sent the derived MCP
+    # probes at host_url from inside the container.
+    monkeypatch.delenv("OSPREY_IN_CONTAINER", raising=False)
+    monkeypatch.setattr("os.path.exists", lambda p: p == "/run/.containerenv")
     record = derive_mcp_servers(_settings(), _expanded({"matlab": _server()}))
     check = _only_check(record)
     assert check.params["url"] == "http://matlab:9000/mcp"
@@ -226,12 +237,12 @@ def test_permissions_non_mapping_treated_as_absent_but_check_emitted():
         pytest.param({"bad": "not-a-mapping"}, id="non_mapping_entry"),
         pytest.param({"bad": _server(url="")}, id="empty_url"),
         pytest.param(
-            {"bad": {"transport": "http", "network": {"host_url": "http://x/mcp"}}},
+            {"bad": {"network": {"host_url": "http://x/mcp"}}},
             id="missing_url",
         ),
-        pytest.param({"bad": {"transport": "http", "url": "http://x/mcp"}}, id="missing_network"),
+        pytest.param({"bad": {"url": "http://x/mcp"}}, id="missing_network"),
         pytest.param(
-            {"bad": {"transport": "http", "url": "http://x/mcp", "network": "nope"}},
+            {"bad": {"url": "http://x/mcp", "network": "nope"}},
             id="non_mapping_network",
         ),
         pytest.param({"bad": _server(host_url=None)}, id="missing_network_url_key"),

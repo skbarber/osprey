@@ -18,14 +18,12 @@ Usage in tools:
 from __future__ import annotations
 
 import logging
-import os
-from pathlib import Path
 from typing import Any
 
-import yaml
-
+from osprey.mcp_server.channel_finder_common import load_cf_config, resolve_cf_path
 from osprey.services.channel_finder.core.base_database import BaseDatabase
 from osprey.services.channel_finder.rate_limiter import configure_rate_limiter
+from osprey.utils.facility import resolve_facility_name
 
 logger = logging.getLogger("osprey.mcp_server.channel_finder_in_context.server_context")
 
@@ -64,7 +62,7 @@ class ChannelFinderICContext:
         if self._initialized:
             return
 
-        self._raw_config = self._load_config()
+        self._raw_config = load_cf_config(logger)
 
         cf_config = self._raw_config.get("channel_finder", {})
         ic_config = cf_config.get("pipelines", {}).get("in_context", {})
@@ -73,7 +71,7 @@ class ChannelFinderICContext:
         db_type = db_config.get("type", "template")
 
         if db_path:
-            db_path = self._resolve_path(db_path)
+            db_path = resolve_cf_path(db_path)
 
             if db_type == "template":
                 from osprey.services.channel_finder.databases.template import (
@@ -98,8 +96,7 @@ class ChannelFinderICContext:
                 "channel finder tools will fail until config is provided"
             )
 
-        facility = self._raw_config.get("facility", {})
-        self._facility_name = facility.get("name", "control system")
+        self._facility_name = resolve_facility_name(self._raw_config, "control system")
 
         # Resolve subagent model and provider.
         #
@@ -122,7 +119,7 @@ class ChannelFinderICContext:
             self._subagent_model_id = ic_model
             self._subagent_provider = ic_provider if ic_provider else cc_config.get("provider", "")
         else:
-            from osprey.cli.claude_code_resolver import ClaudeCodeModelResolver
+            from osprey.build.claude_code_resolver import ClaudeCodeModelResolver
 
             api_providers = self._raw_config.get("api", {}).get("providers", {})
             # Model-id reader only (consumes tier_to_model); a telemetry
@@ -236,7 +233,7 @@ class ChannelFinderICContext:
     def system_prompt_input_tokens(self) -> int:
         """Tokens in the system prompt, counted once at init for the configured model.
 
-        Used by query_channels to compute per-query input_tokens without
+        Used by ask_channels to compute per-question input_tokens without
         re-tokenizing the (large) channel-database prompt on every call.
         """
         return self._system_prompt_input_tokens
@@ -245,33 +242,6 @@ class ChannelFinderICContext:
     def raw_config(self) -> dict[str, Any]:
         """Full raw config dict."""
         return self._raw_config
-
-    @staticmethod
-    def _load_config() -> dict[str, Any]:
-        """Load config.yml from OSPREY_CONFIG env var or cwd."""
-        config_path = Path(
-            os.path.expandvars(os.environ.get("OSPREY_CONFIG", str(Path.cwd() / "config.yml")))
-        )
-        raw: dict[str, Any] = {}
-        if config_path.exists():
-            with open(config_path) as f:
-                raw = yaml.safe_load(f) or {}
-            logger.info("ChannelFinderICContext: config loaded from %s", config_path)
-        else:
-            logger.warning("Config file not found: %s", config_path)
-
-        return raw
-
-    @staticmethod
-    def _resolve_path(path_str: str) -> str:
-        """Resolve path relative to config file directory."""
-        config_path = Path(
-            os.path.expandvars(os.environ.get("OSPREY_CONFIG", str(Path.cwd() / "config.yml")))
-        )
-        p = Path(path_str)
-        if not p.is_absolute():
-            p = config_path.parent / p
-        return str(p.resolve())
 
 
 # ---------------------------------------------------------------------------

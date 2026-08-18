@@ -17,14 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from osprey.interfaces.artifacts import resolve as resolve_mod
+from osprey.agent_runner import artifact_resolve as resolve_mod
 from osprey.stores.artifact_store import ArtifactStore
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"fake-png-body"
@@ -43,12 +42,11 @@ def _save(
     body: bytes,
 ) -> str:
     """Save one artifact tagged with ``run_id`` (via the env the store reads)."""
-    prev = os.environ.get("OSPREY_DISPATCH_RUN_ID")
-    if run_id:
-        os.environ["OSPREY_DISPATCH_RUN_ID"] = run_id
-    else:
-        os.environ.pop("OSPREY_DISPATCH_RUN_ID", None)
-    try:
+    with pytest.MonkeyPatch.context() as mp:
+        if run_id:
+            mp.setenv("OSPREY_DISPATCH_RUN_ID", run_id)
+        else:
+            mp.delenv("OSPREY_DISPATCH_RUN_ID", raising=False)
         entry = store.save_file(
             file_content=body,
             filename=filename,
@@ -56,25 +54,23 @@ def _save(
             artifact_type="image",
             mime_type=mime,
         )
-    finally:
-        if prev is None:
-            os.environ.pop("OSPREY_DISPATCH_RUN_ID", None)
-        else:
-            os.environ["OSPREY_DISPATCH_RUN_ID"] = prev
     return entry.id
 
 
 def _rooted_store(tmp_path: Path, monkeypatch) -> ArtifactStore:
     """Store rooted so ``resolve._get_store()`` reads the same place.
 
-    ``_get_store()`` roots at ``$OSPREY_PROJECT_DIR/_agent_data``; the byte/list/
-    describe surfaces all go through it, so tests must write there too.
+    ``_get_store()`` roots at the ``agent_data.base_dir`` of the config the
+    process was pointed at, anchored on ``$OSPREY_PROJECT_DIR`` — with no config
+    in reach that is the default ``var/agent_data``. The byte/list/describe
+    surfaces all go through it, so tests must write there too.
     """
     project = tmp_path / "project"
-    (project / "_agent_data").mkdir(parents=True)
+    (project / "var" / "agent_data").mkdir(parents=True)
     monkeypatch.setenv("OSPREY_PROJECT_DIR", str(project))
     monkeypatch.delenv("OSPREY_CONFIG", raising=False)
-    return ArtifactStore(workspace_root=project / "_agent_data")
+    monkeypatch.delenv("CONFIG_FILE", raising=False)
+    return ArtifactStore(workspace_root=project / "var" / "agent_data")
 
 
 # ---------------------------------------------------------------------------
@@ -209,13 +205,29 @@ class TestStoreRooting:
 
     def test_root_follows_project_dir_not_cwd(self, tmp_path, monkeypatch):
         project = tmp_path / "project"
-        (project / "_agent_data" / "artifacts").mkdir(parents=True)
+        (project / "var" / "agent_data" / "artifacts").mkdir(parents=True)
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
         monkeypatch.setenv("OSPREY_PROJECT_DIR", str(project))
         monkeypatch.delenv("OSPREY_CONFIG", raising=False)
+        monkeypatch.delenv("CONFIG_FILE", raising=False)
         monkeypatch.chdir(elsewhere)
-        assert resolve_mod._get_store()._store_dir == project / "_agent_data" / "artifacts"
+        assert resolve_mod._get_store()._store_dir == project / "var" / "agent_data" / "artifacts"
+
+    def test_root_follows_the_configs_relocated_agent_data_dir(self, tmp_path, monkeypatch):
+        """A project that moved ``agent_data.base_dir`` moves the store with it.
+
+        The compose generator renders the worker's volume mount target from this
+        same key, so a resolver that ignored it would read a directory the mount
+        never covers.
+        """
+        project = tmp_path / "project"
+        (project / "build").mkdir(parents=True)
+        (project / "build" / "config.yml").write_text("agent_data:\n  base_dir: state/data\n")
+        monkeypatch.setenv("OSPREY_PROJECT_DIR", str(project))
+        monkeypatch.setenv("CONFIG_FILE", str(project / "build" / "config.yml"))
+        monkeypatch.delenv("OSPREY_CONFIG", raising=False)
+        assert resolve_mod._get_store()._store_dir == project / "state" / "data" / "artifacts"
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +403,7 @@ class TestInjectionResistance:
         c, _, ids = client
         # Plant a persisted run record for run-1 whose results "reference" run-2's
         # artifact (as a prompt-injected agent might emit).
-        log_dir = tmp_path / "project" / "_agent_data" / "dispatch"
+        log_dir = tmp_path / "project" / "var" / "agent_data" / "dispatch"
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / "run-1.json").write_text(
             json.dumps(
@@ -476,7 +488,7 @@ class TestStatusBodyDiskFallback:
         from osprey.mcp_server.dispatch_worker import dispatch_api
 
         dispatch_api._runs.pop("run-1", None)  # evicted from memory
-        log_dir = tmp_path / "project" / "_agent_data" / "dispatch"
+        log_dir = tmp_path / "project" / "var" / "agent_data" / "dispatch"
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / "run-1.json").write_text(json.dumps({"status": "completed", "artifacts": []}))
         r = c.get("/dispatch/run-1", headers=_auth())

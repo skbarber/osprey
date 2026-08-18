@@ -70,9 +70,9 @@ class HealthCheckEngine:
     """Owns the cached report and the single-flight refresh that produces it.
 
     Args:
-        loader: The synchronous config-load phase (task 2.1). Called on a daemon
+        loader: The synchronous config-load phase. Called on a daemon
             thread via :func:`offload.run_sync` each refresh.
-        lifecycle: The connector-runtime owner (task 2.2). Its
+        lifecycle: The connector-runtime owner. Its
             :meth:`~HealthRuntimeLifecycle.reconcile` is called each cycle and
             its in-flight-task provider is wired to this engine so teardown can
             cancel a running refresh.
@@ -276,6 +276,6 @@ class HealthCheckEngine:
 
     # -- default disk-change probe ----------------------------------------------
 
-    def _default_disk_signature(self) -> tuple[Any, Any]:
-        """Stat ``config.yml`` and its sibling ``.env`` for the breaker fast-path."""
+    def _default_disk_signature(self) -> tuple[Any, ...]:
+        """Stat ``config.yml`` and the deployment's env chain for the breaker fast-path."""
         return _resolve_disk_signature(self._config_path)

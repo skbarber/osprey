@@ -1,7 +1,7 @@
 """Unit tests for the OpenObserve root-password entry in the token-mint map.
 
 control_assistant ships telemetry LIVE against a co-deployed OpenObserve store,
-so ``osprey deploy up`` must self-provision a ``ZO_ROOT_USER_PASSWORD`` into the
+so ``osprey up`` must self-provision a ``ZO_ROOT_USER_PASSWORD`` into the
 project ``.env`` (``_SERVICE_TOKEN_VARS["openobserve"]``). Two properties make
 this entry different from every other minted token and are pinned here:
 
@@ -12,16 +12,23 @@ this entry different from every other minted token and are pinned here:
   (the same failure shape as ``BLUESKY_TILED_API_KEY``/Tiled).
 * Its compose template carries an insecure ``:-Complexpass#123`` default, so the
   motivation is not fail-closed arming (as with dispatch/bluesky) but replacing a
-  shared, transcript-guarding default with a per-deploy secret.
+  shared, transcript-guarding default with a per-deploy secret. That same
+  published default is refused outright when an operator sets it — the one
+  failure no format rule can express, since the value satisfies OpenObserve's
+  policy in full (see ``TestPublishedDefaultIsRefused``).
 """
 
 from __future__ import annotations
 
 import base64
+import re
+from pathlib import Path
 
 import pytest
 
 from osprey.deployment import container_lifecycle
+from osprey.deployment.service_tokens import _VAR_FORBIDDEN_VALUES
+from osprey.utils.dotenv import format_env_line
 
 _MINT_SAMPLES = 200
 
@@ -131,7 +138,7 @@ def test_openobserve_mint_is_idempotent(tmp_path, monkeypatch):
 def test_minted_password_yields_a_valid_openobserve_auth_header(tmp_path, monkeypatch):
     """Cross-check the two halves: a minted password flows through the agent's
     telemetry resolver into a clean base64 Basic-auth header (no ${VAR} leak)."""
-    from osprey.cli.claude_code_telemetry import _openobserve_auth_header
+    from osprey.build.claude_code_telemetry import _openobserve_auth_header
 
     monkeypatch.delenv("ZO_ROOT_USER_PASSWORD", raising=False)
     env_path = tmp_path / ".env"
@@ -217,3 +224,265 @@ def test_ensure_service_tokens_accepts_a_strong_operator_password(tmp_path, monk
 def test_service_token_vars_map_includes_openobserve():
     """Lock in the map shape: only the password, not the email."""
     assert container_lifecycle._SERVICE_TOKEN_VARS["openobserve"] == ("ZO_ROOT_USER_PASSWORD",)
+
+
+# ---------------------------------------------------------------------------
+# The published compose default is refused outright — the one failure no format
+# rule can express, because that value satisfies OpenObserve's policy in full.
+# ---------------------------------------------------------------------------
+
+
+class TestPublishedDefaultIsRefused:
+    """A password that is public is not a password, however well-formed.
+
+    ``ZO_ROOT_USER_PASSWORD`` is interpolated in the compose template with a
+    ``:-`` fallback, so a project that never sets it still starts — on a value
+    printed in every rendered copy of the template, guarding a store that holds
+    full agent conversation transcripts. The mint exists to replace that value,
+    but nothing stopped an operator from writing it back into ``.env`` by hand,
+    and it passes every character-class check there is.
+
+    The refusal is deliberately narrow. It reads the *effective* value at the
+    deploy boundary, after the mint, so it can only fire on a value an operator
+    supplied — never on the fresh-repo path, where the template default resolves
+    transiently and the mint replaces it before this check ever runs.
+    """
+
+    def test_the_registered_default_is_the_one_the_template_ships(self):
+        """The declaration must track the template, or the refusal guards nothing.
+
+        Parse the fallback out of the shipped compose template rather than
+        restating it: a template edit that changes the published default while
+        this map keeps the old one would leave the new default accepted, and
+        nothing else in the suite would notice.
+        """
+        import osprey.templates
+
+        template = (
+            Path(osprey.templates.__file__).parent
+            / "services"
+            / "openobserve"
+            / "docker-compose.yml.j2"
+        )
+        shipped = re.search(
+            r"\$\{ZO_ROOT_USER_PASSWORD:-([^}]*)\}", template.read_text(encoding="utf-8")
+        )
+        assert shipped, f"no ${{ZO_ROOT_USER_PASSWORD:-...}} fallback found in {template}"
+
+        assert shipped.group(1) in _VAR_FORBIDDEN_VALUES["ZO_ROOT_USER_PASSWORD"]
+
+    def test_the_published_default_would_pass_every_format_check(self):
+        """Why this needs its own mechanism rather than another validator."""
+        for published in _VAR_FORBIDDEN_VALUES["ZO_ROOT_USER_PASSWORD"]:
+            assert _satisfies_openobserve_policy(published)
+            assert container_lifecycle._validate_var("ZO_ROOT_USER_PASSWORD", published)
+
+    @pytest.mark.parametrize("published", sorted(_VAR_FORBIDDEN_VALUES["ZO_ROOT_USER_PASSWORD"]))
+    def test_an_operator_supplied_default_refuses_the_deploy(
+        self, tmp_path, monkeypatch, published
+    ):
+        monkeypatch.delenv("ZO_ROOT_USER_PASSWORD", raising=False)
+        env_path = tmp_path / ".env"
+        env_path.write_text(format_env_line("ZO_ROOT_USER_PASSWORD", published) + "\n")
+        # The value must survive the .env round-trip, or the test would be
+        # asserting the refusal fires on something the operator never set.
+        assert _parse_dotenv(env_path)["ZO_ROOT_USER_PASSWORD"] == published
+
+        with pytest.raises(RuntimeError) as exc_info:
+            container_lifecycle._ensure_service_tokens(
+                {"deployed_services": ["openobserve"]}, expose_network=False, env_path=env_path
+            )
+
+        assert str(exc_info.value) == (
+            "ZO_ROOT_USER_PASSWORD is invalid: must not be the default published in the "
+            "openobserve compose template — that value ships in every rendered project, "
+            "so it is a shared password rather than a secret, and this store holds full "
+            "agent conversation transcripts; remove the line from .env (and unset any "
+            "shell export of the same name) so the next run mints a per-deploy value. "
+            "Refusing to deploy. (Value not shown.)"
+        )
+        # Names only: the refusal must not echo the credential it rejected.
+        assert published not in str(exc_info.value)
+
+    def test_a_shell_export_of_the_default_refuses_too(self, tmp_path, monkeypatch):
+        """Process env wins over ``.env``, so it is just as much "set to the default"."""
+        published = next(iter(_VAR_FORBIDDEN_VALUES["ZO_ROOT_USER_PASSWORD"]))
+        monkeypatch.setenv("ZO_ROOT_USER_PASSWORD", published)
+
+        with pytest.raises(RuntimeError, match="ZO_ROOT_USER_PASSWORD") as exc_info:
+            container_lifecycle._ensure_service_tokens(
+                {"deployed_services": ["openobserve"]},
+                expose_network=False,
+                env_path=tmp_path / ".env",
+            )
+
+        assert published not in str(exc_info.value)
+
+    def test_a_fresh_repo_mints_and_does_not_refuse(self, tmp_path, monkeypatch):
+        """The narrowness this check is designed around.
+
+        Nothing in the process env, nothing on disk — the state every first
+        deploy starts from, and the state in which the template's ``:-``
+        fallback is what the value *would* resolve to. The mint runs first, so
+        the effective value is a per-deploy secret and the deploy proceeds. A
+        build-time twin of this refusal would fire here, on every new project,
+        which is why there is none.
+        """
+        monkeypatch.delenv("ZO_ROOT_USER_PASSWORD", raising=False)
+        env_path = tmp_path / ".env"
+        assert not env_path.exists()
+
+        minted = container_lifecycle._ensure_service_tokens(
+            {"deployed_services": ["openobserve"]}, expose_network=False, env_path=env_path
+        )
+
+        assert minted == {"ZO_ROOT_USER_PASSWORD"}
+        assert (
+            _parse_dotenv(env_path)["ZO_ROOT_USER_PASSWORD"]
+            not in _VAR_FORBIDDEN_VALUES["ZO_ROOT_USER_PASSWORD"]
+        )
+
+    def test_a_second_run_over_a_minted_value_still_does_not_refuse(self, tmp_path, monkeypatch):
+        """Idempotence survives the new check: a minted value is not forbidden."""
+        monkeypatch.delenv("ZO_ROOT_USER_PASSWORD", raising=False)
+        env_path = tmp_path / ".env"
+        config = {"deployed_services": ["openobserve"]}
+
+        container_lifecycle._ensure_service_tokens(config, expose_network=False, env_path=env_path)
+        minted = _parse_dotenv(env_path)["ZO_ROOT_USER_PASSWORD"]
+        container_lifecycle._ensure_service_tokens(config, expose_network=False, env_path=env_path)
+
+        assert _parse_dotenv(env_path)["ZO_ROOT_USER_PASSWORD"] == minted
+
+    def test_the_generator_can_never_mint_a_forbidden_value(self):
+        """The mint and the refusal must not be able to disagree."""
+        for _ in range(_MINT_SAMPLES):
+            assert not container_lifecycle._is_forbidden_value(
+                "ZO_ROOT_USER_PASSWORD", container_lifecycle._generate_openobserve_password()
+            )
+
+    def test_only_the_registered_var_has_a_forbidden_value(self, tmp_path, monkeypatch):
+        """Opt-in per var, exactly like ``_VAR_VALIDATORS``.
+
+        The same string set on an unregistered var is nobody's published
+        default, so it passes — the check is a named-value refusal, not a
+        password-strength opinion applied everywhere.
+        """
+        published = next(iter(_VAR_FORBIDDEN_VALUES["ZO_ROOT_USER_PASSWORD"]))
+        assert not container_lifecycle._is_forbidden_value("EVENT_DISPATCHER_TOKEN", published)
+
+        monkeypatch.setenv("EVENT_DISPATCHER_TOKEN", published)
+        monkeypatch.setenv("DISPATCH_WORKER_TOKEN", published)
+        container_lifecycle._ensure_service_tokens(
+            {"deployed_services": ["event_dispatcher"]},
+            expose_network=False,
+            env_path=tmp_path / ".env",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Volume-continuity warning — the one thing a re-mint cannot fix by itself
+# ---------------------------------------------------------------------------
+
+
+class TestVolumeContinuityReporting:
+    """A re-minted password is silently rejected by a volume that already exists.
+
+    OpenObserve and Postgres read their root credential ONLY when they
+    initialize a fresh data volume. Every other minted token takes effect on the
+    next restart; these two do not. So the dangerous moment is an operator who
+    lost ``.env`` — or just deleted its minted section — while the volumes
+    lived: the next deploy mints a NEW secret, the surviving volume keeps
+    ignoring it, and the failure surfaces as "I cannot log in" with nothing
+    anywhere connecting that to the mint.
+
+    Neither variable can be guarded by compose — both are interpolated with a
+    ``:-`` DEFAULT in their templates, so no ``:?`` guard aborts the deploy and
+    says why. What closes the gap instead is
+    ``_preflight_stale_store_volumes``, and the mint's only job is to tell it
+    which vars are newly minted. That hand-off is what is pinned here; the
+    refusal it feeds is pinned in test_stale_store_volume_preflight.py.
+    """
+
+    def test_a_minted_password_is_reported_as_a_volume_continuity_hazard(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("ZO_ROOT_USER_PASSWORD", raising=False)
+        config = {"deployed_services": ["openobserve"]}
+
+        minted = container_lifecycle._ensure_service_tokens(
+            config, expose_network=False, env_path=tmp_path / ".env"
+        )
+
+        assert minted == {"ZO_ROOT_USER_PASSWORD"}
+
+    def test_an_adopted_password_is_not_reported(self, tmp_path, monkeypatch):
+        """Nothing was minted, so the volume and the value agree by construction.
+
+        The distinction the whole preflight rests on: only a *new* value can
+        disagree with a volume that already exists.
+        """
+        monkeypatch.delenv("ZO_ROOT_USER_PASSWORD", raising=False)
+        # Must satisfy the same complexity constraint a real adopted value would.
+        (tmp_path / ".env").write_text("ZO_ROOT_USER_PASSWORD=Preexisting1!\n", encoding="utf-8")
+
+        minted = container_lifecycle._ensure_service_tokens(
+            {"deployed_services": ["openobserve"]},
+            expose_network=False,
+            env_path=tmp_path / ".env",
+        )
+
+        assert minted == set()
+
+    def test_the_warning_never_prints_the_value(self, tmp_path, monkeypatch, caplog):
+        """Names only, never values — the same rule every other line here follows."""
+        monkeypatch.delenv("ZO_ROOT_USER_PASSWORD", raising=False)
+        env_path = tmp_path / ".env"
+
+        with caplog.at_level("WARNING"):
+            container_lifecycle._ensure_service_tokens(
+                {"deployed_services": ["openobserve"]}, expose_network=False, env_path=env_path
+            )
+
+        secret = _parse_dotenv(env_path)["ZO_ROOT_USER_PASSWORD"]
+        assert secret
+        assert secret not in caplog.text
+
+    def test_a_password_that_was_already_there_draws_no_warning(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The warning is about the MINT, not about the variable.
+
+        A deploy that finds an existing value changes nothing, so there is
+        nothing for a volume to disagree with. Warning here would train the
+        operator to ignore it on every single deploy, which is the same as not
+        having it.
+        """
+        monkeypatch.setenv("ZO_ROOT_USER_PASSWORD", "Alr3ady#Set!")
+
+        with caplog.at_level("WARNING"):
+            container_lifecycle._ensure_service_tokens(
+                {"deployed_services": ["openobserve"]},
+                expose_network=False,
+                env_path=tmp_path / ".env",
+            )
+
+        assert "fresh data volume" not in caplog.text
+
+    def test_an_ordinary_token_draws_no_volume_warning(self, tmp_path, monkeypatch, caplog):
+        """Only the two volume-initialized vars qualify.
+
+        A dispatch token is read from the environment on every start, so a
+        re-mint takes effect immediately and there is nothing to warn about.
+        """
+        for var in ("EVENT_DISPATCHER_TOKEN", "DISPATCH_WORKER_TOKEN"):
+            monkeypatch.delenv(var, raising=False)
+
+        with caplog.at_level("WARNING"):
+            container_lifecycle._ensure_service_tokens(
+                {"deployed_services": ["event_dispatcher"]},
+                expose_network=False,
+                env_path=tmp_path / ".env",
+            )
+
+        assert "fresh data volume" not in caplog.text

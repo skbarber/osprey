@@ -32,7 +32,7 @@ async def build_execution_response(
     reported errors, raises ``ToolError`` carrying the OSPREY error envelope
     so fastmcp produces a wire-form ``CallToolResult(isError=True)`` (returning
     a CallToolResult with ``isError`` set is silently dropped by fastmcp's
-    ``convert_result`` — see the migration in commit cdba442d).
+    ``convert_result``).
 
     Args:
         code: Original source code (for notebook/metadata — not augmented).
@@ -134,10 +134,11 @@ async def build_execution_response(
         logger.debug("Notebook artifact creation failed (non-fatal)", exc_info=True)
 
     if not save_output:
-        # Return inline (legacy-compatible path for callers that opt out)
+        # Return inline (the path for callers that opt out of saving)
         result = {
             "description": description,
             "execution_mode": execution_mode,
+            "execution_method": exec_result.execution_method_used,
             "stdout": stdout_text,
             "stderr": stderr_text,
             "has_errors": has_errors,
@@ -179,6 +180,7 @@ async def build_execution_response(
         summary["artifact_count"] = len(artifact_ids)
     access_details = {
         "execution_mode": execution_mode,
+        "execution_method": exec_result.execution_method_used,
         "code_lines": len(code.splitlines()),
         "stdout_length": len(stdout_text),
         "stderr_length": len(stderr_text),

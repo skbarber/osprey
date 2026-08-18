@@ -2,7 +2,7 @@
 co-deployed as real containers, is equivalent to (and honest about divergence
 from) a real EPICS beamline (PROPOSAL.md's Risk-1/Station-2 gate).
 
-One module-scoped build + ``osprey deploy up -d --dev`` co-deploys the
+One module-scoped init + build + ``osprey up -d --dev`` co-deploys the
 Virtual Accelerator (task 4.1) and the Bluesky bridge (task 2.9) wired to the
 EPICS substrate scanner (task 2.3), with one sp-echo ``:SP`` pre-faulted
 (task 3.1's ``VA_STUCK_SETPOINTS``) via task 4.2's env passthrough. Five
@@ -12,16 +12,23 @@ proofs then exercise the whole stack end to end:
   P2 liveness:      the full manifest namespace is reachable over CA.
   P3 read-equiv:    a pyepics (host) read and an ophyd-async (bridge) read of
                      the same PV agree.
-  P4 concurrent:    an EPICS-substrate ``scan`` plan runs to completion while a
-                     concurrent host read observes the same PV consistently —
-                     the loop-affinity falsifier (task 2.1).
+  P4 concurrent:    an EPICS-substrate ``grid_scan`` plan runs to completion
+                     while a concurrent host read observes the same PV
+                     consistently — the loop-affinity falsifier.
   P5 honest divergence: a write to a pre-faulted ``:SP`` verifies (the SP
                      always latches its own readback), but an independent read
                      of the sibling ``:RB`` proves it never moved — and both
                      CA clients (host + bridge) agree on that frozen value.
 
+Plans reach the hardware through the bridge's QUEUE, not a direct-execute
+route: P3/P4 stage the plan in the shared draft, enqueue that exact revision,
+and arm ``POST /queue/start`` with the launch token (``PATCH /draft`` ->
+``POST /queue/items`` -> ``POST /queue/start`` -> poll ``GET /runs/{id}``,
+spelled once in ``tests/e2e/_queue_drive.py``). That is transport only — what
+these proofs assert about the substrate is unchanged.
+
 No preset channel names are hardcoded: every address used below is derived
-from the DEPLOYED project's own ``data/channel_limits.json`` (writable ⟺ a
+from the DEPLOYED render's own ``build/data/channel_limits.json`` (writable ⟺ a
 ``:SP`` address) restricted to sp-echo pairs (``classify_partition`` — a
 write to a pyat-coupled ``:SP`` has ring-wide physics side effects, wrong for
 an isolated fault/equivalence probe; sp-echo is a pure software echo, exactly
@@ -31,7 +38,10 @@ Container safety: every docker invocation below names an exact container/image
 — never a wildcard, never ``system prune``/``--volumes``. The one forced
 ``docker rmi -f <image>`` (below) names an exact image, matching
 ``test_bluesky_deploy.py``'s precedent for forcing a fresh ``--dev`` build.
-Teardown goes through ``osprey deploy down``, never a raw ``docker rm`` sweep.
+Teardown goes through ``osprey down``, never a raw ``docker rm`` sweep,
+followed by exact-named removal of this project's own volumes
+(``tests/e2e/_volumes.py``): ``down`` keeps them by design, and a rerun must
+not inherit their state.
 
 Gating: needs Docker; the VA image builds natively for the host arch, so on
 Apple Silicon PyAT/softioc compile from source (no prebuilt aarch64 wheels) —
@@ -63,6 +73,9 @@ from typing import Any
 import pytest
 
 from osprey.deployment.compose_generator import resolve_project_name
+from tests.e2e import _orm_stack, _queue_drive
+from tests.e2e._deploy_diagnostics import dead_container_logs, queue_stack_logs
+from tests.e2e._volumes import remove_project_volumes
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SWEEP_SCRIPT = REPO_ROOT / "scripts" / "va" / "sweep_check.py"
@@ -81,8 +94,8 @@ HOST_CA_RESULT_MARKER = "__HOST_CA_RESULT__"
 # connector config below and the container's published port must both stay
 # at this value, or the two silently drift apart.
 VA_CA_PORT = 5064
-# The fixture builds/deploys under this project name; the compose templates
-# render each service's container_name AND its locally-built image as
+# The deployment repo's directory name IS the deployment's name; the compose
+# templates render each service's container_name AND its locally-built image as
 # ``<project>-<service>`` (services/*/docker-compose.yml.j2), so derive both
 # (via resolve_project_name, exactly as the templates do) rather than hardcode
 # host-global names that break the moment the templates are namespaced per-project.
@@ -97,23 +110,25 @@ BRIDGE_URL = f"http://localhost:{BRIDGE_PORT}"
 BRIDGE_CONTAINER = f"{PROJECT_NAME}-bluesky-bridge"
 BRIDGE_IMAGE = f"{resolve_project_name({'project_name': PROJECT_NAME})}-bluesky-bridge:local"
 
-# Device names wired into the bridge via BLUESKY_EPICS_MOTORS/_DETECTORS —
-# arbitrary, resolved against explicit PV addresses (see _write_scan_env
+# Device names wired into the bridge via BLUESKY_EPICS_SETPOINTS/_DETECTORS —
+# arbitrary, resolved against explicit PV addresses (see _write_substrate_env
 # below), never a preset naming convention.
 SCAN_MOTOR = "scan_motor"
 P3_DETECTOR = "p3_det"
 P4_DETECTOR = "p4_det"
 P5_DETECTOR = "p5_det"
 
-# The bridge's launch route (POST /runs/{id}/launch) fails closed on an unset
-# BLUESKY_LAUNCH_TOKEN. `osprey deploy up` normally auto-mints one, but the
-# control-assistant preset deploys with control_system.writes_enabled: true AND
-# execution.execution_method: local, which deliberately gates auto-arming off
-# (container_lifecycle._local_exec_arming_unsafe — a local unsandboxed agent
-# could read the token and bypass the write gate). This e2e is a controlled
-# test, not agent code, so it supplies its own token explicitly (the supported
-# operator-provides-a-token path) rather than exercise that arming policy here.
+# The bridge's arming route (POST /queue/start) fails closed on an unset
+# BLUESKY_LAUNCH_TOKEN. `osprey up` mints one for the deployed bluesky
+# service, but this e2e supplies its own explicitly (the supported
+# operator-provides-a-token path) so the test knows the token value up front
+# and never has to read it back out of the repo's .env.
 LAUNCH_TOKEN = "e2e-substrate-equivalence-launch-token"
+
+# Identifies this suite as the draft's writer on every PATCH /draft frame. The
+# draft is a single shared document, so a client id that names the writer is
+# what makes a stray edit attributable.
+_QUEUE_CLIENT_ID = "va-substrate-equivalence-e2e"
 
 BUILD_TIMEOUT_SEC = 300
 DEPLOY_UP_TIMEOUT_SEC = 1200  # first-time native VA source build is slow (minutes)
@@ -175,13 +190,19 @@ def _run(cmd: list[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess
     )
 
 
-def _channel_limits(project_dir: Path) -> dict[str, Any]:
-    return json.loads((project_dir / "data" / "channel_limits.json").read_text(encoding="utf-8"))
+def _channel_limits(repo: Path) -> dict[str, Any]:
+    """The RENDER's channel limits — the file the deployed containers get.
+
+    ``build/data/`` rather than the repo root's ``data/``: the latter is the
+    source an operator edits, the former is what this build produced and what
+    the bridge and the VA both read.
+    """
+    return json.loads((repo / "build" / "data" / "channel_limits.json").read_text(encoding="utf-8"))
 
 
 def _select_sp_echo_pairs(channel_limits: dict[str, Any], count: int) -> list[tuple[str, str]]:
     """Derive ``count`` disjoint sp-echo (``:SP``, ``:RB``) pairs from the
-    deployed project's own channel_limits.json -- no hardcoded preset
+    deployed render's own channel_limits.json -- no hardcoded preset
     channels.
 
     A channel is writable (candidate ``:SP``) iff its channel_limits.json
@@ -226,10 +247,14 @@ def _select_sp_echo_pairs(channel_limits: dict[str, Any], count: int) -> list[tu
     return pairs[:count]
 
 
-def _write_scan_env(project_dir: Path, pairs: dict[str, tuple[str, str]]) -> None:
-    """Append task 4.2's contract env vars to the project ``.env`` -- BEFORE
-    ``osprey deploy up`` (the bridge/VA compose templates pass these through
-    from the project ``.env``, same mechanism as ``BLUESKY_LAUNCH_TOKEN``).
+def _write_substrate_env(repo: Path, pairs: dict[str, tuple[str, str]]) -> None:
+    """Append task 4.2's contract env vars to the repo's ``.env`` -- BEFORE
+    ``osprey up`` (the bridge/VA compose templates pass these through from the
+    repo root's ``.env``, same mechanism as ``BLUESKY_LAUNCH_TOKEN``).
+
+    Creating that file is also what lets ``up`` run at all: the repo root's
+    ``.env`` is the deployment's whole secret store, and ``up`` aborts when it
+    is missing.
     """
     p3_sp, p3_rb = pairs["p3"]
     p4_sp, p4_rb = pairs["p4"]
@@ -240,14 +265,14 @@ def _write_scan_env(project_dir: Path, pairs: dict[str, tuple[str, str]]) -> Non
         # config gates auto-minting off (see LAUNCH_TOKEN above).
         "BLUESKY_LAUNCH_TOKEN": LAUNCH_TOKEN,
         "BLUESKY_EPICS_SUBSTRATE": "1",
-        "BLUESKY_EPICS_MOTORS": f"{SCAN_MOTOR}={p4_sp}|{p4_rb}",
-        "BLUESKY_EPICS_DETECTORS": (
+        "BLUESKY_EPICS_SETPOINTS": f"{SCAN_MOTOR}={p4_sp}|{p4_rb}",
+        "BLUESKY_EPICS_READBACKS": (
             f"{P3_DETECTOR}={p3_rb},{P4_DETECTOR}={p4_rb},{P5_DETECTOR}={p5_rb}"
         ),
         "VA_STUCK_SETPOINTS": p5_sp,
     }
 
-    env_path = project_dir / ".env"
+    env_path = repo / ".env"
     existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
     if existing and not existing.endswith("\n"):
         existing += "\n"
@@ -256,12 +281,10 @@ def _write_scan_env(project_dir: Path, pairs: dict[str, tuple[str, str]]) -> Non
 
 
 class DeployedStack:
-    """Everything the P1-P5 tests need about the one co-deployed project."""
+    """Everything the P1-P5 tests need about the one co-deployed repo."""
 
-    def __init__(
-        self, project_dir: Path, pairs: dict[str, tuple[str, str]], limits: dict[str, Any]
-    ):
-        self.project_dir = project_dir
+    def __init__(self, repo: Path, pairs: dict[str, tuple[str, str]], limits: dict[str, Any]):
+        self.repo = repo
         self.pairs = pairs
         self.limits = limits
 
@@ -274,7 +297,7 @@ class DeployedStack:
 def deployed_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[DeployedStack]:
     osprey_bin = _find_osprey_console_script()
     base = tmp_path_factory.mktemp("va_substrate_build")
-    project_dir = base / PROJECT_NAME
+    repo = base / PROJECT_NAME
 
     # Extends control-assistant (which already ships data/simulation/machine.json
     # + channel_limits.json) with the one flag it doesn't default to: the
@@ -289,40 +312,52 @@ def deployed_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Deploye
     # build than the VA image already is.
     # `modules.web_terminals.enabled: false` scopes this deploy back to the VA +
     # bridge substrate: the control-assistant preset now ships the multi-user
-    # web-terminal stack on by default, so an unqualified `deploy up` would also
-    # auto-render both persona projects, build two web images, and start
-    # nginx/web containers -- none of which this substrate-equivalence proof
-    # exercises (that topology is covered by test_control_assistant_demo.py).
+    # web-terminal stack on by default, so an unqualified deploy would also
+    # render both persona projects, build two web images, and start nginx/web
+    # containers -- none of which this substrate-equivalence proof exercises
+    # (that topology is covered by test_control_assistant_demo.py).
+    # `_orm_stack.VA_ARCHIVER_CI_KNOBS` shrinks the archive the preset declares
+    # to a CI-sized one -- this proof deploys the store (the preset's
+    # `va_archiver:` block is what makes the VA's history real) but reads none
+    # of its history, and seeding a tutorial-sized month costs every run.
     override_path = base / "override.yml"
     override_path.write_text(
         "config:\n"
         "  control_system.type: virtual_accelerator\n"
         "  modules.web_terminals.enabled: false\n"
-        "dispatch: null\n",
+        "dispatch: null\n" + _orm_stack.VA_ARCHIVER_CI_KNOBS,
         encoding="utf-8",
     )
 
-    build = _run(
+    # Two steps, because the surface has two: `init` writes the repo's source
+    # zone from the preset, `build` renders build/ from it. The repo directory
+    # name IS the deployment name, so the container names above still hold.
+    init = _run(
         [
             str(osprey_bin),
-            "build",
-            PROJECT_NAME,
+            "init",
+            str(repo),
             "--preset",
             "control-assistant",
+            "--no-git",
             "--override",
             str(override_path),
             "--set",
             f"virtual_accelerator.port={VA_CA_PORT}",
             "--set",
             f"bluesky.port={BRIDGE_PORT}",
-            "--set",
-            "bluesky.demo_runner=false",
-            "--skip-deps",
-            "--skip-lifecycle",
-            "--output-dir",
-            str(base),
-            "--force",
         ],
+        cwd=base,
+        timeout=BUILD_TIMEOUT_SEC,
+    )
+    if init.returncode != 0:
+        pytest.fail(
+            f"osprey init failed (rc={init.returncode}):\n"
+            f"--- stdout ---\n{init.stdout}\n--- stderr ---\n{init.stderr}"
+        )
+
+    build = _run(
+        [str(osprey_bin), "build", "--repo", str(repo), "--skip-deps", "--skip-lifecycle", "--dev"],
         cwd=base,
         timeout=BUILD_TIMEOUT_SEC,
     )
@@ -332,14 +367,14 @@ def deployed_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Deploye
             f"--- stdout ---\n{build.stdout}\n--- stderr ---\n{build.stderr}"
         )
 
-    limits = _channel_limits(project_dir)
+    limits = _channel_limits(repo)
     sp3, sp4, sp5 = _select_sp_echo_pairs(limits, count=3)
     pairs = {"p3": sp3, "p4": sp4, "p5": sp5}
-    _write_scan_env(project_dir, pairs)
+    _write_substrate_env(repo, pairs)
 
     # Force fresh --dev builds so the deployed containers run CURRENT source
-    # (osprey deploy up does not pass --build to compose, so it would
-    # otherwise reuse a stale cached image). Exact-named images only.
+    # (osprey up does not pass --build to compose, so it would otherwise reuse a
+    # stale cached image). Exact-named images only.
     # E2E_REUSE_IMAGES=1 skips this (dev-only: fast local iteration on the test
     # itself when the osprey source is unchanged; never set it in CI, where a
     # source change must always rebuild). The first-time native VA build is slow.
@@ -349,23 +384,45 @@ def deployed_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Deploye
 
     try:
         up = _run(
-            [str(osprey_bin), "deploy", "up", "-d", "--dev"],
-            cwd=project_dir,
+            [str(osprey_bin), "up", "-d", "--dev"],
+            cwd=repo,
             timeout=DEPLOY_UP_TIMEOUT_SEC,
         )
         if up.returncode != 0:
             pytest.fail(
-                f"osprey deploy up -d --dev failed (rc={up.returncode}):\n"
-                f"--- stdout ---\n{up.stdout}\n--- stderr ---\n{up.stderr}"
+                f"osprey up -d --dev failed (rc={up.returncode}):\n"
+                f"--- stdout ---\n{up.stdout}\n--- stderr ---\n{up.stderr}\n"
+                f"--- containers that are not running ---\n{_dead_container_logs()}"
             )
-        _wait_for_health(f"{BRIDGE_URL}/health", HEALTH_TIMEOUT_SEC)
-        yield DeployedStack(project_dir=project_dir, pairs=pairs, limits=limits)
+        try:
+            _wait_for_health(f"{BRIDGE_URL}/health", HEALTH_TIMEOUT_SEC)
+        except AssertionError as exc:
+            pytest.fail(f"{exc}\n--- containers that are not running ---\n{_dead_container_logs()}")
+        # HTTP readiness is not enqueue readiness -- the worker namespace the
+        # enqueue validates against exists only once the RE worker environment
+        # is open, and the bridge opens that off the readiness path. See
+        # `_queue_drive.wait_for_worker_environment`. Its own diagnostic is the
+        # two RUNNING containers that own the environment, which
+        # `_dead_container_logs` skips by design.
+        try:
+            _queue_drive.wait_for_worker_environment(BRIDGE_URL)
+        except AssertionError as exc:
+            pytest.fail(f"{exc}\n{queue_stack_logs(_orm_stack.project_prefix(PROJECT_NAME))}")
+        yield DeployedStack(repo=repo, pairs=pairs, limits=limits)
     finally:
-        down = _run([str(osprey_bin), "deploy", "down"], cwd=project_dir, timeout=300)
+        down = _run([str(osprey_bin), "down"], cwd=repo, timeout=300)
         if down.returncode != 0:
             print(  # noqa: T201 - surface teardown issues in CI logs
-                f"osprey deploy down rc={down.returncode}\n{down.stdout}\n{down.stderr}"
+                f"osprey down rc={down.returncode}\n{down.stdout}\n{down.stderr}"
             )
+        # `osprey down` keeps volumes by design; drop this project's own so a
+        # rerun cannot inherit their state (see tests/e2e/_volumes.py).
+        remove_project_volumes(_orm_stack.project_prefix(PROJECT_NAME))
+
+
+def _dead_container_logs() -> str:
+    """Logs from every container of this deployment that is not running."""
+    return dead_container_logs(resolve_project_name({"project_name": PROJECT_NAME}))
 
 
 def _wait_for_health(url: str, timeout: float) -> None:
@@ -402,14 +459,14 @@ def _wait_for_container_health(container: str, timeout: float) -> None:
     )
 
 
-def _minted_token(project_dir: Path) -> str:
+def _minted_token(repo: Path) -> str:
     from osprey.utils.dotenv import parse_dotenv_file
 
-    env_path = project_dir / ".env"
+    env_path = repo / ".env"
     assert env_path.is_file(), f"no .env written at {env_path} — token was not minted"
     env = parse_dotenv_file(env_path)
     token = env.get("BLUESKY_LAUNCH_TOKEN")
-    assert token, "BLUESKY_LAUNCH_TOKEN missing/empty in the project .env"
+    assert token, "BLUESKY_LAUNCH_TOKEN missing/empty in the deployment repo's .env"
     return token
 
 
@@ -417,21 +474,6 @@ def _get(path: str) -> tuple[int, dict]:
     req = urllib.request.Request(f"{BRIDGE_URL}{path}", method="GET")  # noqa: S310
     try:
         with urllib.request.urlopen(req, timeout=10.0) as resp:  # noqa: S310
-            return resp.status, json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read().decode("utf-8"))
-
-
-def _post(path: str, body: dict, headers: dict | None = None) -> tuple[int, dict]:
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(  # noqa: S310
-        f"{BRIDGE_URL}{path}",
-        data=data,
-        method="POST",
-        headers={"Content-Type": "application/json", **(headers or {})},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15.0) as resp:  # noqa: S310
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read().decode("utf-8"))
@@ -460,29 +502,33 @@ def _docker_inspect(container: str, fmt: str) -> str:
 
 
 async def _run_scan(
-    plan_name: str, plan_args: dict, project_dir: Path, timeout: float = SCAN_TIMEOUT_SEC
+    plan_name: str, plan_args: dict, repo: Path, timeout: float = SCAN_TIMEOUT_SEC
 ) -> tuple[str, dict]:
-    """POST /runs -> launch -> poll to a terminal status. Returns (run_id, final_status_body)."""
-    token = _minted_token(project_dir)
-    status, body = _post("/runs", {"plan_name": plan_name, "plan_args": plan_args})
-    assert status == 200, f"POST /runs failed: {status} {body}"
-    run_id = body["id"]
+    """Stage -> enqueue -> armed start -> poll. Returns (run_id, final_status_body).
 
-    status, body = _post(f"/runs/{run_id}/launch", {}, headers={"X-Launch-Token": token})
-    assert status == 200, f"launch failed: {status} {body}"
+    The three writes go through `_queue_drive`, the one copy of the queue flow.
+    The poll stays here, and stays ``async``: P4 runs a host-side CA read
+    concurrently with the run, so this module's loop must never be blocked
+    while a plan is under way.
+    """
+    token = _minted_token(repo)
+    run_id = _queue_drive.stage_and_enqueue(
+        BRIDGE_URL, plan_name, plan_args, client_id=_QUEUE_CLIENT_ID
+    )
+    _queue_drive.start_queue(BRIDGE_URL, token)
 
     deadline = time.monotonic() + timeout
     last_status_body: dict = {}
     while time.monotonic() < deadline:
         _, last_status_body = _get(f"/runs/{run_id}")
-        if last_status_body.get("status") in ("completed", "error", "stopped"):
+        if last_status_body.get("status") in _queue_drive.TERMINAL_STATUSES:
             break
         await asyncio.sleep(0.2)
     return run_id, last_status_body
 
 
 def _host_ca_op_spec(
-    project_dir: Path,
+    repo: Path,
     *,
     read: str,
     write: dict[str, Any] | None = None,
@@ -491,10 +537,15 @@ def _host_ca_op_spec(
     """Build the JSON spec for one out-of-process host CA op (``_va_host_ca_op.py``).
 
     Carries the SAME ``get_config_value`` overrides the in-process connector
-    used -- ``project_root`` and ``limits_checking.database_path`` point at the
-    REAL deployed project so ``LimitsValidator`` enforces the REAL
-    channel_limits.json this test selected channels from (these proofs write only
-    LISTED sp-echo ``:SP`` channels, so limits are actually applied to them), and
+    used -- ``project_root`` is the deployment repo and
+    ``limits_checking.database_path`` names the RENDER's channel_limits.json, so
+    ``LimitsValidator`` enforces the very file this test selected channels from
+    (these proofs write only LISTED sp-echo ``:SP`` channels, so limits are
+    actually applied to them). Spelled absolute rather than repo-relative: a
+    relative ``database_path`` resolves against ``CONFIG_FILE``'s directory when
+    that is set and against ``project_root`` otherwise, and this subprocess sets
+    neither anchor to the render.
+
     ``CONNECTOR_CONFIG`` is passed verbatim so the subprocess builds a REAL
     production ``VirtualAcceleratorConnector`` via ``ConnectorFactory`` under
     test-supplied config. Config keys these proofs don't exercise (e.g.
@@ -506,9 +557,11 @@ def _host_ca_op_spec(
     overrides: dict[str, Any] = {
         "control_system.writes_enabled": True,
         "control_system.limits_checking.enabled": True,
-        "control_system.limits_checking.database_path": "data/channel_limits.json",
+        "control_system.limits_checking.database_path": str(
+            repo / "build" / "data" / "channel_limits.json"
+        ),
         "control_system.limits_checking.allow_unlisted_channels": True,
-        "project_root": str(project_dir),
+        "project_root": str(repo),
     }
     return {
         "connector_config": CONNECTOR_CONFIG,
@@ -652,7 +705,7 @@ async def test_p3_read_equivalence(deployed_stack: DeployedStack) -> None:
     # heavy load.
     host = _run_host_ca_op(
         _host_ca_op_spec(
-            deployed_stack.project_dir,
+            deployed_stack.repo,
             read=rb,
             write={"address": sp, "value": value},
             settle_read=True,
@@ -668,15 +721,15 @@ async def test_p3_read_equivalence(deployed_stack: DeployedStack) -> None:
     host_read = host["read_value"]
 
     # grid_scan is the catalog's minimal acquisition plan (`count` was dropped
-    # with the trust-tiered registry): step the p4 scan motor through a 2-point
-    # sweep and read the p3 detector at each point — the p3 pair itself is
+    # with the trust-tiered registry): step the p4 scan setpoint through a 2-point
+    # sweep and read the p3 readback at each point — the p3 pair itself is
     # never driven, so both rows sample the settled sp-echo value.
     m_sp, _ = deployed_stack.pairs["p4"]
     m_lo, m_hi = deployed_stack.bounds(m_sp)
     run_id, status_body = await _run_scan(
         "grid_scan",
         {
-            "detectors": [P3_DETECTOR],
+            "readbacks": [P3_DETECTOR],
             "axes": [
                 {
                     "setpoint": SCAN_MOTOR,
@@ -686,10 +739,10 @@ async def test_p3_read_equivalence(deployed_stack: DeployedStack) -> None:
                 }
             ],
         },
-        deployed_stack.project_dir,
+        deployed_stack.repo,
     )
     assert status_body.get("status") == "completed", (
-        f"P3 read-equivalence scan did not complete: {status_body}"
+        f"P3 read-equivalence run did not complete: {status_body}"
     )
 
     status, data = _get(f"/runs/{run_id}/data")
@@ -711,7 +764,7 @@ async def test_p3_read_equivalence(deployed_stack: DeployedStack) -> None:
 
 
 # ---------------------------------------------------------------------------
-# P4: concurrent scan + read — the loop-affinity falsifier
+# P4: concurrent run + read — the loop-affinity falsifier
 # ---------------------------------------------------------------------------
 
 
@@ -723,35 +776,33 @@ async def test_p4_concurrent_scan_and_read(deployed_stack: DeployedStack) -> Non
     stop = lo + 0.75 * (hi - lo)
     num = 4
 
-    token = _minted_token(deployed_stack.project_dir)
-    status, body = _post(
-        "/runs",
+    # Driven step by step rather than through `_run_scan`: the host read below
+    # has to be spawned between the armed start and the first poll, so this
+    # proof needs the start and the polling loop separated.
+    token = _minted_token(deployed_stack.repo)
+    run_id = _queue_drive.stage_and_enqueue(
+        BRIDGE_URL,
+        "grid_scan",
         {
-            "plan_name": "grid_scan",
-            "plan_args": {
-                "detectors": [P4_DETECTOR],
-                "axes": [{"setpoint": SCAN_MOTOR, "start": start, "stop": stop, "num_points": num}],
-            },
+            "readbacks": [P4_DETECTOR],
+            "axes": [{"setpoint": SCAN_MOTOR, "start": start, "stop": stop, "num_points": num}],
         },
+        client_id=_QUEUE_CLIENT_ID,
     )
-    assert status == 200, f"POST /runs failed: {status} {body}"
-    run_id = body["id"]
+    _queue_drive.start_queue(BRIDGE_URL, token)
 
-    status, body = _post(f"/runs/{run_id}/launch", {}, headers={"X-Launch-Token": token})
-    assert status == 200, f"launch failed: {status} {body}"
-
-    # Launch the host read in its OWN process immediately after launch, before
-    # any polling sleep, so it genuinely overlaps the bridge's in-flight scan (a
-    # wrong-loop/dead-monitor connect on the bridge side would stall the scan;
+    # Launch the host read in its OWN process immediately after the start, before
+    # any polling sleep, so it genuinely overlaps the bridge's in-flight run (a
+    # wrong-loop/dead-monitor connect on the bridge side would stall the run;
     # see module docstring and task 2.1). Isolating it in a subprocess is what
     # keeps the libca CA-teardown assertion from ever recurring in this process
     # (see _va_host_ca_op.py). Even if subprocess connect latency lands the read
-    # after the scan settles, it still lands on a settled sp-echo step — which
+    # after the run settles, it still lands on a settled sp-echo step — which
     # the candidate set below accepts.
     read_proc = await asyncio.create_subprocess_exec(
         sys.executable,
         str(HOST_CA_OP_SCRIPT),
-        json.dumps(_host_ca_op_spec(deployed_stack.project_dir, read=rb)),
+        json.dumps(_host_ca_op_spec(deployed_stack.repo, read=rb)),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -766,10 +817,10 @@ async def test_p4_concurrent_scan_and_read(deployed_stack: DeployedStack) -> Non
         status_body: dict = {}
         while time.monotonic() < deadline:
             _, status_body = _get(f"/runs/{run_id}")
-            if status_body.get("status") in ("completed", "error", "stopped"):
+            if status_body.get("status") in _queue_drive.TERMINAL_STATUSES:
                 break
             await asyncio.sleep(0.2)
-        assert status_body.get("status") == "completed", f"P4 scan did not complete: {status_body}"
+        assert status_body.get("status") == "completed", f"P4 run did not complete: {status_body}"
 
         stdout_b, stderr_b = await asyncio.wait_for(
             read_proc.communicate(), timeout=HOST_CA_OP_TIMEOUT_SEC
@@ -807,7 +858,7 @@ async def test_p4_concurrent_scan_and_read(deployed_stack: DeployedStack) -> Non
     candidates = [0.0, *row_values]
     assert any(abs(concurrent_value - c) <= 1e-6 for c in candidates), (
         f"concurrent host read of {rb} ({concurrent_value}) matched neither the "
-        f"pristine default nor any scanned row {row_values}"
+        f"pristine default nor any row from the run {row_values}"
     )
 
 
@@ -828,7 +879,7 @@ async def test_p5_honest_divergence_under_stuck_setpoint(deployed_stack: Deploye
     # Host side (pyepics), isolated in its own process: write the pre-faulted SP,
     # then read the sibling RB back — one connect/write/read in one subprocess.
     host = _run_host_ca_op(
-        _host_ca_op_spec(deployed_stack.project_dir, read=rb, write={"address": sp, "value": value})
+        _host_ca_op_spec(deployed_stack.repo, read=rb, write={"address": sp, "value": value})
     )
     # The SP always latches its own written value (records.py) even when stuck --
     # only the propagation to RB is dropped. write_channel's readback
@@ -849,14 +900,14 @@ async def test_p5_honest_divergence_under_stuck_setpoint(deployed_stack: Deploye
     )
 
     # grid_scan replaces the dropped `count` builtin (see P3): drive the p4
-    # scan motor, never the stuck p5 pair, and read the frozen p5 readback at
+    # scan setpoint, never the stuck p5 pair, and read the frozen p5 readback at
     # each of the 2 grid points.
     m_sp, _ = deployed_stack.pairs["p4"]
     m_lo, m_hi = deployed_stack.bounds(m_sp)
     run_id, status_body = await _run_scan(
         "grid_scan",
         {
-            "detectors": [P5_DETECTOR],
+            "readbacks": [P5_DETECTOR],
             "axes": [
                 {
                     "setpoint": SCAN_MOTOR,
@@ -866,10 +917,10 @@ async def test_p5_honest_divergence_under_stuck_setpoint(deployed_stack: Deploye
                 }
             ],
         },
-        deployed_stack.project_dir,
+        deployed_stack.repo,
     )
     assert status_body.get("status") == "completed", (
-        f"P5 divergence scan did not complete: {status_body}"
+        f"P5 divergence run did not complete: {status_body}"
     )
 
     status, data = _get(f"/runs/{run_id}/data")

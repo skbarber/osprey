@@ -7,8 +7,9 @@
 
 import { initTheme } from '/design-system/js/theme-manager.js';
 import { applyEmbedded } from '/design-system/js/frame-params.js';
+import { contributeHeader, onHeaderAction } from '/design-system/js/header-contrib.js';
 import { capabilitiesApi } from './api.js';
-import { initSearch, performSearch, clearSearch } from './search.js';
+import { initSearch, performSearch, clearSearch, onUiModeChange } from './search.js';
 import { initEntries, loadEntries, showEntry, closeEntryModal, loadDraft, showImageLightbox } from './entries.js';
 import { initDashboard, loadStatus, startAutoRefresh, stopAutoRefresh } from './dashboard.js';
 import { initAdvancedOptions } from './advanced-options.js';
@@ -21,14 +22,75 @@ import { initSettings } from './settings.js';
 // pre-paint; this call attaches the follower's postMessage listener.
 initTheme({ role: 'follower' });
 
+// Live Expert<->Simple switch broadcast by the hub's header toggle. The
+// pre-paint rung (mode-boot.js) already set the initial data-ui-mode; this is
+// the runtime flip. Coerce anything non-"simple" to "expert", re-stamp the
+// attribute (CSS deltas key off it), then repaint the current results so plain
+// cards <-> scored cards swap without re-running the query. Mirrors the
+// artifacts panel's gallery.js listener.
+window.addEventListener('message', (e) => {
+  if (e.origin !== window.location.origin) return;
+  if (e.data && e.data.type === 'osprey-mode-change' && e.data.mode) {
+    const mode = e.data.mode === 'simple' ? 'simple' : 'expert';
+    document.documentElement.setAttribute('data-ui-mode', mode);
+    onUiModeChange();
+  }
+});
+
 // Current view
 let currentView = 'search';
+
+/**
+ * Whether the app runs embedded in the web terminal iframe.
+ * Reads the `embedded` body class set by applyEmbedded() in init().
+ * @returns {boolean}
+ */
+function isEmbedded() {
+  return document.body.classList.contains('embedded');
+}
+
+/**
+ * Default view when no hash is present. Search is standalone-only: when
+ * embedded in the web terminal, logbook search goes through the agent, so
+ * the panel opens on Browse instead.
+ * @returns {string}
+ */
+function defaultView() {
+  return isEmbedded() ? 'browse' : 'search';
+}
+
+/**
+ * Views the tile bar's nav offers when embedded. Search and Status are
+ * standalone-only (navigateTo redirects both to browse), so the bar carries
+ * the two views an operator actually works in.
+ * @type {{ id: string, label: string }[]}
+ */
+const HEADER_VIEWS = [
+  { id: 'browse', label: 'Browse' },
+  { id: 'create', label: 'New Entry' },
+];
+
+/**
+ * Publish this panel's tile-bar contribution for the current view. The hub
+ * renders only what the last contribution says, so the WHOLE nav goes out
+ * again on every view change. No-op standalone.
+ */
+function publishHeaderContribution() {
+  contributeHeader([
+    {
+      kind: 'nav',
+      id: 'view',
+      items: HEADER_VIEWS.map(v => ({ id: v.id, label: v.label, active: v.id === currentView })),
+    },
+  ]);
+}
 
 /**
  * Initialize the application.
  */
 async function init() {
-  // Embedded mode — hide logo when loaded inside web terminal iframe
+  // Embedded mode — drops the panel's own header entirely (the host tile bar
+  // is the one header) when loaded inside the web terminal iframe
   applyEmbedded();
 
   // Initialize modules — wrapped in try/catch so navigation always works
@@ -54,7 +116,7 @@ async function init() {
   setupNavigation();
   setupModals();
 
-  const hash = window.location.hash.slice(1) || 'search';
+  const hash = window.location.hash.slice(1) || defaultView();
   navigateTo(hash);
 
   // Expose app API to window for onclick handlers
@@ -87,8 +149,14 @@ function setupNavigation() {
 
   // Handle hash changes
   window.addEventListener('hashchange', () => {
-    const hash = window.location.hash.slice(1) || 'search';
+    const hash = window.location.hash.slice(1) || defaultView();
     navigateTo(hash);
+  });
+
+  // Embedded: the same nav lives in the host tile bar. The hub posts the
+  // clicked entry's id back here and navigateTo re-publishes the active state.
+  onHeaderAction((id, value) => {
+    if (id === 'view' && value) navigateTo(value);
   });
 }
 
@@ -143,6 +211,15 @@ function parseHash(hash) {
 function navigateTo(hash) {
   const { viewName, params } = parseHash(hash);
 
+  // Search and Status are standalone-only: embedded users search the logbook
+  // through the agent, and the hub's own ARIEL dot reports service health.
+  // Redirect stray hashes so neither view can activate (which also keeps the
+  // status auto-refresh interval — started only on that activation — off).
+  if (isEmbedded() && (viewName === 'search' || viewName === 'status')) {
+    navigateTo('browse');
+    return;
+  }
+
   // Update URL hash
   window.location.hash = hash;
 
@@ -193,6 +270,8 @@ function navigateTo(hash) {
   }
 
   currentView = viewName;
+
+  publishHeaderContribution();
 }
 
 // Initialize when DOM is ready

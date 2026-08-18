@@ -15,8 +15,11 @@ import time
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+from osprey.agent_runner.artifact_resolve import deployed_config_path, deployed_render_dir
+from osprey.agent_runner.primitives import await_mcp_ready, expected_mcp_servers
 from osprey.mcp_server.dispatch_worker import failure_class, run_stats
 
 logger = logging.getLogger("osprey.mcp_server.dispatch_worker.sdk_runner")
@@ -53,6 +56,7 @@ try:
     from claude_agent_sdk import (
         AssistantMessage,
         ClaudeAgentOptions,
+        ClaudeSDKClient,
         HookMatcher,
         ResultMessage,
         SystemMessage,
@@ -60,14 +64,11 @@ try:
         ToolResultBlock,
         ToolUseBlock,
         UserMessage,
-        query,
     )
 
     HAS_SDK = True
 except ImportError:
     HAS_SDK = False
-
-_DEFAULT_PROJECT_DIR = "/app/project"
 
 # Bounds on per-run captured output. A run's text/tool output is held in memory,
 # persisted to JSON, and proxied to the dashboard, so an adversarial or runaway
@@ -159,10 +160,10 @@ def _load_entry_b64(entry_id: str) -> str | None:
     Used to re-inline an ``ingest=True`` image input (its bytes already live in
     the ArtifactStore, so the seam item carries no ``content_b64``) as an image
     content block. The store copy is retained — the same entry stays readable
-    later via ``data_read`` — so this only reads, never removes.
+    later via ``artifact_read`` — so this only reads, never removes.
     """
     try:
-        from osprey.interfaces.artifacts.resolve import get_run_store
+        from osprey.agent_runner.artifact_resolve import get_run_store
 
         path = get_run_store().get_file_path(entry_id)
         if path is None or not path.exists():
@@ -179,7 +180,7 @@ def _descriptor_line(item: dict[str, Any], *, inlined: bool) -> str:
     An inlined image is marked ``image shown inline [shown_inline]`` — the
     literal ``shown_inline`` token is a consumed marker (a downstream channel
     prompt keys on it). A store-resident file is referenced by the mechanism a
-    reader uses to open it: ``data_read("<entry_id>")``. No mention of
+    reader uses to open it: ``artifact_read("<entry_id>")``. No mention of
     base64/ingest/caps — mechanism only.
     """
     filename = item.get("filename")
@@ -188,7 +189,7 @@ def _descriptor_line(item: dict[str, Any], *, inlined: bool) -> str:
         return f"- {filename} ({mime}) — image shown inline [shown_inline]"
     entry_id = item.get("entry_id")
     if entry_id:
-        return f'- {filename} ({mime}) — read with data_read("{entry_id}")'
+        return f'- {filename} ({mime}) — read with artifact_read("{entry_id}")'
     # Degenerate: a non-image seam item with neither an entry_id nor a way to
     # inline it. The seam contract makes text-mime inputs store-resident, so this
     # is not expected; emit a bare descriptor rather than a false access hint.
@@ -239,6 +240,58 @@ def _assemble_user_content(
         return text
     # Image-then-text order verified by the SDK spike; block ordering is free.
     return [*image_blocks, {"type": "text", "text": text}]
+
+
+async def _stream_with_ready_mcp(
+    options: Any,
+    render_dir: str,
+    prompt_stream: Any,
+) -> Any:
+    """Yield the run's messages, holding the first turn until MCP is registered.
+
+    The streaming ``ClaudeSDKClient`` rather than the one-shot ``query()``,
+    because only the client exposes ``get_mcp_status()``. MCP servers register
+    asynchronously (~1.5s for controls, longer on a loaded host), and a turn
+    that fires before then sees no OSPREY tools: the agent answers "I don't
+    have that tool" and the run is scored as a model give-up when it was a
+    cold start. Polling the status until the project's declared servers report
+    connected gives every dispatch a ready toolset, matching what
+    ``osprey.agent_runner.runner`` already does for interactive runs.
+
+    The barrier is bounded (see ``await_mcp_ready``) and returns the last
+    snapshot on timeout rather than raising, so a server that genuinely never
+    registers still runs — and is logged as such — instead of failing the
+    dispatch outright.
+
+    Written as an async generator so the caller keeps driving one object with
+    ``__anext__``/``aclose()``: the inactivity watchdog and the cancellation
+    path are unchanged, and ``aclose()`` unwinds the client's context manager.
+    """
+    async with ClaudeSDKClient(options=options) as client:
+        # No declared servers — nothing to wait for. Skipped explicitly because
+        # ``await_mcp_ready`` polls an empty expectation to its full deadline,
+        # which would add that delay to every run of a project whose .mcp.json
+        # declares nothing (or could not be read).
+        expected = expected_mcp_servers(Path(render_dir))
+        if expected:
+            servers = await await_mcp_ready(client, expected)
+            connected = {s.get("name") for s in servers if s.get("status") == "connected"}
+            missing = sorted(expected - connected)
+            if missing:
+                logger.warning(
+                    "MCP servers not connected before first turn: %s (expected %s) — "
+                    "the agent may not see their tools",
+                    missing,
+                    sorted(expected),
+                )
+            else:
+                logger.info("MCP ready before first turn: %s", sorted(connected))
+        else:
+            logger.debug("No MCP servers declared for %s; skipping readiness barrier", render_dir)
+
+        await client.query(prompt_stream)
+        async for message in client.receive_response():
+            yield message
 
 
 async def run_dispatch(
@@ -308,15 +361,19 @@ async def run_dispatch(
             0,
         )
 
-    project_dir = os.environ.get("OSPREY_PROJECT_DIR", _DEFAULT_PROJECT_DIR)
+    # The render inside the deployment repo — what the agent CLI treats as ITS
+    # project, the directory holding ``.mcp.json``, ``.claude/`` and the rendered
+    # ``config.yml``. Derived from the environment the compose service sets
+    # (``CONFIG_FILE`` beside ``OSPREY_PROJECT_DIR``), never re-derived here.
+    render_dir = str(deployed_render_dir())
     stderr_lines: list[str] = []
 
     # Build env the same way the OSPREY web server does for operator sessions:
     # build_clean_env() strips CLAUDECODE/CLAUDE_CODE_* vars and resolves auth
     # conflicts.  Provider env (auth token, base URL, model tier IDs) is already
     # injected into os.environ by _inject_provider_env_once() at worker startup.
-    from osprey.interfaces.web_terminal.operator_session import build_clean_env
-    from osprey.interfaces.web_terminal.sdk_context import build_system_prompt
+    from osprey.agent_runner.clean_env import build_clean_env
+    from osprey.agent_runner.sdk_context import build_system_prompt
     from osprey.mcp_server.dispatch_worker.agent_surfaces import parse_project_agents
     from osprey.mcp_server.dispatch_worker.tool_policy import (
         make_backstop,
@@ -325,15 +382,31 @@ async def run_dispatch(
     )
     from osprey.utils.config import get_facility_timezone
 
-    sdk_env = build_clean_env(project_cwd=project_dir)
+    sdk_env = build_clean_env(project_cwd=render_dir)
 
-    # Point OSPREY config resolution at the project explicitly. The worker
-    # process CWD is the image WORKDIR (``/app`` in the container), not the
-    # project dir, and ``osprey.utils.config`` falls back to ``CWD/config.yml``
-    # when ``CONFIG_FILE`` is unset — so without this, the spawned agent and its
+    # Keep subagent delegation in the foreground. Since CLI 2.1.x the Agent tool
+    # auto-backgrounds delegated subagents: it returns immediately, the turn
+    # ends, and the results arrive on a *later* turn as a task notification.
+    # ``_drain_response`` stops at the first ResultMessage, so the worker would
+    # answer "the agent is searching, I'll notify you when it completes" and
+    # silently drop the delegated work. Set explicitly rather than inherited —
+    # ``build_clean_env()`` strips every ``CLAUDE_CODE_*`` key by design.
+    #
+    # Deliberately NOT set in ``build_clean_env()`` itself: the interactive
+    # web-terminal sessions share that helper, and they converge on a later
+    # turn, so backgrounding is correct there. Only this single-drain path
+    # needs the guard. The cost is that parallel delegations run sequentially.
+    sdk_env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
+
+    # Point OSPREY config resolution at the render explicitly. ``build_clean_env``
+    # carries the worker's own ``CONFIG_FILE`` through, and
+    # ``deployed_config_path`` reads that same variable, so this normally just
+    # restates the compose service's value — it is set unconditionally because a
+    # worker started without it would otherwise leave the spawned agent and its
     # hook subprocesses (which ``ClaudeAgentOptions(cwd=...)`` does not relocate)
-    # error with "No config.yml found in current directory" on every dispatch.
-    sdk_env["CONFIG_FILE"] = os.path.join(project_dir, "config.yml")
+    # falling back to ``CWD/config.yml`` and failing with "No config.yml found in
+    # current directory" on every dispatch.
+    sdk_env["CONFIG_FILE"] = str(deployed_config_path())
 
     # The container sets CLAUDE_CONFIG_DIR=/data/claude-config (root-owned, used
     # by osprey-web).  The dispatch user can't write there, and the CLI hangs on
@@ -349,9 +422,9 @@ async def run_dispatch(
 
     # Attribute every artifact this run saves to the run, so the worker can
     # later report and serve exactly this run's plots. NOT OSPREY_SESSION_ID:
-    # that variable also relocates the artifact store into
-    # _agent_data/sessions/<id>/ (resolve_agent_data_root), which would move
-    # dispatch plots off the shared root the gallery reads.
+    # that variable relocates other session-scoped agent data (sandbox/session
+    # working dirs via resolve_agent_data_root) and tags artifacts with a
+    # session id — a dispatch run is not an interactive session.
     if run_id:
         sdk_env["OSPREY_DISPATCH_RUN_ID"] = run_id
 
@@ -369,8 +442,12 @@ async def run_dispatch(
 
     # Declared subagent tool surfaces from the provisioned .claude/agents/ —
     # each subagent is held to exactly its declared tools (web-terminal parity)
-    # without the trigger having to enumerate them.
-    agent_surfaces = parse_project_agents(project_dir)
+    # without the trigger having to enumerate them. Read from the RENDER, which
+    # is where the build writes ``.claude/`` and where the CLI itself loads the
+    # agents from; reading the repo root instead found nothing, and an empty
+    # surface map denies every delegation (see ``tool_policy``) — fail-closed,
+    # but it silently costs dispatch its subagents.
+    agent_surfaces = parse_project_agents(render_dir)
 
     # Narrow the main thread's allow set to this surface's keep-list, if any.
     # Pure removal only — cannot add a tool absent from allowed_tools, and
@@ -408,7 +485,13 @@ async def run_dispatch(
         can_use_tool=make_backstop(effective_tools, agent_surfaces, denied_tools),
         hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[policy_hook])]},
         disallowed_tools=sorted(disallowed),
-        cwd=project_dir,
+        # The render, not the repo root: the agent CLI takes its working
+        # directory as its project root, which is how it finds this deployment's
+        # ``.mcp.json``, ``.claude/`` tree (settings, hooks, skills, agents) and
+        # ``CLAUDE.md``. Same choice ``osprey chat`` makes when it chdirs into
+        # the render before launching, so headless dispatch and an interactive
+        # session see one project.
+        cwd=render_dir,
         env=sdk_env,
         max_turns=max_turns,
         stderr=lambda line: stderr_lines.append(line),
@@ -472,12 +555,13 @@ async def run_dispatch(
         yield {"type": "user", "message": {"role": "user", "content": user_content}}
 
     t0 = time.monotonic()
-    agen = query(prompt=_prompt_stream(), options=options)
+    agen = _stream_with_ready_mcp(options, render_dir, _prompt_stream())
     try:
         # Drive the generator manually (rather than ``async for``) so each
         # ``__anext__`` is bounded by the inactivity watchdog. A full-window
         # silence means the provider never responded — fail fast with a clear
         # message instead of stalling to the worker's outer DISPATCH_TIMEOUT_SEC.
+        first_message_seen = False
         while True:
             try:
                 message = await asyncio.wait_for(agen.__anext__(), timeout=_INACTIVITY_TIMEOUT_SEC)
@@ -489,15 +573,34 @@ async def run_dispatch(
                 except Exception:
                     logger.debug("agen.aclose() raised after inactivity timeout", exc_info=True)
                 duration_sec = time.monotonic() - t0
-                msg = (
-                    f"No response from the model provider for "
-                    f"{_INACTIVITY_TIMEOUT_SEC:.0f}s — dispatch aborted. This usually "
-                    "means an invalid or expired provider credential, or an "
-                    "unreachable provider base URL."
-                )
+                if first_message_seen:
+                    msg = (
+                        f"No response from the model provider for "
+                        f"{_INACTIVITY_TIMEOUT_SEC:.0f}s — dispatch aborted. This usually "
+                        "means an invalid or expired provider credential, or an "
+                        "unreachable provider base URL."
+                    )
+                else:
+                    # The first window is NOT pure provider time: it also spans
+                    # SDK startup, the CLI spawn, and the MCP-ready barrier — so
+                    # on a cold or overloaded host it can expire without any
+                    # provider traffic having been attempted. Name both causes
+                    # rather than blaming the credential unconditionally.
+                    msg = (
+                        f"No response from the model provider within the first "
+                        f"{_INACTIVITY_TIMEOUT_SEC:.0f}s — dispatch aborted before any "
+                        "message arrived. This can mean an invalid or expired provider "
+                        "credential or an unreachable provider base URL — but this first "
+                        "window also covers local agent-runtime startup (SDK, CLI spawn, "
+                        "MCP servers), so a cold or overloaded host can exhaust it "
+                        "without any provider fault."
+                    )
                 logger.error("Dispatch aborted after %.1fs: %s", duration_sec, msg)
                 await _push({"type": "error", "message": msg})
-                # No bytes from the provider within the window — a provider fault.
+                # Nothing arrived within the window. Classified as a provider
+                # failure either way: mid-stream that is certain, and on the
+                # first window it remains the best single guess — the message
+                # above is what carries the cold-start caveat.
                 return failure_class._stamp(
                     _finalize(
                         {
@@ -515,6 +618,8 @@ async def run_dispatch(
                     failure_class.FAILURE_PROVIDER,
                     _num_calls(),
                 )
+
+            first_message_seen = True
 
             # Tool RESULTS arrive as ToolResultBlock inside UserMessage (the
             # SDK's message_parser wraps tool_result content that way), while

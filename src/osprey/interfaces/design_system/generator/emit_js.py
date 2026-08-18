@@ -49,7 +49,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from osprey.interfaces.design_system.generator.model import TokenTree
+from osprey.interfaces.design_system.generator.model import TokenTree, default_flagged_stem
 from osprey.interfaces.design_system.generator.validate import VALID_THEME_MODES
 
 __all__ = [
@@ -59,6 +59,7 @@ __all__ = [
     "ThemeFamilyDefaultsError",
     "build_theme_manifest",
     "build_theme_defaults",
+    "build_family_labels",
     "render_tokens_js",
     "render_theme_boot_js",
 ]
@@ -95,12 +96,20 @@ class ThemeManifestEntry:
             :func:`build_theme_defaults`) and, separately, selects the
             theme's required WCAG gate tuple
             (:func:`~osprey.interfaces.design_system.generator.validate.gates_for_family`).
+        family_label: The display name for the *family*
+            (``$extensions.family_label``), or ``None`` when the theme declares
+            none. Exists for families whose id does not title-case correctly
+            (``desy`` -> ``DESY``); consumers fall back to deriving a label
+            from the family id. Validation requires every declaration within
+            one family to agree, so this is a family-level fact carried on
+            each member rather than a per-theme one.
     """
 
     id: str
     label: str
     mode: str
     family: str
+    family_label: str | None = None
 
 
 class ThemeFamilyDefaultsError(ValueError):
@@ -136,9 +145,38 @@ def build_theme_manifest(tree: TokenTree) -> list[ThemeManifestEntry]:
             label=metadata["label"],
             mode=metadata["mode"],
             family=metadata["family"],
+            family_label=metadata.get("family_label"),
         )
         for metadata in tree.theme_metadata.values()
     ]
+
+
+def build_family_labels(entries: Sequence[ThemeManifestEntry]) -> dict[str, str]:
+    """Build the ``{family: display label}`` map for families that declare one.
+
+    Only families with an explicit ``$extensions.family_label`` appear. A family
+    that declares none is absent from the map entirely rather than present with a
+    derived value: deriving is the *consumer's* fallback (``familyLabel()`` in
+    display-menu.js and osprey-theme-switcher.js), and baking a derived value in
+    here would make the map look authoritative when it is not.
+
+    Validation (``check_theme_metadata``) already rejects a family whose members
+    declare conflicting labels, so the first declaration wins here only in the
+    sense that there is nothing to disagree with.
+
+    Args:
+        entries: The ordered manifest, as returned by
+            :func:`build_theme_manifest`.
+
+    Returns:
+        ``{family: label}`` in manifest order, omitting families that declare
+        no label.
+    """
+    labels: dict[str, str] = {}
+    for entry in entries:
+        if entry.family_label and entry.family not in labels:
+            labels[entry.family] = entry.family_label
+    return labels
 
 
 def build_theme_defaults(entries: Sequence[ThemeManifestEntry]) -> dict[str, dict[str, str]]:
@@ -191,13 +229,15 @@ def build_theme_defaults(entries: Sequence[ThemeManifestEntry]) -> dict[str, dic
 def _default_family(tree: TokenTree, defaults: dict[str, dict[str, str]]) -> str | None:
     """The fallback family for ``auto`` when no better signal is available.
 
-    Prefer the family of a theme explicitly flagged ``$extensions.default:
-    true`` -- this pins ``DEFAULT_FAMILY`` deterministically, independent
-    of filename/manifest order, so a family whose files sort before the
-    canonical one can never silently become the product default. When no
-    theme is flagged, fall back to the first family declared in the
-    manifest (insertion order, itself manifest/filename order -- the
-    historical behavior).
+    Prefer the family of the theme flagged ``$extensions.default: true``
+    (resolved by the shared :func:`~.model.default_flagged_stem`, the same
+    source ``emit_css``'s ``:root``-fallback selection uses -- so the CSS
+    and JS artifacts cannot disagree about the product default). The flag
+    pins ``DEFAULT_FAMILY`` deterministically, independent of filename/
+    manifest order, so a family whose files sort before the canonical one
+    can never silently become the product default. When no theme is
+    flagged, fall back to the first family declared in the manifest
+    (insertion order, itself manifest/filename order).
 
     Shared by :func:`render_tokens_js` (which exports it as
     ``DEFAULT_FAMILY`` for ``theme-manager.js`` to read) and
@@ -212,11 +252,11 @@ def _default_family(tree: TokenTree, defaults: dict[str, dict[str, str]]) -> str
     Returns:
         The default family key, or ``None`` if ``defaults`` is empty.
     """
-    for metadata in tree.theme_metadata.values():
-        if metadata.get("default") is True:
-            family = metadata.get("family")
-            if family in defaults:
-                return family
+    flagged = default_flagged_stem(tree)
+    if flagged is not None:
+        family = tree.theme_metadata[flagged].get("family")
+        if family in defaults:
+            return family
     return next(iter(defaults), None)
 
 
@@ -270,6 +310,7 @@ def render_tokens_js(tree: TokenTree) -> str:
     entries = build_theme_manifest(tree)
     defaults = build_theme_defaults(entries)
     default_family = _default_family(tree, defaults)
+    family_labels = build_family_labels(entries)
 
     themes_json = json.dumps(
         [{"id": e.id, "label": e.label, "mode": e.mode, "family": e.family} for e in entries],
@@ -278,6 +319,7 @@ def render_tokens_js(tree: TokenTree) -> str:
     )
     defaults_json = json.dumps(defaults, indent=2, ensure_ascii=True)
     default_family_json = json.dumps(default_family, ensure_ascii=True)
+    family_labels_json = json.dumps(family_labels, indent=2, ensure_ascii=True)
 
     body = (
         "// Theme registry only: no color palettes here (see module docstring\n"
@@ -288,7 +330,12 @@ def render_tokens_js(tree: TokenTree) -> str:
         "// The explicit-default family ($extensions.default), else the first\n"
         "// declared -- the single fallback\n"
         "// theme-manager.js reads instead of re-deriving it from DEFAULTS.\n"
-        f"export const DEFAULT_FAMILY = {default_family_json};"
+        f"export const DEFAULT_FAMILY = {default_family_json};\n\n"
+        "// Display names for families whose id does not title-case correctly\n"
+        "// ('desy' -> 'DESY'). Sparse BY DESIGN: a family that declares no\n"
+        "// $extensions.family_label is absent here, and consumers derive its\n"
+        "// label from the family id instead.\n"
+        f"export const FAMILY_LABELS = {family_labels_json};"
     )
     return _render(GENERATED_HEADER_LINES, body)
 
@@ -301,7 +348,7 @@ def render_theme_boot_js(tree: TokenTree) -> str:
     server-rendered ``<html data-theme>`` attribute, each validated
     against the baked-in id list (the query/storage rungs also accept the
     special ``'auto'`` value); the first candidate that validates wins,
-    and anything left over (missing or unknown/legacy) falls all the way
+    and anything left over (missing or unrecognized) falls all the way
     through to ``'auto'``. ``'auto'`` resolves via
     ``matchMedia('(prefers-color-scheme: dark)')`` against ``DEFAULTS``.
     ``data-theme`` is set synchronously as the script's last statement, so
@@ -310,7 +357,7 @@ def render_theme_boot_js(tree: TokenTree) -> str:
     before it.
 
     Server-attribute contract (for whoever renders ``<html>`` server-side,
-    e.g. Task 1.10's web_terminal server): the boot script reads
+    e.g. the web_terminal server): the boot script reads
     ``document.documentElement.getAttribute("data-theme")`` — i.e. the
     ``data-theme`` attribute on the ``<html>`` element. It is treated as a
     candidate only when it is a non-null string present in the baked
@@ -334,8 +381,7 @@ def render_theme_boot_js(tree: TokenTree) -> str:
     otherwise ``DEFAULT_FAMILY`` — the first family declared in the
     manifest (manifest/filename order — never re-sorted) — is the
     deterministic fallback, reached only when no server attribute is
-    present/valid (e.g. before Task 1.10 wires up server rendering, or if
-    it's ever omitted).
+    present/valid (a host that does no server rendering, or omits it).
 
     Args:
         tree: A token tree that has already passed
@@ -425,7 +471,7 @@ def render_theme_boot_js(tree: TokenTree) -> str:
 
   // The server-rendered rung (finding I4): whatever data-theme already
   // sits on <html> when this script runs, e.g. stamped by the web server
-  // from config (Task 1.10). Read once so both the resolution candidate
+  // from config. Read once so both the resolution candidate
   // below and the no-clobber check at the end use the exact same value.
   function readServerTheme() {{
     try {{

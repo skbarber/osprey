@@ -21,9 +21,9 @@ from osprey.services.ariel_search.config import (
     EnhancementModuleConfig,
     IngestionConfig,
     ModelConfig,
-    ReasoningConfig,
     SearchModuleConfig,
     WatchConfig,
+    resolve_ariel_dsn,
 )
 from osprey.services.ariel_search.exceptions import (
     AdapterNotFoundError,
@@ -49,11 +49,7 @@ from osprey.services.ariel_search.models import (
     AttachmentInfo,
     EmbeddingTableInfo,
     EnhancedLogbookEntry,
-    IngestionEntryError,
-    IngestionProgress,
-    IngestionResult,
     MetadataSchema,
-    SearchMode,
     enhanced_entry_from_row,
     resolve_time_range,
 )
@@ -76,9 +72,9 @@ __all__ = [
     "EnhancementModuleConfig",
     "IngestionConfig",
     "ModelConfig",
-    "ReasoningConfig",
     "SearchModuleConfig",
     "WatchConfig",
+    "resolve_ariel_dsn",
     # Ingestion scheduler
     "IngestionPollResult",
     "IngestionScheduler",
@@ -101,11 +97,7 @@ __all__ = [
     "AttachmentInfo",
     "EmbeddingTableInfo",
     "EnhancedLogbookEntry",
-    "IngestionEntryError",
-    "IngestionProgress",
-    "IngestionResult",
     "MetadataSchema",
-    "SearchMode",
     "enhanced_entry_from_row",
     "resolve_time_range",
 ]

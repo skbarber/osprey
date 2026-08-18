@@ -15,10 +15,11 @@ from osprey.services.bluesky_bridge.orm_analysis import (
     column_anomaly,
     localize_kick,
     row_anomaly,
+    singular_values,
 )
 
 CORRECTORS = ["corr1", "corr2", "corr3"]
-DETECTORS = ["bpm1", "bpm2", "bpm3", "bpm4"]
+BPMS = ["bpm1", "bpm2", "bpm3", "bpm4"]
 
 # A known [n_bpm, n_corr] response matrix the synthetic rows below are built
 # to reproduce exactly (no noise).
@@ -32,7 +33,7 @@ KNOWN_MATRIX = np.array(
 )
 
 
-def _rows_for_matrix(matrix: np.ndarray, correctors: list[str], detectors: list[str]) -> list:
+def _rows_for_matrix(matrix: np.ndarray, correctors: list[str], readbacks: list[str]) -> list:
     """Synthetic ORM rows: one dict per (corrector, current) point, each
     carrying only the swept corrector's key (others are a different
     corrector's sweep and never appear in this row) plus every BPM reading --
@@ -43,8 +44,8 @@ def _rows_for_matrix(matrix: np.ndarray, correctors: list[str], detectors: list[
     for j, corrector in enumerate(correctors):
         for current in currents:
             row = {corrector: float(current)}
-            for i, detector in enumerate(detectors):
-                row[detector] = float(matrix[i, j] * current)
+            for i, bpm in enumerate(readbacks):
+                row[bpm] = float(matrix[i, j] * current)
             rows.append(row)
     return rows
 
@@ -55,11 +56,11 @@ def _rows_for_matrix(matrix: np.ndarray, correctors: list[str], detectors: list[
 
 
 def test_matrix_recovers_a_known_response_matrix() -> None:
-    rows = _rows_for_matrix(KNOWN_MATRIX, CORRECTORS, DETECTORS)
+    rows = _rows_for_matrix(KNOWN_MATRIX, CORRECTORS, BPMS)
 
-    result = build_response_matrix(rows, CORRECTORS, DETECTORS)
+    result = build_response_matrix(rows, CORRECTORS, BPMS)
 
-    assert result.shape == (len(DETECTORS), len(CORRECTORS))
+    assert result.shape == (len(BPMS), len(CORRECTORS))
     assert np.allclose(result, KNOWN_MATRIX)
 
 
@@ -72,13 +73,55 @@ def test_matrix_matches_columns_by_device_name_prefix() -> None:
     for j, corrector in enumerate(CORRECTORS):
         for current in currents:
             row = {f"{corrector}-readback": float(current)}
-            for i, detector in enumerate(DETECTORS):
-                row[f"{detector}-value"] = float(KNOWN_MATRIX[i, j] * current)
+            for i, bpm in enumerate(BPMS):
+                row[f"{bpm}-value"] = float(KNOWN_MATRIX[i, j] * current)
             rows.append(row)
 
-    result = build_response_matrix(rows, CORRECTORS, DETECTORS)
+    result = build_response_matrix(rows, CORRECTORS, BPMS)
 
     assert np.allclose(result, KNOWN_MATRIX)
+
+
+def test_matrix_prefers_the_exact_column_over_a_prefixed_one() -> None:
+    """A run carrying both spellings for a channel is read through the exact one.
+
+    The two spellings come from the two device implementations, and a row can
+    legitimately carry both (a device named `bpm1` next to a `bpm1-value` child
+    signal of something else). `plan_fields.resolve_column` settles it in one
+    place -- exact first -- and this pins that the fit sees that resolution
+    rather than whichever key the row happened to list first.
+    """
+    currents = np.linspace(-1.0, 1.0, 5)
+    rows = []
+    for current in currents:
+        rows.append(
+            {
+                "corr1-readback": float(current),  # only spelling for the corrector
+                "bpm1-value": 99.0,  # decoy: prefixed spelling listed first
+                "bpm1": float(2.0 * current),  # the exact column, listed second
+            }
+        )
+
+    result = build_response_matrix(rows, ["corr1"], ["bpm1"])
+
+    assert result.shape == (1, 1)
+    assert result[0, 0] == pytest.approx(2.0)
+
+
+def test_matrix_skips_a_row_whose_corrector_column_holds_no_value() -> None:
+    """A present-but-empty column is not a sample.
+
+    A column resolving to a `None` value is a channel that did not report on
+    that point, which is a gap, not a zero -- it must be excluded from the fit
+    exactly as an absent column is, not coerced into `float(None)`.
+    """
+    currents = np.linspace(-1.0, 1.0, 5)
+    rows: list[dict] = [{"corr1": float(c), "bpm1": float(2.0 * c)} for c in currents]
+    rows.insert(2, {"corr1": None, "bpm1": None})
+
+    result = build_response_matrix(rows, ["corr1"], ["bpm1"])
+
+    assert result[0, 0] == pytest.approx(2.0)
 
 
 def test_matrix_leaves_an_undersampled_corrector_column_at_zero() -> None:
@@ -94,14 +137,14 @@ def test_matrix_leaves_an_undersampled_corrector_column_at_zero() -> None:
 
 
 def test_matrix_on_empty_rows_is_all_zero() -> None:
-    result = build_response_matrix([], CORRECTORS, DETECTORS)
+    result = build_response_matrix([], CORRECTORS, BPMS)
 
-    assert result.shape == (len(DETECTORS), len(CORRECTORS))
+    assert result.shape == (len(BPMS), len(CORRECTORS))
     assert np.all(result == 0.0)
 
 
 def _real_shape_rows(
-    matrix: np.ndarray, correctors: list[str], detectors: list[str], sweeps: list[np.ndarray]
+    matrix: np.ndarray, correctors: list[str], readbacks: list[str], sweeps: list[np.ndarray]
 ) -> list[dict]:
     """Rows shaped like a real `orm` plan run: every row carries EVERY
     corrector's key (idle ones at 0.0), not just the one being swept --
@@ -112,39 +155,105 @@ def _real_shape_rows(
         for current in sweeps[j]:
             row = dict.fromkeys(correctors, 0.0)
             row[corrector] = float(current)
-            for i, detector in enumerate(detectors):
-                row[detector] = float(matrix[i, j] * current)
+            for i, bpm in enumerate(readbacks):
+                row[bpm] = float(matrix[i, j] * current)
             rows.append(row)
     return rows
 
 
 def test_guard_is_quiet_on_a_real_shaped_symmetric_sweep() -> None:
-    """Every idle-corrector row (current 0.0) sits at the fit's x-mean when
-    each corrector's own sweep is symmetric about 0, so it carries zero
-    leverage on the slope -- the guard must not fire on this, the real
-    plan's shape.
+    """Every idle-corrector row sits at the fit's x-mean when each
+    corrector's own sweep is symmetric about the value it idles at, so it
+    carries zero leverage on the slope -- the guard must not fire on this,
+    the real plan's shape. Here the idle value is 0.0, the virtual
+    accelerator's; see the nonzero-working-point case below for a ring's.
     """
     currents = np.linspace(-1.0, 1.0, 5)
-    rows = _real_shape_rows(KNOWN_MATRIX, CORRECTORS, DETECTORS, [currents] * len(CORRECTORS))
+    rows = _real_shape_rows(KNOWN_MATRIX, CORRECTORS, BPMS, [currents] * len(CORRECTORS))
 
-    result = build_response_matrix(rows, CORRECTORS, DETECTORS)
+    result = build_response_matrix(rows, CORRECTORS, BPMS)
 
     assert np.allclose(result, KNOWN_MATRIX)
 
 
+def _relative_shape_rows(
+    matrix: np.ndarray,
+    correctors: list[str],
+    readbacks: list[str],
+    kicks: np.ndarray,
+    working_points: list[float],
+) -> list[dict]:
+    """Rows shaped like a real `orm` run on a ring with a corrected orbit.
+
+    The difference from `_real_shape_rows` is the whole point of the relative
+    sweep: each corrector holds its own nonzero working point, is swept
+    *about* it, and is put back — so an idle corrector's key carries ITS
+    working point rather than 0.0. BPM readings respond to the kick away from
+    the working point (`matrix @ kick`) on top of the arbitrary corrected
+    orbit those working points are already holding, so a fit that mistook the
+    absolute setpoint for the kick would land on the wrong slope.
+    """
+    base_orbit = np.linspace(-3e-4, 3e-4, len(readbacks))
+    rows = []
+    for j, corrector in enumerate(correctors):
+        for kick in kicks:
+            row = {name: working_points[k] for k, name in enumerate(correctors)}
+            row[corrector] = working_points[j] + float(kick)
+            for i, bpm in enumerate(readbacks):
+                row[bpm] = float(base_orbit[i] + matrix[i, j] * kick)
+            rows.append(row)
+    return rows
+
+
+def test_guard_is_quiet_on_a_sweep_about_a_nonzero_working_point() -> None:
+    """The real plan sweeps each corrector about its own pre-plan working
+    point, so an idle corrector reads back that working point, not 0.0.
+
+    The zero-leverage argument survives that intact — a sweep symmetric about
+    `w` puts the fit's x-mean exactly at `w`, which is precisely where every
+    idle sample sits — so the guard must stay quiet and the fitted slopes
+    must still be the truth. The invariant was never "about zero"; zero was
+    only the value a machine with no orbit to correct happens to idle at.
+    """
+    working_points = [2.5, -1.25, 4.0]
+    kicks = np.linspace(-1.0, 1.0, 5)
+    rows = _relative_shape_rows(KNOWN_MATRIX, CORRECTORS, BPMS, kicks, working_points)
+
+    result = build_response_matrix(rows, CORRECTORS, BPMS)
+
+    assert np.allclose(result, KNOWN_MATRIX)
+
+
+def test_guard_fires_on_a_sweep_not_centred_on_the_idle_value() -> None:
+    """A corrector swept about something other than where it idles is still
+    rejected. Widening the invariant to "symmetric about the working point"
+    must not widen it to "anything goes": here the corrector idles at 2.5 but
+    is swept about 7.5, so the idle rows sit off the fit's x-mean and would
+    bias its slope exactly as before.
+    """
+    working_points = [2.5, -1.25, 4.0]
+    kicks = np.linspace(-1.0, 1.0, 5)
+    rows = _relative_shape_rows(KNOWN_MATRIX, CORRECTORS, BPMS, kicks, working_points)
+    for row in rows[: len(kicks)]:
+        row[CORRECTORS[0]] += 5.0  # swept about 7.5 while idling at 2.5
+
+    with pytest.raises(DegenerateFitError, match="symmetric about"):
+        build_response_matrix(rows, CORRECTORS, BPMS)
+
+
 def test_guard_fires_on_a_real_shaped_asymmetric_sweep() -> None:
-    """A corrector swept off-center (here [4, 6] instead of [-1, 1]) breaks
-    the zero-mean invariant `build_response_matrix` depends on -- idle rows
-    from the *other* correctors' symmetric sweeps no longer sit at this
-    corrector's x-mean, so they would silently bias its fitted slope. The
-    guard must raise instead of fitting garbage.
+    """A corrector swept off-center (here [4, 6] while idling at 0.0) breaks
+    the invariant `build_response_matrix` depends on -- idle rows from the
+    *other* correctors' sweeps no longer sit at this corrector's x-mean, so
+    they would silently bias its fitted slope. The guard must raise instead
+    of fitting garbage.
     """
     currents = np.linspace(-1.0, 1.0, 5)
-    off_center = currents + 5.0  # [4.0, ..., 6.0] -- not symmetric about 0
-    rows = _real_shape_rows(KNOWN_MATRIX, CORRECTORS, DETECTORS, [off_center, currents, currents])
+    off_center = currents + 5.0  # [4.0, ..., 6.0] -- not centred on the 0.0 idle value
+    rows = _real_shape_rows(KNOWN_MATRIX, CORRECTORS, BPMS, [off_center, currents, currents])
 
-    with pytest.raises(DegenerateFitError, match="symmetric about 0"):
-        build_response_matrix(rows, CORRECTORS, DETECTORS)
+    with pytest.raises(DegenerateFitError, match="symmetric about its idle value"):
+        build_response_matrix(rows, CORRECTORS, BPMS)
 
 
 # =========================================================================
@@ -266,3 +375,54 @@ def test_row_anomaly_detector_is_all_zero_with_fewer_than_two_bpms() -> None:
     scores = row_anomaly(np.ones((1, 4)))
 
     assert np.all(scores == 0.0)
+
+
+# =========================================================================
+# 3.7 singular_values
+# =========================================================================
+
+
+def test_singular_values_are_returned_largest_first() -> None:
+    values = singular_values(_clean_matrix())
+
+    assert values.size > 0
+    assert np.all(np.diff(values) <= 0.0)
+
+
+def test_a_separable_matrix_has_exactly_one_significant_mode() -> None:
+    """`_clean_matrix` is a rank-1 outer product, so all the response lives in
+    the first singular value -- the spectrum a perfectly-correlated (and so
+    uninformative-beyond-one-mode) machine would show."""
+    values = singular_values(_clean_matrix())
+
+    assert values[0] > 0.0
+    assert np.all(values[1:] < values[0] * 1e-10)
+
+
+def test_added_independent_structure_raises_the_second_mode() -> None:
+    matrix = _clean_matrix()
+    matrix[:, 1] += np.array([0.4, -0.4, 0.4, -0.4, 0.4])  # a second direction
+
+    values = singular_values(matrix)
+
+    assert values[1] > values[0] * 1e-3
+
+
+def test_singular_values_count_is_the_smaller_dimension() -> None:
+    assert singular_values(np.ones((7, 3))).size == 3
+    assert singular_values(np.ones((3, 7))).size == 3
+
+
+def test_singular_values_of_an_empty_matrix_is_empty() -> None:
+    assert singular_values(np.zeros((0, 0))).size == 0
+    assert singular_values(np.zeros((5, 0))).size == 0
+
+
+def test_singular_values_of_a_non_finite_matrix_is_empty() -> None:
+    """`numpy.linalg.svd` raises on NaN rather than returning one, and a
+    figure is a view: a partly-fitted matrix must degrade to no spectrum, not
+    to an exception that costs the whole figure."""
+    matrix = _clean_matrix()
+    matrix[1, 1] = np.nan
+
+    assert singular_values(matrix).size == 0

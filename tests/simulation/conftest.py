@@ -42,6 +42,22 @@ TEST_MACHINE = {
         "T:MODE": {"value": "CW", "description": "Operating mode"},
         "T:NOISY": {"value": 100.0, "noise": 0.05, "description": "Noisy diagnostic"},
         "T:VAC": {"value": 8.0e-9, "units": "Torr", "noise": 0.0, "description": "Vacuum"},
+        # Zero-baseline channels: the regime where relative 'noise' multiplies to a
+        # dead-flat constant. They carry the additive keys instead, so they exercise
+        # absolute noise and baseline texture at the 0.0 baseline that broke.
+        "T:ZERO:NOISY": {
+            "value": 0.0,
+            "units": "mm",
+            "noise_abs": 0.02,
+            "description": "Zero-baseline position with absolute noise only",
+        },
+        "T:ZERO:TEXTURED": {
+            "value": 0.0,
+            "units": "mm",
+            "noise_abs": 0.005,
+            "texture": {"kind": "wander", "amplitude": 0.05, "period_s": 3600.0},
+            "description": "Zero-baseline position with absolute noise and wander texture",
+        },
     },
     "scenarios": {
         "nominal": {"description": "All systems nominal."},
@@ -84,6 +100,28 @@ TEST_MACHINE = {
 
 
 @pytest.fixture
+def state_dir(tmp_path):
+    """Per-test scenario-state directory (the engine's ``_agent_data/simulation/``)."""
+    path = tmp_path / "_agent_data" / "simulation"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ambient_state_dir(monkeypatch, state_dir):
+    """Keep engines built without an explicit ``state_dir`` inside ``tmp_path``.
+
+    Unset, the state directory resolves from the ambient config — under pytest
+    that is the repo checkout, so a test that activates a scenario would write
+    ``active_scenarios`` into the working tree. Every engine here lands in its
+    own tmp dir instead.
+    """
+    from osprey.simulation import engine as engine_module
+
+    monkeypatch.setattr(engine_module, "default_state_dir", lambda: state_dir)
+
+
+@pytest.fixture
 def machine_dict():
     """Deep copy of the inline test machine, safe to mutate per test."""
     return copy.deepcopy(TEST_MACHINE)
@@ -108,14 +146,15 @@ def machine_file(machine_dict, make_machine_file):
 
 
 @pytest.fixture
-def engine_factory(tmp_path):
+def engine_factory(tmp_path, state_dir):
     """Build the shipped control_assistant engine under given scenario(s).
 
     Copies the shipped ``machine.json`` and its ``scenarios/`` bundle tree into
-    a temp dir alongside an ``active_scenarios`` state file; the engine re-reads
-    the state file on mtime change, so the returned engine is already pinned to
-    the requested set (``nominal`` is always implicitly active). Variadic, so
-    composition can be exercised: ``make('vacuum-burst', 'rf-thermal')``.
+    a temp dir, and seeds the ``active_scenarios`` state file in the separate
+    state directory; the engine re-reads the state file on mtime change, so the
+    returned engine is already pinned to the requested set (``nominal`` is
+    always implicitly active). Variadic, so composition can be exercised:
+    ``make('vacuum-burst', 'rf-thermal')``.
     """
     from osprey.simulation import SimulationEngine
 
@@ -124,7 +163,7 @@ def engine_factory(tmp_path):
         shutil.copy(TEMPLATE_SIM / "machine.json", machine)
         shutil.copytree(TEMPLATE_SIM / "scenarios", tmp_path / "scenarios")
         active = names or ("nominal",)
-        (tmp_path / "active_scenarios").write_text("\n".join(active) + "\n")
-        return SimulationEngine.from_file(machine)
+        (state_dir / "active_scenarios").write_text("\n".join(active) + "\n")
+        return SimulationEngine.from_file(machine, state_dir=state_dir)
 
     return make

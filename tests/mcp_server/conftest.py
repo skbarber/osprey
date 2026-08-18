@@ -113,24 +113,83 @@ def extract_response_dict(result) -> dict:
 
 @pytest.fixture(autouse=True)
 def _reset_singletons(monkeypatch):
-    """Reset the MCP registry and ArtifactStore singletons between tests."""
-    # Reset config caches BEFORE each test to prevent cross-contamination
-    reset_config_cache()
+    """Reset the MCP registry, ArtifactStore, screen-capture backend and config caches.
+
+    Leak guarded: the server context, artifact store, screen-capture backend and
+    the ``osprey.utils.config`` caches are all process-wide singletons. Every one
+    of them is reset both before and after the test, so a directory that ran
+    earlier in the same worker cannot hand its state to the first test here, and
+    this directory cannot hand its state to whatever runs next.
+    """
     import osprey.utils.config as _cfg
+
+    def _reset_all():
+        reset_server_context()
+        reset_artifact_store()
+        reset_backend()
+        reset_config_cache()
+        _cfg._config_cache.clear()
 
     monkeypatch.setattr(_cfg, "_default_config", None)
     monkeypatch.setattr(_cfg, "_default_configurable", None)
     saved_cache = _cfg._config_cache.copy()
-    _cfg._config_cache.clear()
+    _reset_all()
 
     yield
 
-    reset_server_context()
-    reset_artifact_store()
-    reset_backend()
-    reset_config_cache()
-    _cfg._config_cache.clear()
+    _reset_all()
     _cfg._config_cache.update(saved_cache)
+
+
+@pytest.fixture(autouse=True)
+def _unregister_artifact_activity():
+    """Disarm the artifact-activity listener around every test in this directory.
+
+    ``initialize_workspace_singletons()`` subscribes the listener to the
+    ArtifactStore *class*, so any test that calls it leaves every later test in
+    the same worker emitting real ``/api/agent-activity`` POSTs at whatever is
+    listening on the web-terminal port. Unregistering on both sides keeps that
+    process-global arming inside the test that asked for it.
+    """
+    from osprey.mcp_server.artifact_activity import unregister_artifact_activity_listeners
+
+    unregister_artifact_activity_listeners()
+    yield
+    unregister_artifact_activity_listeners()
+
+
+@pytest.fixture(autouse=True)
+def _block_web_terminal_posts(request, monkeypatch):
+    """Keep the notify_* helpers' HTTP POSTs inside the test process.
+
+    Every ``notify_*`` helper in :mod:`osprey.mcp_server.http` opens a real
+    socket to the resolved web-terminal port. On CI nothing is listening and the
+    connection is merely refused, but on a developer box a live web terminal is
+    — and then the unit suite drives the operator's actual UI, glowing tiles and
+    filling the activity strip. Both posters are stubbed here to the outcome
+    they already produce when the terminal is down: ``post_json`` swallows and
+    returns ``None``; ``_post_json_with_response`` raises ``URLError`` so
+    ``notify_panel_register`` / ``notify_panel_arrange`` take their existing
+    unreachable branch. Patching only ``post_json`` would miss those two.
+
+    Patched in the ``http`` module's own namespace, which is where the helpers
+    resolve them from, so it holds however a tool module imported the helper.
+    Tests that assert on emits patch ``notify_agent_activity`` at their own call
+    site — above this seam — and are unaffected. ``test_http.py`` exercises the
+    posters themselves and opts out with the ``real_http_posters`` marker.
+    """
+    if request.node.get_closest_marker("real_http_posters"):
+        return
+
+    import urllib.error
+
+    from osprey.mcp_server import http as _http
+
+    def _unreachable(url, payload, *, timeout=3):
+        raise urllib.error.URLError("web terminal POSTs are blocked in unit tests")
+
+    monkeypatch.setattr(_http, "post_json", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_http, "_post_json_with_response", _unreachable)
 
 
 @pytest.fixture
@@ -204,55 +263,6 @@ def mock_config_writes_disabled(tmp_path):
 
 
 @pytest.fixture
-def mock_config_with_execution(tmp_path):
-    """Config including execution infrastructure settings for adapter tests."""
-    config = tmp_path / "config.yml"
-    config.write_text(
-        yaml.dump(
-            {
-                "control_system": {
-                    "type": "mock",
-                    "writes_enabled": True,
-                    "write_verification": {
-                        "default_level": "callback",
-                        "default_tolerance": 0.1,
-                    },
-                    "limits_checking": {"enabled": False},
-                },
-                "archiver": {"type": "mock"},
-                "execution": {
-                    "execution_method": "container",
-                    "modes": {
-                        "read_only": {"kernel_name": "python3-epics-readonly"},
-                        "write_access": {"kernel_name": "python3-epics-write"},
-                    },
-                },
-                "services": {
-                    "jupyter": {
-                        "containers": {
-                            "read": {
-                                "hostname": "localhost",
-                                "port_host": 8088,
-                                "execution_modes": ["read_only"],
-                            },
-                            "write": {
-                                "hostname": "localhost",
-                                "port_host": 8089,
-                                "execution_modes": ["write_access"],
-                            },
-                        }
-                    }
-                },
-                "python_executor": {
-                    "execution_timeout_seconds": 300,
-                },
-            }
-        )
-    )
-    return config
-
-
-@pytest.fixture
 def mock_config_with_limits(tmp_path):
     """Config with limits_checking enabled and a channel_limits.json database."""
     limits_db = tmp_path / "channel_limits.json"
@@ -286,11 +296,7 @@ def mock_config_with_limits(tmp_path):
                 },
                 "archiver": {"type": "mock"},
                 "execution": {
-                    "execution_method": "local",
-                    "modes": {
-                        "read_only": {"kernel_name": "python3"},
-                        "write_access": {"kernel_name": "python3"},
-                    },
+                    "execution_method": "subprocess",
                 },
                 "python_executor": {
                     "execution_timeout_seconds": 60,

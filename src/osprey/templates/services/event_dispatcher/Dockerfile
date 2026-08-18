@@ -10,11 +10,11 @@
 #     from PyPI in one RUN, plus any local dependency delta staged as
 #     osprey-local-requirements.txt on dev builds. Its build cache is shared
 #     across projects and only rebuilds when the staged manifest changes.
-#   * wheel layer — when `osprey deploy up --dev` stages a locally-built wheel
+#   * wheel layer — when `osprey up --dev` stages a locally-built wheel
 #     into the build context, this later layer overlays it (so unreleased code
 #     is included). With no wheel staged it is a no-op and the image is complete
 #     after the deps layer.
-# This image is built locally by `osprey deploy up`; override with
+# This image is built locally by `osprey up`; override with
 # OSPREY_DISPATCH_IMAGE / OSPREY_WORKER_IMAGE to use a prebuilt/published image.
 
 FROM python:3.11-slim
@@ -56,7 +56,13 @@ WORKDIR /app
 ARG OSPREY_VERSION=""
 ARG OSPREY_DEV=""
 COPY .dockerignore osprey-local-requirements.tx[t] /tmp/deps-ctx/
+# setuptools 84.0.0 breaks setuptools_dso's compile-probe error handling and
+# fails sdist compiles of the EPICS toolchain (pvxslibs/epicscorelibs/softioc)
+# where no binary wheel exists (notably linux/arm64); PIP_CONSTRAINT reaches
+# pip's isolated build environments. Drop once a fixed release is out.
 RUN [ -n "$OSPREY_VERSION" ] || { echo "ERROR: OSPREY_VERSION build-arg is required" >&2; exit 1; } \
+    && printf 'setuptools<84\n' > /tmp/deps-ctx/pip-constraints.txt \
+    && export PIP_CONSTRAINT=/tmp/deps-ctx/pip-constraints.txt \
     && apt-get update \
     && apt-get install -y --no-install-recommends build-essential python3-dev \
     && { pip install --no-cache-dir "osprey-framework==$OSPREY_VERSION" \
@@ -74,7 +80,7 @@ RUN [ -n "$OSPREY_VERSION" ] || { echo "ERROR: OSPREY_VERSION build-arg is requi
     && rm -rf /var/lib/apt/lists/* /tmp/deps-ctx
 
 # ── wheel layer ──────────────────────────────────────────────────────────────
-# Overlay a locally-built wheel when `osprey deploy up --dev` stages one into
+# Overlay a locally-built wheel when `osprey up --dev` stages one into
 # the build context. `.dockerignore` is a guaranteed sibling of the COPY, so
 # the glob always matches at least one file; `*.wh[l]` optionally pulls in the
 # wheel. The wheel is installed plain (no extra — the deps layer already primed

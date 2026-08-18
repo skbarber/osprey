@@ -60,6 +60,7 @@ short-lived topic branches that PR back into it. Releases are CalVer tags
 - Branch your work off ``main``, and open your PR against ``main``.
 - ``main`` is always the integration target. CI gates every PR; protected status checks must pass before merge.
 - Releases are cut by maintainers tagging a commit on ``main``; the PyPI publish workflow runs on ``v*.*.*`` tags.
+- The ``osprey-connectors`` workspace package releases independently via ``osprey-connectors-v*`` tags. Because the framework wheel depends on it from PyPI, a connectors version satisfying the framework's requirement must be published **before** the framework tag that needs it.
 - Hotfixes follow the same path: branch from the tag (or ``main``), PR back, tag again as ``vYYYY.M.P+1``. No special hotfix branches.
 
 Branch Naming
@@ -137,6 +138,40 @@ enforces:
 
 If a required check turns out to be wrong, fix it forward — there is no
 escape hatch.
+
+Dependency Update Pull Requests
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Dependabot opens pull requests for dependency bumps, subject to a **seven-day
+cooldown**: a release is not proposed until it has been public for a week, so
+that a hijacked or malicious version has time to be found and yanked before it
+reaches this repository. Security updates are exempt, by design — a fix for a
+known vulnerability should not wait.
+
+These pull requests run with a deliberate gap in coverage. GitHub treats a
+Dependabot-triggered run as if it came from a fork: it receives only the
+Dependabot secret store, never the repository's Actions secrets. The lanes that
+need a live model endpoint therefore **skip** rather than run — the agentic
+flows, the E2E suite, the dispatch stacks, and the two chat bridges. The run
+summary of the ``All CI Checks Passed`` job names them explicitly, so a green
+check on a dependency PR is never mistaken for full coverage.
+
+To close that gap before merging, review the diff and then revalidate the branch
+yourself. Because *you* trigger it, that run gets the normal secrets:
+
+.. code-block:: bash
+
+   gh workflow run ci.yml --ref <dependabot-branch> -f revalidate_secret_lanes=true
+
+Find the branch name with ``gh pr view <number> --json headRefName``. Watch the
+resulting run to completion before merging.
+
+The reason this is a manual step rather than an automatic one is worth stating:
+mirroring the model API key into the Dependabot secret store would make these
+lanes pass unattended, but it would also hand a live credential to a
+newly-published third-party package at install time — the precise supply-chain
+exposure the cooldown exists to reduce. The human read of the diff is the point,
+not an inconvenience around it.
 
 Osprey Agent Workflow Skill
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -434,7 +469,7 @@ neither a container runtime nor seeded data. Regenerate one recipe with
 
 - ``SCREENSHOTOPTS=--stack`` -- the ARIEL search/browse/create/status views.
   Builds the ``control-assistant`` tutorial project, brings up Postgres
-  (``osprey deploy up -d``), and seeds the logbook with
+  (``osprey up -d``), and seeds the logbook with
   ``osprey sim apply nominal --yes --now <anchor>``. Needs a container runtime
   and a free host port 5432. The ``--now`` anchor freezes the seeded dates, so
   repeat captures are byte-stable.
@@ -459,6 +494,50 @@ Postgres; the hero needs a live agent). It is distinct from the CI visual-drift
 guard -- pixel diffs of each rendered interface against a committed baseline
 live in the front-end **Visual** tests above (regenerated with
 ``--regen-baselines``), and continue to run in CI unchanged.
+
+----
+
+Reviewing a web-interface redesign (contact sheet)
+--------------------------------------------------
+
+When a web interface is being restyled, the **contact-sheet renderer** boots the
+*real* interface in every theme/mode variant and folds the shots into one
+self-contained page, so a whole redesign can be reviewed as a single artifact --
+no live agent, provider, hardware, or network. It lives beside the screenshot
+framework in ``docs/screenshots/`` but is a review tool, not a committed doc
+image: nothing it produces is checked in or CI-gated.
+
+.. code-block:: console
+
+   $ uv run python -m docs.screenshots.contact_sheet --out /tmp/sheet
+
+That captures the Web Terminal's four shells -- the **dark** and **light** themes
+crossed with the **expert** and **simple** UI modes -- writes one PNG per cell
+into the output directory, composes them into ``contact-sheet.html`` there, and
+prints its path. Open that one file to review every variant side by side.
+
+**Comparing accent candidates.** Add ``--accents`` to render each of the four
+variants twice, once under each accent candidate (blue vs teal), so a pending
+accent decision can be made from real output rather than a mockup:
+
+.. code-block:: console
+
+   $ uv run python -m docs.screenshots.contact_sheet --out /tmp/sheet --accents
+
+To keep every cell looking like a working session with no live backend, the
+renderer points the workspace panel at a pre-seeded demo store and replays a
+canned terminal transcript. That transcript is width-guarded against the narrow
+terminal card -- the run fails fast if a line would overflow, before any browser
+launches. Where no browser runtime is available the run skips with a one-line
+notice instead of erroring.
+
+**Extending it to another target.** The variant grid is the ``VARIANTS`` list of
+``(theme, mode)`` tuples near the top of ``contact_sheet.py``, and the
+completeness invariant ``_FULL_MATRIX`` mirrors it -- add a cell to *both* to
+capture a new theme/mode combination. To cover a new panel, seed its backing
+store the way ``seed_demo_workspace`` seeds the workspace artifacts and wire it
+into ``hermetic_hub`` so the panel renders populated; the capture loop and the
+composed sheet then pick it up unchanged.
 
 ----
 

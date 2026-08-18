@@ -10,6 +10,7 @@ launch attempt after a fresh deploy.
 from __future__ import annotations
 
 import secrets
+import subprocess
 
 import pytest
 
@@ -36,10 +37,17 @@ def captured_argv(monkeypatch, tmp_path):
         container_lifecycle, "get_runtime_command", lambda config: ["docker", "compose"]
     )
 
-    def _fake_run(cmd, env=None, check=False):
+    def _fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
+        # run_captured hangs its spool path off the result, so the stand-in has
+        # to be an object, and it passes redirection kwargs this ignores.
+        return subprocess.CompletedProcess(list(cmd), 0)
 
-    monkeypatch.setattr(container_lifecycle.subprocess, "run", _fake_run)
+    # Stubbed at `run_captured`, the one seam every deploy child goes through:
+    # a watched capture (the image builds pass `on_line=`) reads its child
+    # through a pipe instead of `subprocess.run`, so a `subprocess.run` stub
+    # would be walked straight past and this test would run a real build.
+    monkeypatch.setattr(container_lifecycle, "run_captured", _fake_run)
     return captured
 
 
@@ -125,15 +133,45 @@ def test_bluesky_process_env_token_not_written_to_dotenv(captured_argv, monkeypa
     assert "BLUESKY_LAUNCH_TOKEN" not in env
 
 
-def test_bluesky_expose_refuses_empty_token(captured_argv, monkeypatch, tmp_path):
-    # A token explicitly set empty must not be auto-overwritten, and --expose must
-    # refuse rather than bind a fail-open server to 0.0.0.0.
+def test_an_empty_dotenv_token_is_minted_on_the_default_loopback_deploy(
+    captured_argv, _clean_token_env, monkeypatch, tmp_path
+):
+    """``BLUESKY_LAUNCH_TOKEN=`` in ``.env`` is a blank the mint fills in.
+
+    The off-host refusal below is the only guard that ever caught this, and a
+    default deploy publishes on loopback — so before the mint reached empty
+    values, a bare ``VAR=`` line brought the bridge up with no launch token and
+    nothing said so.
+    """
+    (tmp_path / ".env").write_text("BLUESKY_LAUNCH_TOKEN=\n", encoding="utf-8")
+    # The deploy loads that .env over the process environment before it mints,
+    # so this is the state the predicate sees. Set through monkeypatch so the
+    # minted value does not outlive the test.
     monkeypatch.setenv("BLUESKY_LAUNCH_TOKEN", "")
 
-    with pytest.raises(RuntimeError, match="refusing to --expose"):
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
+
+    env = _parse_env(tmp_path)
+    assert env["BLUESKY_LAUNCH_TOKEN"], "the empty launch token was left empty"
+    assert env["BLUESKY_TILED_API_KEY"].isalnum()
+
+
+def test_an_exposed_bluesky_deploy_refuses_an_empty_exported_token(
+    captured_argv, monkeypatch, tmp_path
+):
+    # An *exported* empty token is the one spelling a mint cannot repair: the
+    # export shadows the .env line minting would write, so nothing is generated
+    # and a deployment reachable off-host refuses rather than bind a fail-open
+    # server to it. The remedy names the environment, since editing .env would
+    # not change what compose resolves while the export stands.
+    monkeypatch.setenv("BLUESKY_LAUNCH_TOKEN", "")
+
+    with pytest.raises(RuntimeError, match="reachable off-host with an empty token") as exc_info:
         container_lifecycle.deploy_up(
             str(tmp_path / "config.yml"), detached=True, expose_network=True
         )
+
+    assert "Unset BLUESKY_LAUNCH_TOKEN in the environment" in str(exc_info.value)
 
 
 def test_bluesky_alongside_dispatch_mints_both_independently(
@@ -154,7 +192,11 @@ def test_bluesky_alongside_dispatch_mints_both_independently(
     monkeypatch.setattr(
         container_lifecycle, "get_runtime_command", lambda config: ["docker", "compose"]
     )
-    monkeypatch.setattr(container_lifecycle.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        container_lifecycle,
+        "run_captured",
+        lambda cmd, **k: subprocess.CompletedProcess(list(cmd), 0),
+    )
 
     container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
 
@@ -243,10 +285,13 @@ def test_ensure_service_tokens_writes_an_alphanumeric_tiled_key_every_time(
 def test_var_generators_registry_is_pinned():
     """Pin the blast radius: only vars with a downstream alphabet/policy
     constraint override the default token recipe (Tiled's alphanumeric
-    --api-key, OpenObserve's four-class root password)."""
+    --api-key, OpenObserve's four-class root password, and the URI-safe
+    alphabet the ARIEL Postgres and archiver Mongo passwords share)."""
     assert set(container_lifecycle._VAR_GENERATORS) == {
         "BLUESKY_TILED_API_KEY",
         "ZO_ROOT_USER_PASSWORD",
+        "ARIEL_DB_PASSWORD",
+        "MONGO_ROOT_PASSWORD",
     }
     declared = {
         var for token_vars in container_lifecycle._SERVICE_TOKEN_VARS.values() for var in token_vars
@@ -299,10 +344,10 @@ def test_deploy_up_routes_each_var_through_its_own_generator(
 # _VAR_VALIDATORS — deploy-boundary validation of the effective value (F1/F3)
 #
 # _ensure_service_tokens(config, expose_network=False, env_path=...) is the
-# DEFAULT loopback deploy path (deploy_up's default is --expose off). These
+# DEFAULT loopback deploy path: a build that publishes only on 127.0.0.1. These
 # tests call it directly, mirroring test_ensure_service_tokens_writes_an_
 # alphanumeric_tiled_key_every_time above, to prove the boundary check fires
-# on that path and not only under --expose.
+# on that path and not only on a deployment reachable off-host.
 # ---------------------------------------------------------------------------
 
 
@@ -366,11 +411,9 @@ def test_ariel_dsn_validator_accepts_a_clean_dsn():
 # ---------------------------------------------------------------------------
 # _VALIDATE_ONLY_VARS (ARIEL_DSN) — checked at the boundary when present, but
 # never minted and never a _SERVICE_TOKEN_VARS member. ARIEL_DSN has no
-# osprey-native service consumer in this deploy system: it belongs to the
-# separate osprey-build-deploy facility-scaffolding pipeline (its own
-# generated docker-compose.yml/.env.template, brought up by the facility's
-# own scripts/deploy.sh via a raw `docker compose`/`podman compose` call,
-# never through `osprey deploy up`). These tests call the real
+# osprey-native service consumer in this deploy system: it names a database
+# the facility runs itself, supplied through its own `profile/.env` and
+# validated at the boundary rather than minted here. These tests call the real
 # _ensure_service_tokens with NO _SERVICE_TOKEN_VARS monkeypatch — proving
 # the check fires unconditionally, independent of deployed_services/service
 # membership, as defense-in-depth for the case where an operator or other
@@ -471,6 +514,8 @@ def test_validator_registry_keyset_is_pinned():
         "BLUESKY_TILED_API_KEY",
         "ARIEL_DSN",
         "ZO_ROOT_USER_PASSWORD",
+        "ARIEL_DB_PASSWORD",
+        "MONGO_ROOT_PASSWORD",
     }
 
     declared = {

@@ -17,16 +17,23 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Config sections relevant to the agent (exclude internal/infra sections)
+# Config sections the Form view offers for editing. Deliberately narrower than
+# the file: infra/build sections (api, cli, deploy, modules, file_paths, ...)
+# are left to the Raw YAML view. Every name here must match a real top-level
+# key -- an entry that matches nothing renders nothing, silently, which is how
+# "python_execution" (the section is called "execution") kept the execution
+# settings out of the form.
 _AGENT_CONFIG_SECTIONS = [
     "control_system",
+    "archiver",
     "approval",
     "claude_code",
     "channel_finder",
     "ariel",
-    "python_execution",
+    "logbook",
+    "facility_knowledge",
+    "execution",
     "artifact_server",
-    "workspace",
     "screen_capture",
     "hooks",
 ]

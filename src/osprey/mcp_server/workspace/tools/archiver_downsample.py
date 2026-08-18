@@ -1,81 +1,80 @@
 """MCP tool: archiver_downsample.
 
-Returns chart-ready downsampled timeseries data from an artifact entry.
+Returns per-channel downsampled timeseries data from an artifact entry.
 Uses LTTB (Largest-Triangle-Three-Buckets) to preserve visual shape while
-keeping the payload small enough for inline report generation.
+keeping the payload small enough for inline report generation. Each channel
+carries its own timestamps -- channels have independent sample cadences and
+are not aligned to a shared axis.
 """
 
 import json
 import logging
 
-from fastmcp.exceptions import ToolError
-
 from osprey.mcp_server.errors import make_error
 from osprey.mcp_server.workspace.server import mcp
-from osprey.utils.timeseries import extract_timeseries_frame, lttb_downsample
-from osprey.utils.workspace import resolve_workspace_root
+from osprey.utils.timeseries import (
+    downsample_channel_map,
+    extract_channel_series,
+)
 
 logger = logging.getLogger("osprey.mcp_server.tools.archiver_downsample")
 
 
 @mcp.tool()
 async def archiver_downsample(
-    entry_id: str,
+    artifact_id: str,
     max_points: int = 200,
     channels: list[str] | None = None,
 ) -> str:
-    """Downsample a timeseries artifact entry for chart embedding.
+    """Downsample a timeseries artifact for chart embedding.
 
-    Uses LTTB (Largest-Triangle-Three-Buckets) to reduce point count while
-    preserving the visual shape of the data. Returns a chart-ready payload
-    with labels and datasets that can be directly embedded in Chart.js config.
+    Uses LTTB (Largest-Triangle-Three-Buckets) to reduce each channel's point
+    count independently while preserving its visual shape. A non-numeric
+    (enum/status) channel's values are never coerced for the triangle-area
+    math -- it passes through unchanged when it already fits under
+    ``max_points`` and is evenly subsampled (keeping the first and last
+    points) otherwise.
 
-    Only works on category="archiver_data" entries.
+    Only works on category="archiver_data" artifacts.
 
     Args:
-        entry_id: Artifact entry ID to downsample.
-        max_points: Maximum number of points to return (default 200).
+        artifact_id: ID of the artifact to downsample.
+        max_points: Maximum number of points to return per channel (default 200).
         channels: Optional list of channel names to include. If omitted,
             all channels are included.
 
     Returns:
-        JSON with labels, datasets, original_points, downsampled_points,
-        and time_range suitable for Chart.js.
+        JSON with ``datasets`` (each ``{"channel", "timestamps", "values",
+        "original_points", "downsampled_points", "numeric"}``), plus top-level
+        ``original_points``/``downsampled_points`` summed across channels
+        and a ``time_range`` spanning all returned channels. Each dataset
+        carries its own timestamps. ``numeric`` is False for enum/status
+        channels, which cannot share a numeric axis with the others.
     """
-    try:
-        workspace_root = resolve_workspace_root()
-    except ToolError:
-        raise
-    except Exception as e:
-        return make_error(
-            "internal_error",
-            f"Could not resolve workspace root: {e}",
-        )
+    from osprey.stores.artifact_store import get_artifact_store
 
-    from osprey.stores.artifact_store import ArtifactStore
-
-    store = ArtifactStore(workspace_root=workspace_root)
-    entry = store.get_entry(entry_id)
+    store = get_artifact_store()
+    entry = store.get_entry(artifact_id)
 
     if entry is None:
         return make_error(
             "validation_error",
-            f"Artifact entry '{entry_id}' not found.",
-            suggestions=["Use session_summary to list available entries."],
+            f"Artifact '{artifact_id}' not found.",
+            suggestions=["Use artifact_list to see available artifacts."],
         )
 
     if entry.category != "archiver_data":
         return make_error(
             "validation_error",
-            f"Entry '{entry_id}' has category={entry.category!r}, not 'archiver_data'.",
-            suggestions=["Only archiver_data entries can be downsampled."],
+            f"Artifact '{artifact_id}' has category={entry.category!r}, not 'archiver_data'.",
+            suggestions=["Only archiver_data artifacts can be downsampled."],
         )
 
-    filepath = store.get_file_path(entry_id)
+    filepath = store.get_file_path(artifact_id)
     if filepath is None:
         return make_error(
             "internal_error",
-            f"Data file for entry '{entry_id}' not found on disk.",
+            f"File for artifact '{artifact_id}' not found on disk.",
         )
 
     try:
@@ -86,64 +85,41 @@ async def archiver_downsample(
             f"Could not read data file: {e}",
         )
 
-    frame, query_meta = extract_timeseries_frame(raw)
-    all_columns = frame.get("columns", [])
-    index = frame.get("index", [])
-    rows = frame.get("data", [])
-    original_points = len(index)
+    series, _query_meta = extract_channel_series(raw)
 
-    if original_points == 0:
-        return json.dumps(
-            {
-                "labels": [],
-                "datasets": [],
-                "original_points": 0,
-                "downsampled_points": 0,
-                "time_range": {"start": None, "end": None},
-            }
-        )
-
-    # Filter channels if requested
-    if channels:
-        col_indices = [i for i, c in enumerate(all_columns) if c in channels]
-        if not col_indices:
-            return make_error(
-                "validation_error",
-                f"None of the requested channels {channels} found in entry columns {all_columns}.",
-            )
-        selected_columns = [all_columns[i] for i in col_indices]
-        filtered_rows = [[row[i] for i in col_indices] for row in rows]
-    else:
-        selected_columns = all_columns
-        filtered_rows = rows
-
-    # Downsample
     max_points = max(3, min(max_points, 10000))
-    ds_index, ds_rows = lttb_downsample(index, filtered_rows, max_points)
-    downsampled_points = len(ds_index)
+    records = downsample_channel_map(series, max_points, channels=channels or None)
 
-    # Build Chart.js-ready datasets
-    datasets = []
-    for col_idx, col_name in enumerate(selected_columns):
-        values = [row[col_idx] if col_idx < len(row) else None for row in ds_rows]
-        datasets.append(
-            {
-                "channel": col_name,
-                "values": values,
-            }
+    if channels and not records:
+        return make_error(
+            "validation_error",
+            f"None of the requested channels {channels} found in entry channels {list(series)}.",
         )
 
-    time_range = {
-        "start": ds_index[0] if ds_index else None,
-        "end": ds_index[-1] if ds_index else None,
-    }
+    datasets = [
+        {
+            "channel": record["channel"],
+            "timestamps": record["timestamps"],
+            "values": record["values"],
+            "original_points": record["original_points"],
+            "downsampled_points": record["returned_points"],
+            "numeric": record["numeric"],
+        }
+        for record in records
+    ]
+
+    # An empty channel must not erase the other channels' spans in the
+    # min/max; default=None covers the case where every channel is empty.
+    spans = [d["timestamps"] for d in datasets if d["timestamps"]]
 
     result = {
-        "labels": ds_index,
         "datasets": datasets,
-        "original_points": original_points,
-        "downsampled_points": downsampled_points,
-        "time_range": time_range,
+        "original_points": sum(d["original_points"] for d in datasets),
+        "downsampled_points": sum(d["downsampled_points"] for d in datasets),
+        "time_range": {
+            "start": min((s[0] for s in spans), default=None),
+            "end": max((s[-1] for s in spans), default=None),
+        },
     }
 
     return json.dumps(result, indent=2)

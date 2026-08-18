@@ -5,6 +5,18 @@ with a real terminal (PTY) and live workspace file viewer.
 
 Supports `--detach` for background operation and `osprey web stop`
 to shut down a detached instance.
+
+What it serves is ``build/`` — the render, which is where ``config.yml``,
+``.mcp.json`` and the ``.claude/`` tree live — found by the one discovery rule
+every repo-scoped verb uses: walk up to the nearest ``profile.yml``. ``stop``
+runs the *same* walk as the start, so the two can never disagree about which
+server is being stopped.
+
+``OSPREY_CONFIG`` is written here only as the publication this process makes
+for its own children (PTY shells, their MCP servers, the ``--reload`` worker).
+It is never read as a way of *finding* the deployment: an ambient export from
+whichever project the operator last worked in must not decide what this
+command serves.
 """
 
 from __future__ import annotations
@@ -20,8 +32,21 @@ from pathlib import Path
 
 import click
 
-PID_FILE = ".osprey-web.pid"
-LOG_FILE = ".osprey-web.log"
+from osprey.utils.workspace import STATE_DIR_NAME
+
+from . import output
+from .repo_resolver import find_repo_root, repo_option
+
+#: The detached server's PID and log files, relative to the repo root and in
+#: the STATE zone. Three properties of ``var/`` are all required here and no
+#: other zone has them: it is git-ignored (a running server must not dirty
+#: ``git status``), it is host-local (a PID means nothing on another machine),
+#: and it survives ``osprey build``, which wipes ``build/`` — a rebuild
+#: underneath a running server would otherwise take the only handle on it.
+#: Unhidden, unlike the old repo-root spelling: hiding a file inside a
+#: directory that is already private buys nothing and costs discoverability.
+PID_FILE = f"{STATE_DIR_NAME}/osprey-web.pid"
+LOG_FILE = f"{STATE_DIR_NAME}/osprey-web.log"
 DECLARED_BIND_ENV = "OSPREY_TERMINAL_BIND_HOST"
 DECLARED_WEB_PORT_ENV = "OSPREY_TERMINAL_WEB_PORT"
 
@@ -90,12 +115,12 @@ def get_config_value(key: str, default=None):
 # -- helpers ---------------------------------------------------------------
 
 
-def _read_pid(project_dir: Path) -> int | None:
+def _read_pid(repo_root: Path) -> int | None:
     """Read PID file and return the PID if the process is alive.
 
     Removes stale PID files automatically.
     """
-    pid_path = project_dir / PID_FILE
+    pid_path = repo_root / PID_FILE
     if not pid_path.exists():
         return None
     try:
@@ -113,9 +138,60 @@ def _read_pid(project_dir: Path) -> int | None:
     return pid
 
 
-def _write_pid(project_dir: Path, pid: int) -> None:
-    """Write PID to file."""
-    (project_dir / PID_FILE).write_text(str(pid))
+def _write_pid(repo_root: Path, pid: int) -> None:
+    """Write PID to file, creating the STATE zone if this repo has none yet."""
+    pid_path = repo_root / PID_FILE
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(str(pid))
+
+
+def _resolve_render(repo: Path | None) -> tuple[Path, Path, Path]:
+    """Find the deployment repo, and make its render authoritative.
+
+    One decision, made once and up front, that everything downstream derives
+    from: the panel set, the companion servers, the provider wiring, the
+    ``.claude/`` tree the PTY's agent reads, and the ``watch_dir`` the file
+    viewer follows. The rule is the shared one — walk up from cwd (or from
+    ``--repo``) to the nearest ``profile.yml`` — and the served directory is
+    that repo's ``build/``, because the render *is* the project as far as every
+    runtime consumer is concerned.
+
+    The render becomes the working directory, so cwd-relative resolvers, the
+    PTY shells, and the ``--reload`` worker all agree without being told twice.
+    ``OSPREY_CONFIG`` is then published for this process and every child — a
+    publication, not a lookup: nothing above reads it to decide *which*
+    deployment to serve. The repo ``.env`` is loaded off that same publication
+    (:func:`osprey.mcp_env.load_dotenv_from_project` walks up from the render
+    to the repo root), so the ``get_config_value`` reads that follow can expand
+    ``${VAR}`` placeholders against it.
+
+    Returns:
+        ``(repo_root, build_dir, config_path)``, all absolute.
+
+    Raises:
+        RepoNotFoundError: When no ``profile.yml`` encloses the search start.
+        click.ClickException: When the repo has no render to serve.
+    """
+    from osprey.utils.workspace import BUILD_DIR_NAME, rendered_config_path
+
+    repo_root = find_repo_root(repo)
+    build_dir = repo_root / BUILD_DIR_NAME
+    config_path = rendered_config_path(repo_root)
+    if not config_path.is_file():
+        raise click.ClickException(
+            f"no build found at {build_dir} — run `osprey build` first.\n\n"
+            "The web terminal serves the rendered deployment, and there is "
+            "nothing rendered yet. Without it the terminal would come up with "
+            "no panels, no companion servers and no provider."
+        )
+
+    os.chdir(build_dir)
+    os.environ["OSPREY_CONFIG"] = str(config_path)
+
+    from osprey.mcp_env import load_dotenv_from_project
+
+    load_dotenv_from_project()
+    return repo_root, build_dir, config_path
 
 
 def _preflight_vendor_check() -> None:
@@ -134,40 +210,30 @@ def _preflight_vendor_check() -> None:
     if not problems:
         return
 
-    click.echo("ERROR: offline mode is on but vendor assets are missing or corrupt:", err=True)
-    for p in problems[:5]:
-        click.echo(f"  {p}", err=True)
+    listed = [str(p) for p in problems[:5]]
     if len(problems) > 5:
-        click.echo(f"  ... and {len(problems) - 5} more", err=True)
-    click.echo("\nFix:  uv run osprey vendor fetch", err=True)
+        listed.append(f"and {len(problems) - 5} more")
+    output.fail(
+        "Offline mode is on but vendor assets are missing or corrupt",
+        "\n".join(listed),
+        "fetch them with: uv run osprey vendor fetch",
+    )
     raise SystemExit(1)
-
-
-# FRAMEWORK_WEB_SERVERS keys don't line up 1:1 with the panel ids
-# _load_panel_config() reports: channel_finder/lattice_dashboard use
-# underscores while profiles.web_panels.BUILTIN_PANELS uses the hyphenated/
-# short ids the frontend and web.panels config actually key on
-# ("channel-finder", "lattice"). "artifact" is intentionally absent — it's a
-# UNIVERSAL_PANELS entry the lifespan launches unconditionally (see
-# _create_lifespan in web_terminal/app.py), so it is never gated on
-# web.panels membership.
-_PANEL_ID_FOR_REGISTRY_KEY: dict[str, str] = {
-    "ariel": "ariel",
-    "channel_finder": "channel-finder",
-    "lattice_dashboard": "lattice",
-    "okf": "okf",
-    "system_health": "system-health",
-}
 
 
 def _probe_companion_ports() -> list[str]:
     """Probe 1: TCP-connect-probe every companion panel port the lifespan will bind.
 
     Resolves the panel set the same way ``_create_lifespan`` does: enabled via
-    ``web.panels`` (or ``artifact``, which is always launched) AND actually
+    ``web.panels`` (or a UNIVERSAL panel, which is always launched) AND actually
     launchable per ``auto_launch``/``require_section``. A panel that is
     enabled but not launched (e.g. ``channel_finder`` with an unmet
     ``require_section``) is excluded — its port is never probed.
+
+    Panel ids come from each registry entry's own ``panel_id`` — the registry
+    keys are a different namespace from the ids ``web.panels`` and the frontend
+    use (``artifact``/``artifacts``, ``channel_finder``/``channel-finder``), and
+    a local translation table here drifted from the health category's copy.
 
     A listener already bound to a companion port before we start ours is
     foreign: at best it steals the panel's tab, at worst it silently
@@ -178,20 +244,31 @@ def _probe_companion_ports() -> list[str]:
     from osprey.infrastructure.server_launcher import (
         _launchers,
         _make_auto_launch_checker,
-        _make_config_reader,
     )
     from osprey.interfaces.web_terminal.app import _load_panel_config
-    from osprey.registry.web import FRAMEWORK_WEB_SERVERS
+    from osprey.profiles.web_panels import UNIVERSAL_PANELS
+    from osprey.registry.web import (
+        FRAMEWORK_WEB_SERVERS,
+        WebServerConfigDepthError,
+        resolve_web_server_address,
+    )
 
     enabled_panels, _custom_panels, _default_panel = _load_panel_config()
 
     failures: list[str] = []
     for key, defn in FRAMEWORK_WEB_SERVERS.items():
-        if key != "artifact" and _PANEL_ID_FOR_REGISTRY_KEY.get(key) not in enabled_panels:
+        if defn.panel_id not in UNIVERSAL_PANELS and defn.panel_id not in enabled_panels:
             continue  # panel disabled in web.panels — the lifespan never calls its launcher
-        if not _make_auto_launch_checker(defn)():
-            continue  # auto_launch off, or require_section unmet
-        host, port = _make_config_reader(defn)()
+        try:
+            if not _make_auto_launch_checker(defn)():
+                continue  # auto_launch off, or require_section unmet
+            host, port = resolve_web_server_address(key)
+        except WebServerConfigDepthError as exc:
+            # A misplaced host/port/auto_launch key is a config defect, not a
+            # port clash — report it here rather than letting it traceback out
+            # of pre-flight, so `osprey web` names the key and the fix.
+            failures.append(str(exc))
+            continue
         if _launchers[key]._port_has_listener(host, port):
             failures.append(
                 f"Companion panel '{key}' ({defn.name}) port {port} is already in use "
@@ -201,20 +278,7 @@ def _probe_companion_ports() -> list[str]:
     return failures
 
 
-def _resolve_project_config_path(project_dir: Path) -> Path:
-    """Resolve config.yml the same way ``resolve_config_path()`` does, for *project_dir*.
-
-    Mirrors ``osprey.utils.workspace.resolve_config_path()`` (``OSPREY_CONFIG``
-    env var first, else ``<dir>/config.yml``) but keyed off the pre-flight's
-    already-resolved ``project_dir`` instead of ``Path.cwd()`` — the two agree
-    whenever ``--project`` isn't passed, since ``project_dir`` defaults to cwd.
-    """
-    return Path(
-        os.path.expandvars(os.environ.get("OSPREY_CONFIG", str(project_dir / "config.yml")))
-    )
-
-
-def _probe_auth_secret(project_dir: Path | None) -> tuple[list[str], list[str]]:
+def _probe_auth_secret(build_dir: Path, repo_root: Path) -> tuple[list[str], list[str]]:
     """Probe 2: the resolved provider's auth secret must be resolvable before launch.
 
     A proxy provider (als-apg, cborg, a custom ``api.providers`` entry, ...)
@@ -223,25 +287,54 @@ def _probe_auth_secret(project_dir: Path | None) -> tuple[list[str], list[str]]:
     has no such requirement, so a missing ``ANTHROPIC_API_KEY`` there is only
     a warning, not an abort.
 
-    Checks both ``os.environ`` and the project's ``.env`` (via
-    ``dotenv_values``, which reads without mutating ``os.environ``): the real
-    launch's ``load_dotenv_from_project()`` only runs after pre-flight on the
-    foreground path (see ``web()``), so a secret that lives only in ``.env``
-    must still count as present here — otherwise a healthy proxy launch would
-    false-fail.
+    The two directories are genuinely different files: the provider is declared
+    in the render (``build/config.yml``), while the secret it needs lives in
+    the repo's ``.env`` — the SECRETS zone, deliberately outside the render so
+    it survives ``osprey build`` wiping ``build/``.
+
+    Checks both ``os.environ`` and that ``.env`` (via ``dotenv_values``, which
+    reads without mutating ``os.environ``). ``_resolve_render()`` does load
+    ``.env`` before pre-flight runs, but this probe must not DEPEND on that
+    side effect: reading ``.env`` directly keeps it correct on its own, so a
+    secret that lives only in ``.env`` counts as present regardless of load
+    ordering — otherwise a healthy proxy launch could false-fail.
 
     Zero network: ``load_provider_spec`` is a pure config read. A missing or
     malformed config.yml, or an unknown provider name, is left for Probe 3 (or
     the launch itself) to report — this probe just skips quietly rather than
     duplicating that diagnosis.
-    """
-    if project_dir is None:
-        return [], []
 
-    from osprey.cli.claude_code_resolver import load_provider_spec
+    The one exception is
+    :class:`~osprey.build.claude_code_telemetry.ObservabilityCredentialError`:
+    nothing else in pre-flight resolves telemetry credentials, so a quiet skip
+    there leaves the operator with an empty report and no reason for it. That
+    case returns a warning naming what stopped the read, which keeps the launch
+    going (telemetry credentials are orthogonal to whether the terminal can
+    authenticate) while saying why the auth check never ran.
+    """
+    from osprey.build.claude_code_resolver import load_provider_spec
+    from osprey.build.claude_code_telemetry import ObservabilityCredentialError
 
     try:
-        spec = load_provider_spec(project_dir)
+        # The provider is declared in the render and its ``${VAR}`` references
+        # resolve from the repo's ``.env`` — the two directories this probe
+        # already holds apart. Without ``env_dir`` the expansion sees only
+        # ``os.environ``, so a custom provider whose ``base_url``/``api_key``
+        # lives in ``.env`` resolves to a literal placeholder and the probe
+        # reports on a provider the launch will not use.
+        spec = load_provider_spec(build_dir, env_dir=repo_root)
+    except ObservabilityCredentialError as exc:
+        # Must come BEFORE the ValueError arm: this type subclasses
+        # TelemetryConfigError, which subclasses ValueError, so the broad arm
+        # would swallow it and the operator would see an empty pre-flight with
+        # no reason for it. The provider was never read, so there is nothing to
+        # say about auth; report what stopped the read instead of nothing. Only
+        # names reach the message, never a credential's value.
+        return [], [
+            "provider auth check skipped: the telemetry credentials in this "
+            "deployment could not be resolved, so the provider was never read.\n"
+            f"  {exc}"
+        ]
     except (OSError, ValueError):
         return [], []
     if spec is None or not spec.auth_secret_env:
@@ -249,7 +342,7 @@ def _probe_auth_secret(project_dir: Path | None) -> tuple[list[str], list[str]]:
 
     secret_present = bool(os.environ.get(spec.auth_secret_env))
     if not secret_present:
-        env_file = project_dir / ".env"
+        env_file = repo_root / ".env"
         if env_file.is_file():
             from dotenv import dotenv_values
 
@@ -266,7 +359,7 @@ def _probe_auth_secret(project_dir: Path | None) -> tuple[list[str], list[str]]:
     )
 
 
-def _probe_config_validity(project_dir: Path | None) -> list[str]:
+def _probe_config_validity(build_dir: Path, config_path: Path) -> list[str]:
     """Probe 3: config.yml and .claude/settings.json must at least parse.
 
     ``load_osprey_config()`` swallows every exception and returns ``{}`` on
@@ -278,15 +371,15 @@ def _probe_config_validity(project_dir: Path | None) -> list[str]:
     does not call ``validate_agent_tools_against_permissions()`` — agent-tool
     / permission drift is a build-time concern, not a launch gate.
 
-    Both files are optional — a project without one is not a failure, just
+    ``config_path`` is the path ``_resolve_render()`` already settled on —
+    threaded through rather than re-derived, so pre-flight can never parse a
+    different file than the one the server will actually load.
+    ``settings.json`` is optional; a render without one is not a failure, just
     nothing to validate.
     """
-    if project_dir is None:
-        return []
-
     failures: list[str] = []
 
-    settings_path = project_dir / ".claude" / "settings.json"
+    settings_path = build_dir / ".claude" / "settings.json"
     if settings_path.exists():
         import json
 
@@ -295,7 +388,6 @@ def _probe_config_validity(project_dir: Path | None) -> list[str]:
         except json.JSONDecodeError as e:
             failures.append(f"{settings_path}: invalid JSON ({e})")
 
-    config_path = _resolve_project_config_path(project_dir)
     if config_path.exists():
         import yaml
 
@@ -308,7 +400,7 @@ def _probe_config_validity(project_dir: Path | None) -> list[str]:
 
 
 def _preflight(
-    config: dict, project_dir: Path | None, host: str, port: int
+    config: dict, repo_root: Path, build_dir: Path, config_path: Path, host: str, port: int
 ) -> tuple[list[str], list[str]]:
     """Run fast, synchronous, zero-network pre-flight probes before the server binds.
 
@@ -319,17 +411,19 @@ def _preflight(
     ``ANTHROPIC_API_KEY`` in env — subscription/OAuth login is still
     launchable).
 
+    ``repo_root``/``build_dir``/``config_path`` are what ``_resolve_render()``
+    settled on — every probe sees the SAME deployment the server will serve.
     ``config``/``host``/``port`` are threaded through for probes that need
     them; none currently do. Probe 1 (companion port collisions) reads its own
-    panel/port config directly; Probes 2-3 use ``project_dir``.
+    panel/port config directly; Probes 2-3 use the resolved paths.
     """
     failures: list[str] = []
     warnings: list[str] = []
     failures.extend(_probe_companion_ports())
-    auth_failures, auth_warnings = _probe_auth_secret(project_dir)
+    auth_failures, auth_warnings = _probe_auth_secret(build_dir, repo_root)
     failures.extend(auth_failures)
     warnings.extend(auth_warnings)
-    failures.extend(_probe_config_validity(project_dir))
+    failures.extend(_probe_config_validity(build_dir, config_path))
     return failures, warnings
 
 
@@ -360,10 +454,9 @@ def _notice_declared_override(env_var: str, flag_name: str, flag_value: object, 
     """
     declared = os.environ.get(env_var)
     if declared and flag_value is not None and str(flag_value) != declared:
-        click.echo(
-            f"NOTICE: {env_var}={declared} is authoritative for the "
-            f"multi-user reverse-proxy {what}; ignoring {flag_name} {flag_value}.",
-            err=True,
+        output.warn(
+            f"{env_var}={declared} is authoritative for the multi-user reverse-proxy {what}",
+            f"Ignoring {flag_name} {flag_value}.",
         )
 
 
@@ -413,12 +506,7 @@ def _resolve_web_shell_command(
 @click.option("--host", default=None, help="Host to bind to (default: from config or 127.0.0.1)")
 @click.option("--reload", is_flag=True, help="Enable auto-reload for development")
 @click.option("--shell", default=None, help="Shell command to run (default: claude)")
-@click.option(
-    "--project",
-    type=click.Path(exists=True, file_okay=False),
-    default=None,
-    help="OSPREY project directory (default: current directory)",
-)
+@repo_option
 @click.option("--detach", is_flag=True, help="Run in background, write PID file")
 @click.option(
     "--skip-preflight",
@@ -432,7 +520,7 @@ def web(
     host: str | None,
     reload: bool,
     shell: str | None,
-    project: str | None,
+    repo: Path | None,
     detach: bool,
     skip_preflight: bool,
 ) -> None:
@@ -440,6 +528,11 @@ def web(
 
     Starts a FastAPI server with a split-pane UI: a real terminal (PTY) on the
     left and a live workspace file viewer on the right.
+
+    Serves the deployment enclosing the current directory — the nearest
+    profile.yml above it, or --repo — and what it serves is that repo's build/
+    as it was last rendered. A repo with no build/ is refused rather than
+    served as an empty terminal.
 
     Example:
 
@@ -450,10 +543,19 @@ def web(
         osprey web --shell zsh             # Use zsh instead of claude
         osprey web --reload                # Development mode
         osprey web --detach                # Start in background
+        osprey web --repo ~/als-assistant  # Serve another deployment
         osprey web stop                    # Stop background server
     """
     if ctx.invoked_subcommand is not None:
         return
+
+    # Resolve the deployment FIRST and fail loudly if there is none. Everything
+    # below — the vendor check's offline flag, host/port/shell resolution,
+    # pre-flight's probes, and the server itself — reads the render's config,
+    # so an unresolvable one must abort here rather than degrade into a mystery
+    # terminal serving another directory's defaults.
+    repo_root, build_dir, project_config = _resolve_render(repo)
+    output.section("", {"Repo": repo_root, "Build": build_dir})
 
     _preflight_vendor_check()
 
@@ -473,32 +575,36 @@ def web(
     try:
         shell_command = _resolve_web_shell_command(cc_config, user_shell_override, wt_config)
     except FileNotFoundError as e:
-        click.echo(f"ERROR: {e}", err=True)
+        output.fail("Cannot resolve the shell the terminal should run", str(e))
         raise SystemExit(1) from e
 
     if not skip_preflight:
         from osprey.utils.workspace import load_osprey_config
 
-        project_dir = Path(project).resolve() if project else Path.cwd()
-        failures, warnings = _preflight(load_osprey_config(), project_dir, host, port)
+        failures, warnings = _preflight(
+            load_osprey_config(), repo_root, build_dir, project_config, host, port
+        )
         for warning in warnings:
-            click.echo(f"WARNING: {warning}", err=True)
+            output.warn(warning)
         if failures:
-            click.echo("ERROR: pre-flight checks failed:", err=True)
-            for finding in failures:
-                click.echo(f"  - {finding}", err=True)
-            click.echo("\nRun with --skip-preflight to bypass (not recommended).", err=True)
+            output.fail(
+                "Pre-flight checks failed",
+                "\n".join(f"- {finding}" for finding in failures),
+                "fix the findings above, or pass --skip-preflight to start anyway",
+            )
             raise SystemExit(1)
 
     if detach:
-        _start_detached(host, port, user_shell_override, project)
+        _start_detached(host, port, user_shell_override, repo_root)
         return
 
     # -- foreground (original behavior) ------------------------------------
 
     if host == "0.0.0.0":
-        click.echo("WARNING: Binding to 0.0.0.0 exposes the terminal to the network.")
-        click.echo("This is a single-user tool — add authentication before external exposure.\n")
+        output.warn(
+            "Binding to 0.0.0.0 exposes the terminal to the network",
+            "This is a single-user tool. Add authentication before you expose it.",
+        )
 
     # Pre-flight: check if port is already in use. SO_REUSEADDR matches
     # uvicorn's own bind semantics — without it, TIME_WAIT sockets from a
@@ -510,9 +616,11 @@ def web(
             s.bind((host, port))
         except OSError as exc:
             if port_pinned:
-                click.echo(f"ERROR: Port {port} is already in use.", err=True)
-                click.echo(f"  Find the process:  lsof -i :{port}", err=True)
-                click.echo(f"  Or use another:    osprey web --port {port + 1}", err=True)
+                output.fail(
+                    f"Port {port} is already in use",
+                    f"Find the process holding it with: lsof -i :{port}",
+                    f"or start on another port with: osprey web --port {port + 1}",
+                )
                 raise SystemExit(1) from exc
             # Port was left unspecified and the default is taken — let the OS
             # assign a free one instead of hard-failing (single-user QoL). A
@@ -522,23 +630,19 @@ def web(
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as free_sock:
                 free_sock.bind((host, 0))
                 port = free_sock.getsockname()[1]
-            click.echo(f"Port {busy_port} in use — using :{port} instead.")
+            output.warn(f"Port {busy_port} is in use, so this is on port {port} instead")
 
     # Publish the ACTUAL port to every child process (PTY shells, their MCP
     # servers): web_terminal_url() resolves OSPREY_WEB_PORT first, and
-    # without this, panel tools (switch_panel etc.) fire-and-forget their
+    # without this, panel tools (open_panel etc.) fire-and-forget their
     # focus POSTs at the config default (8087) whenever --port differs —
     # reporting success while the real terminal never hears the event.
     os.environ["OSPREY_WEB_PORT"] = str(port)
 
-    click.echo(f"Starting OSPREY Web Terminal on http://{host}:{port}")
-    click.echo(f"Shell: {' '.join(shell_command)}")
-    click.echo("Press Ctrl+C to stop\n")
-
-    # Load .env so secrets (e.g. CONFLUENCE_ACCESS_TOKEN) are available
-    from osprey.mcp_env import load_dotenv_from_project
-
-    load_dotenv_from_project()
+    output.report(f"Starting OSPREY Web Terminal on http://{host}:{port}")
+    output.note(f"Shell: {' '.join(shell_command)}")
+    output.note("Press Ctrl+C to stop")
+    output.report("")
 
     try:
         if reload:
@@ -548,6 +652,9 @@ def web(
 
             _open_browser_when_ready(f"http://{host}:{port}")
 
+            # The reload worker re-imports create_app() with no arguments; it
+            # finds the render via the OSPREY_CONFIG publication made in
+            # _resolve_render().
             uvicorn.run(
                 "osprey.interfaces.web_terminal.app:create_app",
                 factory=True,
@@ -559,12 +666,19 @@ def web(
         else:
             from osprey.interfaces.web_terminal import run_web
 
-            run_web(host=host, port=port, shell_command=shell_command, project_dir=project)
+            run_web(
+                host=host,
+                port=port,
+                shell_command=shell_command,
+                config_path=str(project_config),
+                project_dir=str(build_dir),
+            )
     except KeyboardInterrupt:
-        click.echo("\nShutting down...")
+        output.report("")
+        output.report("Shutting down...")
 
 
-def _start_detached(host: str, port: int, shell: str | None, project: str | None) -> None:
+def _start_detached(host: str, port: int, shell: str | None, repo_root: Path) -> None:
     """Spawn the web server as a background process.
 
     ``shell`` is the raw user ``--shell`` flag (or None), NOT the resolved argv.
@@ -572,14 +686,16 @@ def _start_detached(host: str, port: int, shell: str | None, project: str | None
     pin remains honored from config; if we forwarded a resolved/pinned argv here,
     it would re-enter ``resolve_shell_command()`` in the child and fail for
     multi-word forms like ``npx -y @anthropic-ai/claude-code@<v>``.
-    """
-    project_dir = Path(project).resolve() if project else Path.cwd()
 
+    ``repo_root`` is the repo ``_resolve_render()`` settled on — always present,
+    never re-derived from cwd here, which matters more than ever now that the
+    parent has already chdir'ed into the render.
+    """
     # Idempotent: if already running, just report
-    existing = _read_pid(project_dir)
+    existing = _read_pid(repo_root)
     if existing is not None:
-        click.echo(f"Web terminal already running (PID {existing}).")
-        click.echo("  Stop with: osprey web stop")
+        output.report(f"Web terminal already running (PID {existing}).")
+        output.note("Stop it with: osprey web stop")
         return
 
     # Build the child command (no --detach to avoid recursion). --skip-preflight
@@ -599,10 +715,14 @@ def _start_detached(host: str, port: int, shell: str | None, project: str | None
     ]
     if shell:
         cmd += ["--shell", shell]
-    if project:
-        cmd += ["--project", str(Path(project).resolve())]
+    # Always name the repo in the child argv: it's what `ps` shows and what
+    # humans and agents copy to restart the server. A restart from another
+    # directory must not silently lose the deployment identity — and the child
+    # would otherwise inherit the parent's cwd, which is the render, not a repo.
+    cmd += ["--repo", str(repo_root)]
 
-    log_path = project_dir / LOG_FILE
+    log_path = repo_root / LOG_FILE
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(log_path, "w")  # noqa: SIM115
     proc = subprocess.Popen(
         cmd,
@@ -612,55 +732,71 @@ def _start_detached(host: str, port: int, shell: str | None, project: str | None
     )
     log_fh.close()  # child retains its own fd copy
 
-    _write_pid(project_dir, proc.pid)
+    _write_pid(repo_root, proc.pid)
 
     if _wait_for_server(host, port, proc):
-        click.echo(f"Web terminal started (PID {proc.pid}).")
-        click.echo(f"  URL:  http://{host}:{port}")
-        click.echo(f"  Log:  {log_path}")
-        click.echo("  Stop: osprey web stop")
+        output.report(f"Web terminal started (PID {proc.pid}).")
+        output.section(
+            "",
+            {"URL": f"http://{host}:{port}", "Log": log_path, "Stop": "osprey web stop"},
+        )
     else:
         exit_code = proc.poll()
         if exit_code is not None:
-            click.echo(f"Server exited immediately (code {exit_code}). Check {log_path}")
-            (project_dir / PID_FILE).unlink(missing_ok=True)
+            output.fail(
+                f"The web terminal exited immediately with code {exit_code}",
+                None,
+                f"read what it wrote to {log_path}",
+            )
+            (repo_root / PID_FILE).unlink(missing_ok=True)
         else:
-            click.echo(f"Server started (PID {proc.pid}) but not yet responding on port {port}.")
-            click.echo(f"  Log: {log_path}")
-            click.echo("  Stop: osprey web stop")
+            output.warn(
+                f"The web terminal started with PID {proc.pid} "
+                f"but is not answering on port {port} yet",
+                f"Log:  {log_path}\nStop: osprey web stop",
+            )
 
 
 @web.command("stop")
-@click.option(
-    "--project",
-    type=click.Path(exists=True, file_okay=False),
-    default=None,
-    help="OSPREY project directory (default: current directory)",
-)
-def web_stop(project: str | None) -> None:
-    """Stop a background web terminal server."""
-    project_dir = Path(project).resolve() if project else Path.cwd()
-    pid_path = project_dir / PID_FILE
-    log_path = project_dir / LOG_FILE
+@repo_option
+@click.pass_context
+def web_stop(ctx: click.Context, repo: Path | None) -> None:
+    """Stop a background web terminal server.
+
+    Finds the deployment exactly the way starting one does — the nearest
+    profile.yml at or above the current directory, or --repo — so the server
+    this stops is always the server that directory's `osprey web --detach`
+    started.
+    """
+    # `osprey web --repo X stop` and `osprey web stop --repo X` are the same
+    # request. The group parses --repo before the subcommand name, so without
+    # this fallback the first form would silently stop whatever server the
+    # current directory happens to enclose.
+    if repo is None and ctx.parent is not None:
+        repo = ctx.parent.params.get("repo")
+
+    repo_root = find_repo_root(repo)
+    pid_path = repo_root / PID_FILE
+    log_path = repo_root / LOG_FILE
 
     if not pid_path.exists():
-        click.echo("No running web terminal found (no PID file).")
+        output.report("No running web terminal found. There is no PID file.")
         return
 
     try:
         pid = int(pid_path.read_text().strip())
     except (ValueError, OSError):
-        click.echo("Corrupt PID file — removing.")
+        output.warn("Removing a corrupt PID file", str(pid_path))
         pid_path.unlink(missing_ok=True)
         return
 
     try:
         os.kill(pid, signal.SIGTERM)
-        click.echo(f"Stopped web terminal (PID {pid}).")
+        output.report(f"Stopped web terminal (PID {pid}).")
     except ProcessLookupError:
-        click.echo(f"Process {pid} not found (already stopped). Cleaning up.")
+        output.report(f"Process {pid} not found, so it had already stopped. Cleaning up.")
     except PermissionError:
-        click.echo(f"Permission denied killing PID {pid}.")
+        output.fail(f"Permission denied stopping the web terminal (PID {pid})")
         return
 
     pid_path.unlink(missing_ok=True)

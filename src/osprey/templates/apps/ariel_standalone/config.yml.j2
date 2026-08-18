@@ -9,9 +9,20 @@
 # Project identity
 project_name: "{{ project_name }}"
 
-# Facility identity — substituted into agent prompts (CLAUDE.md, subagents).
-# Keep this in sync with .claude/rules/facility.md.
-facility_name: "Example Research Facility"
+# Facility identity — one block, two keys:
+#   name   — display name woven into the agent prompts (CLAUDE.md, subagents)
+#            and the web-terminal landing page. Keep it in sync with
+#            .claude/rules/facility.md. A top-level `facility_name` is
+#            honored as a fallback, but this is the canonical spelling and
+#            wins over it.
+#   prefix — short abbreviation the deployed web stack uses for container
+#            names (`<prefix>-nginx`, `<prefix>-web-<user>`); must be a
+#            non-empty valid Docker name start ([a-zA-Z0-9]). Only the
+#            multi-user web-terminal stack reads it, so it stays commented
+#            here.
+facility:
+  name: "Example Research Facility"
+  # prefix: ex
 
 build_dir: ./build
 
@@ -37,6 +48,10 @@ api:
     openai:
       api_key: ${OPENAI_API_KEY}
       base_url: https://api.openai.com/v1
+      models:                        # GPT-5 sizes mapped onto the standard tiers
+        haiku: gpt-5-nano
+        sonnet: gpt-5-mini
+        opus: gpt-5
     anthropic:
       api_key: ${ANTHROPIC_API_KEY}
       base_url: https://api.anthropic.com
@@ -47,14 +62,20 @@ api:
     google:
       api_key: ${GOOGLE_API_KEY}
       base_url: https://generativelanguage.googleapis.com/v1beta
+      models:                        # Gemini 2.5 sizes mapped onto the standard tiers
+        haiku: gemini-2.5-flash-lite
+        sonnet: gemini-2.5-flash
+        opus: gemini-2.5-pro
     ollama:
       api_key: ollama
       base_url: ${OLLAMA_HOST:-http://localhost:11434}
-      host: localhost
-      port: 11434
+      models:                        # Local models — `ollama pull` each one before use
+        haiku: mistral:7b
+        sonnet: gpt-oss:20b
+        opus: gpt-oss:120b
     als-apg:
       api_key: ${ALS_APG_API_KEY}
-      base_url: https://llm.gianlucamartino.com/v1
+      base_url: ${ALS_APG_BASE_URL:-https://llm.gianlucamartino.com/v1}
       models:
         haiku: claude-haiku-4-5-20251001
         sonnet: claude-sonnet-4-6
@@ -67,7 +88,6 @@ api:
 #
 #   ANTHROPIC_API_KEY=sk-ant-...    # or CBORG_API_KEY for the LBL proxy
 #   OLLAMA_HOST=http://localhost:11434  # optional: semantic search embeddings
-#   TZ=UTC
 #
 
 # ============================================================
@@ -76,6 +96,14 @@ api:
 # Container runtime selection for deployment
 # Options: auto (default), docker, podman
 container_runtime: auto
+
+# ── Deployment ──────────────────────────────────────────────────────
+# Host interface the deployed services publish their ports on. The default
+# (127.0.0.1, applied when this block is absent) keeps every service
+# loopback-only — the safe state. Binding 0.0.0.0 exposes every deployed
+# service port to the network; review credentials first.
+# deployment:
+#   bind_address: 127.0.0.1
 
 # ============================================================
 # SYSTEM CONFIGURATION
@@ -91,7 +119,9 @@ system:
 # ============================================================
 # SERVICE CONFIGURATION
 # ============================================================
-# Only PostgreSQL is needed for ARIEL logbook search
+# PostgreSQL backs ARIEL logbook search; OpenObserve is the local telemetry
+# store. Declare a service here and add its name to `deployed_services:` to
+# launch it with `osprey up`.
 
 {% if deploy_services | default(true) %}
 services:
@@ -99,13 +129,17 @@ services:
     path: ./services/postgresql
     database_name: ariel
     username: ariel
-    password: ariel
+    # No password key: the Postgres password lives in the project .env as
+    # ARIEL_DB_PASSWORD (minted by `osprey up`), read by both the
+    # container and the agent's ARIEL DSN — which is derived from the keys in
+    # this block rather than written out, so this is the single source of
+    # truth for both. Mirrors the openobserve credentials convention.
     port_host: 5432
 
   # Local telemetry backend for the OSPREY agent — a single-binary OTLP
   # logs/metrics store (see the `telemetry:` block under `claude_code:` below
   # and docs/how-to/monitor-agent.rst). Deployed by default: the agent emits its
-  # telemetry here, so `osprey deploy up` + `osprey web` gives you a working,
+  # telemetry here, so `osprey up` + `osprey web` gives you a working,
   # queryable observability store out of the box. Bound to localhost.
   openobserve:
     path: ./services/openobserve
@@ -113,10 +147,49 @@ services:
     retention_days: 14  # Growth bound: drop data older than N days (min 3). A
                         # named volume has no size cap, so age is the size knob.
 
-# Services to deploy with `osprey deploy up`
+  # Semantic-search sidecar. It indexes the deployment's markdown corpora — the
+  # ARIEL mirror that `ariel.enhancement_modules.qmd_export` writes, and a
+  # facility-knowledge bundle if one is configured — and answers hybrid
+  # keyword+semantic queries over HTTP. It backs the `hybrid` ARIEL search
+  # mode, and it is self-contained: its language models are baked into the
+  # image, so unlike the `semantic` search mode it needs no Ollama on the host.
+  #
+  # Deployed by default, together with the two ARIEL blocks that feed and
+  # query it (`ariel.enhancement_modules.qmd_export`,
+  # `ariel.search_modules.hybrid`) — disable all three together or not at all.
+  # The image is built locally on the first `osprey up` (never pulled; the
+  # ~2.1 GB of baked-in models make that first build long).
+  #
+  # SIZE WARNING: the first index pass scans the whole mirror before the
+  # sidecar opens its port — measured at ~41 minutes for a 135,000-entry
+  # logbook. `osprey health` shows the container as starting until then; a
+  # deployment attaching a large existing logbook should expect that one-time
+  # cost, and raise `interval` (see below) once it is up.
+  qmd:
+    path: ./services/qmd
+    port: 8180      # Host port clients talk to. Deliberately NOT qmd's own
+                    # 8181: the daemon binds IPv6 loopback only, hardcoded, so
+                    # the container runs it on an internal 8181 and fronts it
+                    # with a forwarder that owns this port.
+                    #
+                    # There is no per-service bind_address, on purpose. Like
+                    # every service here this one publishes on the
+                    # project-wide `deployment.bind_address` (default
+                    # 127.0.0.1), and that default is load-bearing: the
+                    # endpoint carries no token and no TLS, so an interface
+                    # other than loopback exposes the whole indexed corpus to
+                    # anything that can route to it.
+    interval: 30    # Fallback corpus-sweep period, in seconds. The bundle's
+                    # `.qmd-touch` marker is the primary re-index trigger, so
+                    # this is the ceiling on staleness, not the usual lag.
+                    # Raise it on a large corpus, where a no-op sweep is not
+                    # free (~12.5 s at 135,000 entries).
+
+# Services to deploy with `osprey up`
 deployed_services:
   - postgresql
   - openobserve
+  - qmd             # Comment out together with the `qmd:` block above.
 {% else %}
 # Attached project (deploy_services: false): connects to a services stack
 # another OSPREY project deployed on the same host, so it scaffolds nothing.
@@ -130,15 +203,27 @@ deployed_services: []
 # ============================================================
 
 # Approval workflow for sensitive operations
-# Policies: always (prompt every time), selective (content-aware), skip (no approval)
+# Policies: always (prompt every time), selective (content-aware for `execute`
+#   only — under `selective` every other tool is treated as `always`), skip (no
+#   approval).
+# Scope: applied by the osprey_approval PreToolUse hook, so these policies reach
+# only tools whose matcher runs that hook — in this app exactly three: ARIEL
+# `entry_create`, workspace `setup_patch`, and facility-knowledge
+# `draft_concept`. Everything else is gated by the rendered settings.json
+# permissions instead.
 approval:
   enabled: true
-  default_policy: "always"        # Fail-closed: unknown tools require approval
+  default_policy: "always"        # Fail-closed for hook-wired tools not listed below
   tools:
     entry_create: always           # ARIEL logbook entry creation requires approval
 
 # ── Hook observability ──────────────────────────────────────────────
-# Set debug: true to enable hook activity logging to stderr.
+# Shipped ON. This drives three things, not just a debug print: one line per
+# hook call to stderr; an append-only <project>/.claude/hooks/hook_debug.jsonl
+# that is never rotated or size-capped (prune it yourself on a long-lived
+# deployment); and the web terminal's Safety-panel hook-activity feed, which
+# reads that file and shows nothing new while this is false. The OSPREY_HOOK_DEBUG
+# environment variable forces it on regardless of this key.
 hooks:
   debug: true
 
@@ -150,10 +235,36 @@ hooks:
 # exposes raw search and entry lookup over MCP/HTTP.
 
 ariel:
-  database:
-    uri: postgresql://ariel:ariel@localhost:5432/ariel
+  # No `database.uri`: the DSN is derived from the `services.postgresql` block
+  # above (username, database_name, port_host), so moving the database port or
+  # renaming the database stays a one-place edit. Password reads
+  # ARIEL_DB_PASSWORD from the project .env — the SAME value the postgresql
+  # compose service reads as POSTGRES_PASSWORD (single source of truth).
+  # `osprey up` mints a strong value into .env; the fallback password
+  # `ariel` keeps the service launchable before the first deploy. An existing
+  # Postgres data volume keeps the password it was initialized with — see the
+  # postgresql compose template.
+  #
+  # To point ARIEL at a database this project does not run (an existing
+  # facility Postgres, say), set the DSN explicitly — an explicit uri wins over
+  # the derived one:
+  # database:
+  #   uri: postgresql://ariel:${ARIEL_DB_PASSWORD}@logbook-db.example.org:5432/ariel
 
-  default_max_results: 10
+  # osprey:panel-port ariel
+  # ARIEL tab: the search UI is a web server of its own, configured under this
+  # section rather than a top-level one. It launches when `ariel` is in the
+  # panel list under `web:` below; this section existing is not required, so
+  # 8085 is bound by default. Resolution order: OSPREY_ARIEL_PORT wins
+  # (multi-user deployments export it per user), then `port` here, then the
+  # built-in 8085; `host` has no env override. The launcher resolves host/port
+  # through one shared function; the web terminal computes this panel's URL
+  # separately and is kept in step by hand, so an env override must be set
+  # consistently. Uncomment to move or disable it.
+  # web:
+  #   host: "127.0.0.1"
+  #   port: 8085
+  #   auto_launch: true
 
   # Ingestion - demo logbook data (bundled with template)
   # For production: change adapter and source_url to your logbook system
@@ -172,14 +283,37 @@ ariel:
       provider: ollama   # References api.providers.ollama
       model: nomic-embed-text
 
+    # Hybrid keyword+semantic search answered by the qmd sidecar instead of
+    # Postgres — the best-ranked retrieval this project ships, and the only
+    # semantic-quality mode that needs nothing on the host (the sidecar bakes
+    # its models into its image; `semantic` above needs Ollama). It needs two
+    # other things running: the `services.qmd` sidecar, and the markdown
+    # mirror that the `qmd_export` enhancement below writes for it to index.
+    # All three are on by default — disable them together or not at all:
+    # enabled without the others, the mode is advertised to the agent and then
+    # fails every call with "search is down".
+    hybrid:
+      enabled: true
+      # These knobs MUST stay under `settings:`. The search-config loader keeps
+      # only `enabled`, `provider`, `model` and `settings` and drops every
+      # other key without a word, so a knob written as a sibling of `enabled`
+      # is silently inert — no error, just the defaults forever.
+      settings:
+        rerank: true          # qmd's LLM reranker. Costs roughly 4x the query
+                              # latency and its cost barely grows with corpus
+                              # size. This is an agent tool with no interactive
+                              # budget to blow, so it keeps the quality path;
+                              # set false for the fast one.
+        candidate_limit: 40   # Candidates the reranker considers. Lowering it
+                              # trades recall for latency.
+
   # Enhancement modules — run during ingestion
   enhancement_modules:
     # Semantic processor: LLM-based keyword extraction and summarization
     semantic_processor:
       enabled: false                          # Requires LLM API calls
-      provider: {{ default_provider }}
+      provider: {{ default_provider }}         # Required (no default)
       model:
-        provider: {{ default_provider }}
         model_id: {{ default_model }}
         max_tokens: 256
 
@@ -191,7 +325,23 @@ ariel:
         - name: nomic-embed-text
           dimension: 768
 
-  # Default embedding provider (fallback for modules without explicit provider)
+    # qmd export: writes one markdown file per entry into a mirror tree that
+    # the qmd sidecar indexes. It is what makes `search_modules.hybrid` above
+    # able to answer, and it is on for the same reason that one is.
+    qmd_export:
+      enabled: true
+      settings:
+        # Resolved against the directory holding this file, like every other
+        # config-relative path here. It belongs under var/, the durable STATE
+        # zone: the mirror is machine-written from Postgres, is as large as the
+        # logbook, and the repo's .gitignore keeps var/ out of git. The compose
+        # generator binds this same path into the sidecar read-only, so moving
+        # it stays a one-place edit.
+        mirror_path: var/ariel_mirror
+
+  # Default provider for EMBEDDING modules that name none of their own. It is
+  # not a general fallback: the semantic_processor LLM module above requires
+  # its own explicit `provider`.
   embedding:
     provider: ollama
 
@@ -199,20 +349,43 @@ ariel:
 # LOGBOOK COMPOSITION
 # ============================================================
 # LLM settings for the logbook compose panel in the artifact gallery.
+# provider falls back to claude_code.provider when omitted; default_tier is
+# mapped to a model ID via api.providers[provider].models, so no model_id key
+# is needed unless that mapping has no entry for the tier.
 
 logbook:
   composition:
     provider: {{ default_provider }}
-    model_id: {{ default_model | default("haiku") }}
     default_tier: haiku   # Options: haiku | sonnet | opus
 
 # ============================================================
 # AGENT DATA & ARTIFACT GALLERY
 # ============================================================
+# Resolved relative to `project_root` above — the deployment repo's root, not
+# this file's directory. It belongs under var/, the durable STATE zone: build/
+# is wiped and re-rendered by every build, and the repo's .gitignore keeps var/
+# out of git. A path outside var/ would land the agent's memory in the tracked
+# source zone and dirty `git status` on first run.
 
 agent_data:
-  base_dir: "./_agent_data"
+  base_dir: "var/agent_data"
 
+# Subdirectory names within the agent data directory above. A subdirectory key
+# absent from this block falls back to the key's own name, so without it the
+# registry export lands in `<agent_data.base_dir>/registry_exports_dir/`.
+file_paths:
+  api_calls_dir: api_calls
+  registry_exports_dir: registry_exports
+
+# osprey:panel-port artifact
+# WORKSPACE tab. Universal: under `osprey web` it is launched at startup
+# whatever panels are listed under `web:` below (headless runs instead start it
+# on the first artifact save), so `auto_launch: false` is the only thing that
+# stops it — and when it does, the tab is reported unavailable rather than
+# serving a dead iframe. Port resolution is the one shared function every launcher and URL
+# builder uses: OSPREY_ARTIFACT_SERVER_PORT wins (multi-user deployments export
+# it per user), then `port` here, then the built-in 8086. `host` has no env
+# override.
 artifact_server:
   host: "127.0.0.1"
   port: 8086
@@ -258,7 +431,7 @@ claude_code:
   telemetry:
     enabled: true                        # Master switch
     backend: openobserve                 # openobserve | generic
-    protocol: http/protobuf              # http/protobuf | grpc
+    protocol: http/protobuf              # http/protobuf | grpc — grpc requires an explicit `endpoint:` below; it is refused against the auto-derived openobserve endpoint (HTTP only)
     # backend: openobserve auto-derives the endpoint per network context —
     # http://localhost:5080/api/<org> on the host, http://openobserve:5080/api/<org>
     # inside the deploy network — so `endpoint` is intentionally OMITTED here.
@@ -268,7 +441,7 @@ claude_code:
     # OpenObserve auth + org routing. user/password read the OpenObserve root
     # credentials from the project .env — the SAME values the openobserve service
     # reads — so container and agent auth stay in sync (single source of truth).
-    # `osprey deploy up` mints a strong ZO_ROOT_USER_PASSWORD into .env; the
+    # `osprey up` mints a strong ZO_ROOT_USER_PASSWORD into .env; the
     # ${VAR:-default} fallbacks keep the agent launchable before the first deploy.
     openobserve:
       user: ${ZO_ROOT_USER_EMAIL:-root@example.com}
@@ -287,7 +460,8 @@ claude_code:
 # WEB PANEL CONFIGURATION
 # ============================================================
 # Controls which panel tabs appear in the web terminal (osprey web).
-# Universal panels (Workspace, Activity, Session Analytics) are always shown.
+# The Workspace panel is always shown; the Activity log is a separate page,
+# not a tab.
 
 web:
 {%- set _BUILTIN_PANELS = builtin_panels | default(["ariel", "channel-finder"]) %}
@@ -314,12 +488,18 @@ web:
     {{ preset_name | tojson }}: [{{ preset_panels | join(", ") }}]
 {%- endfor %}
 {%- endif %}
-  # Optional panel controls (off by default; uncomment to use):
-  #   web.panels.<id>.hidden: true                          # launch the panel but keep its tab hidden until shown
-  #   web.allow_runtime_panels: true                        # let the agent register ad-hoc URL panels at runtime
-  #   web.runtime_panel_allowlist: ["dashboard.local:3000"] # restrict registration targets to these host[:port]
-  #   web.presets:                                          # named "Layouts" a human applies from the "+" popover
-  #     "Logbook review": [ariel, artifacts]
+  # Optional panel controls (off by default; uncomment to use). These are
+  # nested keys under `web:` — config.yml is never flattened, so a dotted
+  # key like `web.allow_runtime_panels` written here is stored verbatim and
+  # read by nothing. The dotted spelling belongs only in a build profile's
+  # `config:` block, which is expanded into nested YAML at build time.
+  # panels:
+  #   <id>:
+  #     hidden: true                          # launch the panel but keep its tab hidden until shown
+  # allow_runtime_panels: true                # let the agent register ad-hoc URL panels at runtime
+  # runtime_panel_allowlist: ["dashboard.local:3000"]  # restrict registration targets to these host[:port]
+  # presets:                                  # named "Layouts" a human applies from the "+" popover
+  #   "Logbook review": [ariel, artifacts]
 
 # ──────────────────────────────────────────────────────────────────────
 # User-Owned Prompt Artifacts

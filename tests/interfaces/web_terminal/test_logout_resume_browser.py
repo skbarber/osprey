@@ -4,9 +4,10 @@ Exercises the client-side half of the multi-user round trip in a real Chromium
 page — the part a FastAPI TestClient can't see because it neither runs the
 frontend JS nor persists ``localStorage`` across navigations:
 
-  * the header user display (``#header-user-name``) and the logout control
-    (``#logout-btn`` carrying ``data-landing-url``) render only when the server
-    emitted a non-empty ``terminal_user`` / ``landing_url`` (multi-user);
+  * the display menu's session footer — the identity line naming the user and
+    the logout control beside System Settings (``#logout-btn`` carrying
+    ``data-landing-url``) — renders only when the server emitted a non-empty
+    ``terminal_user`` / ``landing_url`` (multi-user);
   * clicking logout POSTs the real server logout route (``logout_terminal``,
     routes/websocket.py — empties the PTY and operator registries), clears the
     client's stored PTY session id, THEN navigates to the configured landing
@@ -39,9 +40,11 @@ import sys
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from tests.interfaces._panel_launch import publish_artifact_url
 from tests.interfaces.conftest import _run_app_server
 
 if TYPE_CHECKING:
@@ -124,8 +127,8 @@ def _launch_terminal(
             return_value=({"artifacts"}, [], None),
         ),
         patch(
-            "osprey.interfaces.web_terminal.app._launch_artifact_server",
-            side_effect=lambda a: setattr(a.state, "artifact_server_url", "http://127.0.0.1:8086"),
+            "osprey.interfaces.web_terminal.app._launch_panel_server",
+            side_effect=publish_artifact_url(),
         ),
     ):
         from osprey.interfaces.web_terminal.app import create_app
@@ -196,11 +199,12 @@ def test_logout_and_return_starts_fresh_session(tmp_path, monkeypatch, chromium_
         )
         assert "session_id=" not in opening_url
 
-        # Header shows the configured user; logout control carries the landing url.
-        expect(page.locator("#header-user-name")).to_have_text(user)
+        # The logout control carries the landing url.
         logout = page.locator("#logout-btn")
         expect(logout).to_have_count(1)
         assert logout.get_attribute("data-landing-url") == landing_url
+        # It lives inside the display menu's popover, so it starts hidden.
+        expect(logout).to_be_hidden()
 
         # --- Represent an established (warm) PTY session (see module docstring) ---
         page.evaluate("(id) => localStorage.setItem('osprey-pty-session', id)", stored_id)
@@ -213,11 +217,40 @@ def test_logout_and_return_starts_fresh_session(tmp_path, monkeypatch, chromium_
             "() => { const o = document.getElementById('welcome-overlay'); if (o) o.remove(); }"
         )
 
+        # Record the auth-sidecar chaining request. This deployment has NO
+        # sidecar (no auth stanza, so nginx renders no `location /auth/` and
+        # nothing is listening), which makes this the live proof of the
+        # authentication-off case: the request is made, it fails, and the
+        # logout still completes. A *navigation* to the sidecar here would
+        # strand the browser on a 404 instead of the landing page.
+        auth_requests: list[str] = []
+
+        def _record(request) -> None:
+            if "/auth/logout" in request.url:
+                auth_requests.append(request.url)
+
+        page.on("request", _record)
+
         # --- Logout: clears the stored pointer, THEN navigates to landing ---
+        # Logout lives in the display menu's session footer; open the menu first.
+        page.click("#display-menu-btn")
+        # The footer names the operator, so they can confirm WHICH terminal they
+        # are leaving before they leave it.
+        expect(page.locator("#display-menu-card .display-menu-identity-name")).to_have_text(user)
+        expect(page.locator("#logout-btn")).to_be_visible()
         page.click("#logout-btn")
         page.wait_for_url(lambda u: u.startswith(landing_url))
         assert page.url.startswith(landing_url)
         expect(page.locator("#landing-marker")).to_be_visible()
+
+        # The auth session was asked to end, addressed at the ORIGIN ROOT — not
+        # under `/u/<user>/` (which `base_url` is, and which would reach this
+        # container rather than the sidecar) — and naming exactly this user once.
+        assert auth_requests, "logout did not attempt to end the auth session"
+        assert len(auth_requests) == 1
+        requested = urlsplit(auth_requests[0])
+        assert requested.path == "/auth/logout"
+        assert parse_qs(requested.query) == {"user": [user]}
 
         # NOTE: we can't read the terminal origin's localStorage from here —
         # the page has navigated to the landing origin (a different
@@ -245,8 +278,9 @@ def test_standalone_has_no_logout_control(tmp_path, monkeypatch, chromium_browse
     """Plain ``osprey web`` (no landing_url env) omits the logout control.
 
     With neither ``OSPREY_TERMINAL_USER`` nor ``OSPREY_TERMINAL_LANDING_URL`` set,
-    both the user display and the logout button must be absent from the DOM — the
-    single-user experience is unchanged.
+    both halves of the session footer — the identity line and the logout button
+    beside System Settings — must be absent from the DOM; the single-user
+    experience is unchanged.
     """
     with _launch_terminal(tmp_path, monkeypatch, terminal_user="", landing_url="") as base_url:
         page = chromium_browser.new_page()
@@ -256,6 +290,8 @@ def test_standalone_has_no_logout_control(tmp_path, monkeypatch, chromium_browse
         page.wait_for_selector(".header-actions", timeout=10_000)
 
         expect(page.locator("#logout-btn")).to_have_count(0)
-        expect(page.locator("#header-user-name")).to_have_count(0)
+        expect(page.locator(".display-menu-identity")).to_have_count(0)
+        # ...and Settings, alone in the footer, is still there.
+        expect(page.locator("#display-menu-settings")).to_have_count(1)
 
         page.close()

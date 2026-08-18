@@ -9,11 +9,9 @@ flat locations (``data/channel_databases/<paradigm>.json`` and
 """
 
 import logging
-import os
 import shutil
 from pathlib import Path
 
-from osprey.cli.styles import console
 from osprey.cli.templates._rendering import render_template
 
 logger = logging.getLogger("osprey.cli.templates")
@@ -29,117 +27,69 @@ logger = logging.getLogger("osprey.cli.templates")
 _DEFAULT_CLAUDE_CLI_VERSION = "2.1.146"
 
 
-def _detect_system_timezone() -> str | None:
-    """Detect the system IANA timezone name (e.g., 'America/New_York').
+def provider_api_key_entries() -> list[dict[str, str]]:
+    """Provider API-key env vars for env-file templates, in registry order.
 
-    Uses /etc/localtime symlink (macOS/Linux) or /etc/timezone (Linux).
-    Returns None if detection fails.
-    """
-    import pathlib
-
-    # macOS / Linux: /etc/localtime is usually a symlink into zoneinfo
-    localtime = pathlib.Path("/etc/localtime")
-    if localtime.is_symlink():
-        target = str(localtime.resolve())
-        if "zoneinfo/" in target:
-            tz_name = target.split("zoneinfo/", 1)[1]
-            try:
-                from zoneinfo import ZoneInfo
-
-                ZoneInfo(tz_name)
-                return tz_name
-            except (KeyError, Exception):
-                pass
-
-    # Linux: /etc/timezone contains the IANA name directly
-    etc_tz = pathlib.Path("/etc/timezone")
-    if etc_tz.exists():
-        tz_name = etc_tz.read_text().strip()
-        if "/" in tz_name:
-            return tz_name
-
-    return None
-
-
-def detect_environment_variables() -> dict[str, str]:
-    """Detect environment variables from the system for use in templates.
-
-    This checks for common environment variables that are typically
-    needed in .env files (API keys, paths, etc.) and returns those that are
-    currently set in the system.
-
-    Sources are checked in priority order (highest priority last, so it wins):
-    1. Shell environment (os.environ)
-    2. Project root .env file (if running from within an osprey project)
-
-    The .env file takes precedence because it represents the user's explicitly
-    configured project values, which may be more current than stale shell exports.
+    Derived from :data:`osprey.models.provider_registry.PROVIDER_API_KEYS`
+    (the single source of truth for the provider list) so that
+    ``env.example.j2`` cannot drift from the real provider set. Key-less
+    providers (ollama, vllm, ds4, asksage) are excluded — they have no API-key
+    env var to scaffold.
 
     Returns:
-        Dictionary of detected environment variables with their values.
-        Only includes variables that are actually set (non-empty).
+        Ordered list of ``{"provider": <name>, "var": <ENV_VAR>}`` dicts.
     """
-    # API key env vars from canonical registry + non-API env vars
     from osprey.models.provider_registry import PROVIDER_API_KEYS
 
-    env_vars_to_check = [v for v in PROVIDER_API_KEYS.values() if v is not None] + [
-        "PROJECT_ROOT",
-        "LOCAL_PYTHON_VENV",
-        "CONFLUENCE_ACCESS_TOKEN",
-        "TZ",
+    return [
+        {"provider": provider, "var": var}
+        for provider, var in PROVIDER_API_KEYS.items()
+        if var is not None
     ]
 
-    # Load .env file from current directory if it exists (project root values
-    # take precedence over shell environment for API keys)
-    dotenv_values = {}
-    env_file = Path.cwd() / ".env"
-    if env_file.is_file():
-        try:
-            from dotenv import dotenv_values as _dotenv_values
 
-            dotenv_values = _dotenv_values(env_file)
-        except ImportError:
-            pass
-
-    detected = {}
-    for var in env_vars_to_check:
-        # Shell environment first, then .env file overrides
-        value = os.environ.get(var)
-        if value:
-            detected[var] = value
-        env_file_value = dotenv_values.get(var)
-        if env_file_value:
-            detected[var] = env_file_value
-
-    # If TZ not in environment, try to detect system timezone
-    if "TZ" not in detected:
-        detected_tz = _detect_system_timezone()
-        if detected_tz:
-            detected["TZ"] = detected_tz
-
-    return detected
+# Human-readable blurbs for the deploy-minted variables, keyed by var name.
+# Prose only: the *list* of variables comes from ``_SERVICE_TOKEN_VARS``, so a
+# newly minted var still reaches ``.env.example`` (named by the services that
+# declare it) even with no entry here. Nothing silently drops out.
+_SERVICE_TOKEN_VAR_NOTES: dict[str, str] = {
+    "EVENT_DISPATCHER_TOKEN": "authenticates callers to the event-dispatcher API",
+    "DISPATCH_WORKER_TOKEN": "authenticates the dispatch worker back to the dispatcher",
+    "BLUESKY_LAUNCH_TOKEN": "arms the Bluesky bridge's plan-launch endpoint",
+    "BLUESKY_TILED_API_KEY": "the key the bridge presents to the co-deployed Tiled catalog",
+    "ZO_ROOT_USER_PASSWORD": "OpenObserve root/ingest credential",
+    "ARIEL_DB_PASSWORD": "ARIEL Postgres password (also fills the agent's derived DSN)",
+    "MONGO_ROOT_PASSWORD": "archiver store root password (the seeder, recorder and agent all authenticate with it)",
+}
 
 
-def _render_env_preserving_existing(jinja_env, project_dir: Path, ctx: dict) -> None:
-    """Render ``project/env.j2`` to ``.env``, merging with an existing file.
+def service_token_var_entries() -> list[dict[str, str]]:
+    """Every variable ``osprey up`` mints, for env-file templates.
 
-    On a fresh build this is a plain render. On a --force re-render an
-    existing ``.env`` is authoritative: its values win over freshly detected
-    environment values and keys it alone carries are appended — the project's
-    service tokens and volume-pinned passwords must survive a re-render (see
-    :func:`osprey.utils.dotenv.merge_env_preserving_existing`).
+    Derived from :data:`osprey.deployment.container_lifecycle._SERVICE_TOKEN_VARS`
+    — the map the deploy path actually mints from — so the documented set
+    cannot fall behind the minted set. A variable declared by more than one
+    service (``EVENT_DISPATCHER_TOKEN``) appears once, naming both.
+
+    Returns:
+        Ordered list of ``{"var": <ENV_VAR>, "services": "<a, b>", "note":
+        <blurb or "">}`` dicts, in declaration order.
     """
-    env_path = project_dir / ".env"
-    rendered = jinja_env.get_template("project/env.j2").render(**ctx)
-    if env_path.exists():
-        from osprey.utils.dotenv import merge_env_preserving_existing
+    from osprey.deployment.container_lifecycle import _SERVICE_TOKEN_VARS
 
-        content = merge_env_preserving_existing(rendered, env_path.read_text(encoding="utf-8"))
-    else:
-        content = rendered if rendered.endswith("\n") else rendered + "\n"
-    env_path.write_text(content, encoding="utf-8")
-    # Owner read/write only: the file carries secrets.
-    os.chmod(env_path, 0o600)
+    services_by_var: dict[str, list[str]] = {}
+    for service, token_vars in _SERVICE_TOKEN_VARS.items():
+        for var in token_vars:
+            services_by_var.setdefault(var, []).append(service)
+
+    return [
+        {
+            "var": var,
+            "services": ", ".join(services),
+            "note": _SERVICE_TOKEN_VAR_NOTES.get(var, ""),
+        }
+        for var, services in services_by_var.items()
+    ]
 
 
 def create_project_structure(
@@ -149,12 +99,28 @@ def create_project_structure(
     data_bundle: str,
     ctx: dict,
 ):
-    """Create base project files (config, README, pyproject.toml, etc.).
+    """Create base project files (config, README, Dockerfile, etc.).
+
+    No ``.env`` is written. The render is ``build/``, and the deployment's one
+    secret store is the ``.env`` at the repo root — the only file compose is
+    pointed at
+    (``--project-directory <repo>`` + ``--env-file <repo>/.env``), the file
+    ``osprey up`` mints service tokens into, and the file a ``rm -rf build/`` is
+    documented not to touch. A second copy inside the render would be a second
+    thing to keep in step, and one that a build could silently rewrite.
+
+    ``.env.example`` is rendered here: it carries no values, documents
+    what the repo's ``.env`` may hold, and is safe to commit.
+
+    No ``.env.shared`` either, for the same reason as ``.env``. It is committed
+    rather than secret, but it is still one of the two files the deployment's
+    env chain is read from at the repo root, and a copy inside the render would
+    be a second one to keep in step. ``osprey init`` authors the repo's, once.
 
     Args:
         template_root: Path to osprey's bundled templates directory
         jinja_env: Jinja2 environment for template rendering
-        project_dir: Root directory of the project
+        project_dir: Root directory of the rendered project
         data_bundle: Name of the data bundle (apps/ subdirectory) to use
         ctx: Template context variables
     """
@@ -162,7 +128,7 @@ def create_project_structure(
     app_template_dir = template_root / "apps" / data_bundle
 
     # Expose claude_code.cli_version to Dockerfile.j2's CLAUDE_CLI_VERSION ARG
-    # default, so the same version pin that `osprey claude chat`/`osprey web`
+    # default, so the same version pin that `osprey chat`/`osprey web`
     # honor at runtime (osprey.utils.claude_launcher) also pins the image's
     # build-time CLI install. Callers may pre-populate ctx["claude_code_cli_version"]
     # (flat) or ctx["claude_code"]["cli_version"] (nested, mirroring config.yml's
@@ -204,18 +170,6 @@ def create_project_structure(
         elif default_template.exists():
             # Use default project template
             render_template(jinja_env, f"project/{template_file}", ctx, project_dir / output_file)
-
-    # Create .env file only if API keys are detected
-    from osprey.models.provider_registry import PROVIDER_API_KEYS
-
-    detected_env_vars = ctx.get("env", {})
-    api_key_names = {v for v in PROVIDER_API_KEYS.values() if v is not None}
-    has_api_keys = any(key in detected_env_vars for key in api_key_names)
-
-    if has_api_keys:
-        env_template = project_template_dir / "env.j2"
-        if env_template.exists():
-            _render_env_preserving_existing(jinja_env, project_dir, ctx)
 
     # Copy static files
     for src_name, dst_name in static_files:
@@ -316,6 +270,7 @@ def copy_template_data(
     data_bundle: str,
     ctx: dict,
     jinja_env=None,
+    data_root: Path | None = None,
 ):
     """Copy data files from template to project root (no src/ package).
 
@@ -331,7 +286,28 @@ def copy_template_data(
         data_bundle: Name of the data bundle (apps/ subdirectory) to use
         ctx: Template context variables
         jinja_env: Optional Jinja2 environment for rendering .j2 data files
+        data_root: Resolved data tree carried by the build profile (its ``data:``
+            key). When given it fully replaces the bundle's data tree — see the
+            profile-mode branch below. Symlinks inside the tree are
+            dereferenced into real files, matching the bundle branch: a built
+            project is self-contained and must not depend on paths under the
+            profile directory surviving.
     """
+    # Profile-sourced data is a full replacement, not a layer: neither the
+    # apps/<bundle>/data derivation nor the rglob fallback below runs, so no
+    # bundle file can leak into the project alongside the facility's own tree.
+    # It is content, not templates — a plain copytree, so a stray ``.j2`` lands
+    # byte-identical. Rendering is not merely skipped but impossible here:
+    # _copy_data_tree addresses templates by their path relative to
+    # ``template_root`` through a package-rooted Jinja loader, which cannot
+    # reach a tree outside the osprey package at all.
+    if data_root is not None:
+        dst_data = project_dir / "data"
+        # dirs_exist_ok is defensive — no build path reaches here with data/ present.
+        shutil.copytree(data_root, dst_data, dirs_exist_ok=True)
+        logger.debug("Copied profile data files from %s to %s", data_root, dst_data)
+        return
+
     app_template_dir = template_root / "apps" / data_bundle
 
     # Look for data/ subdirectory in the template
@@ -342,9 +318,7 @@ def copy_template_data(
             _copy_data_tree(template_data_dir, dst_data, template_root, jinja_env, ctx)
         else:
             shutil.copytree(template_data_dir, dst_data, dirs_exist_ok=True)
-        console.print(
-            f"  [success]✓[/success] Copied template data files to [path]{dst_data}[/path]"
-        )
+        logger.debug("Copied template data files to %s", dst_data)
         return
 
     # Fallback: scan for data/ directories inside template subdirectories
@@ -369,9 +343,7 @@ def copy_template_data(
                         elif item.is_file():
                             dst_item.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy2(item, dst_item)
-            console.print(
-                f"  [success]✓[/success] Copied template data files to [path]{dst_data}[/path]"
-            )
+            logger.debug("Copied template data files to %s", dst_data)
             return
 
 
@@ -468,10 +440,11 @@ def materialize_tier_artifacts(project_dir: Path, tier: int, channel_finder_mode
     if queries_src_root.exists():
         shutil.rmtree(queries_src_root)
 
-    console.print(
-        f"  [success]✓[/success] Materialized tier{tier} artifacts "
-        f"(channel DB + queries) for {sorted(paradigms)!r} to "
-        f"[path]{project_dir / 'data'}[/path]"
+    logger.debug(
+        "Materialized tier%s artifacts (channel DB + queries) for %r to %s",
+        tier,
+        sorted(paradigms),
+        project_dir / "data",
     )
 
 
@@ -499,143 +472,4 @@ def prune_csv_build_artifacts(project_dir: Path, channel_finder_mode: str) -> No
         return
 
     shutil.rmtree(raw_dir)
-    console.print(
-        f"  [success]✓[/success] Removed [path]{raw_dir}[/path] "
-        f"(no CSV build path for {channel_finder_mode!r} paradigm)"
-    )
-
-
-def create_application_code(
-    template_root: Path,
-    jinja_env,
-    src_dir: Path,
-    package_name: str,
-    data_bundle: str,
-    ctx: dict,
-    project_root: Path = None,
-):
-    """Create application code from template.
-
-    Args:
-        template_root: Path to osprey's bundled templates directory
-        jinja_env: Jinja2 environment for template rendering
-        src_dir: src/ directory where package will be created
-        package_name: Python package name (e.g., "my_assistant")
-        data_bundle: Name of the data bundle (apps/ subdirectory) to use
-        ctx: Template context variables
-        project_root: Actual project root (for placing scripts/ at root)
-
-    Note:
-        Special handling: Files in scripts/ directory are placed at project root
-        instead of inside the package to provide convenient CLI access.
-    """
-    app_template_dir = template_root / "apps" / data_bundle
-    app_dir = src_dir / package_name
-    app_dir.mkdir(parents=True)
-
-    # Use src_dir's parent as project_root if not provided
-    if project_root is None:
-        project_root = src_dir.parent
-
-    # Project-level files that should only live at project root, not in src/
-    # These are handled by create_project_structure() and should be skipped here
-    PROJECT_LEVEL_FILES = {
-        "config.yml.j2",
-        "config.yml",
-        "README.md.j2",
-        "README.md",
-        "env.example.j2",
-        "env.example",
-        "env.j2",
-        ".env",
-        "requirements.txt.j2",
-        "requirements.txt",
-        "pyproject.toml.j2",
-        "pyproject.toml",
-    }
-
-    # Process all files in the template
-    for template_file in app_template_dir.rglob("*"):
-        if not template_file.is_file():
-            continue
-
-        rel_path = template_file.relative_to(app_template_dir)
-
-        # Skip project-level files at template root (handled by create_project_structure)
-        if len(rel_path.parts) == 1 and rel_path.name in PROJECT_LEVEL_FILES:
-            continue
-
-        # Special handling for scripts/ directory - place at project root
-        if rel_path.parts[0] == "scripts":
-            base_output_dir = project_root
-            output_rel_path = rel_path
-        else:
-            base_output_dir = app_dir
-            output_rel_path = rel_path
-
-        # Determine output path
-        if template_file.suffix == ".j2":
-            # Template file - render it
-            output_name = template_file.stem  # Remove .j2 extension
-            output_path = base_output_dir / output_rel_path.parent / output_name
-            # Convert Windows backslashes to forward slashes for Jinja2
-            # (harmless on Linux/macOS where paths already use forward slashes)
-            template_path_str = f"apps/{data_bundle}/{rel_path}".replace("\\", "/")
-            render_template(jinja_env, template_path_str, ctx, output_path)
-        else:
-            # Static file - copy directly
-            output_path = base_output_dir / output_rel_path
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(template_file, output_path)
-
-
-def create_agent_data_structure(template_root: Path, project_dir: Path, ctx: dict):
-    """Create _agent_data directory structure for the project.
-
-    This creates the agent data directory and all standard subdirectories
-    based on osprey's default configuration. This ensures that container
-    deployments won't fail due to missing mount points.
-
-    Args:
-        template_root: Path to osprey's bundled templates directory
-        project_dir: Root directory of the project
-        ctx: Template context variables (used for conditional directory creation)
-    """
-    # Create main _agent_data directory
-    agent_data_dir = project_dir / "_agent_data"
-    agent_data_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create standard subdirectories
-    subdirs = [
-        "executed_scripts",
-        "user_memory",
-        "api_calls",
-    ]
-
-    for subdir in subdirs:
-        subdir_path = agent_data_dir / subdir
-        subdir_path.mkdir(parents=True, exist_ok=True)
-
-    console.print(
-        f"  [success]✓[/success] Created agent data structure at [path]{agent_data_dir}[/path]"
-    )
-
-    # Create a README to explain the directory structure
-    readme_content = """# Agent Data Directory
-
-This directory contains runtime data for the Claude Code project:
-
-- `executed_scripts/`: Python scripts executed via MCP tools
-- `user_memory/`: User memory data
-- `api_calls/`: Raw LLM API inputs/outputs (when API logging enabled)
-"""
-
-    readme_content += """
-This directory is excluded from git (see .gitignore) but is required for
-proper framework operation, especially when using containerized services.
-"""
-
-    readme_path = agent_data_dir / "README.md"
-    # Use UTF-8 encoding explicitly to support Unicode characters on Windows
-    with open(readme_path, "w", encoding="utf-8") as f:
-        f.write(readme_content)
+    logger.debug("Removed %s (no CSV build path for %r paradigm)", raw_dir, channel_finder_mode)

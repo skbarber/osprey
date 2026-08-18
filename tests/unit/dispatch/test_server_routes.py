@@ -148,6 +148,58 @@ def test_webhook_unconfigured_token_fails_closed_503(triggers_yml, monkeypatch):
     assert resp.json() == {"detail": "Server misconfigured"}
 
 
+def test_create_server_fails_loud_on_malformed_triggers(tmp_path, monkeypatch):
+    """A malformed triggers.yml must crash ``create_server()`` at boot, not start
+    the dispatcher with silently-dropped triggers.
+
+    ``load_triggers`` raises ``ValueError`` on a bad file, and ``create_server``
+    only guards ``FileNotFoundError`` — so the ValueError must propagate. This is
+    the container-boot contract: fail loud rather than come up degraded. (The
+    per-field validation itself is covered in test_trigger_config.py; this pins
+    that create_server does not swallow it.)
+    """
+    bad = tmp_path / "triggers.yml"
+    # A trigger missing the required action.prompt -> ValueError from load_triggers.
+    bad.write_text(
+        "dispatcher:\n"
+        "  dispatch_target: http://localhost:9999\n"
+        "triggers:\n"
+        "  - name: broken\n"
+        "    source: webhook\n"
+        "    action: {}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TRIGGERS_YML", str(bad))
+
+    with pytest.raises(ValueError, match="broken"):
+        server.create_server()
+
+
+def test_create_server_degrades_when_triggers_missing(tmp_path, monkeypatch):
+    """A missing triggers.yml must NOT crash the dispatcher: it starts with zero
+    triggers, health is OK, and every /webhook resolves to 404.
+
+    This degraded-startup branch (``except FileNotFoundError`` -> empty trigger
+    list, DISPATCH_TARGET-env dispatcher config) lets the dispatcher boot for a
+    health check even before a triggers file is mounted.
+    """
+    monkeypatch.setenv("TRIGGERS_YML", str(tmp_path / "does-not-exist.yml"))
+    monkeypatch.setenv("EVENT_DISPATCHER_TOKEN", "secret")
+
+    app = server.create_server().http_app()
+    with TestClient(app) as client:
+        health = client.get("/health")
+        assert health.status_code == 200
+        assert health.json()["trigger_count"] == 0
+
+        resp = client.post(
+            "/webhook/anything",
+            json={},
+            headers={"Authorization": "Bearer secret"},
+        )
+    assert resp.status_code == 404
+
+
 def test_webhook_disabled_returns_409(app):
     with TestClient(app) as client:
         # Disable the trigger via the status route first.
@@ -180,7 +232,7 @@ def test_dashboard_state_shape(app):
 
 
 # ---------------------------------------------------------------------------
-# Dashboard READ endpoints are now bearer-gated (they surface agent output).
+# Dashboard READ endpoints are bearer-gated (they surface agent output).
 # ---------------------------------------------------------------------------
 
 _GATED_READ_ROUTES = [
@@ -479,13 +531,13 @@ async def test_dispatch_with_policy_retries_with_backoff_on_dispatch_error(monke
     """
     from osprey.dispatch.registry import TriggerRegistry
     from osprey.dispatch.trigger_config import TriggerConfig
-    from osprey.dispatch.worker_client import DispatchError
+    from osprey.dispatch.worker_client import WorkerUnreachableError
 
     attempts = {"dispatch": 0}
 
     async def always_fails(url, prompt, allowed_tools, token, timeout=30.0, **kwargs):
         attempts["dispatch"] += 1
-        raise DispatchError("worker unreachable")
+        raise WorkerUnreachableError("worker unreachable")
 
     slept: list[float] = []
 
@@ -535,10 +587,10 @@ async def test_dispatch_with_policy_alert_records_and_returns_none(monkeypatch):
     """``on_error: alert`` logs + records the error and returns None (no retry)."""
     from osprey.dispatch.registry import TriggerRegistry
     from osprey.dispatch.trigger_config import TriggerConfig
-    from osprey.dispatch.worker_client import DispatchError
+    from osprey.dispatch.worker_client import WorkerUnreachableError
 
     async def always_fails(url, prompt, allowed_tools, token, timeout=30.0, **kwargs):
-        raise DispatchError("worker unreachable")
+        raise WorkerUnreachableError("worker unreachable")
 
     monkeypatch.setattr(server, "dispatch_to_worker", always_fails)
 
@@ -558,14 +610,14 @@ async def test_dispatch_with_policy_alert_records_and_returns_none(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_with_policy_auth_error_flows_through_policy(monkeypatch):
-    """An AuthError is handled by the policy (recorded + dropped), not raised."""
+async def test_dispatch_with_policy_auth_rejected_flows_through_policy(monkeypatch):
+    """A rejected bearer token is handled by the policy (recorded + dropped), not raised."""
     from osprey.dispatch.registry import TriggerRegistry
     from osprey.dispatch.trigger_config import TriggerConfig
-    from osprey.dispatch.worker_client import AuthError
+    from osprey.dispatch.worker_client import WorkerAuthRejectedError
 
     async def auth_fails(url, prompt, allowed_tools, token, timeout=30.0, **kwargs):
-        raise AuthError("Unauthorized (401)")
+        raise WorkerAuthRejectedError("Unauthorized (401)")
 
     monkeypatch.setattr(server, "dispatch_to_worker", auth_fails)
 
@@ -600,10 +652,10 @@ async def test_dispatch_with_policy_generic_exception_propagates(monkeypatch):
 
 def test_dashboard_state_surfaces_worker_error(app, monkeypatch):
     """When the worker is unreachable, /dashboard/state carries a worker_error marker."""
-    from osprey.dispatch.worker_client import DispatchError
+    from osprey.dispatch.worker_client import WorkerUnreachableError
 
     async def fetch_fails(url, token, timeout=10.0):
-        raise DispatchError("Connection error")
+        raise WorkerUnreachableError("Connection error")
 
     monkeypatch.setattr(server, "fetch_worker_runs", fetch_fails)
     with TestClient(app) as client:
@@ -615,10 +667,10 @@ def test_dashboard_state_surfaces_worker_error(app, monkeypatch):
 
 
 def test_dashboard_runs_worker_down_returns_502(app, monkeypatch):
-    from osprey.dispatch.worker_client import DispatchError
+    from osprey.dispatch.worker_client import WorkerUnreachableError
 
     async def fetch_fails(url, token, timeout=10.0):
-        raise DispatchError("Connection error")
+        raise WorkerUnreachableError("Connection error")
 
     monkeypatch.setattr(server, "fetch_worker_runs", fetch_fails)
     with TestClient(app) as client:
@@ -676,10 +728,10 @@ def test_dashboard_cancel_proxies_to_worker(app, monkeypatch):
 
 
 def test_dashboard_cancel_worker_auth_failure_returns_502(app, monkeypatch):
-    from osprey.dispatch.worker_client import AuthError
+    from osprey.dispatch.worker_client import WorkerAuthRejectedError
 
     async def fake_cancel(url, token, run_id):
-        raise AuthError("nope")
+        raise WorkerAuthRejectedError("nope")
 
     monkeypatch.setattr(server, "cancel_worker_run", fake_cancel)
     with TestClient(app) as client:

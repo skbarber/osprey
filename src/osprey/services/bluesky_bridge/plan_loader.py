@@ -1,18 +1,18 @@
-"""Loads scan plans from a layered directory catalog plus the legacy facility
+"""Loads plans from a layered directory catalog plus the legacy facility
 plan-injection contract, and merges both into one trust-resolved plan set.
 
 Two kinds of plan source, both scanned into the same fail-closed registry:
 
 - **Directory layers** — ordered ``(directory, provenance)`` pairs, each
   scanned for ``.py`` files exposing ``PLAN_METADATA``/``build_plan``
-  (optionally ``PARAMS``). Device-agnostic: these files never define
+  (optionally ``PARAMS`` and ``render``). Device-agnostic: these files never define
   ``get_devices()``; their plans resolve device names against the bridge's
   own device map at launch.
 - **The legacy single-module contract** — a single ``.py`` file exposing
   ``PLANS: dict[str, PlanSpec]`` and ``get_devices()``, resolved from
-  ``BLUESKY_PLAN_MODULE`` (env) or ``bluesky.plan_module`` (config.yml). This
-  predates the layered model and is folded in as a one-entry ``facility``-tier
-  layer — it is the only source of injected devices.
+  ``BLUESKY_PLAN_MODULE`` (env) or ``bluesky.plan_module`` (config.yml). It is
+  folded in as a one-entry ``facility``-tier layer — and is the only source of
+  injected devices.
 
 Layer sources and their provenance-tier mapping:
 
@@ -24,7 +24,7 @@ Layer sources and their provenance-tier mapping:
    operator trust than a per-instance runtime override.
 3. ``facility`` — directories listed in ``BLUESKY_PLAN_DIRS`` (env,
    ``os.pathsep``-separated), set per bridge instance at launch. This mirrors
-   the legacy contract's existing precedent that an env override outranks
+   the legacy contract's own precedent that an env override outranks
    config (``BLUESKY_PLAN_MODULE`` wins over ``bluesky.plan_module``). The
    legacy single-module contract itself is also pinned to ``facility`` —
    it is scanned *first*, so a lower-trust directory layer (``shipped`` or
@@ -68,13 +68,15 @@ import importlib.util
 import logging
 import os
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
 
+from .figure import REASON_RENDER_NOT_SUPPORTED_FOR_SESSION_PLANS, Figure, RowWindow
+from .plan_fields import MOVABLE_ROLE, channel_roles
 from .plan_metadata import parse_plan_metadata
 from .plan_types import PlanSpec, Provenance
 from .plan_validation import hash_plan_body
@@ -94,8 +96,8 @@ _PLAN_DIRS_ENV = "BLUESKY_PLAN_DIRS"
 # bridge instance. Unioned with config.yml's ``bluesky.excluded_plans``.
 _EXCLUDED_PLANS_ENV = "BLUESKY_EXCLUDED_PLANS"
 
-# The in-image core plan directory shipped with this package (task 1.5
-# populates it; scanned even if absent/empty).
+# The in-image core plan directory shipped with this package (scanned even if
+# absent/empty).
 _SHIPPED_PLANS_DIR = Path(__file__).parent / "plans_core"
 
 _TRUST_ORDER: dict[Provenance, int] = {
@@ -117,8 +119,9 @@ class _EmptyParams(BaseModel):
 
 class PlanLoaderError(ValueError):
     """A directory-layer plan file fails its load contract (missing/uncallable
-    ``build_plan``, malformed ``PARAMS``). Always caught and quarantined by
-    the scanner — never escapes this module."""
+    ``build_plan``, malformed ``PARAMS``, a declared write with no movable
+    channel field). Always caught and quarantined by the scanner — never
+    escapes this module."""
 
 
 @dataclass
@@ -336,6 +339,77 @@ def _register_plan(
         registry[name] = (provenance, source, spec)
 
 
+def _resolve_render(
+    module: Any,
+    path: Path,
+    provenance: Provenance,
+) -> Callable[[RowWindow, Any], Figure] | None:
+    """Resolve a plan file's optional module-level ``render(window, params)``.
+
+    Never raises, and never causes a quarantine: a plan whose ``render`` is
+    unusable is still a perfectly good plan to *launch*, and refusing to
+    register it would take the scan away over a drawing concern. The worst
+    outcome here is ``None``, which the figure route serves as the default
+    figure with a reason attached.
+
+    The rule, by tier:
+
+    - ``session``/``unreviewed`` — never resolved, even when the file defines
+      one. ``render()`` runs in the bridge API process on every poll tick of
+      every watching client, so an agent-authored one is an unbounded-work
+      denial-of-service seam that the validation gate (which checks the file
+      is a *plan*, not that its drawing code terminates) does not close. A
+      file that declares one warns at load time, quoting the route's
+      ``render_not_supported_for_session_plans`` reason so the author sees the
+      same words the panel will show them. A file that declares none is
+      silent — there is nothing to warn about.
+    - ``shipped``/``preset``/``facility`` — a callable module-level ``render``
+      is stored on the spec. A *missing* one is silent and ordinary (most
+      plans have no view of their own). A present-but-non-callable one warns:
+      it reads as an author mistake — a stray constant, or a name shadowed by
+      an import — not as a deliberate opt-out.
+
+    ``getattr`` itself is guarded because a module can define ``__getattr__``
+    (PEP 562) and raise from it; that must not become a quarantine either.
+    """
+    try:
+        render = getattr(module, "render", None)
+    except Exception as exc:  # PEP 562 module __getattr__ may raise
+        logger.warning(
+            "plan_loader: could not read render from %s (%s): %s — loading without a figure",
+            path,
+            provenance,
+            exc,
+        )
+        return None
+
+    if provenance in ("session", "unreviewed"):
+        if render is not None:
+            logger.warning(
+                "plan_loader: ignoring render() in %s-tier plan file %s (%s) — a "
+                "plan's render() runs in the bridge process on every poll tick, so "
+                "it is only honored for operator-supplied plans; this run will show "
+                "the default figure",
+                provenance,
+                path,
+                REASON_RENDER_NOT_SUPPORTED_FOR_SESSION_PLANS,
+            )
+        return None
+
+    if render is None:
+        return None
+    if not callable(render):
+        logger.warning(
+            "plan_loader: ignoring non-callable render in %s (%s): %r — loading without a figure",
+            path,
+            provenance,
+            render,
+        )
+        return None
+
+    return render  # type: ignore[no-any-return]
+
+
 def _load_plan_file(
     path: Path,
     provenance: Provenance,
@@ -344,8 +418,9 @@ def _load_plan_file(
     """Load, validate, and register one directory-layer plan file.
 
     Never raises: any failure (syntax error, missing/invalid `PLAN_METADATA`,
-    missing `build_plan`, malformed `PARAMS`) is logged as a warning and the
-    file is quarantined — skipped, without aborting the rest of the scan.
+    missing `build_plan`, malformed `PARAMS`, an undeclared write — see the load
+    gate below) is logged as a warning and the file is quarantined — skipped,
+    without aborting the rest of the scan.
 
     Catches `SystemExit` alongside `Exception` (it isn't an `Exception`
     subclass) so a plan file that calls `sys.exit()` at import time is
@@ -369,6 +444,25 @@ def _load_plan_file(
     provenance (not on "no metadata"/"no record" alone) matters: built-ins and
     the shipped exemplars carry no validation record either, and a broader
     gate would wrongly quarantine them too.
+
+    Every tier passes one further contract check, the LOAD GATE: a plan whose
+    metadata declares ``writes: true`` must name at least one movable channel
+    field in its ``PARAMS`` (read via `plan_fields.channel_roles`). A plan that
+    claims to change machine state without declaring what it moves is
+    unenforceable downstream — the enqueue pre-check, the pre-flight preview and
+    the permission entries all describe a write in terms of those declared
+    fields, and with none of them there is nothing to check, show, or arm.
+    Catching it at load time makes it an authoring error the author sees once,
+    rather than a silently under-described write at every launch. The reverse
+    (declared movable fields with ``writes: false``) is deliberately NOT gated:
+    that direction fails safe, and a plan may legitimately take a channel name
+    it only reads back. Plans are stored with their introspected roles on
+    `PlanSpec.roles`, so no request-time consumer re-walks the schema.
+
+    An optional module-level ``render`` is resolved onto the spec by
+    `_resolve_render`, which is total: no ``render`` attribute, an unusable
+    one, or an untrusted tier all yield ``render=None``, and the plan itself
+    still registers.
     """
     try:
         if provenance in ("session", "unreviewed"):
@@ -397,6 +491,13 @@ def _load_plan_file(
             raise PlanLoaderError(
                 f"{path}: PARAMS must be a pydantic BaseModel subclass, got {params_attr!r}"
             )
+        roles = tuple(channel_roles(params_schema))
+        if meta.writes and not any(role == MOVABLE_ROLE for _, role in roles):
+            raise PlanLoaderError(
+                f"{path}: PLAN_METADATA declares writes: true but no movable channel "
+                f"field in PARAMS — a plan that changes machine state must declare "
+                f"which channels it moves"
+            )
         spec = PlanSpec(
             name=meta.name,
             plan=build_plan,
@@ -404,6 +505,8 @@ def _load_plan_file(
             description=meta.description,
             metadata=meta,
             provenance=provenance,
+            render=_resolve_render(module, path, provenance),
+            roles=roles,
         )
     except (Exception, SystemExit) as exc:
         logger.warning("plan_loader: quarantining %s (%s): %s", path, provenance, exc)
@@ -510,7 +613,7 @@ def _load_startup_layers(module_path: str | None) -> _StartupLayers:
 # repeat callers that compare by identity (or just want a stable reference)
 # see one. A signature/mtime-based skip was deliberately rejected: a file's
 # mtime doesn't change when a *validation record* is added after the fact
-# (task 2.3's validate route only touches `validation_record.py`, never the
+# (the validate route only touches `validation_record.py`, never the
 # file), so caching on file staleness alone would keep serving a stale
 # rejection after a plan actually became valid — exactly the live-authoring
 # case this layer exists for. Re-gating on every call is the correctness
@@ -532,7 +635,7 @@ def get_facility_plans() -> FacilityPlans:
     (`shipped`/`preset`/`facility`/`session`) into one trust-resolved plan
     set. The startup layers are loaded once and cached (see
     `_load_startup_layers`) — but the `session` layer is a live authoring
-    surface (task 2.3's `POST /plans/session` writes into it between
+    surface (`POST /plans/session` writes into it between
     requests, and its validation status can change without the file itself
     changing), so it is fully re-scanned and re-gated (see `_load_plan_file`)
     on *every* call, merged fresh over the cached startup registry. A newly

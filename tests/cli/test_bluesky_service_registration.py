@@ -56,9 +56,6 @@ def test_inject_bluesky_default_config(tmp_path: Path) -> None:
     assert svc["port"] == 8090
     assert svc["tiled_enabled"] is False
     assert svc["tiled_port"] == 8091
-    # demo_runner defaults OFF — a facility profile must opt in explicitly;
-    # it must never silently override real device/plan wiring.
-    assert svc["demo_runner"] is False
     # No pinned image: the service builds the project's local image (compose
     # template defaults to <project>-bluesky-bridge:local + a build: section).
     assert "image" not in svc
@@ -81,20 +78,6 @@ def test_inject_bluesky_custom_ports_and_tiled(tmp_path: Path) -> None:
     assert svc["port"] == 9500
     assert svc["tiled_enabled"] is True
     assert svc["tiled_port"] == 9501
-
-
-def test_inject_bluesky_demo_runner_opt_in(tmp_path: Path) -> None:
-    """demo_runner=True is written through to config.yml (2.14a's app.py hook
-    reads BLUESKY_DEMO_RUNNER off the rendered compose env; this test only
-    covers this task's half — the config.yml/compose passthrough)."""
-    project_path = tmp_path / "project"
-    project_path.mkdir()
-    _write_config(project_path)
-
-    _inject_bluesky(BlueskyConfig(demo_runner=True), project_path)
-
-    config = _read_config(project_path)
-    assert config["services"]["bluesky"]["demo_runner"] is True
 
 
 def test_inject_bluesky_idempotent_rerun(tmp_path: Path) -> None:
@@ -156,7 +139,6 @@ def _render_copied_compose(project_path: Path, config: dict) -> dict:
         "osprey_labels": {
             "project_name": "p",
             "project_root": str(project_path),
-            "deployed_at": "x",
         },
         "osprey_version": "",
         "system": {"timezone": "UTC"},
@@ -166,27 +148,25 @@ def _render_copied_compose(project_path: Path, config: dict) -> dict:
     return pyyaml.safe_load(tmpl.render(ctx))
 
 
-def test_demo_runner_env_passthrough_round_trips_through_compose(tmp_path: Path) -> None:
-    """The config.yml demo_runner flag `_inject_bluesky` writes must actually
-    reach the container as BLUESKY_DEMO_RUNNER — the other half of 2.14a's
-    contract (app.py reads the env var this template renders)."""
-    project_path = tmp_path / "project"
-    project_path.mkdir()
-    _write_config(project_path)
+def test_the_retired_demo_runner_knob_reaches_nothing(tmp_path: Path) -> None:
+    """The bridge does not run plans — the queueserver worker does — so there
+    is no in-process demo runner and no `bluesky.demo_runner` knob to arm one.
 
-    _inject_bluesky(BlueskyConfig(demo_runner=True), project_path)
-    config = _read_config(project_path)
-    rendered = _render_copied_compose(project_path, config)
-    assert rendered["services"]["bluesky-bridge"]["environment"]["BLUESKY_DEMO_RUNNER"] == "true"
-
-
-def test_demo_runner_off_by_default_omits_env_var(tmp_path: Path) -> None:
+    This is a standing guard, not a regression test for a bug: such a knob would
+    render `BLUESKY_DEMO_RUNNER` into compose and print a console line promising
+    a demo, so introducing either half would ship a config key that lies about
+    what the deployment does. A stale `demo_runner:` left in a profile is
+    ignored by the loader (the `bluesky` block ignores every unknown key), which
+    is why the guard is on the OUTPUT rather than on the parse.
+    """
     project_path = tmp_path / "project"
     project_path.mkdir()
     _write_config(project_path)
 
     _inject_bluesky(BlueskyConfig(), project_path)
+
     config = _read_config(project_path)
+    assert "demo_runner" not in config["services"]["bluesky"]
     rendered = _render_copied_compose(project_path, config)
     assert "BLUESKY_DEMO_RUNNER" not in rendered["services"]["bluesky-bridge"]["environment"]
 
@@ -202,10 +182,10 @@ def test_inject_bluesky_plan_dir_written_to_config(tmp_path: Path) -> None:
     project_path.mkdir()
     _write_config(project_path)
 
-    _inject_bluesky(BlueskyConfig(plan_dir="/opt/facility/scan_plans"), project_path)
+    _inject_bluesky(BlueskyConfig(plan_dir="/opt/facility/plans"), project_path)
 
     config = _read_config(project_path)
-    assert config["services"]["bluesky"]["plan_dir"] == "/opt/facility/scan_plans"
+    assert config["services"]["bluesky"]["plan_dir"] == "/opt/facility/plans"
 
 
 def test_inject_bluesky_no_plan_dir_omits_key(tmp_path: Path) -> None:
@@ -254,15 +234,15 @@ def test_plan_dir_mount_and_env_round_trip_through_compose(tmp_path: Path) -> No
     project_path.mkdir()
     _write_config(project_path)
 
-    _inject_bluesky(BlueskyConfig(plan_dir="/opt/facility/scan_plans"), project_path)
+    _inject_bluesky(BlueskyConfig(plan_dir="/opt/facility/plans"), project_path)
     config = _read_config(project_path)
     rendered = _render_copied_compose(project_path, config)
 
     bridge = rendered["services"]["bluesky-bridge"]
     assert bridge["environment"]["BLUESKY_PLAN_DIRS"] == "/app/project/plans"
-    assert "/opt/facility/scan_plans:/app/project/plans:ro" in bridge["volumes"]
+    assert "/opt/facility/plans:/app/project/plans:ro" in bridge["volumes"]
     # The host path never appears in the container's environment block.
-    assert "/opt/facility/scan_plans" not in bridge["environment"].values()
+    assert "/opt/facility/plans" not in bridge["environment"].values()
 
 
 def test_plan_dir_absent_omits_mount_and_env(tmp_path: Path) -> None:
@@ -322,7 +302,7 @@ def test_loopback_bind_and_failclosed_token_survive_plan_dir_wiring(tmp_path: Pa
     project_path.mkdir()
     _write_config(project_path)
 
-    _inject_bluesky(BlueskyConfig(plan_dir="/opt/facility/scan_plans"), project_path)
+    _inject_bluesky(BlueskyConfig(plan_dir="/opt/facility/plans"), project_path)
 
     template_text = (project_path / "services" / "bluesky" / "docker-compose.yml.j2").read_text()
     assert (
@@ -340,20 +320,19 @@ def test_loopback_bind_and_failclosed_token_survive_plan_dir_wiring(tmp_path: Pa
 
 
 def test_profile_without_bluesky_key_leaves_bluesky_none() -> None:
-    profile = _parse_profile({"name": "no-scan-here"})
+    profile = _parse_profile({"name": "no-plan-here"})
     assert profile.bluesky is None
 
 
 def test_profile_bluesky_key_parses_overrides() -> None:
     profile = _parse_profile(
         {
-            "name": "with-scan",
+            "name": "with-plan",
             "bluesky": {
                 "port": 8123,
                 "tiled_enabled": True,
                 "tiled_port": 8124,
-                "demo_runner": True,
-                "plan_dir": "/opt/facility/scan_plans",
+                "plan_dir": "/opt/facility/plans",
             },
         }
     )
@@ -361,17 +340,15 @@ def test_profile_bluesky_key_parses_overrides() -> None:
     assert profile.bluesky.port == 8123
     assert profile.bluesky.tiled_enabled is True
     assert profile.bluesky.tiled_port == 8124
-    assert profile.bluesky.demo_runner is True
-    assert profile.bluesky.plan_dir == "/opt/facility/scan_plans"
+    assert profile.bluesky.plan_dir == "/opt/facility/plans"
 
 
 def test_profile_bluesky_key_defaults_when_empty_mapping() -> None:
-    profile = _parse_profile({"name": "with-scan-defaults", "bluesky": {}})
+    profile = _parse_profile({"name": "with-plan-defaults", "bluesky": {}})
     assert profile.bluesky is not None
     assert profile.bluesky.port == 8090
     assert profile.bluesky.tiled_enabled is False
     assert profile.bluesky.tiled_port == 8091
-    assert profile.bluesky.demo_runner is False
     assert profile.bluesky.plan_dir is None
     assert profile.bluesky.excluded_plans == []
 

@@ -48,12 +48,13 @@ Bring It Up
 ===========
 
 Both services are registered in ``deployed_services``, so they come up with the
-rest of the stack. ``osprey deploy up`` auto-generates both bearer tokens into
-``.env`` when they are unset:
+rest of the stack. ``osprey up`` auto-generates both bearer tokens into
+the profile's ``.env`` when they are unset, then derives the project's ``.env``
+from it:
 
 .. code-block:: bash
 
-   osprey deploy up        # add --dev to bake in a local osprey checkout
+   osprey up        # add --dev to bake in a local osprey checkout
 
 The first build is slow: both images install Node and the agent CLI the
 worker runs on.
@@ -62,14 +63,15 @@ worker runs on.
    :icon: package
 
    The two services use two different images, both built locally on first
-   ``osprey deploy up``:
+   ``osprey up``:
 
    - the **dispatcher** gets its own small image
      (``<project>-dispatch:local``, from
      ``services/event_dispatcher/Dockerfile``);
    - the **worker** runs the full *project image* (``<project>:local`` — the
-     same image :doc:`containerize-project` describes, with your overlays and
-     ``data/`` baked in), so the agent it launches sees the real project.
+     same image :doc:`containerize-project` describes, with your profile's
+     artifacts and ``data/`` baked in), so the agent it launches sees the real
+     project.
 
    Pass ``--dev`` to install your local osprey checkout (incl. unreleased
    code) via a wheel; otherwise the images install ``osprey-framework`` from
@@ -82,7 +84,7 @@ worker runs on.
 
       OSPREY_DISPATCH_IMAGE=my-registry/osprey-dispatch:dev \
       OSPREY_WORKER_IMAGE=my-registry/my-project:dev \
-        osprey deploy up
+        osprey up
 
    Inside the compose network the worker is reachable as
    ``dispatch-worker-1:9190`` — the default ``dispatch_target`` in
@@ -257,10 +259,12 @@ Authoring Triggers
 Authentication
 ==============
 
-Two bearer tokens live in the project ``.env``. ``osprey deploy up``
-auto-generates a strong random value for each when it is unset (and logs where
-it wrote it), so a containerized deploy needs no token editing. Set your own
-values in ``.env`` to override:
+Two bearer tokens guard the stack. ``osprey up`` auto-generates a strong
+random value for each when it is unset (and logs where it wrote it), so a
+containerized deploy needs no token editing. A generated value is written into
+the **profile's** ``.env`` and derived from there into the project's, so a
+rebuild comes up on the same token. To pick your own values, set them in the
+profile's ``.env`` and rebuild:
 
 - ``EVENT_DISPATCHER_TOKEN`` — guards **inbound** webhook and write endpoints.
   Send it as ``Authorization: Bearer <token>``.
@@ -289,4 +293,4 @@ values in ``.env`` to override:
        Container deployment mechanics for all Osprey services.
 
    :doc:`../cli-reference/index`
-       Full ``osprey build`` and ``osprey deploy`` reference.
+       Full ``osprey build`` and lifecycle-verb reference.

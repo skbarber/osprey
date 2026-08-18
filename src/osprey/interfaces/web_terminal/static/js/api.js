@@ -16,6 +16,7 @@
  * @typedef {object} EventSourceHandlers
  * @property {(data: any) => void} [onMessage]
  * @property {() => void} [onError]
+ * @property {() => void} [onOpen]
  */
 
 /** @type {ConnState} */
@@ -60,6 +61,75 @@ export function withPrefix(path) {
 }
 
 /**
+ * Set once a probe has seen a 401, i.e. the session behind this page is gone.
+ * A reload is already on its way, so every reconnect loop stops here.
+ */
+let sessionExpired = false;
+
+/** In-flight health probe, shared by all channels so closes don't fan out. */
+/** @type {Promise<boolean>|null} */
+let healthProbe = null;
+
+/**
+ * Ask the app's own health route whether this page still has a session,
+ * resolving true only on a definite 401.
+ *
+ * The browser WebSocket API hides handshake status codes from JavaScript, so
+ * a connection the perimeter refused with 401 reaches `onclose` looking
+ * exactly like a dropped network — without this probe an expired session
+ * leaves the terminal reconnecting forever. Three details are load-bearing:
+ *
+ * - The URL goes through {@link withPrefix}, so it is the per-user app's own
+ *   `/u/<user>/health`. That route sits behind its user's auth gate, which is
+ *   what makes the 401 visible; the auth sidecar's `/health` is unauthenticated
+ *   and would always answer 200, and a root-absolute `/health` is not proxied.
+ * - `Accept: application/json`. The perimeter content-negotiates its 401: an
+ *   Accept mentioning text/html gets a 302 to the login page, anything else
+ *   gets a bare 401. We want the status, not the page.
+ * - The app decides nothing about authorization and holds no secret. It reads
+ *   one status code and reacts.
+ *
+ * Anything that is not a 401 — a network error, a 5xx, a healthy 200 — resolves
+ * false and leaves the caller's reconnect/backoff behavior untouched. Where no
+ * auth fronts the deployment (single-origin/dev), the probe simply always sees
+ * the app's own 200.
+ * @returns {Promise<boolean>}
+ */
+function probeSessionExpired() {
+  if (sessionExpired) return Promise.resolve(true);
+  if (!healthProbe) {
+    healthProbe = fetch(withPrefix('/health'), {
+      cache: 'no-store',
+      headers: { Accept: 'application/json' },
+    })
+      .then((res) => res.status === 401)
+      .catch(() => false)
+      .finally(() => {
+        healthProbe = null;
+      });
+  }
+  return healthProbe;
+}
+
+/**
+ * Probe after a channel closed and, on an expired session, reload so the HTML
+ * navigation path triggers the perimeter's login redirect. Fire-and-forget:
+ * callers schedule their ordinary reconnect first, so a probe that fails for
+ * any other reason costs nothing but one request.
+ * @param {() => void} [onExpired] tear down the caller's own handle first
+ *   (an EventSource would otherwise keep retrying until the reload lands)
+ */
+function reloadIfSessionExpired(onExpired) {
+  probeSessionExpired().then((expired) => {
+    if (!expired) return;
+    if (onExpired) onExpired();
+    if (sessionExpired) return; // another channel already triggered the reload
+    sessionExpired = true;
+    location.reload();
+  });
+}
+
+/**
  * Build a same-origin WebSocket URL with the scheme that matches the current
  * page: wss:// when served over HTTPS, ws:// otherwise. Pass a root-absolute
  * path such as '/ws/terminal'. Avoids mixed-content failures under TLS.
@@ -84,7 +154,7 @@ export function createWebSocket(url, { onOpen, onMessage, onClose, onError } = {
   let wsUrl = url;
 
   function connect() {
-    if (stopped) return;
+    if (stopped || sessionExpired) return;
     wsState = 'connecting';
     notifyStateChange();
 
@@ -107,6 +177,7 @@ export function createWebSocket(url, { onOpen, onMessage, onClose, onError } = {
       notifyStateChange();
       if (onClose) onClose(e);
       scheduleReconnect();
+      reloadIfSessionExpired();
     };
 
     ws.onerror = (e) => {
@@ -115,7 +186,7 @@ export function createWebSocket(url, { onOpen, onMessage, onClose, onError } = {
   }
 
   function scheduleReconnect() {
-    if (stopped) return;
+    if (stopped || sessionExpired) return;
     const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
     attempt++;
     setTimeout(connect, delay);
@@ -144,24 +215,41 @@ export function createWebSocket(url, { onOpen, onMessage, onClose, onError } = {
 
 /**
  * Create an EventSource with reconnection.
+ *
+ * The browser's built-in retry covers only network-level failures on a
+ * still-live source; a non-2xx response or wrong content type (a proxy 502
+ * while the backend restarts, an auth redirect) parks the EventSource in
+ * CLOSED permanently, where the spec forbids any further retry. This wrapper
+ * takes over from there with the same exponential backoff createWebSocket
+ * uses, so the panel event channel survives backend restarts.
+ *
+ * `onOpen` fires on EVERY open — first connect, browser auto-retry, and this
+ * wrapper's own reconnects. SSE has no replay (no event ids are sent), so
+ * anything published while disconnected is gone; the hook is the caller's
+ * seam for re-fetching authoritative state instead.
  * @param {string} url
  * @param {EventSourceHandlers} [handlers]
  */
-export function createEventSource(url, { onMessage, onError } = {}) {
+export function createEventSource(url, { onMessage, onError, onOpen } = {}) {
   /** @type {EventSource|null} */
   let es = null;
   let stopped = false;
+  let attempt = 0;
+  /** @type {ReturnType<typeof setTimeout>|null} */
+  let reconnectTimer = null;
 
   function connect() {
-    if (stopped) return;
+    if (stopped || sessionExpired) return;
     sseState = 'connecting';
     notifyStateChange();
 
     es = new EventSource(withPrefix(url));
 
     es.onopen = () => {
+      attempt = 0;
       sseState = 'connected';
       notifyStateChange();
+      if (onOpen) onOpen();
     };
 
     es.onmessage = (e) => {
@@ -179,12 +267,32 @@ export function createEventSource(url, { onMessage, onError } = {}) {
       sseState = 'disconnected';
       notifyStateChange();
       if (onError) onError();
-      // EventSource auto-reconnects, but update state
+      // readyState 2 is CLOSED (spec constant): the browser has given up on
+      // this source for good, so reconnection is ours from here. While
+      // CONNECTING/OPEN the built-in retry is still running — never race it.
+      if (es && es.readyState === 2) scheduleReconnect();
+      reloadIfSessionExpired(() => {
+        if (es) es.close();
+      });
     };
+  }
+
+  function scheduleReconnect() {
+    if (stopped || sessionExpired || reconnectTimer != null) return;
+    const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
+    attempt++;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, delay);
   }
 
   function stop() {
     stopped = true;
+    if (reconnectTimer != null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     if (es) es.close();
     sseState = 'disconnected';
     notifyStateChange();
@@ -203,4 +311,31 @@ export async function fetchJSON(url) {
   const res = await fetch(withPrefix(url), { cache: 'no-store' });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
   return res.json();
+}
+
+/**
+ * JSON API request through the {@link withPrefix} chokepoint. Covers the
+ * mutating verbs (POST/PUT/PATCH/DELETE) that fetchJSON's GET contract
+ * doesn't: serializes `json` as the request body, and on a non-OK response
+ * throws an Error carrying the server's `detail` message when the error body
+ * has one, else `"<errorPrefix> (HTTP <status>)"`. Resolves with the parsed
+ * JSON response body (null when the body isn't JSON, e.g. empty DELETE
+ * responses).
+ * @param {string} url
+ * @param {{method?: string, json?: any, errorPrefix?: string}} [opts]
+ * @returns {Promise<any>}
+ */
+export async function apiRequest(url, { method = 'POST', json, errorPrefix = 'Request failed' } = {}) {
+  /** @type {RequestInit} */
+  const init = { method };
+  if (json !== undefined) {
+    init.headers = { 'Content-Type': 'application/json' };
+    init.body = JSON.stringify(json);
+  }
+  const resp = await fetch(withPrefix(url), init);
+  if (!resp.ok) {
+    const detail = await resp.json().catch(() => ({}));
+    throw new Error(detail.detail || `${errorPrefix} (HTTP ${resp.status})`);
+  }
+  return resp.json().catch(() => null);
 }

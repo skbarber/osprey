@@ -29,7 +29,7 @@ logger = get_logger("ariel")
 
 
 # ---------------------------------------------------------------------------
-# Base class & utilities (formerly migration.py)
+# Base class & utilities
 # ---------------------------------------------------------------------------
 
 
@@ -162,7 +162,7 @@ def model_to_table_name(model_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Migration runner (formerly migrate.py)
+# Migration runner
 # ---------------------------------------------------------------------------
 
 # Format: (name, module_path, class_name, requires_module)
@@ -191,6 +191,12 @@ KNOWN_MIGRATIONS: list[tuple[str, str, str, str | None]] = [
         "osprey.services.ariel_search.database.attachment_migration",
         "AttachmentMigration",
         None,  # Always runs
+    ),
+    (
+        "qmd_resync_index",
+        "osprey.services.ariel_search.database.qmd_resync_migration",
+        "QmdResyncMigration",
+        "qmd_export",
     ),
 ]
 

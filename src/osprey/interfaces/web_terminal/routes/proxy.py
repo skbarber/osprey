@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
 import os
 import re
+from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
 
 from osprey.interfaces.web_terminal.url_prefix import compute_url_prefix
+from osprey.registry.web import FRAMEWORK_WEB_SERVERS, panel_url_state_attr
 from osprey.utils.http_proxy import HOP_BY_HOP
 
 logger = logging.getLogger(__name__)
@@ -66,14 +69,20 @@ _REWRITABLE_TYPES = {
 # artifact gallery's immutable versioned vendor bundles) keeps it.
 _DEFAULT_NO_CACHE = "no-cache, no-store, must-revalidate"
 
-# Panel ID → app.state attribute name
+# Panel ID → app.state attribute name, derived from the web-server registry
+# rather than hand-listed. Registry keys and panel ids are two namespaces
+# (``artifact``/``artifacts``, ``channel_finder``/``channel-finder``), and each
+# consumer that kept its own translation table drifted from the others; the
+# relation lives once, on ``WebServerDefinition.panel_id``.
+#
+# The attribute name comes from ``registry.web.panel_url_state_attr`` — the same
+# function ``web_terminal/app.py`` publishes under — rather than being spelled
+# out a second time here. Both ends import it from the registry because they
+# cannot import each other, and a convention agreed on by two independent
+# f-strings is a convention only until one of them is edited.
 _PANEL_STATE_MAP = {
-    "artifacts": "artifact_server_url",
-    "ariel": "ariel_server_url",
-    "channel-finder": "channel_finder_server_url",
-    "lattice": "lattice_dashboard_server_url",
-    "okf": "okf_server_url",
-    "system-health": "system_health_server_url",
+    definition.panel_id: panel_url_state_attr(key)
+    for key, definition in FRAMEWORK_WEB_SERVERS.items()
 }
 
 
@@ -151,6 +160,79 @@ def _rewrite_content(body: str, panel_id: str, outer_prefix: str = "") -> str:
     body = body.replace("href='/'", f"href='{prefix}/'")
 
     return body
+
+
+#: The hub's own copy of the shared design system — the same directory
+#: ``_app_setup.mount_shared_static()`` serves at ``/design-system``.
+_DESIGN_SYSTEM_DIR = Path(__file__).resolve().parents[2] / "design_system" / "static"
+
+#: Text asset suffixes that get the same root-absolute rewrite proxied
+#: HTML/JS/CSS receives, mapped to the content type to serve them as.
+_DS_TEXT_TYPES = {
+    ".css": "text/css",
+    ".js": "text/javascript",
+    ".mjs": "text/javascript",
+    ".html": "text/html",
+    ".json": "application/json",
+    ".map": "application/json",
+}
+
+
+@router.api_route(
+    "/panel/{panel_id}/design-system/{asset_path:path}",
+    methods=["GET", "HEAD"],
+)
+async def proxy_panel_design_system(panel_id: str, asset_path: str, request: Request):
+    """Serve the HUB's design-system assets to an embedded panel.
+
+    MUST stay declared above :func:`proxy_panel` — that route's
+    ``{path:path}`` is a catch-all and Starlette matches in declaration
+    order, so moving this below it makes it unreachable.
+
+    Every panel's HTML loads ``/design-system/css/tokens.css`` root-absolute,
+    which :func:`_rewrite_content` turns into
+    ``/panel/<id>/design-system/css/tokens.css``. Left to the generic proxy
+    that request reaches the *sidecar*, which serves whatever design-system
+    copy its own build shipped. A sidecar running an older release — a
+    container image built before a token change, say — then renders a
+    different palette than the terminal hosting it, and the theme the hub
+    broadcasts resolves to the wrong colors inside that one frame.
+
+    Intercepting here makes the shared design system single-sourced from the
+    hub for every embedded panel, so theme consistency does not depend on
+    each sidecar's build being in step. Sidecars still serve their own
+    ``/design-system`` on their standalone URLs; only the embedded path is
+    redirected to the hub's copy.
+
+    Falls through to the sidecar (404 here → the generic proxy never runs, so
+    a genuinely missing asset 404s) rather than masking a bad path.
+    """
+    if not _DESIGN_SYSTEM_DIR.is_dir():  # pragma: no cover - packaging guard
+        return Response(content="design system unavailable", status_code=404)
+
+    # Contain the path: reject anything that escapes the static root via
+    # traversal or an absolute path before touching the filesystem.
+    candidate = (_DESIGN_SYSTEM_DIR / asset_path).resolve()
+    if not candidate.is_relative_to(_DESIGN_SYSTEM_DIR.resolve()) or not candidate.is_file():
+        return Response(content="Not found", status_code=404)
+
+    headers = {"cache-control": _DEFAULT_NO_CACHE}
+    media_type = _DS_TEXT_TYPES.get(candidate.suffix.lower())
+
+    if media_type is None:
+        guessed, _ = mimetypes.guess_type(candidate.name)
+        return Response(
+            content=candidate.read_bytes(),
+            headers=headers,
+            media_type=guessed or "application/octet-stream",
+        )
+
+    # Text assets carry root-absolute self-references (e.g.
+    # osprey-theme-switcher.js dynamically imports '/design-system/js/
+    # theme-manager.js'). Apply the proxy's own rewrite so those resolve back
+    # into this panel's namespace — and therefore back to the hub's copy.
+    text = _rewrite_content(candidate.read_text(encoding="utf-8"), panel_id, compute_url_prefix())
+    return Response(content=text, headers=headers, media_type=media_type)
 
 
 @router.api_route(

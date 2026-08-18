@@ -20,10 +20,16 @@ carries these as *relative* timestamps (``when: {days_ago, time}``); applying
 the scenario resolves them against one apply-time anchor (newest entry lands
 two days before today) and seeds them into ARIEL. The telemetry ground truth
 lives in the same bundle (``data/simulation/scenarios/rf-thermal/``): the three
-CAVITY01 thermal excursions are declared at normalized window fractions (0.20,
-0.55, 0.85), so they appear at those relative positions in any window the agent
-chooses and the test stays date-agnostic. The test activates the scenario after
-building the project via ``activate_scenarios(project, "rf-thermal")``, which
+CAVITY01 thermal excursions are anchored to that same apply-time T0 via
+``at_offset`` — T0-38h, T0-21h and T0-7h, each a 2h-sigma spike. They therefore
+sit at fixed wall-clock times rather than at a fixed proportion of whatever
+window the agent asks for, which is what makes them storable in a real archiver;
+because the anchor is set when the scenario is applied, the test stays
+date-agnostic all the same. Two consequences for the agent's search: the most
+recent excursion falls a few hours back, so the prompt's "this morning" points
+at real data, and a lookback shorter than about two days will not show all three
+excursions. The test activates the scenario after
+building the deployment via ``activate_scenarios(repo, "rf-thermal")``, which
 also purges + reseeds the logbook so narrative and telemetry share one clock;
 the mock connectors then route RF cavity / klystron / DCCT reads through the
 engine instead of the flat ``nominal`` default.
@@ -55,6 +61,7 @@ import pytest
 from tests.e2e.judge import LLMJudge
 from tests.e2e.sdk_helpers import (
     HAS_SDK,
+    SCENARIO_INTEGRITY_DISALLOWED_TOOLS,
     _default_opus_model,
     activate_scenarios,
     ariel_db_skip_reason,
@@ -72,6 +79,7 @@ from tests.e2e.test_preset_agentic import (
 # on CI runners where the SDK is installed but no system ``claude`` is.
 pytestmark = [
     pytest.mark.e2e,
+    pytest.mark.agentic_benchmark,
     pytest.mark.requires_als_apg,
     pytest.mark.skipif(not HAS_SDK, reason="claude_agent_sdk not installed"),
     # Skipped on CI: needs a running ARIEL logbook postgres (seeded
@@ -98,7 +106,7 @@ async def test_rf_cavity01_correlation_flow(tmp_path: Path) -> None:
     layer guards against the agent fetching data but failing to name CAVITY01.
 
     The ARIEL logbook is seeded deterministically at setup by
-    ``activate_scenarios(project, "rf-thermal")``: it purges and reseeds the DB
+    ``activate_scenarios(repo, "rf-thermal")``: it purges and reseeds the DB
     from the scenario bundle so the CAVITY01 arc (DEMO-026/027/028) is present
     and matches the telemetry against one apply-time clock — no manual pre-seed,
     and no stale/wrong-preset DB to silently derail the agent. Needs a running
@@ -126,7 +134,7 @@ async def test_rf_cavity01_correlation_flow(tmp_path: Path) -> None:
     # Tier 3 (full channel DB): match the sibling vacuum scenario so both run
     # against the complete facility the simulation machine model defines, not a
     # minimal tier-1 subset.
-    project = init_project(
+    repo = init_project(
         tmp_path,
         "rf_correlation_demo",
         template="control_assistant",
@@ -135,11 +143,12 @@ async def test_rf_cavity01_correlation_flow(tmp_path: Path) -> None:
         tier=3,
     )
     # Switch the mock connectors' data substrate to the ``rf-thermal`` scenario
-    # bundle — the CAVITY01 thermal excursions at window fractions 0.20/0.55/0.85 —
-    # and seed its DEMO-026/027/028 incident arc into ARIEL (purge + reseed) so
-    # logbook and telemetry share one apply-time clock.
-    activate_scenarios(project, "rf-thermal")
-    cf_server = _channel_finder_server_name(project)
+    # bundle — the CAVITY01 thermal excursions anchored at T0-38h/-21h/-7h — and
+    # seed its DEMO-026/027/028 incident arc into ARIEL (purge + reseed) so
+    # logbook and telemetry share one apply-time clock. T0 is set here, so the
+    # newest excursion is a few hours old by the time the agent looks.
+    activate_scenarios(repo, "rf-thermal")
+    cf_server = _channel_finder_server_name(repo)
     if cf_server is None:
         pytest.skip("control-assistant preset has no channel-finder server")
 
@@ -148,11 +157,17 @@ async def test_rf_cavity01_correlation_flow(tmp_path: Path) -> None:
     # No subsystem names, no PV addresses, no cavity ID, no time window.
     query = "The beam dumped this morning. Figure out what happened and plot the data."
     result = await run_sdk_query(
-        project,
+        repo,
         query,
         max_turns=50,
         max_budget_usd=30.0,
-        model=_default_opus_model(project),
+        model=_default_opus_model(repo),
+        # rf-thermal's own scenario.json names the cavity-1 thermal excursion
+        # outright, and it sits in the agent's cwd. Unlike a VA-backed physics
+        # fault the bundle cannot be deleted -- it IS the live archiver overlay
+        # the mock connector serves -- so the filesystem-search surface is what
+        # gets closed instead. See SCENARIO_INTEGRITY_DISALLOWED_TOOLS.
+        disallowed_tools=SCENARIO_INTEGRITY_DISALLOWED_TOOLS,
     )
 
     # --- Tool routing contract -------------------------------------------------
@@ -208,9 +223,11 @@ async def test_rf_cavity01_correlation_flow(tmp_path: Path) -> None:
 
     # --- Diagnostic conclusion -------------------------------------------------
     # The logbook unambiguously names CAVITY01 (DEMO-026/027/028) and the
-    # archiver data unambiguously shows three thermal excursions on CAVITY01
-    # with CAVITY02 stable for contrast. The agent must commit to CAVITY01 and
-    # connect the thermal excursions to the beam dumps.
+    # archiver data unambiguously shows thermal excursions on CAVITY01 with
+    # CAVITY02 stable for contrast — one of them within hours of the reported
+    # dump, so even a short lookback lands on the evidence, and all three appear
+    # once the agent widens to a couple of days. The agent must commit to
+    # CAVITY01 and connect the thermal excursions to the beam dumps.
     eval = await judge.evaluate(
         _to_workflow_result(query, result),
         expectations=(

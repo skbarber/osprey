@@ -18,7 +18,7 @@ Integration Architecture
 
    User Query
        ↓
-   Osprey agent (via osprey claude chat)
+   Osprey agent (via osprey chat)
        ↓  selects from ARIEL MCP tools
    ARIEL MCP Server → ARIELSearchService
        ↓
@@ -97,8 +97,8 @@ agent:
      - ``tuple[str, ...]``
      - Entry IDs used as sources
    * - ``search_modes_used``
-     - ``tuple[SearchMode, ...]``
-     - Modes executed (e.g., ``KEYWORD``, ``SEMANTIC``)
+     - ``tuple[str, ...]``
+     - Modes executed (e.g., ``keyword``, ``semantic``)
    * - ``reasoning``
      - ``str``
      - Explanation of results

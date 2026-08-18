@@ -1,3 +1,6 @@
+# Scratch notes (local idea capture)
+scratch/
+
 # NFS temporary files
 .nfs*
 
@@ -11,9 +14,9 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
+/build/
 develop-eggs/
-dist/
+/dist/
 downloads/
 eggs/
 .eggs/
@@ -39,12 +42,18 @@ pip-delete-this-directory.txt
 htmlcov/
 .tox/
 .coverage
-.coverage.*
+.coverage*
 .cache
 nosetests.xml
 coverage.xml
+coverage.json
 *.cover
 .hypothesis/
+
+# CI diagnostics drop (per-worker event logs, stack dumps, container logs).
+# Written by tests/ci_diagnostics.py and .github/actions/capture-ci-diagnostics
+# whenever OSPREY_CI_DIAG_DIR is set; uploaded as an artifact, never committed.
+/ci-diag/
 .pytest_cache/
 
 # Jupyter Notebook
@@ -80,9 +89,11 @@ Thumbs.db
 !models/.gitkeep
 results/
 !results/.gitkeep
-# The Phase-6 bluesky results panel is SOURCE, not ML output — the broad
-# unanchored results/ ignore above must not swallow it.
-!src/osprey/services/bluesky_panels/panels/results/
+# Any source dir named results/ is SOURCE, not ML output — the broad unanchored
+# results/ ignore above must not swallow it (this negation is deliberately
+# path-independent: pinning it to one package broke when the bluesky-web
+# sidecar moved services/ -> interfaces/, silently dropping the panel from the move).
+!src/**/results/
 # Benchmark model-matrix run exhaust (#259) — regenerable from scripts/benchmark/.
 # All generated artifacts (dashboard.html, results_box/, live_updater.log) live
 # under one output dir co-located with the tooling, keeping the repo root clean.
@@ -97,6 +108,7 @@ scripts/benchmark/_out/
 # Logs
 logs/
 *.log
+!tests/deployment/fixtures/*.log
 tensorboard/
 
 # Temporary files
@@ -120,6 +132,10 @@ valves.json
 
 # Agent data directories
 _agent_data/*
+.agents/
+
+# Local coding-agent guidance (kept out of git; see /CLAUDE.md below)
+AGENTS.md
 
 # Sample logbook data (large JSONL files)
 logbook_*.jsonl
@@ -140,18 +156,6 @@ _issues
 # Git worktrees
 .worktrees/
 
-# Tutorials and examples
-weather-agent/
-my-control-assistant/
-my-lattice-assistant/
-my-ariel-standalone/
-my-agent/_audit/
-
-# Persona projects auto-rendered by `osprey deploy up` for the multi-user
-# web-terminal stack (regenerate: re-run `osprey deploy up`)
-control-assistant-operator/
-control-assistant-physicist/
-
 # Generated benchmark databases (regenerate: uv run python scripts/generate_benchmark_suite.py)
 data/benchmarks/cross_paradigm/tier*/
 
@@ -165,12 +169,34 @@ src/osprey/interfaces/tuning/static/vendor/
 src/osprey/interfaces/lattice_dashboard/static/vendor/
 tests/e2e/claude_code/benchmark_results/
 
+# Benchmark results accidentally produced inside the packaged template tree
+# (running the channel-finder benchmark from the template dir writes here;
+# the wheel packages all of src/osprey, so results must never land in git
+# or the build — see also the hatch exclude in pyproject.toml)
+src/osprey/templates/apps/control_assistant/data/benchmarks/results/
+
 # Playwright MCP browser-session cache (page snapshots, console logs)
 .playwright-mcp/
 
 # Node.js (dev-only JS toolchain; not part of the Python wheel)
 node_modules/
 
-# feature-scaffolding logs
-.claude/.logs/.state/
-.claude/.logs/*.jsonl
+# Working directory gitlab-ci-local writes when the deploy goldens are checked
+# against a real pipeline parser. Created wherever the check is run from.
+.gitlab-ci-local/
+
+# Version stamp written by the hatch-vcs build hook. Committing it would recreate
+# the stale-literal problem the git-derived version exists to remove. It is still
+# packaged into the wheel and sdist — the hook registers it as a build artifact.
+src/osprey/_version.py
+
+# feature-scaffolding logs (not committed)
+.claude/.logs/
+
+# Process scaffolding — never committed (specs/plans live here uncommitted)
+docs/superpowers/
+
+# Locally scaffolded deployment project. Carries a real .env, build output and
+# run data; belongs to the working copy, never to the repo. Anchored to the root
+# so the pattern cannot swallow a same-named path elsewhere in the tree.
+/my-control-assistant/

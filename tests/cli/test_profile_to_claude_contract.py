@@ -14,6 +14,7 @@ These tests lock down the translation from profile inputs into rendered
 from __future__ import annotations
 
 import json
+import logging
 import re
 import textwrap
 from pathlib import Path
@@ -289,8 +290,8 @@ _FRAMEWORK_AGENT_EXPECTED: dict[str, dict[str, list[str]]] = {
             "mcp__osprey_workspace__create_document",
             "mcp__osprey_workspace__artifact_save",
             "mcp__osprey_workspace__artifact_get",
-            "mcp__osprey_workspace__data_list",
-            "mcp__osprey_workspace__data_read",
+            "mcp__osprey_workspace__artifact_list",
+            "mcp__osprey_workspace__artifact_read",
             "mcp__osprey_workspace__facility_description",
             "Read",
         ],
@@ -313,8 +314,8 @@ _FRAMEWORK_AGENT_EXPECTED: dict[str, dict[str, list[str]]] = {
             "mcp__python__execute",
             "mcp__osprey_workspace__submit_response",
             "mcp__osprey_workspace__artifact_save",
-            "mcp__osprey_workspace__data_list",
-            "mcp__osprey_workspace__data_read",
+            "mcp__osprey_workspace__artifact_list",
+            "mcp__osprey_workspace__artifact_read",
             "Read",
         ],
         "disallowedTools": [
@@ -379,6 +380,46 @@ def test_disallowed_tools_includes_skill_and_agent(built_control_assistant_proje
         disallowed = _split_csv(fm.get("disallowedTools"))
         assert "Skill" in disallowed, f"{agent_name}: Skill not denied"
         assert "Agent" in disallowed, f"{agent_name}: Agent not denied"
+
+
+# ---------------------------------------------------------------------------
+# Narrowed artifact selections
+# ---------------------------------------------------------------------------
+
+
+def test_narrowed_skill_selection_renders_only_the_selected_skills(tmp_path):
+    """A caller-supplied selection that NARROWS ``skills`` renders only those skills.
+
+    Skills are the one artifact family whose rendering is decided solely by the
+    resolved output manifest: hooks and rules render from ``.j2`` templates that
+    gate on the selection themselves, and agents are filtered from the registry
+    before the copy, so for all three the manifest can only ever remove. Skills
+    are plain ``.md`` files copied whenever the manifest names them, so a
+    manifest built from anything other than the caller's own selection decides
+    the skill set on its own — which is how a persona that drops a skill by name
+    still ended up shipping it.
+
+    Pins a selection strictly smaller than the ``control_assistant`` bundle's,
+    because that is the case a same-or-wider selection cannot distinguish.
+    """
+    manager = TemplateManager()
+    project = manager.create_project(
+        project_name="narrowed-skills",
+        output_dir=tmp_path,
+        data_bundle="control_assistant",
+        context={"channel_finder_mode": "hierarchical"},
+        artifacts={
+            "hooks": ["hook-log", "hook-config"],
+            "rules": ["safety", "timezone"],
+            "skills": ["session-report"],
+            "output_styles": ["control-operator"],
+            "web_panels": ["ariel"],
+        },
+    )
+
+    skills_dir = project / ".claude" / "skills"
+    rendered = sorted(p.name for p in skills_dir.iterdir()) if skills_dir.exists() else []
+    assert rendered == ["session-report"]
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +548,133 @@ def test_extends_phoebus2_rendered_artifacts(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# hook_config.json: control_system.write_tools merge + empty-server rendering
+# ---------------------------------------------------------------------------
+
+
+def _read_hook_config(project: Path) -> dict:
+    return json.loads((project / ".claude" / "hooks" / "hook_config.json").read_text())
+
+
+def _server_names_from_prefixes(hook_cfg: dict) -> list[str]:
+    """Recover enabled server names from ``mcp__<name>__`` hook_config prefixes."""
+    return [p[len("mcp__") : -len("__")] for p in hook_cfg["server_prefixes"]]
+
+
+def test_hook_config_write_tools_dedupe(tmp_path):
+    """``control_system.write_tools`` merges into hook_config without duplicating.
+
+    The writes-check hook rules of every enabled server already contribute their
+    matcher to ``write_tools``. A facility that re-states one of those matchers
+    in ``control_system.write_tools`` (a natural thing to do when spelling out
+    the kill-switch set explicitly) must not get it twice — only genuinely new
+    entries are appended, in config order, after the server-derived ones.
+    """
+    manager = TemplateManager()
+    project = manager.create_project(
+        project_name="write-tools-dedupe",
+        output_dir=tmp_path,
+        data_bundle="hello_world",
+    )
+
+    baseline = _read_hook_config(project)["write_tools"]
+    assert "mcp__controls__channel_write" in baseline, (
+        f"expected the controls writes-check rule to seed write_tools; got {baseline}"
+    )
+
+    from osprey.utils.config_writer import config_update_fields
+
+    config_update_fields(
+        project / "config.yml",
+        {
+            "control_system.write_tools": [
+                "mcp__controls__channel_write",  # already server-derived
+                "mcp__facility__custom_write",  # genuinely new
+            ]
+        },
+    )
+    manager.regenerate_claude_code(project)
+
+    write_tools = _read_hook_config(project)["write_tools"]
+
+    assert write_tools.count("mcp__controls__channel_write") == 1, (
+        f"already-present entry duplicated by the config merge: {write_tools}"
+    )
+    assert write_tools == [*baseline, "mcp__facility__custom_write"], (
+        f"expected only the new entry appended to {baseline}; got {write_tools}"
+    )
+
+
+def test_hook_config_with_no_enabled_servers(tmp_path):
+    """Disabling every server still yields valid JSON with empty lists.
+
+    The hook runtime reads this file unconditionally, so the all-disabled corner
+    must render as a well-formed document with empty collections rather than a
+    truncated or absent one.
+    """
+    manager = TemplateManager()
+    project = manager.create_project(
+        project_name="no-servers",
+        output_dir=tmp_path,
+        data_bundle="hello_world",
+    )
+
+    enabled = _server_names_from_prefixes(_read_hook_config(project))
+    assert enabled, "fixture precondition: the preset must ship some enabled servers"
+
+    from osprey.utils.config_writer import config_update_fields
+
+    config_update_fields(
+        project / "config.yml",
+        {f"claude_code.servers.{name}.enabled": False for name in enabled},
+    )
+    manager.regenerate_claude_code(project)
+
+    # json.loads is the validity assertion — a truncated render raises here.
+    hook_cfg = _read_hook_config(project)
+    assert hook_cfg == {
+        "server_prefixes": [],
+        "approval_prefixes": [],
+        "write_tools": [],
+    }, f"all-disabled build should render empty lists; got {hook_cfg}"
+
+
+# ---------------------------------------------------------------------------
+# Panel-awareness hooks: rendered into the project and wired to their event
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "hook_file,event",
+    [
+        ("osprey_panels_context.py", "SessionStart"),
+        ("osprey_workspace_delta.py", "UserPromptSubmit"),
+    ],
+)
+def test_panel_hooks_rendered_and_wired(built_control_assistant_project, hook_file, event):
+    """Both halves of panel awareness must survive a fresh render.
+
+    The template hook directory is catalog-bound: a hook file that is not listed
+    in the build-artifact catalog and the template manifest never reaches a
+    project's ``.claude/hooks/``, and one that is shipped but wired to no event
+    never runs. Neither failure is visible from the template tree alone, which
+    is what this pair of assertions covers.
+    """
+    project = built_control_assistant_project
+
+    assert (project / ".claude" / "hooks" / hook_file).is_file(), (
+        f"{hook_file} was not rendered into the project — check the build-artifact "
+        f"catalog and the template manifest"
+    )
+
+    settings = json.loads((project / ".claude" / "settings.json").read_text())
+    commands = [hook["command"] for rule in settings["hooks"][event] for hook in rule["hooks"]]
+    assert any(hook_file in command for command in commands), (
+        f"{hook_file} is shipped but wired to no {event} entry in settings.json"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Crown-jewel invariant
 # ---------------------------------------------------------------------------
 
@@ -603,22 +771,23 @@ def test_crown_jewel_invariant_accepts_prefix_match_on_existing_allow(
 # ---------------------------------------------------------------------------
 
 
-def test_build_command_fails_on_violation(tmp_path, monkeypatch):
-    """``osprey build`` must abort when an overlay agent declares an unbacked tool.
+def test_build_command_fails_on_violation(tmp_path, monkeypatch, caplog):
+    """``osprey build`` must abort when a profile agent declares an unbacked tool.
 
-    Uses a synthetic profile with an overlay agent .md that references a
-    tool which is not in any framework MCP server's permissions.allow.
+    Uses a synthetic profile whose ``agents/`` convention directory holds an
+    agent .md referencing a tool that is not in any framework MCP server's
+    permissions.allow.
     """
-    profile_dir = tmp_path / "profile"
+    profile_dir = tmp_path / "broken-deployment"
     profile_dir.mkdir()
-    overlay_dir = profile_dir / "agents"
-    overlay_dir.mkdir()
-    (overlay_dir / "bogus.md").write_text(
+    agents_dir = profile_dir / "agents"
+    agents_dir.mkdir()
+    (agents_dir / "bogus.md").write_text(
         textwrap.dedent(
             """\
             ---
             name: bogus
-            description: An overlay agent with an unbacked tool — should fail build.
+            description: A profile agent with an unbacked tool — should fail build.
             tools: mcp__nonexistent__phantom_tool
             ---
 
@@ -628,7 +797,7 @@ def test_build_command_fails_on_violation(tmp_path, monkeypatch):
         encoding="utf-8",
     )
 
-    profile_yaml = profile_dir / "broken.yml"
+    profile_yaml = profile_dir / "profile.yml"
     profile_yaml.write_text(
         yaml.dump(
             {
@@ -636,9 +805,6 @@ def test_build_command_fails_on_violation(tmp_path, monkeypatch):
                 "data_bundle": "hello_world",
                 "provider": "anthropic",
                 "model": "claude-haiku-4-5",
-                "overlay": {
-                    "agents/bogus.md": ".claude/agents/bogus.md",
-                },
                 "config": {"control_system.type": "mock"},
             },
             default_flow_style=False,
@@ -646,22 +812,18 @@ def test_build_command_fails_on_violation(tmp_path, monkeypatch):
     )
 
     runner = CliRunner()
-    result = runner.invoke(
-        build,
-        [
-            "broken-build",
-            str(profile_yaml),
-            "--output-dir",
-            str(tmp_path / "out"),
-            "--skip-deps",
-            "--skip-lifecycle",
-            "--force",
-        ],
-        catch_exceptions=False,
-    )
+    with caplog.at_level(logging.WARNING):
+        result = runner.invoke(
+            build,
+            ["--repo", str(profile_dir), "--skip-deps", "--skip-lifecycle"],
+            catch_exceptions=False,
+        )
 
     assert result.exit_code != 0, f"build should have failed; stdout:\n{result.output}"
-    # Validator's diagnostic should mention the bogus agent and tool.
-    assert "bogus" in result.output or "phantom_tool" in result.output, (
-        f"build output should name the violation; got:\n{result.output}"
+    # The validator's diagnostic is logged, so it reaches the operator on
+    # stderr rather than stdout. click's Result.output mixes both streams and
+    # cannot distinguish them, so assert on the record itself.
+    assert "bogus" in caplog.text or "phantom_tool" in caplog.text, (
+        f"build should name the violation; got records:\n"
+        f"{[record.getMessage()[:120] for record in caplog.records]}"
     )

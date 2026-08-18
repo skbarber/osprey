@@ -35,15 +35,15 @@ from osprey.mcp_server.dispatch_worker import sdk_runner
 def _stub_osprey_helpers(monkeypatch):
     """Stub the deferred OSPREY helper imports on their source modules."""
     monkeypatch.setattr(
-        "osprey.interfaces.web_terminal.operator_session.build_clean_env",
+        "osprey.agent_runner.clean_env.build_clean_env",
         lambda **kw: {},
     )
     monkeypatch.setattr(
-        "osprey.interfaces.web_terminal.sdk_context.build_system_prompt",
+        "osprey.agent_runner.sdk_context.build_system_prompt",
         lambda *a, **k: "system",
     )
     monkeypatch.setattr(
-        "osprey.interfaces.web_terminal.sdk_context.make_tool_allowlist",
+        "osprey.agent_runner.sdk_context.make_tool_allowlist",
         lambda tools, denied=(): lambda *a, **k: None,
     )
     monkeypatch.setattr(
@@ -69,11 +69,11 @@ async def _drain(queue: asyncio.Queue) -> list[dict]:
 
 @pytest.mark.asyncio
 async def test_happy_path(monkeypatch):
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         yield AssistantMessage(content=[TextBlock(text="hello world")], model="m")
         yield _result_message(cost_usd=0.5, num_turns=4)
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
 
     queue: asyncio.Queue = asyncio.Queue()
     result = await sdk_runner.run_dispatch("do it", ["Read"], event_queue=queue)
@@ -98,7 +98,7 @@ async def test_tool_result_in_user_message_is_captured(monkeypatch):
     must pair them with the originating ToolUseBlock (permission-denial
     messages surface this way; the parity e2e depends on seeing them)."""
 
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         yield AssistantMessage(
             content=[ToolUseBlock(id="tu1", name="mcp__x__y", input={})], model="m"
         )
@@ -112,7 +112,7 @@ async def test_tool_result_in_user_message_is_captured(monkeypatch):
         )
         yield _result_message(cost_usd=0.1, num_turns=1)
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
 
     result = await sdk_runner.run_dispatch("go", ["Read"], event_queue=asyncio.Queue())
 
@@ -138,21 +138,24 @@ async def test_tool_policy_wiring(monkeypatch, tmp_path):
     """
     from types import SimpleNamespace
 
-    # Arrange — a project with one declared subagent
-    agents_dir = tmp_path / ".claude" / "agents"
+    # Arrange — a repo whose RENDER declares one subagent. ``.claude/`` is build
+    # output, so it sits in the render beside the rendered config, never at the
+    # repo root.
+    agents_dir = tmp_path / "build" / ".claude" / "agents"
     agents_dir.mkdir(parents=True)
     (agents_dir / "channel-finder.md").write_text(
         "---\nname: channel-finder\ntools: mcp__channel-finder__search\n---\n"
     )
     monkeypatch.setenv("OSPREY_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("CONFIG_FILE", str(tmp_path / "build" / "config.yml"))
     captured: dict = {}
 
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         captured["options"] = options
         yield AssistantMessage(content=[TextBlock(text="ok")], model="m")
         yield _result_message(cost_usd=0.1, num_turns=1)
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
 
     # Act
     await sdk_runner.run_dispatch(
@@ -180,7 +183,7 @@ async def test_tool_policy_wiring(monkeypatch, tmp_path):
     assert len(matchers) == 1
     assert matchers[0].matcher is None
     (hook,) = matchers[0].hooks
-    denied = await hook({"tool_name": "mcp__osprey_workspace__data_list"}, "t", None)
+    denied = await hook({"tool_name": "mcp__osprey_workspace__artifact_list"}, "t", None)
     assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
     allowed = await hook({"tool_name": "mcp__controls__channel_read"}, "t", None)
     assert allowed == {}
@@ -204,26 +207,154 @@ async def test_tool_policy_wiring(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_config_file_env_points_at_project(monkeypatch):
-    """The dispatched agent's env sets CONFIG_FILE to the project's config.yml.
+async def test_config_file_env_points_at_the_render(monkeypatch):
+    """The dispatched agent's env sets CONFIG_FILE to the RENDER's config.yml.
 
     The worker process CWD is the image WORKDIR (not the project dir), and
     OSPREY config resolution falls back to CWD/config.yml when CONFIG_FILE is
     unset — so without this, every dispatched run errors with "No config.yml
-    found in current directory". Regression guard for that container bug.
+    found in current directory". With no CONFIG_FILE in the worker's own
+    environment the fallback is the repo's render zone, never a flat
+    ``<repo>/config.yml`` — a path no three-zone deployment has.
     """
     monkeypatch.setenv("OSPREY_PROJECT_DIR", "/srv/myproj")
+    monkeypatch.delenv("CONFIG_FILE", raising=False)
+    monkeypatch.delenv("OSPREY_CONFIG", raising=False)
     captured: dict = {}
 
-    async def fake_query(prompt, options):
+    async def fake_query(options, render_dir, prompt):
+        captured["options"] = options
+        captured["render_dir"] = render_dir
+        yield AssistantMessage(content=[TextBlock(text="ok")], model="m")
+        yield _result_message(cost_usd=0.1, num_turns=1)
+
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
+    await sdk_runner.run_dispatch("do it", ["Read"], event_queue=asyncio.Queue())
+
+    assert captured["options"].env["CONFIG_FILE"] == "/srv/myproj/build/config.yml"
+
+
+@pytest.mark.asyncio
+async def test_worker_trusts_the_config_file_its_service_sets(monkeypatch):
+    """CONFIG_FILE from the environment is carried through, never re-derived.
+
+    The dispatch-worker compose service sets it to the staged render config it
+    bind-mounts; a runner that recomputed the path from OSPREY_PROJECT_DIR would
+    silently point the agent at a different file than the worker itself reads.
+    """
+    monkeypatch.setenv("OSPREY_PROJECT_DIR", "/srv/myproj")
+    monkeypatch.setenv("CONFIG_FILE", "/srv/staged/config.yml")
+    captured: dict = {}
+
+    async def fake_query(options, render_dir, prompt):
+        captured["options"] = options
+        captured["render_dir"] = render_dir
+        yield AssistantMessage(content=[TextBlock(text="ok")], model="m")
+        yield _result_message(cost_usd=0.1, num_turns=1)
+
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
+    await sdk_runner.run_dispatch("do it", ["Read"], event_queue=asyncio.Queue())
+
+    assert captured["options"].env["CONFIG_FILE"] == "/srv/staged/config.yml"
+    # ...and the agent runs beside that config, so it discovers the .claude/
+    # tree and .mcp.json that were rendered with it.
+    assert captured["options"].cwd == "/srv/staged"
+    assert captured["render_dir"] == "/srv/staged"
+
+
+@pytest.mark.asyncio
+async def test_subagent_surfaces_are_discovered_from_the_render(tmp_path, monkeypatch):
+    """Declared subagents are read from the render's ``.claude/agents/``.
+
+    SAFETY surface. The allowlist is enforced per-context: a subagent is held to
+    its own declared tools, and delegation to an agent the parser never saw is
+    denied outright. Reading the repo root instead of the render finds no agent
+    files at all — which stays fail-closed (every delegation denied) but costs
+    dispatch its subagents silently, so pin the discovery path itself.
+    """
+    agents_dir = tmp_path / "build" / ".claude" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "channel-finder.md").write_text(
+        "---\nname: channel-finder\ntools: mcp__channel-finder__search\n---\n"
+    )
+    # A decoy at the repo root: the parser must NOT pick this up.
+    root_agents = tmp_path / ".claude" / "agents"
+    root_agents.mkdir(parents=True)
+    (root_agents / "impostor.md").write_text("---\nname: impostor\ntools: Bash\n---\n")
+
+    monkeypatch.setenv("OSPREY_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("CONFIG_FILE", str(tmp_path / "build" / "config.yml"))
+    captured: dict = {}
+
+    async def fake_query(options, render_dir, prompt):
         captured["options"] = options
         yield AssistantMessage(content=[TextBlock(text="ok")], model="m")
         yield _result_message(cost_usd=0.1, num_turns=1)
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
     await sdk_runner.run_dispatch("do it", ["Read"], event_queue=asyncio.Queue())
 
-    assert captured["options"].env["CONFIG_FILE"] == "/srv/myproj/config.yml"
+    (hook,) = captured["options"].hooks["PreToolUse"][0].hooks
+    delegate = {"tool_name": "Task", "tool_input": {"subagent_type": "channel-finder"}}
+    assert await hook(delegate, "t", None) == {}
+    # The repo-root file is not the agent surface — delegating to it is denied.
+    impostor = {"tool_name": "Task", "tool_input": {"subagent_type": "impostor"}}
+    assert (await hook(impostor, "t", None))["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_no_discoverable_agents_denies_every_delegation(tmp_path, monkeypatch):
+    """A worker that finds NO agent files stays fail-closed.
+
+    An empty surface map must never mean "anything goes": both delegation and
+    any tool call arriving in a subagent context are denied.
+    """
+    monkeypatch.setenv("OSPREY_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("CONFIG_FILE", str(tmp_path / "build" / "config.yml"))
+    captured: dict = {}
+
+    async def fake_query(options, render_dir, prompt):
+        captured["options"] = options
+        yield AssistantMessage(content=[TextBlock(text="ok")], model="m")
+        yield _result_message(cost_usd=0.1, num_turns=1)
+
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
+    await sdk_runner.run_dispatch("do it", ["Read"], event_queue=asyncio.Queue())
+
+    (hook,) = captured["options"].hooks["PreToolUse"][0].hooks
+    delegate = {"tool_name": "Task", "tool_input": {"subagent_type": "channel-finder"}}
+    assert (await hook(delegate, "t", None))["hookSpecificOutput"]["permissionDecision"] == "deny"
+    in_subagent = {"tool_name": "Read", "agent_id": "a1", "agent_type": "channel-finder"}
+    assert (await hook(in_subagent, "t", None))["hookSpecificOutput"][
+        "permissionDecision"
+    ] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_subagent_delegation_runs_in_the_foreground(monkeypatch):
+    """The dispatched agent's env disables background tasks.
+
+    Since Claude Code CLI 2.1.x the Agent tool auto-backgrounds delegated
+    subagents: the turn ends immediately and the subagent's results arrive on a
+    *later* turn as a task notification. ``_drain_response`` stops at the first
+    ResultMessage, so the worker would answer "the agent is searching, I'll
+    notify you when it completes" and never deliver the delegated work.
+
+    ``build_clean_env()`` strips every ``CLAUDE_CODE_*`` key, so this guard
+    cannot be inherited — the worker has to set it explicitly. Regression guard
+    for that silent under-run.
+    """
+    captured: dict = {}
+
+    async def fake_query(options, project_dir, prompt):
+        captured["options"] = options
+        yield AssistantMessage(content=[TextBlock(text="ok")], model="m")
+        yield _result_message(cost_usd=0.1, num_turns=1)
+
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
+    await sdk_runner.run_dispatch("do it", ["Read"], event_queue=asyncio.Queue())
+
+    assert captured["options"].env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
 
 
 @pytest.mark.asyncio
@@ -234,7 +365,7 @@ async def test_sdk_missing(monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("query should not be called when HAS_SDK is False")
 
-    monkeypatch.setattr(sdk_runner, "query", _boom)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", _boom)
 
     result = await sdk_runner.run_dispatch("do it", ["Read"])
     assert result["status"] == "error"
@@ -243,11 +374,11 @@ async def test_sdk_missing(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_cancellation_propagates(monkeypatch):
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         yield AssistantMessage(content=[TextBlock(text="partial")], model="m")
         raise asyncio.CancelledError
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
 
     with pytest.raises(asyncio.CancelledError):
         await sdk_runner.run_dispatch("do it", ["Read"], event_queue=asyncio.Queue())
@@ -255,11 +386,11 @@ async def test_cancellation_propagates(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_error_path_does_not_raise(monkeypatch):
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         raise Exception("boom")
         yield  # pragma: no cover - makes this an async generator
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
 
     queue: asyncio.Queue = asyncio.Queue()
     result = await sdk_runner.run_dispatch("do it", ["Read"], event_queue=queue)
@@ -284,11 +415,11 @@ async def test_inactivity_timeout_aborts_with_clear_error(monkeypatch):
     stalling silently to the outer dispatch timeout."""
     monkeypatch.setattr(sdk_runner, "_INACTIVITY_TIMEOUT_SEC", 0.2, raising=False)
 
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         await asyncio.sleep(30)  # hang — never yields a message
         yield  # pragma: no cover - never reached
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
 
     queue: asyncio.Queue = asyncio.Queue()
     # Outer guard so a regression (no watchdog) fails fast instead of hanging
@@ -314,12 +445,12 @@ async def test_inactivity_timeout_after_partial_progress(monkeypatch):
     then stalls is still aborted, with the partial text preserved."""
     monkeypatch.setattr(sdk_runner, "_INACTIVITY_TIMEOUT_SEC", 0.2, raising=False)
 
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         yield AssistantMessage(content=[TextBlock(text="working...")], model="m")
         await asyncio.sleep(30)  # then hang
         yield  # pragma: no cover - never reached
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
     result = await asyncio.wait_for(
         sdk_runner.run_dispatch("do it", ["Read"], event_queue=asyncio.Queue()),
         timeout=5,
@@ -353,11 +484,11 @@ def test_scrub_replaces_secret_values():
 async def test_oversized_text_output_is_truncated(monkeypatch):
     huge = "y" * (sdk_runner._MAX_TEXT_OUTPUT + 10000)
 
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         yield AssistantMessage(content=[TextBlock(text=huge)], model="m")
         yield _result_message(cost_usd=0.1, num_turns=1)
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
     result = await sdk_runner.run_dispatch("do it", ["Read"], event_queue=asyncio.Queue())
 
     assert len(result["text_output"]) <= sdk_runner._MAX_TEXT_OUTPUT + 100
@@ -369,11 +500,11 @@ async def test_secret_scrubbed_from_text_output(monkeypatch):
     secret = "tok-abcdef-1234567890"  # len >= 12
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", secret)
 
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         yield AssistantMessage(content=[TextBlock(text=f"leaked {secret} here")], model="m")
         yield _result_message(cost_usd=0.1, num_turns=1)
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
     result = await sdk_runner.run_dispatch("do it", ["Read"], event_queue=asyncio.Queue())
 
     assert secret not in result["text_output"]
@@ -385,7 +516,7 @@ async def test_tool_use_and_result_are_captured(monkeypatch):
     """A ToolUseBlock + matching ToolResultBlock land in tool_calls with the result."""
     from claude_agent_sdk import ToolResultBlock, ToolUseBlock
 
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         yield AssistantMessage(
             content=[ToolUseBlock(id="tu1", name="Read", input={"path": "f"})], model="m"
         )
@@ -394,7 +525,7 @@ async def test_tool_use_and_result_are_captured(monkeypatch):
         )
         yield _result_message(cost_usd=0.2, num_turns=2)
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
     queue: asyncio.Queue = asyncio.Queue()
     result = await sdk_runner.run_dispatch("do it", ["Read"], event_queue=queue)
 
@@ -426,15 +557,15 @@ async def test_surface_prompt_forwarded_to_build_system_prompt(monkeypatch):
         return "system"
 
     monkeypatch.setattr(
-        "osprey.interfaces.web_terminal.sdk_context.build_system_prompt",
+        "osprey.agent_runner.sdk_context.build_system_prompt",
         _spy_build_system_prompt,
     )
 
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         yield AssistantMessage(content=[TextBlock(text="ok")], model="m")
         yield _result_message(cost_usd=0.1, num_turns=1)
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
     await sdk_runner.run_dispatch(
         "do it", ["Read"], event_queue=asyncio.Queue(), surface_prompt="triggered from Slack"
     )
@@ -455,15 +586,15 @@ async def test_surface_prompt_omitted_leaves_system_prompt_unchanged(monkeypatch
         return "system"
 
     monkeypatch.setattr(
-        "osprey.interfaces.web_terminal.sdk_context.build_system_prompt",
+        "osprey.agent_runner.sdk_context.build_system_prompt",
         _spy_build_system_prompt,
     )
 
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         yield AssistantMessage(content=[TextBlock(text="ok")], model="m")
         yield _result_message(cost_usd=0.1, num_turns=1)
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
     await sdk_runner.run_dispatch("do it", ["Read"], event_queue=asyncio.Queue())
 
     assert len(calls) == 1
@@ -477,14 +608,14 @@ async def test_oversized_tool_result_is_truncated(monkeypatch):
 
     huge = "z" * (sdk_runner._MAX_TOOL_RESULT + 5000)
 
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         yield AssistantMessage(content=[ToolUseBlock(id="tu1", name="Read", input={})], model="m")
         yield AssistantMessage(
             content=[ToolResultBlock(tool_use_id="tu1", content=huge)], model="m"
         )
         yield _result_message(cost_usd=0.1, num_turns=1)
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
     result = await sdk_runner.run_dispatch("do it", ["Read"], event_queue=asyncio.Queue())
 
     body = result["tool_calls"][0]["result"]

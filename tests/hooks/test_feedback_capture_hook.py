@@ -9,6 +9,8 @@ import json
 
 import pytest
 
+from osprey.utils.workspace import DEFAULT_AGENT_DATA_BASE_DIR
+
 # -- Helpers ------------------------------------------------------------------
 
 
@@ -29,8 +31,15 @@ def _hook_extra(tmp_path):
 
 
 def _pending_items(tmp_path):
-    """Read items from pending_reviews.json, return dict or empty."""
-    store = tmp_path / "data" / "feedback" / "pending_reviews.json"
+    """Read items from pending_reviews.json, return dict or empty.
+
+    The store lives under the agent-data root — it is written while the agent
+    runs, and a project's ``data/`` tree is build-owned while ``build/`` is
+    re-rendered by every build. The root is taken from the same constant the
+    hook resolves, so a relocated ``agent_data.base_dir`` moves both together
+    instead of leaving this reading an empty directory and reporting no items.
+    """
+    store = tmp_path / DEFAULT_AGENT_DATA_BASE_DIR / "feedback" / "pending_reviews.json"
     if not store.exists():
         return {}
     data = json.loads(store.read_text())
@@ -114,7 +123,7 @@ class TestFeedbackCaptureResultUnwrapping:
 
         hook_runner(
             "osprey_cf_feedback_capture.py",
-            "mcp__channel-finder__query_channels",
+            "mcp__channel-finder__ask_channels",
             {"query": "correctors", "facility": "test"},
             cwd=tmp_path,
             tool_response=resp,
@@ -282,3 +291,32 @@ class TestFeedbackCaptureNoTotal:
 
         items = _pending_items(tmp_path)
         assert len(items) == 0, f"Expected no items for total=0, got: {items}"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "stdin",
+    ["", "{nope", "[]", "[1,2,3]"],
+    ids=["empty", "invalid-json", "wrong-shape", "wrong-shape-truthy"],
+)
+def test_malformed_stdin_fails_open(tmp_path, hook_runner_raw, stdin):
+    """Unusable stdin captures nothing and leaves the tool call untouched.
+
+    A closed pipe, a truncated write and a non-object payload — falsy (``[]``)
+    or truthy (``[1,2,3]``) — give the hook no channel finder result to store,
+    so it exits 0 without writing a pending review or a decision envelope. The
+    truthy payload is the one an emptiness check lets through, so it has to be
+    rejected on shape.
+    """
+    returncode, stdout, stderr = hook_runner_raw(
+        "osprey_cf_feedback_capture.py",
+        tool_name=None,
+        tool_input=None,
+        cwd=tmp_path,
+        stdin_override=stdin,
+    )
+
+    assert returncode == 0
+    assert stdout.strip() == ""
+    assert "Traceback" not in stderr
+    assert _pending_items(tmp_path) == {}

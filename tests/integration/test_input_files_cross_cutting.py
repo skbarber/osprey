@@ -6,7 +6,9 @@ belong to neither single unit's test module:
 1. **Combined-cap arithmetic** — the caller-file cap, the follow-up re-injection
    cap, and a folded-history budget are sized so a worst-case request body still
    fits the 32 MB request-body limit with roughly a quarter to spare. A change to
-   any one constant that eroded that headroom is caught here.
+   any one constant that eroded that headroom is caught here. Both sides are
+   imported — the bridge budgets from ``osprey.bridges.core.pipeline``, the worker
+   caps from ``input_files_policy`` — so this catches either side moving alone.
 2. **No base64 payload leak, end to end** — a file's ``content_b64`` bytes ride
    only an image content block; they must never reach the assembled prompt text,
    the persisted run record, the dispatcher's recorded history, or any log sink.
@@ -15,7 +17,7 @@ belong to neither single unit's test module:
    must gate the feature on the ``/health`` capability rather than assume the
    worker consumed the batch.
 4. **Fatal-4xx error_code propagation** — a worker 400 with a machine-readable
-   ``detail`` travels webhook -> worker_client ``FatalDispatchError`` -> pool
+   ``detail`` travels webhook -> worker_client ``WorkerRejectedRequestError`` -> pool
    record -> the dispatcher's ``/dispatch/{id}`` poll body as a top-level error
    carrying the same ``error_code``.
 
@@ -37,10 +39,16 @@ from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 from pydantic import BaseModel
 from starlette.testclient import TestClient
 
+from osprey.bridges.core.pipeline import (
+    MAX_FILES,
+    MAX_TOTAL_BYTES,
+    REINJECT_MAX_IMAGES,
+    REINJECT_MAX_TOTAL_BYTES,
+)
 from osprey.dispatch import server
 from osprey.dispatch.sources.webhook import _MAX_WEBHOOK_BYTES, WebhookSource
 from osprey.dispatch.trigger_config import TriggerConfig
-from osprey.dispatch.worker_client import FatalDispatchError
+from osprey.dispatch.worker_client import WorkerRejectedRequestError
 from osprey.mcp_server.dispatch_worker import dispatch_api, sdk_runner
 from osprey.mcp_server.dispatch_worker.dispatch_api import (
     MAX_REQUEST_BYTES,
@@ -60,18 +68,19 @@ _MiB = 1024 * 1024
 # 1. Combined-cap arithmetic pin
 # ===========================================================================
 
-# Bridge-side inbound caps, mirrored here as documented literals because the
-# bridge lives in a separate repository and cannot be imported. A follow-up
+# Bridge-side inbound caps, IMPORTED from the engine that enforces them. They were
+# once mirrored here as literals, on the premise that the bridge lived in a separate
+# repository — it does not, so the mirror only ever compared one literal against
+# another and would not have noticed the bridge raising its own budget. A follow-up
 # request may carry, at most, a batch of newly-attached caller files PLUS a
-# re-injection of a few recent prior images:
-#   * new caller files: at most 5 files, 10 MiB decoded in total (inbound);
-#   * re-injected prior images: at most 3 images, 8 MiB decoded in total.
-# The worker's own ceiling (MAX_TOTAL_DECODED_BYTES) is what actually bounds the
-# sum; these two caps are sized so their sum lands exactly on it.
-_BRIDGE_NEW_FILES_MAX_DECODED = 10 * _MiB
-_BRIDGE_REINJECT_MAX_DECODED = 8 * _MiB
-_BRIDGE_NEW_FILES_MAX_COUNT = 5
-_BRIDGE_REINJECT_MAX_COUNT = 3
+# re-injection of a few recent prior images. The worker's own ceiling
+# (MAX_TOTAL_DECODED_BYTES) is what actually bounds the sum; the bridge caps are
+# sized so their sum lands exactly on it, and importing them is what makes the
+# assertions below fail if either side moves alone.
+_BRIDGE_NEW_FILES_MAX_DECODED = MAX_TOTAL_BYTES
+_BRIDGE_REINJECT_MAX_DECODED = REINJECT_MAX_TOTAL_BYTES
+_BRIDGE_NEW_FILES_MAX_COUNT = MAX_FILES
+_BRIDGE_REINJECT_MAX_COUNT = REINJECT_MAX_IMAGES
 
 # Prior-turn conversation history folded into the prompt on a follow-up dispatch.
 _HISTORY_BUDGET_BYTES = 40 * 1024
@@ -144,11 +153,11 @@ def _project_root(tmp_path: Path, monkeypatch) -> Path:
 def _stub_sdk_helpers(monkeypatch):
     """Stub the deferred OSPREY helper imports so run_dispatch can be driven."""
     monkeypatch.setattr(
-        "osprey.interfaces.web_terminal.operator_session.build_clean_env",
+        "osprey.agent_runner.clean_env.build_clean_env",
         lambda **kw: {},
     )
     monkeypatch.setattr(
-        "osprey.interfaces.web_terminal.sdk_context.build_system_prompt",
+        "osprey.agent_runner.sdk_context.build_system_prompt",
         lambda *a, **k: "system",
     )
     monkeypatch.setattr(
@@ -176,7 +185,7 @@ async def test_input_files_content_b64_absent_from_worker_record_and_logs(
     # then return a normal completion.
     captured: dict = {}
 
-    async def fake_query(prompt, options):  # noqa: A002 - matches SDK signature
+    async def fake_query(options, project_dir, prompt):  # noqa: A002 - matches SDK signature
         messages = []
         async for m in prompt:
             messages.append(m)
@@ -192,7 +201,7 @@ async def test_input_files_content_b64_absent_from_worker_record_and_logs(
         rm.api_error_status = None
         yield rm
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
 
     req = DispatchRequest(
         prompt="describe this",
@@ -395,7 +404,9 @@ def test_input_files_fatal_400_propagates_webhook_to_poll_body(app):
     body as a top-level error carrying the same error_code and trigger name."""
 
     async def _fake_dispatch(**kwargs):
-        raise FatalDispatchError("HTTP 400 from worker", error_code="input_files_cap_exceeded")
+        raise WorkerRejectedRequestError(
+            "HTTP 400 from worker", error_code="input_files_cap_exceeded"
+        )
 
     with patch.object(server, "dispatch_to_worker", _fake_dispatch):
         with TestClient(app) as client:
@@ -434,7 +445,7 @@ def test_input_files_fatal_generic_4xx_propagates_null_error_code(app):
     error, with error_code None rather than an echoed internal detail."""
 
     async def _fake_dispatch(**kwargs):
-        raise FatalDispatchError("HTTP 403 from worker", error_code=None)
+        raise WorkerRejectedRequestError("HTTP 403 from worker", error_code=None)
 
     with patch.object(server, "dispatch_to_worker", _fake_dispatch):
         with TestClient(app) as client:

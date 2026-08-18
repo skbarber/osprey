@@ -17,12 +17,22 @@ Enable OSPREY's built-in panels in ``config.yml``:
        channel-finder: true
        lattice: true
 
+Where the panel rail lives
+--------------------------
+
+Open panels line up in the **panel rail**, which sits along the left edge by
+default. If your team prefers the panel buttons along the top, set
+``web.rail_position: top`` in ``config.yml``, or switch from the panel ``+``
+menu (or the command palette) at any time. The choice is remembered per
+browser, and each user's own pick wins over the configured default. (Pair it
+with the retro theme for a navy-and-teal terminal — see :doc:`theming`.)
+
 Panels backed by a URL
 ----------------------
 
 An entry under ``web.panels`` can also declare a **URL-backed panel** — a tab
 that shows another web service inside the terminal. This is how the EVENTS
-dashboard and the Bluesky PLAN / RESULTS tabs ship in the
+dashboard and the BLUESKY tab ship in the
 ``control-assistant`` preset (a build that includes those stacks registers
 the entries for you):
 
@@ -38,6 +48,27 @@ the entries for you):
 
 The hub shows the service as a tab and proxies requests to it from the same
 origin, so the browser never needs direct access to the backing port.
+
+The Bluesky panel
+-----------------
+
+One tab covers a plan end to end, served by the ``bluesky-web`` sidecar.
+**BLUESKY** (``/bluesky/``) has three views, and the queue's state — with
+**Stop after current item** and **Abort running plan** — stays on screen across
+all three:
+
+**Plans** is where a plan is composed. It binds to the same shared draft the
+OSPREY agent edits, so a field the agent sets glows in the form as it lands,
+and a field you change by hand flows back to the agent. **Add to queue** puts
+the exact revision on screen into the plan queue.
+
+**Queue** lists what the queue server is holding, with **Start queue** and the
+reorder/remove controls, plus the runs that have finished. Picking any run
+opens it under Results. :doc:`/how-to/bluesky/queue` covers what those controls
+do.
+
+**Results** shows the selected run's record and its live figure, with the raw
+data table collapsed underneath and a one-click CSV export.
 
 Adding your own panel
 ---------------------
@@ -89,8 +120,9 @@ unknown id is dropped with a warning, and a layout with no valid members is
 skipped. When no ``web.presets`` are configured — the default — the ``+`` menu is
 unchanged, so layouts never add clutter to a deployment that has not opted in.
 
-Layouts are just a shortcut over the ordinary show/hide of panels, so the OSPREY
-agent can achieve the same result with its ``show_panel`` / ``hide_panel`` tools;
+Layouts are just a shortcut over adding and removing rail entries, so the OSPREY
+agent can achieve the same result with its ``add_panel_to_rail`` /
+``remove_panel_from_rail`` tools;
 ``list_panels`` reports the configured layouts so the agent can honor a request
 like "set up for machine setup."
 

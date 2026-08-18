@@ -1,5 +1,11 @@
+{#- The network axis — this service's network membership and the file-level
+    `networks:` stanza that matches it — is rendered by the shared macro rather
+    than spelled out here, so every service template states the same topology
+    the same way. With no `network:` declared the macros emit exactly the blocks
+    this file carried before it adopted them, byte for byte. -#}
+{%- import "services/_network_axis.j2" as net -%}
 # The dispatch-worker runs the full PROJECT image (<project>:local) that
-# `osprey deploy up` builds from the project root — the same image the web
+# `osprey up` builds from the project root — the same image the web
 # terminal runs, baking the facility overlays and data/ into /app/<project>.
 # It overrides only `command:` to launch the dispatch-worker MCP server instead
 # of the web UI. OSPREY_WORKER_IMAGE overrides with a prebuilt/published image.
@@ -9,17 +15,34 @@
 # Additional workers declared here are provisioned but idle until routing is implemented.
 {% set wc = services.dispatch_worker.worker_count | default(1) %}
 {% set mode = services.dispatch_worker.workspace_mode | default('isolated') %}
+{#- The worker's own axis and port arithmetic, derived once for the whole file.
+
+    On the compose bridge every worker has its own network namespace, so all of
+    them listen on the SAME port and are told apart by their service names. On
+    the host namespace they share one port space, so worker `i` gets its own
+    port `base + (i - 1) * stride` — the same rule the dispatch route and the
+    host-port preflight derive, spelled from the same two config keys rather
+    than repeating the step anywhere.
+
+    Both host-only keys are ABSENT under bridge (writing them would have moved
+    every existing render), so the defaults live here. #}
+{%- set dw = services.dispatch_worker | default({}, true) %}
+{%- set on_host = (dw.network | default('bridge', true)) == 'host' %}
+{%- set port_base = dw.worker_port_base | default(9190) %}
+{%- set port_stride = dw.worker_port_stride | default(1) %}
+{%- set mongo_deployed = 'mongodb' in (deployed_services | default([])) %}
 
 services:
 {% for i in range(1, wc + 1) %}
+{%- set worker_port = (port_base | int) + (i - 1) * (port_stride | int) if on_host else port_base %}
   dispatch-worker-{{ i }}:
     {#- The template-level fallback mirrors _worker_image_target's Python
-        fallback (<project>:local — the PROJECT image `osprey deploy up`
+        fallback (<project>:local — the PROJECT image `osprey up`
         builds), for renders where _inject_project_metadata's setdefault
         didn't fire (e.g. a null `dispatch_worker:` config key). #}
     image: ${OSPREY_WORKER_IMAGE:-{{ services.dispatch_worker.image | default(osprey_labels.project_name ~ ':local') }}}
     # NO build: block here on purpose. The project image (<project>:local) is
-    # built once by `osprey deploy up` (deployment/container_lifecycle.py) from
+    # built once by `osprey up` (deployment/container_lifecycle.py) from
     # the project root before `docker compose up` runs; the worker just
     # references that prebuilt tag. Declaring a second `build:` for it would race
     # the sole builder to tag the same image. `depends_on` keeps the worker
@@ -36,25 +59,65 @@ services:
     command: ["python", "-m", "osprey.mcp_server.dispatch_worker"]
     labels:
       osprey.project.name: "{{ osprey_labels.project_name }}"
+      com.osprey.repo-id: "{{ osprey_labels.repo_id }}"
       osprey.project.root: "{{ osprey_labels.project_root }}"
-      osprey.deployed.at: "{{ osprey_labels.deployed_at }}"
+      # Content fingerprint of the rendered config this deploy built
+      # (runtime_helper's as_built_config_digest, carried in by
+      # OSPREY_CONFIG_DIGEST). The same recreate trigger as the env digest, for
+      # the other file a container reads its settings from: this service mounts
+      # the rendered config.yml, so `osprey set` changes a file the compose
+      # document never mentions and compose would leave the container running on
+      # the settings it parsed at startup. Empty when the invocation did not set
+      # the variable (a hand-run `docker compose up`).
+      osprey.config.digest: "${OSPREY_CONFIG_DIGEST:-}"
+      # Content fingerprint of the env chain this deploy read (runtime_helper's
+      # env_chain_digest, carried in by OSPREY_ENV_DIGEST). It is a label, not
+      # documentation: compose recreates a container when the compose document
+      # changes, and neither provider diffs a running container against the env
+      # FILES it was started from — so without this, editing a chain file left
+      # the running worker on the old values. Folding the chain's hash into a
+      # label makes such an edit a document change. Empty when the invocation
+      # did not set the variable (a hand-run `docker compose up`).
+      osprey.env.digest: "${OSPREY_ENV_DIGEST:-}"
     restart: unless-stopped
-{% if osprey_env_present | default(false) %}
+{% if osprey_env_chain | default([]) %}
     # Provider auth: the worker's startup hook (inject_provider_env) resolves
     # the LLM provider key (e.g. ALS_APG_API_KEY -> ANTHROPIC_AUTH_TOKEN) from
     # the process environment. `env_file:` is read by the compose CLI on the
-    # HOST (as the file's owner), so it works even though the project .env is
+    # HOST (as the file's owner), so it works even though the repo's .env is
     # deliberately 0600 and the worker itself runs as non-root `osprey` and
-    # cannot open it. Path is relative to the compose project directory
-    # (build/services/, same resolution rule as `volumes:` bind sources) — see
-    # the `../../.env` volume path elsewhere in this repo for the same prefix.
+    # cannot open it.
+    #
+    # The deployment's env is a CHAIN of files at the repo root, listed here in
+    # ASCENDING precedence — committed defaults (.env.shared) first, the local
+    # secret file (.env) last — because compose lets a later entry win on any
+    # key an earlier one also sets. That is the same order the invocation's
+    # own `--env-file` flags carry, so what interpolates into this document and
+    # what lands in the container agree.
+    #
+    # Only files that EXIST at render time are listed: an `env_file:` entry
+    # naming a missing path errors `compose up` outright. Every path is relative
+    # to the pinned compose project directory, which is the deployment REPO
+    # ROOT — so these are the deployment's own chain files, not copies inside
+    # the disposable render.
     env_file:
-      - ../../.env
+{%- for env_chain_file in osprey_env_chain %}
+      - {{ env_chain_file }}
+{%- endfor %}
 {% endif %}
     environment:
       # No :-default (see event_dispatcher compose): fail closed on an unset token.
       DISPATCH_WORKER_TOKEN: ${DISPATCH_WORKER_TOKEN}
-      DISPATCH_WORKER_PORT: "{{ services.dispatch_worker.worker_port_base | default(9190) }}"
+      DISPATCH_WORKER_PORT: "{{ worker_port }}"
+{%- if on_host %}
+      # On the host namespace the worker's listening socket IS a host socket,
+      # so it binds the loopback interface rather than every interface: the
+      # dispatcher and the health probe both reach it as localhost, and nothing
+      # off this machine can. (On the compose bridge the default 0.0.0.0 is
+      # what makes the service reachable by its service name at all, and the
+      # network itself is the boundary — hence no bind line there.)
+      DISPATCH_WORKER_BIND: "127.0.0.1"
+{%- endif %}
       DISPATCH_TIMEOUT_SEC: "{{ services.dispatch_worker.timeout_sec | default(300) }}"
       DISPATCH_INACTIVITY_SEC: "{{ services.dispatch_worker.inactivity_sec | default(120) }}"
       OSPREY_PROJECT_DIR: /app/{{ osprey_labels.project_name }}
@@ -63,34 +126,100 @@ services:
       # its own MCP servers. Set CONFIG_FILE explicitly so the worker AND every
       # subprocess resolve config from the mounted project (via env inheritance),
       # independent of CWD. It points at the STAGED config.yml bind-mounted below
-      # (python_env_path stripped), not the copy baked into the image.
-      CONFIG_FILE: /app/{{ osprey_labels.project_name }}/config.yml
+      # (the deploy-time config), not the copy baked into the image.
+      #
+      # Under the project directory, in build/ — the same four-zone shape the
+      # repo has, because this worker runs the PROJECT image and its .mcp.json is
+      # rendered as `{project_root}/build/config.yml` (registry/mcp.py, with
+      # project_root = this /app/<project> root). A flat config.yml here would be
+      # a path the agent's own MCP servers never read. The standalone service
+      # images are the opposite case and stay flat: nothing inside them renders
+      # anything against a project root.
+      CONFIG_FILE: /app/{{ osprey_labels.project_name }}/build/config.yml
       TZ: {{ system.timezone }}
+{%- if on_host %}
+      # OpenObserve telemetry (opt-in): on the host namespace this container's
+      # loopback IS the host's, so the store is reachable at the port it
+      # publishes there — the compose service DNS name resolves to nothing from
+      # here. Declaring the host explicitly is what settles it: the emitter's
+      # own fallback sees a container and would reach for the service name.
+      # Inert unless claude_code.telemetry is enabled with backend: openobserve.
+      #
+      # The variable carries a HOST, and the endpoint the emitter derives from
+      # it pins the store's port at 5080 (build/claude_code_telemetry.py) —
+      # which is what `services.openobserve.port` publishes by default. A
+      # deployment that republishes the store on some other host port must set
+      # `claude_code.telemetry.endpoint` outright; there is no port half of this
+      # variable to carry it.
+      OSPREY_OTEL_OPENOBSERVE_HOST: localhost
+{%- else %}
       # OpenObserve telemetry (opt-in): the worker and its CLI subprocess run on
       # this bridge network, so the store is reachable by its compose service
       # DNS name, not localhost. Declaring the host here — rather than sniffing
       # the container runtime — is what makes emit work under docker AND podman.
       # Inert unless claude_code.telemetry is enabled with backend: openobserve.
       OSPREY_OTEL_OPENOBSERVE_HOST: openobserve
-    # Bind-mount source is relative to the compose project directory
-    # (build/services/), not this service's subdir — hence the dispatch_worker/ prefix.
+{%- endif %}
+{#- Address of the archiver store, for the same reason and by the same
+    convention as OSPREY_OTEL_OPENOBSERVE_HOST above: whichever address is the
+    right one from where this worker actually runs. The worker answers questions
+    about what the machine did, so its agent reaches for `archiver_read` like
+    any other -- but the connection block in config.yml is written for the HOST
+    side (`localhost` and the published `port_host`), which from inside a
+    bridge-networked container names its own loopback.
+
+    Gated on `deployed_services` membership, like the openobserve link above and
+    for a sharper reason than symmetry: these two are a LITERAL address, not a
+    fallback. A project whose archiver is a store someone else runs -- a
+    facility MongoDB, an Archiver Appliance -- has a config block that is
+    already correct from anywhere, and sending this worker to `archiver-mongodb`
+    would point it at a name that resolves to nothing. Set only when THIS
+    project deploys the store, which is the only case where this file knows the
+    store's address better than the config does. #}
+{% if mongo_deployed and on_host %}
+      # On the host namespace the store is reached where it PUBLISHES, so this
+      # is its host port (`services.mongodb.port_host`), never the 27017 inside
+      # the container. Spelled here rather than left to the config block so the
+      # worker's address follows the deployment's topology in both modes, even
+      # if a project authored its connection block against some other host.
+      OSPREY_ARCHIVER_MONGODB_HOST: localhost
+      OSPREY_ARCHIVER_MONGODB_PORT: "{{ (services.mongodb | default({}, true)).port_host | default(27017, true) }}"
+{% elif mongo_deployed %}
+      # `archiver-mongodb` is the store's network alias, pinned in the mongodb
+      # template precisely so this name survives the per-project container_name;
+      # 27017 is its CONTAINER port, never the host publish.
+      OSPREY_ARCHIVER_MONGODB_HOST: archiver-mongodb
+      OSPREY_ARCHIVER_MONGODB_PORT: "27017"
+{% endif %}
+    # Bind-mount sources are relative to the pinned compose project directory,
+    # which is the deployment REPO ROOT — hence the build/services/ prefix on
+    # the render output below.
     volumes:
-      # Staged runtime config (python_env_path stripped) overlays the config.yml
-      # baked into the image, so the worker reads the deploy-time config.
-      - ./dispatch_worker/config.yml:/app/{{ osprey_labels.project_name }}/config.yml:ro
-      # The image creates /app/<project>/_agent_data (and its subdirs) and
+      # The staged runtime config overlays the config.yml baked into the image,
+      # so the worker reads the deploy-time config.
+      - ./build/services/dispatch_worker/config.yml:/app/{{ osprey_labels.project_name }}/build/config.yml:ro
+      # The image creates the agent-data directory (and its subdirs) and
       # `chown -R osprey:osprey /app/<project>` before switching to USER osprey,
       # so a fresh named volume initialized from that path inherits osprey
       # ownership — the non-root worker can write it without any user: override.
+      # The mount target is rendered whole by compose_generator from the SAME
+      # `agent_data.base_dir` the mounted config.yml declares, so the volume
+      # cannot end up mounted anywhere but where the worker writes. It arrives
+      # already joined onto /app/<project> — the join is done there because an
+      # ABSOLUTE base_dir names the same path inside the container and must not
+      # be re-anchored under the project directory, which a template-level
+      # concatenation here could not tell apart from a relative one.
 {% if mode == 'shared' %}
-      - dispatch_workspace:/app/{{ osprey_labels.project_name }}/_agent_data
+      - dispatch_workspace:{{ osprey_container_agent_data_dir }}
 {% else %}
-      - dispatch_workspace_{{ i }}:/app/{{ osprey_labels.project_name }}/_agent_data
+      - dispatch_workspace_{{ i }}:{{ osprey_container_agent_data_dir }}
 {% endif %}
-    networks:
-      - osprey-network
+{{- net.network(services.dispatch_worker) }}
+{#- The probe runs INSIDE this container, so `localhost` is right in both modes
+    -- its own loopback on the compose bridge, the host's under `host` -- and
+    the port is this worker's own. #}
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:{{ services.dispatch_worker.worker_port_base | default(9190) }}/health').status==200 else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:{{ worker_port }}/health').status==200 else 1)\""]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -102,11 +231,19 @@ services:
 volumes:
 {% if mode == 'shared' %}
   dispatch_workspace:
+    labels:
+      com.osprey.repo-id: "{{ osprey_labels.repo_id }}"
 {% else %}
 {% for i in range(1, wc + 1) %}
   dispatch_workspace_{{ i }}:
+    labels:
+      com.osprey.repo-id: "{{ osprey_labels.repo_id }}"
 {% endfor %}
 {% endif %}
-
-networks:
-  osprey-network:
+{# A deliberate blank line precedes the file-level stanza, so this call carries
+   no left-trim marker (`{{-` would eat the blank line along with the newline it
+   is meant to keep): the block above ends its own line, the macro supplies the
+   separating newline, and under `host` — where nothing is declared, because no
+   service in the file joins a network — the file simply ends after the volumes
+   block. -#}
+{{ net.network_declaration(services.dispatch_worker) }}

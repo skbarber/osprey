@@ -202,7 +202,7 @@ class TestPanelFocus:
         # Subscribe before sending
         q = broadcaster.subscribe()
 
-        client.post("/api/panel-focus", json={"panel": "artifacts"})
+        client.post("/api/panel-focus", json={"panel": "artifacts", "source": "agent"})
 
         # The event should be in the queue
         assert not q.empty()
@@ -211,6 +211,68 @@ class TestPanelFocus:
         assert event["panel"] == "artifacts"
 
         broadcaster.unsubscribe(q)
+
+
+class TestPanelsOpenTiles:
+    """``GET /api/panels`` reports tile occupancy and how stale it is.
+
+    ``visible`` is launcher-rail membership; ``open_tiles`` is what a browser
+    last reported as actually on screen. The two freshness companions exist so
+    a consumer can tell "no client has ever reported" from "reported N seconds
+    ago" instead of trusting a possibly-abandoned list.
+
+    The payload carries three distinct states that must never collapse into
+    each other: never reported (all null), unknown occupancy (null list, real
+    age, dock false), and known occupancy (a list, possibly empty).
+    """
+
+    def test_panels_open_tiles_all_null_before_any_report(self, client):
+        """Never reported is all-null — emphatically not a known-empty screen."""
+        body = client.get("/api/panels").json()
+        assert body["open_tiles"] is None
+        assert body["open_tiles_age_s"] is None
+        assert body["open_tiles_dock"] is None
+
+    def test_panels_dock_less_report_is_unknown_occupancy(self, client):
+        """A watching-but-blind client: null tiles, real age, dock false."""
+        client.post("/api/panel-layout", json={"tiles": [], "dock": False})
+        body = client.get("/api/panels").json()
+        assert body["open_tiles"] is None
+        assert body["open_tiles_age_s"] is not None
+        assert body["open_tiles_dock"] is False
+
+    def test_panels_known_empty_is_distinct_from_unknown(self, client):
+        """A dock client reporting [] means the operator closed everything."""
+        client.post("/api/panel-layout", json={"tiles": [], "dock": True})
+        body = client.get("/api/panels").json()
+        assert body["open_tiles"] == []
+        assert body["open_tiles_dock"] is True
+
+    def test_panels_open_tiles_reflect_the_last_report(self, client):
+        client.post("/api/panel-layout", json={"tiles": ["artifacts"], "dock": True})
+        body = client.get("/api/panels").json()
+        assert body["open_tiles"] == ["artifacts"]
+        assert body["open_tiles_dock"] is True
+
+    def test_panels_open_tiles_age_is_seconds_since_the_report(self, client):
+        import time
+
+        client.post("/api/panel-layout", json={"tiles": ["artifacts"], "dock": True})
+        fresh = client.get("/api/panels").json()["open_tiles_age_s"]
+        assert 0 <= fresh < 60
+
+        # Age the stored report; the payload must report it as stale, not fresh.
+        client.app.state.open_tiles_ts = time.time() - 3600
+        aged = client.get("/api/panels").json()["open_tiles_age_s"]
+        assert aged >= 3600
+
+    def test_panels_open_tiles_are_independent_of_rail_membership(self, client):
+        """Closing every tile leaves the rail alone — occupancy is not membership."""
+        before = client.get("/api/panels").json()["visible"]
+        client.post("/api/panel-layout", json={"tiles": [], "dock": True})
+        after = client.get("/api/panels").json()
+        assert after["open_tiles"] == []
+        assert after["visible"] == before
 
 
 class TestStaticServing:
@@ -239,13 +301,13 @@ class TestHeaderAppName:
             with TestClient(app) as c:
                 assert app.state.app_name == "Control Room A"
                 body = c.get("/").text
-                assert "header-app-name" in body
+                assert "header-deployment" in body
                 assert "Control Room A" in body
 
     def test_app_name_absent_when_unset(self, client):
         # The shared `client` fixture supplies no `web` section.
         body = client.get("/").text
-        assert "header-app-name" not in body
+        assert "header-deployment" not in body
 
     def test_env_var_overrides_config(self, workspace_dir):
         # OSPREY_WEB_APP_NAME wins over web.app_name so containers sharing one

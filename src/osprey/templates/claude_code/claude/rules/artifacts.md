@@ -8,8 +8,8 @@ description: How to create, save, and reuse artifacts in the OSPREY gallery
 ## Reuse First
 
 When the user references previous work or wants to act on it (log it, share it,
-re-analyze it), call `data_list()` BEFORE creating anything new.
-Use `tool_filter=` or `category_filter=` to narrow results. Reuse existing artifact IDs
+re-analyze it), call `artifact_list()` BEFORE creating anything new.
+Use `tool=` or `category=` to narrow results. Reuse existing artifact IDs
 rather than recreating content.
 
 ## Creating Artifacts
@@ -54,8 +54,9 @@ and can be viewed with rendered HTML formatting.
 - **Auto-created:** Every execution is saved as a `.ipynb` notebook artifact
 - **Pre-execution review:** When approval is required, a pre-execution notebook
   is created and linked in the approval prompt for code review
-- **Editable:** Use `NotebookEdit` to modify notebook cells in
-  `_agent_data/artifacts/` — the gallery re-renders automatically
+- **Editable:** Use `NotebookEdit` to modify notebook cells in the `artifacts/`
+  directory under the agent-data root (`agent_data.base_dir` in config.yml) —
+  the gallery re-renders automatically
 
 ## Directing User Attention
 

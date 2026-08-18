@@ -7,6 +7,8 @@ that all Osprey applications build upon.
 """
 
 from osprey.connectors.types import (
+    DOOCS,
+    DOOCS_ARCHIVER,
     EPICS,
     EPICS_ARCHIVER,
     MOCK,
@@ -49,7 +51,7 @@ class FrameworkRegistryProvider(RegistryConfigProvider):
                     requires=[],
                 ),
             ],
-            # Framework AI model providers — built-in table now lives in
+            # Framework AI model providers — the built-in table lives in
             # osprey.models.provider_registry (single source of truth).
             # RegistryManager._initialize_providers() delegates to it.
             providers=[],
@@ -77,6 +79,13 @@ class FrameworkRegistryProvider(RegistryConfigProvider):
                     class_name="VirtualAcceleratorConnector",
                     description="Virtual Accelerator connector for PyAT-backed soft-IOC simulations",
                 ),
+                ConnectorRegistration(
+                    name=DOOCS,
+                    connector_type="control_system",
+                    module_path="osprey.connectors.control_system.doocs_connector",
+                    class_name="DOOCSConnector",
+                    description="DOOCS control system connector (requires doocs4py)",
+                ),
                 # Archiver connectors
                 ConnectorRegistration(
                     name=MOCK_ARCHIVER,
@@ -99,6 +108,13 @@ class FrameworkRegistryProvider(RegistryConfigProvider):
                     class_name="MongoDBArchiverConnector",
                     description="MongoDB archiver connector for time-series PV data",
                 ),
+                ConnectorRegistration(
+                    name=DOOCS_ARCHIVER,
+                    connector_type="archiver",
+                    module_path="osprey.connectors.archiver.doocs_archiver_connector",
+                    class_name="DOOCSArchiverConnector",
+                    description="DOOCS local history connector (requires doocs4py)",
+                ),
             ],
             # ARIEL search modules
             ariel_search_modules=[
@@ -111,6 +127,11 @@ class FrameworkRegistryProvider(RegistryConfigProvider):
                     name="semantic",
                     module_path="osprey.services.ariel_search.search.semantic",
                     description="Embedding similarity search using vector cosine distance",
+                ),
+                ArielSearchModuleRegistration(
+                    name="hybrid",
+                    module_path="osprey.services.ariel_search.search.qmd",
+                    description="Hybrid keyword and semantic search via the qmd sidecar",
                 ),
             ],
             # ARIEL enhancement modules
@@ -128,6 +149,13 @@ class FrameworkRegistryProvider(RegistryConfigProvider):
                     class_name="TextEmbeddingModule",
                     description="Generate vector embeddings for logbook entries",
                     execution_order=20,
+                ),
+                ArielEnhancementModuleRegistration(
+                    name="qmd_export",
+                    module_path="osprey.services.ariel_search.enhancement.qmd_export.exporter",
+                    class_name="QmdExportModule",
+                    description="Mirror entries to the markdown tree the qmd sidecar indexes",
+                    execution_order=30,
                 ),
             ],
             # ARIEL ingestion adapters

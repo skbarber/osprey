@@ -6,25 +6,32 @@ via PTY) on the left and a live workspace file viewer on the right.
 
 from __future__ import annotations
 
+import asyncio
 import os
-from contextlib import asynccontextmanager
+from collections import deque
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 import httpx
 import yaml
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.templating import Jinja2Templates
 from jinja2 import pass_context
 
+from osprey.cli.scaffold_cmd import ScaffoldClaimError
 from osprey.interfaces._app_setup import configure_interface_app
 from osprey.interfaces.vendor import vendor_url
 from osprey.interfaces.web_terminal.file_watcher import FileEventBroadcaster, WorkspaceWatcher
 from osprey.interfaces.web_terminal.operator_session import OperatorRegistry
+from osprey.interfaces.web_terminal.ownership import OwnershipStoreError
 from osprey.interfaces.web_terminal.pty_manager import PtyRegistry
 from osprey.interfaces.web_terminal.routes import router
+from osprey.interfaces.web_terminal.routes.agent_activity import ACTIVITY_RING_MAX
 from osprey.interfaces.web_terminal.url_prefix import apply_url_prefix, compute_url_prefix
 from osprey.profiles.web_panels import BUILTIN_PANELS, UNIVERSAL_PANELS
+from osprey.registry.web import PANEL_ID_TO_REGISTRY_KEY, panel_url_state_attr
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence
@@ -60,181 +67,96 @@ templates.env.globals["prefixed"] = _prefixed
 logger = __import__("logging").getLogger(__name__)
 
 
-def _launch_artifact_server(app: FastAPI) -> None:
-    """Auto-launch the artifact gallery server if configured."""
-    try:
-        import os
+def _launch_enabled_panel_servers(app: FastAPI, enabled_panels: set[str]) -> None:
+    """Launch the companion server behind every enabled built-in panel.
 
-        from osprey.infrastructure.server_launcher import ensure_artifact_server
-        from osprey.utils.workspace import load_osprey_config
+    The lifespan used to gate each panel on its own ``if "<id>" in
+    enabled_panels`` line, which made registering a companion server a two-place
+    edit — and left the universal/domain split spelled a second time here, out of
+    sync with :func:`_load_panel_config`, which already folds
+    ``UNIVERSAL_PANELS`` into ``enabled_panels`` unconditionally.
 
-        config = load_osprey_config()
-        art_config = config.get("artifact_server", {})
-        host = art_config.get("host", "127.0.0.1")
-        port = int(os.environ.get("OSPREY_ARTIFACT_SERVER_PORT", art_config.get("port", 8086)))
-
-        app.state.artifact_server_url = f"http://{host}:{port}"
-        ensure_artifact_server()
-        logger.info("Artifact server available at %s", app.state.artifact_server_url)
-    except Exception:
-        logger.warning("Could not auto-launch artifact server", exc_info=True)
-        app.state.artifact_server_url = "http://127.0.0.1:8086"
-
-
-def _launch_ariel_server(app: FastAPI) -> None:
-    """Auto-launch the ARIEL logbook server if configured."""
-    try:
-        from osprey.infrastructure.server_launcher import ensure_ariel_server
-        from osprey.utils.workspace import load_osprey_config
-
-        config = load_osprey_config()
-        ariel_web = config.get("ariel", {}).get("web", {})
-        host = ariel_web.get("host", "127.0.0.1")
-        port = int(os.environ.get("OSPREY_ARIEL_PORT", ariel_web.get("port", 8085)))
-
-        app.state.ariel_server_url = f"http://{host}:{port}"
-        ensure_ariel_server()
-        logger.info("ARIEL server available at %s", app.state.ariel_server_url)
-    except Exception:
-        logger.warning("Could not auto-launch ARIEL server", exc_info=True)
-        app.state.ariel_server_url = None
-
-
-def _launch_channel_finder_server(app: FastAPI) -> None:
-    """Auto-launch the Channel Finder web server if configured."""
-    try:
-        from osprey.infrastructure.server_launcher import ensure_channel_finder_server
-        from osprey.utils.workspace import load_osprey_config
-
-        config = load_osprey_config()
-        cf = config.get("channel_finder", {})
-        if not cf:
-            return
-        cf_web = cf.get("web", {})
-        host = cf_web.get("host", "127.0.0.1")
-        port = int(os.environ.get("OSPREY_CHANNEL_FINDER_PORT", cf_web.get("port", 8092)))
-
-        app.state.channel_finder_server_url = f"http://{host}:{port}"
-        ensure_channel_finder_server()
-        logger.info("Channel Finder server available at %s", app.state.channel_finder_server_url)
-    except Exception:
-        logger.warning("Could not auto-launch Channel Finder server", exc_info=True)
-        app.state.channel_finder_server_url = None
-
-
-def _launch_lattice_dashboard_server(app: FastAPI) -> None:
-    """Auto-launch the lattice dashboard server if configured."""
-    try:
-        from osprey.infrastructure.server_launcher import ensure_lattice_dashboard_server
-        from osprey.utils.workspace import load_osprey_config
-
-        config = load_osprey_config()
-        ld = config.get("lattice_dashboard", {})
-        if not ld:
-            return
-        host = ld.get("host", "127.0.0.1")
-        port = int(os.environ.get("OSPREY_LATTICE_DASHBOARD_PORT", ld.get("port", 8097)))
-
-        app.state.lattice_dashboard_server_url = f"http://{host}:{port}"
-        ensure_lattice_dashboard_server()
-        logger.info("Lattice dashboard available at %s", app.state.lattice_dashboard_server_url)
-    except Exception:
-        logger.warning("Could not auto-launch lattice dashboard", exc_info=True)
-        app.state.lattice_dashboard_server_url = None
-
-
-def _launch_okf_server(app: FastAPI) -> None:
-    """Auto-launch the OKF knowledge panel server if configured.
-
-    The (host, port) computed here MUST match what ``ServerLauncher`` resolves
-    for the ``okf`` definition (``registry/web.py``): host/port read directly
-    from the ``facility_knowledge`` section (no ``web`` subkey), with the
-    ``OSPREY_FACILITY_KNOWLEDGE_PORT`` env override. Otherwise the proxied URL
-    stored here would point at a different port than the one uvicorn binds.
+    Args:
+        app: The web-terminal application whose ``state`` the URLs are published on.
+        enabled_panels: Enabled panel ids from :func:`_load_panel_config`. Ids with
+            no companion server behind them (URL-backed custom panels such as
+            ``events``) are skipped — the framework serves nothing for those.
     """
-    try:
-        from osprey.infrastructure.server_launcher import ensure_okf_server
-        from osprey.utils.workspace import load_osprey_config
-
-        config = load_osprey_config()
-        fk = config.get("facility_knowledge", {})
-        if not fk:
-            return
-        host = fk.get("host", "127.0.0.1")
-        # Guard a set-but-empty env override (e.g. compose `OSPREY_FACILITY_KNOWLEDGE_PORT=`):
-        # int("") would raise and kill this launch (silent dead tab). This mirrors
-        # server_launcher._make_config_reader's `if env_val:` guard so both sides
-        # resolve the SAME port — the launcher would otherwise bind 8093 while we'd die.
-        env_port = os.environ.get("OSPREY_FACILITY_KNOWLEDGE_PORT")
-        port = int(env_port) if env_port else int(fk.get("port", 8093))
-
-        app.state.okf_server_url = f"http://{host}:{port}"
-        ensure_okf_server()
-        logger.info("OKF knowledge panel available at %s", app.state.okf_server_url)
-    except Exception:
-        logger.warning("Could not auto-launch OKF knowledge panel", exc_info=True)
-        app.state.okf_server_url = None
+    for panel_id in sorted(enabled_panels & BUILTIN_PANELS):
+        _launch_panel_server(app, PANEL_ID_TO_REGISTRY_KEY[panel_id])
 
 
-def _launch_system_health_server(app: FastAPI) -> None:
-    """Auto-launch the System Health dashboard server if enabled.
+def _launch_panel_server(app: FastAPI, key: str) -> None:
+    """Auto-launch the companion web server *key* and publish its panel URL.
 
-    The (host, port) computed here MUST match what ``ServerLauncher`` resolves
-    for the ``system_health`` definition (``registry/web.py``): host/port read
-    from the nested ``health.web`` subkey, with the ``OSPREY_HEALTH_PORT`` env
-    override. ``require_section`` is False, so unlike the okf/channel-finder
-    launchers there is no early return on a missing section — the health
-    framework ships a usable default, so the panel is always launchable.
+    One implementation for all six panels. The URL published here is the *only*
+    input to panel availability (``/api/<panel>-server`` and the ``/panel/<id>/``
+    proxy), so it must never outrun the server itself: ``auto_launch: false``
+    makes the launch a no-op, and publishing a URL anyway left the operator an
+    enabled tab whose iframe returned a bare 502. Leaving it unset disables the
+    tab instead, which is what a suppressed server should look like.
+
+    Both the gate and the address come from the shared registry derivations —
+    :func:`~osprey.infrastructure.server_launcher.is_auto_launch_enabled` and
+    :func:`~osprey.registry.web.resolve_web_server_base_url`, the same ones
+    ``ServerLauncher`` itself uses. That is what keeps the port advertised here
+    identical to the port uvicorn binds, including the set-but-empty env
+    override (compose ``OSPREY_<CONFIG_KEY>_PORT=``) that an inline ``int()``
+    turns into a ValueError and a silently dead tab.
+
+    Args:
+        app: The web-terminal application whose ``state`` the URL is published on.
+        key: Key into ``registry.web.FRAMEWORK_WEB_SERVERS``, e.g. ``"artifact"``.
     """
+    attr = panel_url_state_attr(key)
     try:
-        from osprey.infrastructure.server_launcher import ensure_system_health_server
-        from osprey.utils.workspace import load_osprey_config
+        from osprey.infrastructure.server_launcher import (
+            ensure_web_server,
+            is_auto_launch_enabled,
+        )
+        from osprey.registry.web import FRAMEWORK_WEB_SERVERS, resolve_web_server_base_url
 
-        config = load_osprey_config()
-        health_web = config.get("health", {}).get("web", {})
-        host = health_web.get("host", "127.0.0.1")
-        # Guard a set-but-empty env override (e.g. compose `OSPREY_HEALTH_PORT=`):
-        # int("") would raise and kill this launch (silent dead tab). This mirrors
-        # server_launcher._make_config_reader's `if env_val:` guard so both sides
-        # resolve the SAME port — the launcher would otherwise bind 8094 while we'd die.
-        env_port = os.environ.get("OSPREY_HEALTH_PORT")
-        port = int(env_port) if env_port else int(health_web.get("port", 8094))
+        definition = FRAMEWORK_WEB_SERVERS[key]
 
-        app.state.system_health_server_url = f"http://{host}:{port}"
-        ensure_system_health_server()
-        logger.info("System Health dashboard available at %s", app.state.system_health_server_url)
+        # Covers require_section too: a server whose config section is absent
+        # reports auto-launch off, so a panel with nothing behind it stays dark.
+        if not is_auto_launch_enabled(key):
+            logger.info(
+                "%s auto-launch is disabled; the %s panel is unavailable",
+                definition.name,
+                definition.panel_id,
+            )
+            setattr(app.state, attr, None)
+            return
+
+        setattr(app.state, attr, resolve_web_server_base_url(key))
+        ensure_web_server(key)
+        logger.info("%s available at %s", definition.name, getattr(app.state, attr))
     except Exception:
-        logger.warning("Could not auto-launch System Health dashboard", exc_info=True)
-        app.state.system_health_server_url = None
+        logger.warning("Could not auto-launch companion server %r", key, exc_info=True)
+        # No fallback URL: a launch we could not complete must not be advertised
+        # as an available panel. Retract any URL assigned before the failure.
+        setattr(app.state, attr, None)
 
 
 def _load_theme_registry() -> tuple[list[ThemeManifestEntry], dict[str, dict[str, str]]]:
     """Load the baked theme manifest + per-family defaults for SSR resolution.
 
-    Reads the same ``tokens/`` source tree the design-system generator
-    builds from (``generator/build.py::DEFAULT_TOKENS_DIR``) rather than
-    parsing the generated ``tokens.js`` — one source, no risk of drifting
-    from a stale generated artifact. This intentionally skips
-    ``validate.assert_valid``: the checked-in tree is validated by
-    ``build --check`` in CI, and full WCAG/completeness validation isn't
-    needed just to read theme identity for SSR.
+    Thin alias for
+    :func:`osprey.interfaces.design_system.theme_config.load_theme_registry`,
+    kept because this module's lifespan and its tests both reach for it by this
+    name. The multi-user landing-page renderer resolves the same config value
+    through that same module, so the two surfaces cannot disagree about what
+    ``web.theme`` means.
 
     Returns:
         ``(entries, defaults)`` as produced by
         :func:`~osprey.interfaces.design_system.generator.emit_js.build_theme_manifest`
         and :func:`~osprey.interfaces.design_system.generator.emit_js.build_theme_defaults`.
     """
-    from osprey.interfaces.design_system.generator.build import DEFAULT_TOKENS_DIR
-    from osprey.interfaces.design_system.generator.emit_js import (
-        build_theme_defaults,
-        build_theme_manifest,
-    )
-    from osprey.interfaces.design_system.generator.model import load_token_tree
+    from osprey.interfaces.design_system.theme_config import load_theme_registry
 
-    tree = load_token_tree(DEFAULT_TOKENS_DIR)
-    entries = build_theme_manifest(tree)
-    defaults = build_theme_defaults(entries)
-    return entries, defaults
+    return load_theme_registry()
 
 
 def resolve_web_theme_id(
@@ -244,56 +166,166 @@ def resolve_web_theme_id(
 ) -> str:
     """Resolve the ``web.theme`` config value into a concrete baked theme id.
 
-    ``configured`` may be:
+    ``web.theme``-named alias for
+    :func:`osprey.interfaces.design_system.theme_config.resolve_theme_id`,
+    which documents the full contract (family vs concrete id, the warn +
+    fallback on an unknown value, and the guarantee that the result is always a
+    real baked id — what the pre-paint ``theme-boot.js`` rung requires). The
+    multi-user landing-page renderer calls that same function, so the two
+    surfaces cannot disagree about what ``web.theme`` means.
 
-    - A concrete theme id (e.g. ``"high-contrast-light"``) — used as-is.
-      This is how an operator pins a specific mode instead of the
-      family's dark default.
-    - A theme *family* name (e.g. ``"osprey"``, ``"high-contrast"``) —
-      resolved to that family's **dark** id, the canonical SSR default.
-    - Anything else (unknown/misspelled) — logged as a warning and
-      resolved to the ``osprey`` family's dark id.
-
-    Mirrors the warn+fallback shape of
-    :func:`osprey.cli.styles.load_theme_from_config`: never raises.
+    The returned id alone does NOT say whether the deployment pinned a mode —
+    see :func:`resolve_web_theme_pinned_mode` for that half.
 
     Args:
         configured: The raw ``web.theme`` config value.
-        entries: The theme manifest (see
-            :func:`~osprey.interfaces.design_system.generator.emit_js.build_theme_manifest`).
-        defaults: The per-family ``{family: {mode: id}}`` map (see
-            :func:`~osprey.interfaces.design_system.generator.emit_js.build_theme_defaults`).
+        entries: The theme manifest.
+        defaults: The per-family ``{family: {mode: id}}`` map.
 
     Returns:
-        A concrete theme id present in ``entries`` — the pre-paint
-        ``theme-boot.js`` rung (Task 1.8) only honors a server-rendered
-        ``data-theme`` that is a real baked id, never a family name or
-        ``"auto"``.
+        A concrete theme id present in ``entries``.
     """
-    valid_ids = {entry.id for entry in entries}
-    if configured in valid_ids:
+    from osprey.interfaces.design_system.theme_config import resolve_theme_id
+
+    return resolve_theme_id(configured, entries, defaults, config_key="web.theme")
+
+
+def resolve_web_theme_pinned_mode(
+    configured: str,
+    entries: Sequence[ThemeManifestEntry],
+) -> str | None:
+    """The light/dark mode a ``web.theme`` value *pins*, if any.
+
+    ``web.theme``-named alias for
+    :func:`osprey.interfaces.design_system.theme_config.resolve_pinned_mode`,
+    which documents why the pin has to be carried separately from the resolved
+    id at all.
+
+    The lifespan server-renders the result as ``<html data-theme-mode>``, and
+    the browser needs it: without that attribute ``theme-manager.js``'s hub
+    assumes ``mode: 'auto'`` on a first visit and immediately re-resolves the
+    mode from the OS, silently discarding a configured pin one frame after
+    paint.
+
+    Args:
+        configured: The raw ``web.theme`` config value.
+        entries: The theme manifest.
+
+    Returns:
+        ``"dark"`` or ``"light"`` when ``configured`` names a concrete theme id;
+        ``None`` when it names a family or is unknown.
+    """
+    from osprey.interfaces.design_system.theme_config import resolve_pinned_mode
+
+    return resolve_pinned_mode(configured, entries)
+
+
+#: The two supported web UI modes. ``expert`` is the full split-pane terminal
+#: workspace; ``simple`` is the pared-down operator layout. ``expert`` is the
+#: default so an absent/misconfigured ``web.ui_mode`` never strands a deployment
+#: in the reduced surface.
+UI_MODES = ("expert", "simple")
+DEFAULT_UI_MODE = "expert"
+
+
+def resolve_ui_mode(configured: str) -> str:
+    """Resolve the ``web.ui_mode`` config value into a concrete UI mode.
+
+    ``configured`` must be one of :data:`UI_MODES` (``"expert"`` or
+    ``"simple"``). Anything else — a typo, ``None``, an empty string — is
+    logged as a warning and resolved to :data:`DEFAULT_UI_MODE`.
+
+    Mirrors the warn+fallback shape of :func:`resolve_web_theme_id`: it never
+    raises, so a bad value degrades to the safe default instead of blocking
+    server startup.
+
+    Args:
+        configured: The raw ``web.ui_mode`` config value.
+
+    Returns:
+        A concrete mode string in :data:`UI_MODES` — the value stamped onto
+        ``<html data-ui-mode>`` for the pre-paint mode-boot rung, which only
+        honors a real mode.
+    """
+    if configured in UI_MODES:
         return configured
-    if configured in defaults:
-        return defaults[configured]["dark"]
 
     logger.warning(
-        "Unknown web.theme %r (not a theme id or family); falling back to "
-        "osprey's dark theme. Valid ids: %s; valid families: %s",
+        "Unknown web.ui_mode %r (expected one of %s); falling back to %r.",
         configured,
-        sorted(valid_ids),
-        sorted(defaults),
+        list(UI_MODES),
+        DEFAULT_UI_MODE,
     )
-    osprey_dark = defaults.get("osprey", {}).get("dark")
-    if osprey_dark is not None:
-        return osprey_dark
-    # Degenerate case (no built-in ``osprey`` family): still return a real
-    # baked dark id — ``build_theme_defaults`` guarantees each family has a
-    # dark member — rather than an unverified literal, so Task 1.8's boot
-    # rung honors it instead of silently dropping to auto (FOUC).
-    for family_modes in defaults.values():
-        if "dark" in family_modes:
-            return family_modes["dark"]
-    return next(iter(sorted(valid_ids)), "dark")
+    return DEFAULT_UI_MODE
+
+
+#: The two supported rail positions. ``left`` is the icon-rail column;
+#: ``top`` renders the same rail as a horizontal strip under the header.
+RAIL_POSITIONS = ("left", "top")
+DEFAULT_RAIL_POSITION = "left"
+
+#: Per-theme-family rail defaults, applied only when ``web.rail_position``
+#: is absent from config. The ``retro`` family carries a horizontal tab strip
+#: under the header as part of its look — picking Retro without also moving
+#: the rail would give its colors a layout they were never drawn for. Any
+#: family not listed here defaults to :data:`DEFAULT_RAIL_POSITION`.
+#:
+#: This map is the single source of truth for the coupling: ``GET
+#: /api/panels`` echoes it to the browser so ``rail-position.js`` can follow
+#: a live family switch without carrying its own copy.
+FAMILY_RAIL_DEFAULTS: dict[str, str] = {"retro": "top"}
+
+
+def family_rail_default(family: str | None) -> str:
+    """The rail position a theme family implies, absent explicit config.
+
+    Args:
+        family: A theme ``$extensions.family`` value, or ``None`` when the
+            family could not be resolved.
+
+    Returns:
+        The family's entry in :data:`FAMILY_RAIL_DEFAULTS`, else
+        :data:`DEFAULT_RAIL_POSITION`.
+    """
+    return FAMILY_RAIL_DEFAULTS.get(family or "", DEFAULT_RAIL_POSITION)
+
+
+def resolve_rail_position(configured: str | None, theme_family: str | None = None) -> str:
+    """Resolve the ``web.rail_position`` config value into a concrete position.
+
+    An explicit ``configured`` in :data:`RAIL_POSITIONS` (``"left"`` or
+    ``"top"``) always wins — a deployment that states a rail position keeps
+    it in every theme. ``None`` means the key is absent from config, in
+    which case the position comes from the active theme family via
+    :func:`family_rail_default`. Anything else — a typo, an empty string —
+    is logged as a warning and treated as absent.
+
+    Mirrors the warn+fallback shape of :func:`resolve_ui_mode`: it never
+    raises, so a bad value degrades to the safe default instead of blocking
+    server startup.
+
+    Args:
+        configured: The raw ``web.rail_position`` config value, or ``None``
+            when the key is absent.
+        theme_family: The resolved theme's ``$extensions.family``, used only
+            when ``configured`` gives no answer.
+
+    Returns:
+        A concrete position string in :data:`RAIL_POSITIONS` — the value
+        stamped onto ``<html data-rail-position>`` for the pre-paint
+        rail-boot rung, which only honors a real position.
+    """
+    if configured in RAIL_POSITIONS:
+        return configured
+
+    if configured is not None:
+        logger.warning(
+            "Unknown web.rail_position %r (expected one of %s); falling back to "
+            "the position the active theme family implies.",
+            configured,
+            list(RAIL_POSITIONS),
+        )
+    return family_rail_default(theme_family)
 
 
 def _load_panel_config() -> tuple[set[str], list[dict], str | None]:
@@ -313,6 +345,18 @@ def _load_panel_config() -> tuple[set[str], list[dict], str | None]:
         config = load_osprey_config()
     except Exception:
         return set(UNIVERSAL_PANELS), [], None
+
+    if not config:
+        # The CLI refuses to launch without a resolvable config, but this app
+        # can also be created directly (tests, uvicorn factory) — never let
+        # that degrade silently into a rail with most of its panels missing.
+        logger.warning(
+            "No OSPREY config resolved (OSPREY_CONFIG=%s, cwd=%s) — "
+            "serving universal panels only: %s",
+            os.environ.get("OSPREY_CONFIG", "<unset>"),
+            Path.cwd(),
+            sorted(UNIVERSAL_PANELS),
+        )
 
     web_config = config.get("web", {})
     panels_config = web_config.get("panels", {})
@@ -534,12 +578,43 @@ def _create_lifespan(
             )
         max_bg = int(config.get("max_background_sessions", 5))
         app.state.pty_registry = PtyRegistry(max_background=max_bg)
-        app.state.operator_registry = OperatorRegistry()
+
+        # ── Simple-mode chat pool bounds ──
+        # Three knobs bound the operator-chat pool; each fails open to its
+        # default so a missing/broken config never blocks startup. Read from
+        # the top-level `web` section (same section as web.theme/web.ui_mode).
+        # The route handlers re-read the two timeouts off app.state via getattr
+        # with these same defaults, so the attribute names are load-bearing.
+        try:
+            from osprey.utils.config import get_config_value
+
+            chat_turn_timeout_s = float(get_config_value("web.chat_turn_timeout_s", 600))
+            chat_idle_timeout_s = float(get_config_value("web.chat_idle_timeout_s", 1800))
+            chat_max_sessions = int(get_config_value("web.chat_max_sessions", 5))
+        except Exception:  # noqa: BLE001 — never let config load block startup
+            logger.warning(
+                "Could not resolve web.chat_* config keys; using defaults "
+                "(turn=600s, idle=1800s, max=5)",
+                exc_info=True,
+            )
+            chat_turn_timeout_s, chat_idle_timeout_s, chat_max_sessions = 600.0, 1800.0, 5
+        app.state.chat_turn_timeout_s = chat_turn_timeout_s
+        app.state.chat_idle_timeout_s = chat_idle_timeout_s
+        app.state.chat_max_sessions = chat_max_sessions
+
+        app.state.operator_registry = OperatorRegistry(
+            chat_max_sessions=chat_max_sessions,
+            chat_idle_seconds=chat_idle_timeout_s,
+        )
         app.state.project_cwd = str(
             Path(project_dir).resolve() if project_dir else Path.cwd().resolve()
         )
         app.state.broadcaster = FileEventBroadcaster()
         app.state.active_panel = None
+        # Bounded history of agent-activity events. The SSE stream only reaches
+        # browsers that are already connected, so the ring is what a browser
+        # opened (or reloaded) mid-session reads to catch up on recent actions.
+        app.state.agent_activity_ring = deque(maxlen=ACTIVITY_RING_MAX)
         # Optional human-readable deployment name shown in the header so
         # otherwise-identical web terminals are distinguishable. The
         # ``OSPREY_WEB_APP_NAME`` environment variable takes precedence over
@@ -551,7 +626,7 @@ def _create_lifespan(
             or str(_load_web_ui_config(config_path).get("app_name") or "").strip()
         )
         # Per-user deployment identity for multi-user compose stacks. No
-        # config key exists for either of these today, so the config-side
+        # config key exists for either of these, so the config-side
         # fallback is always empty and ``OSPREY_TERMINAL_USER`` /
         # ``OSPREY_TERMINAL_LANDING_URL`` are the sole source. Empty ⇒ no
         # user badge / logout control is rendered.
@@ -570,6 +645,21 @@ def _create_lifespan(
 
         reset_config_cache()
 
+        # Put volume-owned artifact bodies back into the project tree before
+        # anything reads it. In a deployed container the tree comes back
+        # image-fresh on every recreation, while the operator's claimed
+        # versions live on the claude-config volume; without this the agent
+        # would run the framework's originals while the gallery showed the
+        # operator's, and nothing would report the divergence. No-op elsewhere.
+        from osprey.interfaces.web_terminal.scaffold_gallery_service import (
+            restore_scaffold_bodies,
+        )
+
+        try:
+            restore_scaffold_bodies(Path(app.state.project_cwd))
+        except Exception as exc:  # noqa: BLE001 - never block startup on this
+            logger.warning("Could not restore user-owned artifacts from the volume: %s", exc)
+
         # Resolve and store config_path for the settings API
         resolved_config_path = None
         for candidate in [
@@ -582,18 +672,39 @@ def _create_lifespan(
                 break
         app.state.config_path = resolved_config_path
 
-        # ── Web theme (SSR no-FOUC attribute, Task 1.10) ──
+        # ── Web theme (SSR no-FOUC attribute) ──
         # Resolved once at startup and server-rendered onto <html data-theme>
-        # so the generated theme-boot.js first-paints with no flash (Task
-        # 1.8). Fails open on any load error — a missing/broken theme
+        # so the generated theme-boot.js first-paints with no
+        # flash. Fails open on any load error — a missing/broken theme
         # registry must never block server startup.
         try:
             from osprey.utils.config import get_config_value
 
-            configured_web_theme = get_config_value("web.theme", "osprey")
+            # ``OSPREY_WEB_THEME`` takes precedence over ``web.theme``, so
+            # several containers sharing one baked config image can each be
+            # themed individually via the environment — the same shape
+            # ``OSPREY_WEB_APP_NAME`` uses above. Multi-user deployments set it
+            # per user from the roster's ``theme:`` key.
+            configured_web_theme = os.environ.get(
+                "OSPREY_WEB_THEME", ""
+            ).strip() or get_config_value("web.theme", "main")
             theme_entries, theme_defaults = _load_theme_registry()
             app.state.web_theme_id = resolve_web_theme_id(
                 configured_web_theme, theme_entries, theme_defaults
+            )
+            # Whether the configured value pinned a mode (a concrete id) or only
+            # a palette (a family). Server-rendered alongside data-theme so the
+            # browser hub can honor a pin instead of assuming 'auto' — see
+            # resolve_web_theme_pinned_mode().
+            app.state.web_theme_mode = resolve_web_theme_pinned_mode(
+                configured_web_theme, theme_entries
+            )
+            # The resolved theme's family, kept for the rail-position block
+            # below (an unconfigured rail follows the family — see
+            # FAMILY_RAIL_DEFAULTS).
+            app.state.web_theme_family = next(
+                (entry.family for entry in theme_entries if entry.id == app.state.web_theme_id),
+                None,
             )
         except Exception:  # noqa: BLE001 — never let config/theme-registry load block startup
             logger.warning(
@@ -602,12 +713,64 @@ def _create_lifespan(
                 exc_info=True,
             )
             app.state.web_theme_id = "dark"
+            app.state.web_theme_mode = None
+            app.state.web_theme_family = None
+
+        # ── Web UI mode (SSR no-flash attribute) ──
+        # Resolved once at startup and server-rendered onto <html data-ui-mode>
+        # so the pre-paint mode-boot script first-paints in the right
+        # mode. GET /api/panels also carries ui_mode, but first paint must never
+        # depend on that API field — this server-rendered attribute is the
+        # authoritative first-paint rung. Read via load_osprey_config (the same
+        # top-level `web` section the panel loaders in this file use). Fails open
+        # to the default mode on any config-read error.
+        try:
+            from osprey.utils.workspace import load_osprey_config
+
+            configured_ui_mode = load_osprey_config().get("web", {}).get("ui_mode", DEFAULT_UI_MODE)
+            app.state.web_ui_mode = resolve_ui_mode(configured_ui_mode)
+        except Exception:  # noqa: BLE001 — never let config load block startup
+            logger.warning(
+                "Could not resolve web.ui_mode (config load failed); "
+                "server-rendering fallback mode %r",
+                DEFAULT_UI_MODE,
+                exc_info=True,
+            )
+            app.state.web_ui_mode = DEFAULT_UI_MODE
+
+        # ── Rail position (SSR no-flash attribute) ──
+        # Same shape as web.ui_mode above: resolved once at startup and
+        # server-rendered onto <html data-rail-position> so the pre-paint
+        # rail-boot script first-paints the right rail orientation. GET
+        # /api/panels also carries rail_position, but first paint must never
+        # depend on that API field — this attribute is the authoritative rung.
+        # Fails open to the default position on any config-read error.
+        try:
+            from osprey.utils.workspace import load_osprey_config
+
+            configured_rail = load_osprey_config().get("web", {}).get("rail_position")
+            app.state.web_rail_position = resolve_rail_position(
+                configured_rail, getattr(app.state, "web_theme_family", None)
+            )
+            # Whether the deployment stated a position of its own. The browser
+            # needs this to know if a live theme-family switch may move the
+            # rail: an explicit config value outranks the family default.
+            app.state.web_rail_position_configured = configured_rail in RAIL_POSITIONS
+        except Exception:  # noqa: BLE001 — never let config load block startup
+            logger.warning(
+                "Could not resolve web.rail_position (config load failed); "
+                "server-rendering fallback position %r",
+                DEFAULT_RAIL_POSITION,
+                exc_info=True,
+            )
+            app.state.web_rail_position = DEFAULT_RAIL_POSITION
+            app.state.web_rail_position_configured = False
 
         # ── Regenerate stale Claude Code artifacts on launch ──
         # config.yml is a build-time input: safety-critical fields (e.g. the
         # writes_enabled kill-switch baked into settings.json's permissions.deny)
         # only take effect once the artifacts are re-rendered. Regenerating here
-        # — mirroring `osprey claude chat` — means an edited config.yml is honored
+        # — mirroring `osprey chat` — means an edited config.yml is honored
         # on the next server start. Fail open so a regen error never blocks launch.
         try:
             from osprey.cli.templates.manager import TemplateManager
@@ -624,7 +787,7 @@ def _create_lifespan(
             logger.warning("Claude Code artifact regen on launch failed", exc_info=True)
 
         # ── Provider env injection ──
-        from osprey.cli.claude_code_resolver import (
+        from osprey.build.claude_code_resolver import (
             detect_managed_policy_conflicts,
             format_managed_policy_conflicts,
             inject_provider_env,
@@ -643,11 +806,33 @@ def _create_lifespan(
             )
 
         if app.state.config_path:
+            from osprey.utils.workspace import repo_root_for_config
+
             _project_dir = Path(app.state.config_path).parent
-            # load_provider_spec expands ${VAR} in provider config before resolving.
-            _spec = load_provider_spec(_project_dir)
+            # load_provider_spec expands ${VAR} in provider config before
+            # resolving, and it does so against the REPO root's .env — the
+            # deployment's secret store, which deliberately does not live in
+            # the render `osprey build` re-creates from scratch. Reading the
+            # spec from <repo>/build/config.yml while expanding from <repo>/.env
+            # is the same split the dispatch worker uses; without it a custom
+            # provider's `base_url: ${ARGO_PROD_URL}` starts the terminal
+            # pointed at a literal placeholder. In a container the two coincide
+            # (the project dir IS the render), which repo_root_for_config
+            # answers with the same call.
+            _env_dir = repo_root_for_config(app.state.config_path)
+            _spec = load_provider_spec(_project_dir, env_dir=_env_dir)
             if _spec:
-                inject_provider_env(os.environ, _spec, project_dir=_project_dir)
+                # The SPEC is read from the render; the ENV is read from the
+                # repo. inject_provider_env's bulk `.env` passthrough is given
+                # the repo root for the same reason load_provider_spec is given
+                # it above: `<repo>/build/.env` is a file no build ever writes,
+                # so pointing the injection at the render made the whole layer
+                # a no-op — every key it was supposed to publish silently
+                # absent. Every other launch path (chat, the dispatch worker)
+                # already reads the repo's `.env`; this is web joining them.
+                # Inside a container the two directories coincide, so nothing
+                # about the deployed case changes.
+                inject_provider_env(os.environ, _spec, project_dir=_env_dir)
 
                 # Start translation proxy for OpenAI-compatible providers
                 if _spec.needs_proxy and _spec.upstream_base_url:
@@ -664,7 +849,29 @@ def _create_lifespan(
                         _spec.upstream_base_url,
                     )
 
-        workspace_dir = Path(config.get("watch_dir") or "./_agent_data").resolve()
+        # The watcher's default follows the deployment's CONFIGURED agent-data
+        # root, anchored on the repo. Never a cwd-relative literal: state lives
+        # under `var/`, and a path anchored on the working directory means a
+        # terminal started from anywhere but the repo root watches a directory
+        # that does not exist and reports no sessions at all.
+        #
+        # Deliberately NOT resolve_agent_data_root(): that applies
+        # OSPREY_SESSION_ID isolation, and this watcher's whole job is to see
+        # EVERY session's directory rather than one.
+        if config.get("watch_dir"):
+            workspace_dir = Path(config["watch_dir"]).resolve()
+        else:
+            from osprey.utils.workspace import (
+                agent_data_base_dir,
+                anchored_path,
+                load_osprey_config,
+                resolve_project_root,
+            )
+
+            _osprey_config = load_osprey_config()
+            workspace_dir = anchored_path(
+                agent_data_base_dir(_osprey_config), resolve_project_root(_osprey_config)
+            ).resolve()
         app.state.workspace_dir = workspace_dir  # base path (file watcher watches all sessions)
         app.state.workspace_base = workspace_dir  # alias for clarity
         app.state.watcher = WorkspaceWatcher(workspace_dir, app.state.broadcaster)
@@ -684,9 +891,8 @@ def _create_lifespan(
         app.state.visible_panels = panel_runtime.visible_panels
 
         # Config-defined panel presets ("Layouts"): named sets of panel ids a
-        # human applies in one click. Immutable config-derived state — the only
-        # new server state this feature adds. Empty (the default) → the "+" menu
-        # renders exactly as before.
+        # human applies in one click. Immutable config-derived state. Empty
+        # (the default) → the "+" menu renders no presets section.
         app.state.panel_presets = _load_panel_presets(enabled_panels, custom_panels)
 
         if panel_runtime.allow_runtime_panels and not panel_runtime.runtime_panel_allowlist:
@@ -710,20 +916,7 @@ def _create_lifespan(
         except Exception:
             logger.warning("Local panel discovery failed; continuing.", exc_info=True)
 
-        # Universal servers — always launched
-        _launch_artifact_server(app)
-
-        # Domain servers — template-controlled
-        if "ariel" in enabled_panels:
-            _launch_ariel_server(app)
-        if "channel-finder" in enabled_panels:
-            _launch_channel_finder_server(app)
-        if "lattice" in enabled_panels:
-            _launch_lattice_dashboard_server(app)
-        if "okf" in enabled_panels:
-            _launch_okf_server(app)
-        if "system-health" in enabled_panels:
-            _launch_system_health_server(app)
+        _launch_enabled_panel_servers(app, enabled_panels)
 
         # Hook env placeholder — hooks read config.yml directly for
         # hot-reloadable settings (no env var propagation needed).
@@ -739,7 +932,35 @@ def _create_lifespan(
             trust_env=False,
         )
 
+        # ── Idle chat-session reaper ──
+        # Periodically evicts idle chat sessions (per the registry's idle
+        # predicate, which also collects zombie-busy sessions) so an abandoned
+        # Simple-mode tab does not pin a pool slot indefinitely. Fail-open at
+        # every level: a per-cycle exception is swallowed+logged, and the whole
+        # task is wrapped so a reaper crash can never take the app down. Interval
+        # is idle_timeout/4, clamped to [30s, 300s].
+        reap_interval = max(30.0, min(chat_idle_timeout_s / 4.0, 300.0))
+        registry = app.state.operator_registry
+
+        async def _reap_idle_chats() -> None:
+            while True:
+                await asyncio.sleep(reap_interval)
+                try:
+                    reaped = await registry.reap_idle_chat_sessions()
+                    if reaped:
+                        logger.info("Idle chat reaper evicted %d session(s)", reaped)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — one bad cycle must not kill the reaper
+                    logger.warning("Idle chat reaper cycle failed", exc_info=True)
+
+        reaper_task = asyncio.create_task(_reap_idle_chats())
+
         yield
+
+        reaper_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await reaper_task
 
         await app.state.proxy_client.aclose()
 
@@ -753,6 +974,62 @@ def _create_lifespan(
         await app.state.operator_registry.cleanup_all()
 
     return lifespan
+
+
+async def _scaffold_claim_conflict(request: Request, exc: Exception) -> JSONResponse:
+    """Render a refused claim as a 409 carrying the refusal verbatim.
+
+    A refused claim is a conflict with the state of the project, and the
+    message names what to do about it — so it is surfaced as written rather
+    than being let through to become a bare 500 with the message stripped.
+    Saving over a generated file raises the same refusal in the same words,
+    naming the channel that actually owns the file, and reads the same way.
+
+    Args:
+        request: The request whose route raised. Unused; part of the Starlette
+            handler signature.
+        exc: The :class:`~osprey.cli.scaffold_cmd.ScaffoldClaimError` raised.
+
+    Returns:
+        A 409 whose ``detail`` is the exception's message.
+    """
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+async def _ownership_store_conflict(request: Request, exc: Exception) -> JSONResponse:
+    """Render a store that would not take the write as a 409.
+
+    Nothing was recorded, so this must not read as success. Surfacing the
+    reason beats the bare 500 an uncaught store error would otherwise give.
+
+    Args:
+        request: The request whose route raised. Unused; part of the Starlette
+            handler signature.
+        exc: The
+            :class:`~osprey.interfaces.web_terminal.ownership.OwnershipStoreError`
+            raised.
+
+    Returns:
+        A 409 whose ``detail`` is the exception's message.
+    """
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+def register_scaffold_conflict_handlers(app: FastAPI) -> None:
+    """Translate the scaffold family's two refusal types into 409s app-wide.
+
+    Both exceptions mean one thing to the browser — the write was refused and
+    the message says why — and both can come out of most of the gallery's
+    write routes. Handling them once here keeps each route to the translations
+    that genuinely differ per endpoint. Only the scaffold routes reach the code
+    that raises either, so registering them on the app narrows to that family
+    in practice.
+
+    Args:
+        app: The application to register the handlers on.
+    """
+    app.add_exception_handler(ScaffoldClaimError, _scaffold_claim_conflict)
+    app.add_exception_handler(OwnershipStoreError, _ownership_store_conflict)
 
 
 def create_app(
@@ -795,11 +1072,15 @@ def create_app(
     app.state.url_prefix = url_prefix
 
     app.include_router(router)
+    register_scaffold_conflict_handlers(app)
 
     @app.get("/")
     async def root(request: Request):
         app_name = getattr(request.app.state, "app_name", "")
         web_theme_id = getattr(request.app.state, "web_theme_id", "dark")
+        web_theme_mode = getattr(request.app.state, "web_theme_mode", None)
+        web_ui_mode = getattr(request.app.state, "web_ui_mode", DEFAULT_UI_MODE)
+        web_rail_position = getattr(request.app.state, "web_rail_position", DEFAULT_RAIL_POSITION)
         terminal_user = getattr(request.app.state, "terminal_user", "")
         landing_url = getattr(request.app.state, "landing_url", "")
         return templates.TemplateResponse(
@@ -808,6 +1089,9 @@ def create_app(
             {
                 "app_name": app_name,
                 "web_theme_id": web_theme_id,
+                "web_theme_mode": web_theme_mode or "",
+                "web_ui_mode": web_ui_mode,
+                "web_rail_position": web_rail_position,
                 "terminal_user": terminal_user,
                 "landing_url": landing_url,
                 "url_prefix": url_prefix,

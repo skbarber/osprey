@@ -7,8 +7,10 @@ name is ``"grid_scan"`` (see that module's docstring).
 Its *agentic* scenario is explicitly deferred (PROPOSAL.md's Out of Scope —
 it waits on a separate VA physics enhancement), so this non-agentic HTTP-level
 round trip is what keeps the plan itself verified end to end in the meantime
-(Secondary Goal 2): ``GET /plans`` -> ``POST /runs`` -> launch -> poll ->
-``GET /runs/{id}/data``, mirroring ``test_orm_roundtrip.py``'s pattern
+(Secondary Goal 2): ``GET /plans`` -> ``PATCH /draft`` -> ``POST /queue/items``
+-> armed ``POST /queue/start`` -> poll -> ``GET /runs/{id}/data`` (the queue
+flow, spelled once in ``tests/e2e/_queue_drive.py``), mirroring
+``test_orm_roundtrip.py``'s pattern
 (task 5.2) but driving ``grid_scan`` instead of ``orm``, and without that
 test's model-oracle cross-check (``grid_scan`` has no physics model to
 compare against — it wraps ``bluesky.plans.grid_scan`` generically).
@@ -33,58 +35,61 @@ logic.
 
 Container safety: every docker invocation below names an exact
 container/image -- never a wildcard, never ``system prune``/``--volumes``.
-Teardown goes through ``osprey deploy down``, matching every other e2e in
-this directory.
+Teardown goes through ``osprey down``, matching every other e2e in
+this directory, followed by exact-named removal of this project's own volumes
+(``tests/e2e/_volumes.py``): ``down`` keeps them by design, and a rerun must
+not inherit their state.
 
 Gating: needs Docker; the VA image builds natively for the host arch, so on
 Apple Silicon PyAT/softioc compile from source (no prebuilt aarch64 wheels) --
-slow (minutes) on a cold image cache. Also skipped on GitHub Actions runners,
-which do not provision the real Docker VA+bridge+Tiled stack this test needs
-(the other real-stack e2e siblings carry the same CI gate). Run locally
+slow (minutes) on a cold image cache. On CI this runs in the dedicated
+``orm-roundtrip-e2e`` job, after ``test_orm_roundtrip.py`` and never
+alongside it -- both stand up their own VA on CA port 5064. Run locally
 with ``E2E_REUSE_IMAGES=1`` set for fast iteration once the image cache is
 warm.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
-import time
-import urllib.error
-import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tests.e2e import _orm_stack
+from osprey.services.bluesky_bridge.figure import rows_from_columnar
+from tests.e2e import _orm_stack, _queue_drive
+from tests.e2e._deploy_diagnostics import queue_stack_logs
+from tests.e2e._volumes import remove_project_volumes
 
 pytestmark = [
     pytest.mark.e2e,
     pytest.mark.slow,
+    # dockerbuild: full VA/bridge/Tiled image build + deploy -- runs in the
+    # dedicated orm-roundtrip-e2e CI job alongside test_orm_roundtrip.py,
+    # never the shared e2e-tests lane (the marker->--ignore pairing is
+    # enforced by tests/deployment/test_ci_workflow_wiring.py).
+    pytest.mark.dockerbuild,
     pytest.mark.skipif(shutil.which("docker") is None, reason="docker not available"),
-    # Skipped on CI: needs a real Docker VA+bridge+Tiled+postgres stack, which
-    # the default GitHub Actions runner does not provision (see
-    # tests/e2e/README.md; the other real-stack e2e siblings carry the same
-    # gate).
-    pytest.mark.skipif(
-        os.environ.get("GITHUB_ACTIONS") == "true",
-        reason="needs a real Docker stack; not provisioned on CI runners",
-    ),
 ]
 
 # Distinct from every other e2e module's pinned bridge port (_orm_stack.py's
 # 18102, test_bluesky_deploy.py's 18090, test_va_substrate_equivalence.py's
 # 18099, test_tiled_roundtrip.py's 18101, test_bluesky_catalog_e2e.py's
-# 18103, test_bluesky_sandbox_escape_e2e.py's 18105, test_bluesky_panels_deploy.py's
+# 18103, test_bluesky_sandbox_escape_e2e.py's 18105, test_bluesky_web_deploy.py's
 # 18106) so this can run concurrently with any of them on a shared dev
 # machine without a port collision.
 BRIDGE_PORT = 18104
 
 BRIDGE_URL = f"http://localhost:{BRIDGE_PORT}"
+
+#: Compose project this suite deploys under. Locally-built image tags follow
+#: ``<project>-<service>``, so the forced image refresh below needs the same
+#: name the build is given -- hence one constant rather than repeated literals.
+PROJECT_NAME = "grid-scan-roundtrip"
 
 BUILD_TIMEOUT_SEC = _orm_stack.BUILD_TIMEOUT_SEC
 DEPLOY_UP_TIMEOUT_SEC = 1200  # first-time native VA source build is slow (minutes)
@@ -108,61 +113,8 @@ AXIS_STOP_A = 3.0
 NUM_POINTS = 3
 
 
-def _channel_limits(project_dir: Path) -> dict[str, Any]:
-    return json.loads((project_dir / "data" / "channel_limits.json").read_text(encoding="utf-8"))
-
-
-def _minted_token(project_dir: Path) -> str:
-    from osprey.utils.dotenv import parse_dotenv_file
-
-    env_path = project_dir / ".env"
-    assert env_path.is_file(), f"no .env written at {env_path} — token was not minted"
-    env = parse_dotenv_file(env_path)
-    token = env.get("BLUESKY_LAUNCH_TOKEN")
-    assert token, (
-        "BLUESKY_LAUNCH_TOKEN missing/empty in the project .env — the arming-safe "
-        "execution.execution_method: container config (FR11) should auto-mint it"
-    )
-    return token
-
-
-def _wait_for_health(url: str, timeout: float) -> None:
-    deadline = time.monotonic() + timeout
-    last_err = "(no response yet)"
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=3.0) as resp:  # noqa: S310 - localhost
-                if resp.status == 200:
-                    return
-                last_err = f"HTTP {resp.status}"
-        except (urllib.error.URLError, ConnectionError, OSError) as exc:
-            last_err = str(exc)
-        time.sleep(1.0)
-    raise AssertionError(f"timed out after {timeout:.0f}s waiting for {url} (last: {last_err})")
-
-
 def _get(path: str) -> tuple[int, Any]:
-    req = urllib.request.Request(f"{BRIDGE_URL}{path}", method="GET")  # noqa: S310
-    try:
-        with urllib.request.urlopen(req, timeout=10.0) as resp:  # noqa: S310
-            return resp.status, json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read().decode("utf-8"))
-
-
-def _post(path: str, body: dict, headers: dict | None = None) -> tuple[int, dict]:
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(  # noqa: S310
-        f"{BRIDGE_URL}{path}",
-        data=data,
-        method="POST",
-        headers={"Content-Type": "application/json", **(headers or {})},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15.0) as resp:  # noqa: S310
-            return resp.status, json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read().decode("utf-8"))
+    return _queue_drive.request(BRIDGE_URL, path, "GET")
 
 
 def _find_column(columns: list[str], device_name: str) -> str:
@@ -178,10 +130,10 @@ def _find_column(columns: list[str], device_name: str) -> str:
 
 
 class DeployedGridScanStack:
-    """Everything the round-trip test needs about the one co-deployed project."""
+    """Everything the round-trip test needs about the one deployment repo."""
 
-    def __init__(self, project_dir: Path, corrector_name: str, bpm_name: str):
-        self.project_dir = project_dir
+    def __init__(self, repo: Path, corrector_name: str, bpm_name: str):
+        self.repo = repo
         self.corrector_name = corrector_name
         self.bpm_name = bpm_name
 
@@ -191,42 +143,35 @@ def deployed_grid_scan_stack(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[DeployedGridScanStack]:
     base = tmp_path_factory.mktemp("grid_scan_roundtrip_build")
-    project_dir = _orm_stack.build_project_subprocess(
-        "grid-scan-roundtrip", output_dir=base, bridge_port=BRIDGE_PORT, timeout=BUILD_TIMEOUT_SEC
+    # The deployment REPO: `osprey up` runs here, `.env` lives here, and the
+    # render `osprey build` produced is `<repo>/build`.
+    repo = _orm_stack.build_project_subprocess(
+        PROJECT_NAME, output_dir=base, bridge_port=BRIDGE_PORT, timeout=BUILD_TIMEOUT_SEC
     )
 
-    limits = _channel_limits(project_dir)
+    # The render's copy, not the operator-owned source under <repo>/data/ —
+    # build/data is the file the deployed containers actually read.
+    limits = _orm_stack.channel_limits(repo / "build")
     # A single corrector/BPM pair is all a 1-axis grid_scan needs -- unlike
     # the orm plan, grid_scan doesn't sweep every named corrector against
     # every named detector, so there is no benefit to _orm_stack's usual
     # DEFAULT_CORRECTOR_COUNT/DEFAULT_BPM_COUNT of 4.
     correctors = _orm_stack.select_correctors(limits, count=1)
     bpms = _orm_stack.select_bpms(limits, count=1)
-    _orm_stack.write_scan_env(project_dir, correctors=correctors, bpms=bpms)
+    # Writes the repo root's `.env` — the deployment's whole secret store, and
+    # the file `osprey up` refuses to start without.
+    _orm_stack.write_substrate_env(repo, correctors=correctors, bpms=bpms)
 
     osprey_bin = _orm_stack.find_osprey_console_script()
 
-    # Force fresh --dev builds so the deployed containers run CURRENT source
-    # (osprey deploy up does not pass --build to compose, so it would
-    # otherwise reuse a stale cached image). Exact-named images only.
-    # E2E_REUSE_IMAGES=1 skips this for fast local iteration on the test
-    # itself when the osprey source is unchanged; never set it in CI.
-    if not os.environ.get("E2E_REUSE_IMAGES"):
-        subprocess.run(
-            ["docker", "rmi", "-f", _orm_stack.va_image("grid-scan-roundtrip")],
-            capture_output=True,
-            text=True,
-        )
-        subprocess.run(
-            ["docker", "rmi", "-f", _orm_stack.bridge_image("grid-scan-roundtrip")],
-            capture_output=True,
-            text=True,
-        )
+    _orm_stack.force_image_rebuild(
+        _orm_stack.va_image(PROJECT_NAME), _orm_stack.bridge_image(PROJECT_NAME)
+    )
 
     try:
         up = subprocess.run(
-            [str(osprey_bin), "deploy", "up", "-d", "--dev"],
-            cwd=str(project_dir),
+            [str(osprey_bin), "up", "-d", "--dev"],
+            cwd=str(repo),
             capture_output=True,
             text=True,
             timeout=DEPLOY_UP_TIMEOUT_SEC,
@@ -234,27 +179,38 @@ def deployed_grid_scan_stack(
         )
         if up.returncode != 0:
             pytest.fail(
-                f"osprey deploy up -d --dev failed (rc={up.returncode}):\n"
+                f"osprey up -d --dev failed (rc={up.returncode}):\n"
                 f"--- stdout ---\n{up.stdout}\n--- stderr ---\n{up.stderr}"
             )
-        _wait_for_health(f"{BRIDGE_URL}/health", HEALTH_TIMEOUT_SEC)
+        _orm_stack.wait_for_health(f"{BRIDGE_URL}/health", HEALTH_TIMEOUT_SEC)
+        # HTTP readiness is not enqueue readiness -- the worker namespace the
+        # enqueue validates against exists only once the RE worker environment
+        # is open, and the bridge opens that off the readiness path. See
+        # `_queue_drive.wait_for_worker_environment`.
+        try:
+            _queue_drive.wait_for_worker_environment(BRIDGE_URL)
+        except AssertionError as exc:
+            pytest.fail(f"{exc}\n{queue_stack_logs(_orm_stack.project_prefix(PROJECT_NAME))}")
         yield DeployedGridScanStack(
-            project_dir=project_dir,
+            repo=repo,
             corrector_name=next(iter(correctors)),
             bpm_name=next(iter(bpms)),
         )
     finally:
         down = subprocess.run(
-            [str(osprey_bin), "deploy", "down"],
-            cwd=str(project_dir),
+            [str(osprey_bin), "down"],
+            cwd=str(repo),
             capture_output=True,
             text=True,
             timeout=300,
         )
         if down.returncode != 0:
             print(  # noqa: T201 - surface teardown issues in CI logs
-                f"osprey deploy down rc={down.returncode}\n{down.stdout}\n{down.stderr}"
+                f"osprey down rc={down.returncode}\n{down.stdout}\n{down.stderr}"
             )
+        # `osprey down` keeps volumes by design; drop this project's own so a
+        # rerun cannot inherit their state (see tests/e2e/_volumes.py).
+        remove_project_volumes(_orm_stack.project_prefix(PROJECT_NAME))
 
 
 @pytest.mark.flaky(reruns=1, only_rerun=["AssertionError"])
@@ -264,21 +220,22 @@ def test_grid_scan_roundtrip_produces_a_well_formed_grid(
     status, plans_body = _get("/plans")
     assert status == 200, f"GET /plans failed: {status} {plans_body}"
     plan_names = {p["name"] for p in plans_body}
-    assert plan_names == {"orm", "grid_scan"}, (
-        f"expected the shipped plan set to be exactly {{orm, grid_scan}} (FR2), got {plan_names}"
+    assert plan_names == {"orm", "grid_scan", "orbit_bump_sweep"}, (
+        "expected the shipped plan set to be exactly "
+        f"{{orm, grid_scan, orbit_bump_sweep}} (FR2), got {plan_names}"
     )
 
     corrector_name = deployed_grid_scan_stack.corrector_name
     bpm_name = deployed_grid_scan_stack.bpm_name
 
     # Canonical grid_scan schema (plans_core/grid_scan.py's PARAMS): a
-    # `detectors` list, one `GridAxis` per swept dimension
+    # `readables` list, one `GridAxis` per swept dimension
     # (`setpoint`/`start`/`stop`/`num_points`), and `snake_axes`. A single
     # axis here -- the "n-dimensional" contract is exercised by
     # test_exemplar_plans.py's in-process 2-axis case; this e2e's job is the
     # real HTTP+container round trip, kept minimal to run fast.
     plan_args = {
-        "detectors": [bpm_name],
+        "readbacks": [bpm_name],
         "axes": [
             {
                 "setpoint": corrector_name,
@@ -290,25 +247,20 @@ def test_grid_scan_roundtrip_produces_a_well_formed_grid(
         "snake_axes": False,
     }
 
-    status, body = _post("/runs", {"plan_name": "grid_scan", "plan_args": plan_args})
-    assert status == 200, f"POST /runs failed: {status} {body}"
-    run_id = body["id"]
+    token = _orm_stack.minted_launch_token(deployed_grid_scan_stack.repo)
+    run_id, status_body = _queue_drive.run_plan(
+        BRIDGE_URL,
+        "grid_scan",
+        plan_args,
+        token=token,
+        client_id="grid-scan-roundtrip-e2e",
+        timeout=SCAN_TIMEOUT_SEC,
+    )
 
-    token = _minted_token(deployed_grid_scan_stack.project_dir)
-    status, body = _post(f"/runs/{run_id}/launch", {}, headers={"X-Launch-Token": token})
-    assert status == 200, f"launch failed: {status} {body}"
-
-    # No corrector-step hang: poll to a terminal status within a bounded
-    # deadline (same regression class test_orm_roundtrip.py guards -- a
-    # corrector whose :RB never echoes its :SP blocks the bridge's
+    # No corrector-step hang: the poll above ran to a terminal status within a
+    # bounded deadline (same regression class test_orm_roundtrip.py guards --
+    # a corrector whose :RB never echoes its :SP blocks the bridge's
     # ConnectorSettable.set() settle-wait forever).
-    deadline = time.monotonic() + SCAN_TIMEOUT_SEC
-    status_body: dict = {}
-    while time.monotonic() < deadline:
-        _, status_body = _get(f"/runs/{run_id}")
-        if status_body.get("status") in ("completed", "error", "stopped"):
-            break
-        time.sleep(0.5)
     assert status_body.get("status") == "completed", (
         f"grid_scan did not complete within {SCAN_TIMEOUT_SEC:.0f}s (status={status_body}) -- "
         "a corrector step whose :RB never echoes its :SP hangs exactly here, at the bridge's "
@@ -329,7 +281,7 @@ def test_grid_scan_roundtrip_produces_a_well_formed_grid(
     corrector_col = _find_column(columns, corrector_name)
     bpm_col = _find_column(columns, bpm_name)
 
-    rows = [dict(zip(columns, values, strict=True)) for values in data["rows"]]
+    rows = rows_from_columnar(columns, data["rows"], data["row_count"]).rows
     assert len(rows) == NUM_POINTS
 
     corrector_values = [row[corrector_col] for row in rows]

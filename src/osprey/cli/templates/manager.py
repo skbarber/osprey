@@ -1,5 +1,6 @@
 """TemplateManager facade: thin orchestrator delegating to submodules."""
 
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -8,17 +9,20 @@ from typing import Any
 import yaml
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from osprey.cli.build_profile import (
+from osprey.build.build_tiers import (
     VALID_CHANNEL_FINDER_MODES,
     default_tier_for_mode,
     tier_mode_conflict,
 )
-from osprey.cli.styles import console
 from osprey.cli.templates import claude_code, manifest, scaffolding
 from osprey.cli.templates._rendering import render_template as _render_template
 from osprey.errors import BuildProfileError
 from osprey.profiles.web_panels import BUILTIN_PANELS
 from osprey.utils.config import resolve_env_vars
+from osprey.utils.facility import resolve_facility_name
+from osprey.utils.workspace import repo_root_for_config
+
+logger = logging.getLogger("osprey.cli.templates")
 
 
 class TemplateManager:
@@ -126,6 +130,7 @@ class TemplateManager:
         force: bool = False,
         artifacts: dict[str, list[str]] | None = None,
         tier: int | None = None,
+        data_root: Path | None = None,
     ) -> Path:
         """Create complete project from template.
 
@@ -149,6 +154,10 @@ class TemplateManager:
                 ``BuildProfile.resolved_tier``. An explicit tier is honored but
                 validated against the paradigm, so a tier/mode mismatch raises a
                 legible rule error instead of an opaque FileNotFoundError.
+            data_root: Facility data tree to copy instead of the bundle's
+                ``apps/<data_bundle>/data/``, already resolved by
+                ``BuildProfile.resolved_data_root``. A full replacement copied
+                verbatim (no Jinja rendering); ``None`` keeps the bundle tree.
 
         Returns:
             Path to created project directory
@@ -158,12 +167,11 @@ class TemplateManager:
                 exists without ``force=True``.
 
         Note:
-            ``default_provider`` is no longer defaulted here — callers must
-            inject it via ``context``. ``osprey build`` enforces this at the
-            CLI boundary (``click.UsageError``); internal callers that omit
-            it produce an empty ``provider:`` in the rendered ``config.yml``,
-            which the config loader rejects at project runtime. See
-            plan-remove-implicit-synchronous-narwhal.
+            ``default_provider`` is not defaulted here — callers must inject
+            it via ``context``. ``osprey build`` enforces this at the CLI
+            boundary (``click.UsageError``); internal callers that omit it
+            produce an empty ``provider:`` in the rendered ``config.yml``,
+            which the config loader rejects at project runtime.
         """
         # 1. Validate data bundle exists
         bundle_dir = self.template_root / "apps" / data_bundle
@@ -194,11 +202,8 @@ class TemplateManager:
 
         current_python = sys.executable
 
-        # Detect environment variables from the system
-        detected_env_vars = scaffolding.detect_environment_variables()
-
-        # Fall back to preset profile artifacts when the caller didn't pass any
-        # (legacy code path). An explicit empty dict from `osprey build` means the
+        # Fall back to preset profile artifacts when the caller didn't pass any.
+        # An explicit empty dict from `osprey build` means the
         # profile deliberately selects nothing, and must not be overridden.
         if artifacts is None:
             tmpl_manifest = manifest.load_template_manifest(self.template_root, data_bundle)
@@ -229,8 +234,28 @@ class TemplateManager:
             # from this so it can't drift from the real registry. sorted() for
             # deterministic rendered output.
             "builtin_panels": sorted(BUILTIN_PANELS),
-            # Add detected environment variables
-            "env": detected_env_vars,
+            # No `env` key: the render reads nothing from `os.environ`, and
+            # writes no `.env` at all — the deployment's one secret store is the
+            # repo-root `.env`, outside this tree.
+            # Provider API-key env vars, derived from the provider registry
+            # (single source of truth in osprey.models.provider_registry) so
+            # env.example.j2 can't drift from the real provider list.
+            # Ordered list of {"provider", "var"} dicts; key-less providers
+            # (ollama, vllm, …) are excluded.
+            "provider_api_keys": scaffolding.provider_api_key_entries(),
+            # The subset of the above this profile actually uses. Empty here so
+            # a caller with no profile still renders the whole list uncommented;
+            # `osprey init` fills it in and the rest drop below a divider.
+            "active_provider_vars": [],
+            # Deploy-minted service credentials, derived from the map the
+            # deploy path mints from, so .env.example documents every one of
+            # them. Ordered list of {"var", "services", "note"} dicts.
+            "service_token_vars": scaffolding.service_token_var_entries(),
+            # The build profile's `env:` block, documented in .env.example.
+            # Defaulted here so a caller that has no profile (programmatic
+            # create_project) still renders the file.
+            "env_required": [],
+            "env_defaults": {},
             **(context or {}),
         }
 
@@ -265,13 +290,16 @@ class TemplateManager:
                     "channel_finder_tools": list(
                         CHANNEL_FINDER_TOOLS_BY_PIPELINE.get(channel_finder_mode, [])
                     ),
-                    "facility_name": ctx.get("facility_name", project_name),
                 }
             )
 
         # 4. Create project structure
         scaffolding.create_project_structure(
-            self.template_root, self.jinja_env, project_dir, data_bundle, ctx
+            self.template_root,
+            self.jinja_env,
+            project_dir,
+            data_bundle,
+            ctx,
         )
 
         # 5. Copy services: bundle-level services/ dir takes priority, then
@@ -301,7 +329,10 @@ class TemplateManager:
                             self.template_root, project_dir, to_copy
                         )
 
-        # 6. Copy data files from template (no src/ package)
+        # 6. Copy data files from template (no src/ package), or from the
+        # profile's own data tree when one was resolved. Either way this lands
+        # before step 6b's tier materialization and the hierarchy probe in
+        # step 7, both of which read the project's flat data/ paths.
         scaffolding.copy_template_data(
             self.template_root,
             project_dir,
@@ -309,6 +340,7 @@ class TemplateManager:
             data_bundle,
             ctx,
             jinja_env=self.jinja_env,
+            data_root=data_root,
         )
 
         # 6a. Copy machine_data/ if bundle provides it
@@ -316,20 +348,18 @@ class TemplateManager:
         if machine_data_src.exists():
             machine_data_dst = project_dir / "machine_data"
             shutil.copytree(machine_data_src, machine_data_dst, dirs_exist_ok=True)
-            console.print(
-                f"  [success]✓[/success] Copied machine data to [path]{machine_data_dst}[/path]"
-            )
+            logger.debug("Copied machine data to %s", machine_data_dst)
 
-        # 6a'. Copy docker/ if bundle provides it — carries the
-        # docker/web-terminal-context/ overlay tree (base.md + per-user
-        # extra.md/skills) that web-terminal seeding requires at deploy time.
-        docker_src = bundle_dir / "docker"
-        if docker_src.exists():
-            docker_dst = project_dir / "docker"
-            shutil.copytree(docker_src, docker_dst, dirs_exist_ok=True)
-            console.print(
-                f"  [success]✓[/success] Copied docker overlay tree to [path]{docker_dst}[/path]"
-            )
+        # 6a'. Install the web-terminal context baseline. This base.md is the
+        # framework FALLBACK: seeding hard-requires one for any project that
+        # seeds a user, so every bundle gets a generic copy — and a profile
+        # that ships its own `web-terminal-context/base.md` overrides it when
+        # the convention copies apply after this render. Per-user
+        # extra.md/skills stay user-authored under the same tree.
+        context_src = self.template_root / "claude_code" / "web-terminal-context"
+        context_dst = project_dir / "docker" / "web-terminal-context"
+        shutil.copytree(context_src, context_dst, dirs_exist_ok=True)
+        logger.debug("Installed web-terminal context to %s", context_dst)
 
         # 6b. Flatten the preset's tier-routed channel DBs into the canonical
         # data/channel_databases/<paradigm>.json locations. Must run before the
@@ -359,14 +389,12 @@ class TemplateManager:
             scaffolding.materialize_tier_artifacts(project_dir, effective_tier, channel_finder_mode)
             scaffolding.prune_csv_build_artifacts(project_dir, channel_finder_mode)
 
-        # 7. Create _agent_data directory structure
-        scaffolding.create_agent_data_structure(self.template_root, project_dir, ctx)
-
-        # 8. Create Claude Code integration files
+        # 7. Create Claude Code integration files
         # Load rendered config.yml so conditional sections (confluence, etc.)
         # are available to Claude Code templates (mcp.json.j2, CLAUDE.md.j2).
         config_file = project_dir / "config.yml"
         cc_cfg = {}
+        rendered_config: dict = {}
         ctx.setdefault("facility_permissions", {})
         if config_file.exists():
             with open(config_file) as f:
@@ -377,7 +405,7 @@ class TemplateManager:
             cc_cfg = cc_config
             ctx["facility_permissions"] = cc_config.get("permissions", {})
             # Model provider resolution for init-time rendering
-            from osprey.cli.claude_code_resolver import ClaudeCodeModelResolver
+            from osprey.build.claude_code_resolver import ClaudeCodeModelResolver
 
             api_providers = rendered_config.get("api", {}).get("providers", {})
             try:
@@ -390,53 +418,36 @@ class TemplateManager:
             system_config = rendered_config.get("system", {})
             ctx["system_timezone"] = system_config.get("timezone", "UTC")
 
-            # Facility name fallback (already set for control_assistant at line 284,
-            # but setdefault handles other templates)
-            ctx.setdefault("facility_name", rendered_config.get("facility_name", project_name))
+            # Facility identity: canonical `facility.name`, legacy top-level
+            # `facility_name` as fallback (see utils.facility.resolve_facility_name).
+            # setdefault so an explicit caller-supplied context value still wins.
+            ctx.setdefault("facility_name", resolve_facility_name(rendered_config, project_name))
 
             cf_config = rendered_config.get("channel_finder", {})
 
-            # Embed hierarchy info for initial creation (mirrors _build_claude_code_context)
+            # Embed hierarchy info for initial creation, through the same
+            # resolution every later re-render uses.
             if cf_config.get("pipeline_mode") == "hierarchical":
-                try:
-                    db_path = (
-                        cf_config.get("pipelines", {})
-                        .get("hierarchical", {})
-                        .get("database", {})
-                        .get("path", "")
-                    )
-                    if db_path:
-                        from osprey.services.channel_finder.databases.hierarchical import (
-                            HierarchicalChannelDatabase,
-                        )
-
-                        resolved = (project_dir / db_path).resolve()
-                        db = HierarchicalChannelDatabase(str(resolved))
-                        ctx["channel_finder_hierarchy"] = {
-                            "hierarchy_levels": db.hierarchy_levels,
-                            "hierarchy_config": db.hierarchy_config,
-                            "naming_pattern": db.naming_pattern,
-                        }
-                except Exception:
-                    import logging
-
-                    logging.getLogger("osprey.cli.templates").warning(
-                        "Could not load hierarchy info during project creation",
-                        exc_info=True,
-                    )
+                hierarchy = claude_code.resolve_hierarchy_context(cf_config, project_dir)
+                if hierarchy is not None:
+                    ctx["channel_finder_hierarchy"] = hierarchy
             ctx.setdefault("channel_finder_hierarchy", None)
 
-        # Textbooks root -- resolve relative to project directory
-        _textbooks_dir = project_dir.parent / "data" / "textbooks"
-        ctx["textbooks_root"] = str(_textbooks_dir) if _textbooks_dir.is_dir() else None
-        # Tilde variant for permission matching (models abbreviate /Users/x to ~)
-        import os as _os
+        # A bundle that renders no config.yml still needs a facility name for the
+        # agent/CLAUDE.md prompts rendered below.
+        ctx.setdefault("facility_name", project_name)
 
-        _home = _os.path.expanduser("~")
-        if ctx["textbooks_root"] and ctx["textbooks_root"].startswith(_home):
-            ctx["textbooks_root_tilde"] = "~" + ctx["textbooks_root"][len(_home) :]
-        else:
-            ctx["textbooks_root_tilde"] = None
+        # Everything the Claude Code templates read out of config.yml, through
+        # the same helper the build's own render path uses. Without it this path
+        # left `control_system_write_tools` (and the declared-hook wiring)
+        # undefined, and the non-strict Jinja environment rendered that as
+        # nothing: a hook_config.json whose write-kill-switch list was empty,
+        # with no error to say so. setdefault, so an explicit caller-supplied
+        # value still wins.
+        for key, value in claude_code.config_derived_context(rendered_config, project_dir).items():
+            ctx.setdefault(key, value)
+
+        claude_code.apply_textbooks_root(ctx, project_dir)
 
         # Resolve servers and agents via the data-driven registry.
         from osprey.registry.mcp import resolve_agents, resolve_servers
@@ -446,10 +457,23 @@ class TemplateManager:
         ctx["enabled_servers"] = {s["name"] for s in ctx["servers"] if s["enabled"]}
         ctx["enabled_agents"] = {a["name"] for a in ctx["agents"] if a["enabled"]}
 
-        # Load template manifest and resolve allowed outputs
-        manifest_data = manifest.load_template_manifest(self.template_root, data_bundle)
+        # Resolve allowed outputs from THIS render's effective artifact selection —
+        # `artifacts` above, already the caller's own selection where it supplied
+        # one and the data bundle's otherwise. Re-loading the bundle manifest here
+        # would discard the caller's: a persona render inherits its host's data
+        # bundle, so the bundle manifest is the HOST's selection, and a persona
+        # that drops an artifact by name would still have it allowed. Skills are
+        # where that shows, being the one family copied on the strength of this set
+        # alone (hooks and rules gate inside their own templates, agents are
+        # filtered just below), so the leak was silent everywhere else.
+        #
+        # `is not None`, not truthiness: an empty selection is the deliberate
+        # "this render selects nothing" of the fallback above, and must resolve to
+        # the four config artifacts rather than fall back to a wider list.
         allowed_outputs = (
-            manifest.resolve_manifest_outputs(manifest_data) if manifest_data else None
+            manifest.resolve_manifest_outputs({"artifacts": artifacts})
+            if artifacts is not None
+            else None
         )
 
         # Filter agents to manifest (only generate agents the template declares)
@@ -469,33 +493,94 @@ class TemplateManager:
         project_dir: Path,
         dry_run: bool = False,
         project_root_override: Path | str | None = None,
+        runtime_venv_dir: Path | str | None = None,
+        runtime_interpreter: str | None = None,
     ) -> dict:
         """Regenerate Claude Code artifacts from current config.yml.
 
         Args:
-            project_dir: Root directory of the project
+            project_dir: Directory holding the ``config.yml`` and ``.claude/``
+                being regenerated — the *render* (``<repo>/build``), not the
+                repo root.
             dry_run: If True, report what would change without writing files
-            project_root_override: If set, use this path as ``project_root``
-                in the rendered context instead of ``project_dir``.
+            project_root_override: The repo root the regenerated artifacts must
+                name. Defaults to the repo *of the config being read*, resolved
+                through :func:`osprey.utils.workspace.repo_root_for_config` —
+                see the note below. Pass it explicitly only to render for a
+                root other than the one this render sits in.
+            runtime_venv_dir: Directory holding the ``.venv`` the regenerated
+                artifacts will launch from, when the render is written somewhere
+                other than where it will run. Defaults to *project_dir* whenever
+                the repo root is derived — the render is then both, and the note
+                below says why the two have to be stated together.
+            runtime_interpreter: The interpreter the regenerated artifacts must
+                launch with, for a render destined for a machine this one cannot
+                probe — a container image. Overrides the filesystem-derived
+                answer; see :func:`osprey.cli.templates.claude_code.build_claude_code_context`.
 
         Returns:
-            Dict with 'changed', 'unchanged', and 'backup_dir' keys
+            Dict with 'changed' and 'unchanged' keys
+
+        Note:
+            The directory holding ``config.yml`` is not the project root. A
+            rendered deployment lives one level down, at ``<repo>/build``, so
+            taking the render for the root makes the registry's
+            ``{project_root}/build/config.yml`` resolve to
+            ``<repo>/build/build/config.yml`` — a file that does not exist —
+            and every MCP server and hook that reads ``CONFIG_FILE`` fails on
+            it. The default is derived through the same helper the *runtime*
+            resolves a repo root with, so what a regen writes and what a
+            running deployment computes cannot disagree.
+
+            One rule covers both repo shapes, because they are the same shape:
+            ``<repo>/build`` on a host and ``/app/<name>/build`` in a container
+            (a container is a deployment repo in its own right). For a flat
+            directory that holds its own ``config.yml`` the helper returns that
+            directory, which is what this argument fell back to before.
+
+            It follows that regen re-renders a deployment *where it lives*. It
+            is deliberately not a relocation tool: rendering for a root other
+            than the one on disk is a build concern, and those callers
+            (``osprey build``, the container render, ``osprey status``) say so
+            by passing the override.
+
+            That is also why deriving the root states the venv's home in the
+            same breath. Naming a ``project_root`` at all tells
+            ``_derive_runtime_interpreter`` the render is destined for a machine
+            this one cannot probe, so it stops looking for the project's own
+            ``.venv`` — correct for a container render, wrong here, where the
+            venv is ``<render>/.venv`` and is exactly what every MCP server must
+            launch. The two answer different questions (*where the repo is*
+            versus *what starts the processes*), so a caller that knows one
+            still has to say the other.
         """
+        if project_root_override is None:
+            project_root_override = repo_root_for_config(
+                Path(project_dir).absolute() / "config.yml"
+            )
+            if runtime_venv_dir is None:
+                runtime_venv_dir = project_dir
         return claude_code.regenerate_claude_code(
             self.template_root,
             self.jinja_env,
             project_dir,
             dry_run,
             project_root_override=project_root_override,
+            runtime_venv_dir=runtime_venv_dir,
+            runtime_interpreter=runtime_interpreter,
         )
 
     def regen_if_drift(self, project_dir: Path) -> list[str]:
         """Regenerate Claude Code artifacts only if they have drifted from config.
 
         Runs a dry-run first and performs a real regeneration only when something
-        would actually change. This keeps no-op launches free (no backup-dir spam
-        under ``_agent_data/backup/``) while ensuring a stale ``settings.json`` /
-        ``.mcp.json`` is brought back in sync after a ``config.yml`` edit.
+        would actually change, so a launch that has nothing to do rewrites
+        nothing: no artifact is re-emitted, and — the part that is visible to the
+        operator — ``settings.json``'s mtime is not disturbed on a no-op. That
+        mtime is the SessionStart drift hook's signal (see the stamp below), so
+        touching it needlessly is not merely wasted work, it is noise in the one
+        channel that reports real drift. Meanwhile a stale ``settings.json`` /
+        ``.mcp.json`` is still brought back in sync after a ``config.yml`` edit.
 
         Args:
             project_dir: Root directory of the project (contains ``config.yml``
@@ -508,10 +593,11 @@ class TemplateManager:
             Exceptions from the underlying regeneration propagate to the caller,
             which decides whether to fail open (web) or surface the error (CLI).
         """
-        # Resolve symlinks so the rendered project_root matches what `osprey build`
-        # baked in (build resolves the path). Without this, a project built under a
-        # symlinked path (e.g. /tmp → /private/tmp on macOS, or a container bind
-        # mount) reports a phantom .mcp.json diff and churns a backup on first regen.
+        # Resolve symlinks so the rendered project_root — which regenerate_claude_code
+        # derives from this very path — matches what `osprey build` baked in (build
+        # resolves the path). Without this, a project built under a symlinked path
+        # (e.g. /tmp → /private/tmp on macOS, or a container bind mount) reports a
+        # phantom .mcp.json diff and re-renders on first regen.
         project_dir = Path(project_dir).resolve()
         settings_path = project_dir / ".claude" / "settings.json"
         if not settings_path.exists():
@@ -521,7 +607,7 @@ class TemplateManager:
             # Verified in sync — stamp settings.json so the SessionStart drift
             # hook's mtime signal clears. Without this, a config.yml edit that
             # changes no artifact (a comment, a runtime-read field) would warn
-            # at every session start until a full `osprey claude regen`.
+            # at every session start until the next full `osprey build`.
             config_path = project_dir / "config.yml"
             try:
                 if config_path.stat().st_mtime > settings_path.stat().st_mtime:

@@ -1,13 +1,14 @@
 """Seed per-user CLAUDE.md and skills into web-terminal containers.
 
-Runs both as the ``deploy up`` post-up hook and standalone via ``osprey deploy
+Runs both as the ``osprey up`` post-up hook and standalone via ``osprey users
 seed``, sharing one implementation driven directly off the parsed facility
-config. Reads the on-disk ``docker/web-terminal-context/`` overlay tree and
-reconciles each live user container.
+config. Reads the on-disk ``build/docker/web-terminal-context/`` overlay tree
+the build renders (:func:`_context_dir`) and reconciles each live user
+container.
 
 Contract:
 
-* ``CLAUDE.md`` is REPLACED every run: ``docker/web-terminal-context/base.md``
+* ``CLAUDE.md`` is REPLACED every run: the overlay tree's ``base.md``
   concatenated with the user's ``extra.md`` (or the legacy flat ``<user>.md``),
   piped into the container's ``/data/claude-config/CLAUDE.md`` (user scope —
   not gated by ``--setting-sources``, unlike skills). A user whose resolved
@@ -21,7 +22,7 @@ Contract:
   removed.
 * A user whose container isn't up yet is skipped (logged), not fatal — the
   rest of the roster is still seeded.
-* ``docker/web-terminal-context/base.md`` is required whenever at least one
+* The overlay tree's ``base.md`` is required whenever at least one
   to-be-seeded user's persona keeps the base prepend (``seed_base: true``, the
   default); its absence then aborts the whole seed up front (a misconfiguration,
   not a per-user issue) — mirroring the bash source's ``exit 1``. When every
@@ -37,18 +38,27 @@ import tarfile
 from pathlib import Path
 from typing import Any
 
-from osprey.deployment.facility_config import normalize_facility_config
+from osprey.cli.phase_reporter import report_step as _report_step
+from osprey.deployment.compose_generator import resolve_repo_root
 from osprey.deployment.runtime_helper import get_runtime_command, runtime_env
 from osprey.deployment.web_terminals.naming import web_container_name
 from osprey.deployment.web_terminals.personas import as_dict, normalize_users, resolve_personas
 from osprey.utils.config import ConfigBuilder
 from osprey.utils.logger import get_logger
+from osprey.utils.workspace import BUILD_DIR_NAME
 
 logger = get_logger("deployment.web_terminals.seeding")
 
-# Overlay tree root, relative to the project cwd (osprey deploy has already
-# chdir'd into the project root by the time this module runs).
-_CONTEXT_DIR = Path("docker/web-terminal-context")
+# Overlay tree root, relative to the RENDERED PROJECT — i.e. to `build/` in a
+# deployment repo, not to the repo root and not to the source-zone
+# `web-terminal-context/` a profile authors. The tree is build output: every
+# `osprey build` installs the framework's fallback base.md here
+# (templates/manager.py), lets a profile's own `web-terminal-context/base.md`
+# replace it, and copies each roster user's authored directory in below it
+# (profile_conventions.py's `web-terminal-context` convention, whose
+# destination is this same project-relative path). Seeding reads what the build
+# produced, so it resolves against the same zone.
+_CONTEXT_RELPATH = Path("docker/web-terminal-context")
 
 _CLAUDE_MD_TARGET = "/data/claude-config/CLAUDE.md"
 
@@ -102,10 +112,26 @@ _SKILLS_RECONCILE_SH = (
 )
 
 
+def _context_dir(config: dict[str, Any], config_path: str | Path | None = None) -> Path:
+    """Absolute path to this deployment's rendered web-terminal context overlay.
+
+    Derived from the deployment repo by construction rather than from the
+    working directory. ``osprey up`` chdirs to the repo root, but the
+    overlay tree is one zone down in ``build/``, so a cwd-relative
+    ``docker/web-terminal-context`` names a directory a deployment repo simply
+    does not have. Resolved there, a seed either aborts on a ``base.md`` it
+    reports missing from a path that never existed, or — for a roster whose
+    personas all opt out of the base prepend — reports every user seeded while
+    their containers receive nothing, since an absent per-user ``extra.md`` and
+    an empty ``skills/`` are both legitimate.
+    """
+    return Path(resolve_repo_root(config, config_path)) / BUILD_DIR_NAME / _CONTEXT_RELPATH
+
+
 def seed_web_terminals(config_path: str | Path, user: str | None = None) -> None:
     """Load ``config_path`` and (re)seed one or all live web-terminal users' containers.
 
-    Entry point for ``osprey deploy seed`` and any other standalone caller.
+    Entry point for ``osprey users seed`` and any other standalone caller.
 
     Args:
         config_path: Path to the facility ``config.yml``.
@@ -113,24 +139,28 @@ def seed_web_terminals(config_path: str | Path, user: str | None = None) -> None
             seed every user currently on the roster.
 
     Raises:
-        RuntimeError: If ``docker/web-terminal-context/base.md`` is missing while
+        RuntimeError: If the overlay tree's ``base.md`` is missing while
             some to-be-seeded user's persona keeps ``seed_base`` (the default),
             or if every ready container's seed failed (see
             :func:`seed_user_containers`).
         ValueError: If ``user`` is given but not present in
             ``modules.web_terminals.users``.
     """
-    config = normalize_facility_config(ConfigBuilder(str(config_path)).raw_config)
-    seed_user_containers(config, user=user)
+    config = ConfigBuilder(str(config_path)).raw_config
+    seed_user_containers(config, user=user, config_path=config_path)
 
 
 def seed_user_containers(
-    config: dict[str, Any], *, user: str | None = None, env: dict[str, str] | None = None
+    config: dict[str, Any],
+    *,
+    user: str | None = None,
+    env: dict[str, str] | None = None,
+    config_path: str | Path | None = None,
 ) -> None:
     """(Re)seed CLAUDE.md and skills into one or all live web-terminal containers.
 
     Callable standalone (env resolved from ``config`` via
-    :func:`runtime_helper.runtime_env`) or from the ``deploy up`` post-up hook
+    :func:`runtime_helper.runtime_env`) or from the ``osprey up`` post-up hook
     with an already-pinned env, so both paths share one implementation of the
     container-side reconcile contract.
 
@@ -141,7 +171,7 @@ def seed_user_containers(
     actually attempted (i.e. every container that existed and was execed into)
     fails, that is treated as a systemic misconfiguration — e.g. an image
     whose runtime user cannot be determined for the ownership handoff — rather
-    than an isolated per-user issue, and raised so ``deploy up``/``deploy seed``
+    than an isolated per-user issue, and raised so ``osprey up``/``osprey users seed``
     surfaces it instead of silently reporting success with nothing seeded.
 
     A missing ``base.md`` is a misconfiguration too, and not a per-user
@@ -161,7 +191,7 @@ def seed_user_containers(
     path are the same for every user regardless of persona.
 
     Args:
-        config: Parsed, normalizer-wrapped facility config (a ``ConfigBuilder``
+        config: Parsed facility config (a ``ConfigBuilder``
             raw-config dict).
         user: If given, seed only this user's container; a user not present in
             ``modules.web_terminals.users`` raises rather than silently
@@ -169,9 +199,16 @@ def seed_user_containers(
         env: Environment for runtime subprocess calls. Defaults to
             ``runtime_env(config)`` (``os.environ`` pinned with
             ``COMPOSE_PROJECT_NAME``).
+        config_path: Path the ``config`` was loaded from, when the caller has
+            it. Only used to locate the overlay tree (see :func:`_context_dir`),
+            and only as the most authoritative of the several ways
+            :func:`~osprey.deployment.compose_generator.resolve_repo_root` can
+            answer that — omitting it falls back to the config's own
+            ``project_root``, then to the working directory, exactly as every
+            other deploy-path caller does.
 
     Raises:
-        RuntimeError: If ``docker/web-terminal-context/base.md`` is missing while
+        RuntimeError: If the overlay tree's ``base.md`` is missing while
             some to-be-seeded user's persona keeps ``seed_base`` (the default),
             or if at least one container was ready and every ready container's
             seed failed.
@@ -199,7 +236,7 @@ def seed_user_containers(
         targets = roster
 
     runtime = get_runtime_command(config)[0]
-    run_env = env if env is not None else runtime_env(config)
+    run_env = env if env is not None else runtime_env(config, ignore_orphans=True)
     facility_prefix = as_dict(config.get("facility")).get("prefix") or ""
     registry_cfg = as_dict(config.get("registry"))
     # strict=True: an unresolvable persona reference is a misconfiguration, not a
@@ -217,7 +254,8 @@ def seed_user_containers(
     # the requirement follows the actual roster — but still before any container
     # is touched, keeping the missing-base.md abort a pre-flight misconfiguration
     # rather than a per-user failure.
-    base_md_path = _CONTEXT_DIR / "base.md"
+    context_dir = _context_dir(config, config_path)
+    base_md_path = context_dir / "base.md"
     base_md_exists = base_md_path.is_file()
     needs_base = any(resolved_by_name[entry["name"]]["seed_base"] for entry in targets)
     if needs_base and not base_md_exists:
@@ -228,9 +266,9 @@ def seed_user_containers(
         )
     base_content = base_md_path.read_text(encoding="utf-8") if base_md_exists else ""
 
-    logger.info("Seeding per-user CLAUDE.md and skills into claude-config volumes...")
     attempted = 0
     failed = 0
+    skipped: list[str] = []
     for entry in targets:
         resolved = resolved_by_name[entry["name"]]
         # Project scope, not $CLAUDE_CONFIG_DIR — the launcher runs the CLI with
@@ -242,14 +280,28 @@ def seed_user_containers(
             facility_prefix,
             base_content,
             project_skills_dir,
+            context_dir,
             seed_base=resolved["seed_base"],
             env=run_env,
         )
         if outcome is None:
-            continue  # container not ready — never counts toward the systemic check
+            # Container not ready — never counts toward the systemic check, but
+            # the count below and the warning after it keep it visible.
+            skipped.append(entry["name"])
+            continue
         attempted += 1
         if not outcome:
             failed += 1
+
+    # Counts, not an announcement: the per-user lines are DEBUG now, so a short
+    # seed has to be legible on this line alone.
+    _report_step(f"seeded {attempted - failed}/{len(targets)} user contexts")
+    if skipped:
+        logger.warning(
+            f"No container was running for web-terminal user(s) {', '.join(skipped)}, "
+            "so their context was not seeded. Re-run this once those containers "
+            "are up, or those users start with no CLAUDE.md and no skills."
+        )
 
     if attempted and failed == attempted:
         raise RuntimeError(
@@ -266,16 +318,20 @@ def _seed_one_user(
     facility_prefix: str,
     base_content: str,
     project_skills_dir: str,
+    context_dir: Path,
     *,
     seed_base: bool = True,
     env: dict[str, str] | None,
 ) -> bool | None:
     """Seed one user's container; never raise.
 
+    ``context_dir`` is the resolved overlay root (:func:`_context_dir`) this
+    user's ``extra.md`` and ``skills/`` are read from.
+
     ``seed_base`` (default ``True``) controls whether ``base_content`` is
     prepended ahead of the user's ``extra.md``. When ``False``, the user's
     ``CLAUDE.md`` payload is its ``extra.md`` alone — the per-persona base
-    opt-out. With ``seed_base=True`` the payload is byte-for-byte the historical
+    opt-out. With ``seed_base=True`` the payload is the byte-for-byte
     ``base_content + extra_content`` concatenation.
 
     Returns:
@@ -285,16 +341,16 @@ def _seed_one_user(
     """
     container = web_container_name(facility_prefix, user)
     if not _container_exists(runtime, container, env=env):
-        logger.info(f"  (skipped {user}: container not ready)")
+        logger.debug(f"  (skipped {user}: container not ready)")
         return None
     try:
         owner = _container_seed_owner(runtime, container, env=env)
-        extra_content = _resolve_extra_md(user)
+        extra_content = _resolve_extra_md(user, context_dir)
         payload = base_content + extra_content if seed_base else extra_content
         _seed_claude_md(runtime, container, payload, owner, env=env)
-        skills_src = _CONTEXT_DIR / user / "skills"
+        skills_src = context_dir / user / "skills"
         _seed_skills(runtime, container, skills_src, project_skills_dir, owner, env=env)
-        logger.info(f"  seeded {user}")
+        logger.debug(f"  seeded {user}")
         return True
     except Exception as exc:
         logger.warning(f"  (skipped {user}: seeding failed: {_describe_seed_error(exc)})")
@@ -319,17 +375,17 @@ def _describe_seed_error(exc: Exception) -> str:
     return str(exc)
 
 
-def _resolve_extra_md(user: str) -> str:
+def _resolve_extra_md(user: str, context_dir: Path) -> str:
     """The per-user ``extra.md`` content, or ``""`` if neither path exists.
 
-    Per-user overlay lives at ``docker/web-terminal-context/<user>/extra.md``;
-    falls back to the legacy flat ``docker/web-terminal-context/<user>.md`` for
-    facilities that haven't migrated to the directory layout yet. Matches the
-    bash source's ``cat base.md "$extra_md" 2>/dev/null``: a missing extra file
-    is not an error, it just contributes no content.
+    Per-user overlay lives at ``<context_dir>/<user>/extra.md``; falls back to
+    the legacy flat ``<context_dir>/<user>.md`` for facilities that haven't
+    migrated to the directory layout yet. Matches the bash source's
+    ``cat base.md "$extra_md" 2>/dev/null``: a missing extra file is not an
+    error, it just contributes no content.
     """
-    extra_md = _CONTEXT_DIR / user / "extra.md"
-    legacy_md = _CONTEXT_DIR / f"{user}.md"
+    extra_md = context_dir / user / "extra.md"
+    legacy_md = context_dir / f"{user}.md"
     if not extra_md.is_file() and legacy_md.is_file():
         extra_md = legacy_md
     if extra_md.is_file():

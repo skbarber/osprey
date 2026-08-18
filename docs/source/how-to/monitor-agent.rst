@@ -35,7 +35,7 @@ it:
   OTLP; it does not care what receives it.
 - **Phase 2 — the local OpenObserve add-on (the scaffolded default).** A
   single-binary OpenObserve store deployed next to your project with
-  ``osprey deploy up``; all telemetry stays on the same host. This is the
+  ``osprey up``; all telemetry stays on the same host. This is the
   turn-key option when you have no existing observability stack.
 
 .. note::
@@ -79,8 +79,9 @@ Keys:
      - OTLP base endpoint. Use the ``${VAR}`` form so the value comes from your
        ``.env`` rather than being committed to ``config.yml``.
    * - ``protocol``
-     - OTLP transport. Defaults to ``http/protobuf``; set ``grpc`` if your
-       collector prefers it.
+     - OTLP transport. Defaults to ``http/protobuf``. ``grpc`` requires an
+       explicit ``endpoint``: it is refused against the auto-derived
+       ``openobserve`` endpoint, which is HTTP-only.
    * - ``headers``
      - Extra OTLP headers (for example, routing or auth headers your backend
        requires).
@@ -88,7 +89,8 @@ Keys:
      - Attributes stamped onto every emitted record — useful for separating
        environments or agent instances in your backend.
 
-Set the endpoint in your project ``.env`` and run the agent as usual:
+Set the endpoint in your profile's ``.env`` — the build derives the project's
+from it — then run the agent as usual:
 
 .. code-block:: bash
 
@@ -108,7 +110,7 @@ stays on the deploy host.
 1. Check the service is enabled
 -------------------------------
 
-New projects ship with the ``openobserve`` service already declared in
+Projects ship with the ``openobserve`` service already declared in
 ``config.yml`` **and** listed under ``deployed_services`` — it deploys by
 default. If your project removed it, restore it:
 
@@ -126,10 +128,11 @@ default. If your project removed it, restore it:
 ---------------------------------------
 
 The OpenObserve root account doubles as the OTLP ingest credential. You do not
-have to set it yourself: the first ``osprey deploy up`` mints a strong
-``ZO_ROOT_USER_PASSWORD`` into ``.env`` automatically. Set the two variables
-yourself only if you want specific values — the same pair configures the
-container **and** authenticates the agent's OTLP push, one source of truth:
+have to set it yourself: the first ``osprey up`` mints a strong
+``ZO_ROOT_USER_PASSWORD`` into the profile's ``.env`` automatically, and the
+project's ``.env`` is derived from there. Set the two variables yourself (in the
+profile's ``.env``) only if you want specific values — the same pair configures
+the container **and** authenticates the agent's OTLP push, one source of truth:
 
 .. code-block:: bash
 
@@ -142,7 +145,7 @@ container **and** authenticates the agent's OTLP push, one source of truth:
 
 .. code-block:: bash
 
-   osprey deploy up        # brings up openobserve alongside your other services
+   osprey up        # brings up openobserve alongside your other services
 
 The UI is then available at ``http://localhost:5080`` (log in with the
 credentials above). Verify the service is recognized with ``osprey health``.

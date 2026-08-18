@@ -15,9 +15,8 @@ toy lattice: nominal currents are the per-device values baked into
 -- see `_nominal_current` below), device counts/families come from
 `osprey.simulation.facility_spec.ALS_U_AR`, and every "away from nominal"
 setpoint used here was probed against the real optics (see each test's
-comment) rather than carried over from the old toy-ring numbers, since the
-real ring's stability/NaN boundaries sit much closer to nominal than the
-toy ring's did.
+comment) rather than taken from a toy-ring model, since the real ring's
+stability/NaN boundaries sit much closer to nominal than a toy ring's.
 """
 
 from __future__ import annotations
@@ -31,8 +30,10 @@ from osprey.services.virtual_accelerator.ioc.physics_bridge import (
     PhysicsBridge,
     UnknownDeviceError,
 )
-from osprey.services.virtual_accelerator.lattice import orbit_response
+from osprey.services.virtual_accelerator.lattice import build_ring, orbit_response
+from osprey.services.virtual_accelerator.lattice.strengths import StrengthMap
 from osprey.services.virtual_accelerator.manifest.loaders import load_machine_json_channels
+from osprey.services.virtual_accelerator.model.pyat import PyATRingModel
 from osprey.simulation.facility_spec import ALS_U_AR
 
 
@@ -60,8 +61,31 @@ def _nominal_current(address: str) -> float:
 
 
 @pytest.fixture
-def bridge() -> PhysicsBridge:
-    return PhysicsBridge()
+def model() -> PyATRingModel:
+    """The backend the `bridge` fixture serves.
+
+    Built here rather than left to `PhysicsBridge()`'s own default so the
+    ring-level tests can reach the lattice through the model's public
+    `lattice`/`element_index()` surface. Construction is identical to what
+    the bridge would have done for itself.
+    """
+    return PyATRingModel()
+
+
+@pytest.fixture
+def bridge(model) -> PhysicsBridge:
+    return PhysicsBridge(model=model)
+
+
+@pytest.fixture(scope="module")
+def strength_map() -> StrengthMap:
+    """The current->strength calibration the model bakes at construction.
+
+    Baked here from its own fresh `build_ring()`: the map's nominals come
+    from the ring as built, before any write mutates it, so a separately
+    baked map carries the same values as the model's.
+    """
+    return StrengthMap(build_ring())
 
 
 class TestNominalState:
@@ -134,8 +158,8 @@ class TestSetpointWriteMovesBpm:
         # multiplier probed below 1.3x (trace_x jumps to 2.65, unstable);
         # 1.1x is used here to leave comfortable margin below that boundary
         # while still perturbing the gradient enough to move the response
-        # (real ring: 1.5x nominal -- the old toy-ring test's multiplier --
-        # is already well past the instability boundary, so it is not reused).
+        # (real ring: 1.5x nominal -- a typical toy-ring multiplier --
+        # is already well past the instability boundary, so it is not used).
         bridge.on_setpoint("SR:MAG:HCM:01:CURRENT:SP", 10.0)
         response_at_nominal_qf = bridge.bpm_positions()["SR:DIAG:BPM:01:POSITION:X"]
 
@@ -150,7 +174,7 @@ class TestSetpointWriteMovesBpm:
         # (I/I_nom - 1) * BendingAngle / Length) is far more sensitive than
         # the toy ring's -- 1.1x nominal already produces a non-finite
         # one-turn matrix (find_m44 NaN), so 1.05x (still stable, orbit shift
-        # ~13 mm) is used here instead of the old toy-ring 1.2x multiplier.
+        # ~13 mm) is used here instead of a toy-ring 1.2x multiplier.
         bridge.on_setpoint("SR:MAG:HCM:01:CURRENT:SP", 10.0)
         response_at_nominal_dipole = bridge.bpm_positions()["SR:DIAG:BPM:01:POSITION:X"]
 
@@ -200,12 +224,12 @@ class TestWriteComposition:
 
 
 class TestInstabilityRollback:
-    def test_unstable_write_is_rejected_and_state_is_rolled_back(self, bridge):
+    def test_unstable_write_is_rejected_and_state_is_rolled_back(self, bridge, model):
         bridge.on_setpoint("SR:MAG:HCM:01:CURRENT:SP", 10.0)
         before_orbit = bridge.bpm_positions()["SR:DIAG:BPM:01:POSITION:X"]
 
-        qf_idx = bridge._element_index("QF01")
-        before_k = bridge._ring[qf_idx].K
+        qf_idx = model.element_index("QF01")
+        before_k = model.lattice[qf_idx].K
 
         # Measured on the real ring: QF01 at 2x nominal is already unstable
         # (|trace_x| = 9.4); 5x nominal (|trace_x| = 34.0) is used here for a
@@ -219,7 +243,7 @@ class TestInstabilityRollback:
         after_orbit = bridge.bpm_positions()["SR:DIAG:BPM:01:POSITION:X"]
         assert after_orbit == before_orbit
 
-        after_k = bridge._ring[qf_idx].K
+        after_k = model.lattice[qf_idx].K
         assert after_k == before_k
 
     def test_bridge_remains_usable_after_a_rejected_write(self, bridge):
@@ -251,18 +275,20 @@ class TestNaNWriteRollback:
     QF write above trips.
     """
 
-    def test_nan_write_on_kicked_orbit_raises_and_restores_polynomb_elementwise(self, bridge):
+    def test_nan_write_on_kicked_orbit_raises_and_restores_polynomb_elementwise(
+        self, bridge, model
+    ):
         bridge.on_setpoint("SR:MAG:HCM:01:CURRENT:SP", 10.0)
         before_orbit = dict(bridge.bpm_positions())
 
-        dipole_idx = bridge._element_index("DIPOLE01")
-        before_polynom_b = list(bridge._ring[dipole_idx].PolynomB)
+        dipole_idx = model.element_index("DIPOLE01")
+        before_polynom_b = list(model.lattice[dipole_idx].PolynomB)
 
         dipole_nominal = _nominal_current("SR:MAG:DIPOLE:01:CURRENT:SP")
         with pytest.raises(OrbitSolveError, match="non-finite"):
             bridge.on_setpoint("SR:MAG:DIPOLE:01:CURRENT:SP", dipole_nominal * 2.0)
 
-        after_polynom_b = list(bridge._ring[dipole_idx].PolynomB)
+        after_polynom_b = list(model.lattice[dipole_idx].PolynomB)
         assert len(after_polynom_b) == len(before_polynom_b)
         for before_term, after_term in zip(before_polynom_b, after_polynom_b, strict=True):
             assert after_term == before_term
@@ -382,7 +408,7 @@ class TestElementMisalignment:
         # stability boundary, so this is a real, not contrived, boot fault.
         #
         # Spec-derived device counts (24 QF + 24 QD on the real ALS-U AR
-        # ring, from facility_spec.ALS_U_AR), not the old toy ring's
+        # ring, from facility_spec.ALS_U_AR), not a toy ring's
         # `range(1, 17)` (16 + 16) -- measured: roll=0.6 across all 24+24
         # devices does still destabilize the real ring's one-turn map.
         qf_count = ALS_U_AR.family("QF").count
@@ -493,11 +519,13 @@ class TestSextupoleStrengthWhiteBox:
     """
 
     @pytest.mark.parametrize("family", ["SF", "SD", "SHF", "SHD"])
-    def test_polynomb_index2_matches_baked_times_fraction(self, bridge, family):
+    def test_polynomb_index2_matches_baked_times_fraction(
+        self, bridge, model, strength_map, family
+    ):
         fam_name = f"{family}01"
-        idx = bridge._element_index(fam_name)
+        idx = model.element_index(fam_name)
         i_nom = _nominal_current(f"SR:MAG:{family}:01:CURRENT:SP")
-        baked = bridge._strength_map.baked(fam_name)
+        baked = strength_map.baked(fam_name)
 
         current = i_nom * 1.3
         bridge.on_setpoint(f"SR:MAG:{family}:01:CURRENT:SP", current)
@@ -505,7 +533,7 @@ class TestSextupoleStrengthWhiteBox:
         expected = baked * current / i_nom
         # Measured: exact to within ~3.6e-15 (float rounding) across all four
         # families -- rel=1e-9 leaves ample margin over that noise floor.
-        assert bridge._ring[idx].PolynomB[2] == pytest.approx(expected, rel=1e-9)
+        assert model.lattice[idx].PolynomB[2] == pytest.approx(expected, rel=1e-9)
 
     @pytest.mark.parametrize("family", ["SF", "SD", "SHF", "SHD"])
     def test_sextupole_write_away_from_nominal_echoes_into_kicked_bpm_response(

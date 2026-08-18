@@ -72,7 +72,7 @@ installed, just open Claude Code in the repo and describe what you want to
 contribute; the skill picks up wherever you are in the journey.
 
 Other available skills (`osprey skills install --help` lists them all):
-`osprey-build-interview`, `osprey-build-deploy`, `osprey-release`.
+`osprey-build-interview`, `osprey-pre-commit`, `osprey-release`.
 
 ## Branch Strategy
 
@@ -99,12 +99,21 @@ For details (CI gates, branch protection, release cuts) see the [full Contributi
 ## Running Tests
 
 ```bash
-# Unit tests (fast)
+# Unit tests, in parallel — this is what CI runs
+pytest tests/ --ignore=tests/e2e -n 4 --dist loadgroup
+
+# Serial, for debugging a single failure
 pytest tests/ --ignore=tests/e2e -v
 
 # E2E tests (requires API keys)
 pytest tests/e2e/ -v
 ```
+
+Because the unit suite runs across four worker processes, a test that changes
+process-global state can break an unrelated test. **Before writing tests, read
+[`tests/README`](tests/README.md)** — it covers the isolation-fixture house
+style, the patching rules, logging and `caplog`, ports and containers, and the
+checklist for adding a new batch of tests.
 
 ## Front-End JavaScript Tooling
 

@@ -1,16 +1,21 @@
 """E2E: dispatch trigger allowlist is the single authority (real CLI).
 
 Pins the three defects behind the dispatch-allowlist-parity fix and proves
-the fix end-to-end against a real built project, a real dispatch worker
+the fix end-to-end against a real deployment repo, a real dispatch worker
 subprocess, and the bundled Claude CLI:
 
-* **Repro A (settings-allow bypass):** ``mcp__osprey_workspace__data_list``
-  is in the provisioned ``settings.json`` ``permissions.allow``; per SDK
-  semantics such calls never reach ``can_use_tool``, so pre-fix they executed
-  even when the trigger's ``allowed_tools`` excluded them (observed on a
-  deployed worker as ``Agent`` / ``mcp__controls__archiver_read`` running
-  un-triggered). Post-fix the PreToolUse hook — which fires for every call —
-  denies them.
+* **Repro A (settings-allow bypass):** the probe tool is in the provisioned
+  ``settings.json`` ``permissions.allow``; per SDK semantics such calls never
+  reach ``can_use_tool``, so pre-fix they executed even when the trigger's
+  ``allowed_tools`` excluded them (observed on a deployed worker as ``Agent``
+  / ``mcp__controls__archiver_read`` running un-triggered). Post-fix the
+  PreToolUse hook — which fires for every call — denies them. The probe must
+  be a tool NO declared subagent lists (asserted by
+  ``test_probe_tool_is_discriminating``): a surface-declared tool such as
+  ``artifact_list`` is legitimately allowed inside a delegated subagent (that is
+  Repro B's feature), so with such a probe the assertion would hinge on
+  whether the model happens to delegate — the exact nondeterminism that made
+  this test flaky.
 
 * **Repro B (subagent starvation):** with the settings allow-rules stripped
   (so success cannot come from settings), a channel-finder delegation must
@@ -24,6 +29,10 @@ subprocess, and the bundled Claude CLI:
   (see osprey_approval.py's own aggregation note), so pre-fix that allow
   could override the worker's deny. Under ``OSPREY_DISPATCH_RUN=1`` the
   approval hook emits no decision, so the worker hook's deny stands.
+
+Each scenario gets its own COPY of the built repo, mutated in its ``build/``
+zone — the render is what the worker reads, and a copy keeps one scenario's
+edit from reaching another's worker.
 
 Runs are direct ``POST /dispatch`` calls to the worker (bearer-token), no
 dispatcher needed. Requires ALS-APG credentials; skips cleanly without.
@@ -67,60 +76,78 @@ HOOK_DENY_MARKERS = (
     "dispatch server denylist",
 )
 
+# Repro A's probe: settings-allowed, but in NO subagent's declared tools:
+# surface — so it is denied on every path (main thread by the trigger list,
+# subagent context by the surface check) and the assertion cannot depend on
+# whether the model delegates. test_probe_tool_is_discriminating enforces
+# both properties against the real deployment repo.
+PROBE_TOOL = "mcp__osprey_workspace__session_log"
+
 
 def _denied_by_policy(result_text: str | None) -> bool:
     return any(marker in (result_text or "") for marker in HOOK_DENY_MARKERS)
 
 
 # ---------------------------------------------------------------------------
-# Project fixtures — one real build, mutated copies per scenario
+# Repo fixtures — one real build, mutated copies per scenario
 # ---------------------------------------------------------------------------
 
 
+def _run_osprey(argv: list[str], cwd: Path, timeout: int = 300) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [str(_find_osprey_console_script()), *argv],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env={**os.environ, "CLAUDECODE": ""},
+    )
+
+
 @pytest.fixture(scope="module")
-def built_project(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Build a real als-apg control-assistant project once per module."""
+def built_repo(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Init + build a real als-apg control-assistant deployment repo once per module."""
     base = tmp_path_factory.mktemp("parity_build")
-    project_dir = base / "proj"
-    proc = subprocess.run(
+    repo = base / "proj"
+
+    init = _run_osprey(
         [
-            str(_find_osprey_console_script()),
-            "build",
-            "proj",
+            "init",
+            str(repo),
             "--preset",
             "control-assistant",
+            "--no-git",
             "--set",
             "provider=als-apg",
             "--set",
             "model=haiku",
-            "--skip-deps",
-            "--skip-lifecycle",
-            "--output-dir",
-            str(base),
-            "--force",
         ],
-        capture_output=True,
-        text=True,
-        timeout=300,
-        env={**os.environ, "CLAUDECODE": ""},
+        cwd=base,
     )
-    if proc.returncode != 0:
-        pytest.fail(f"osprey build failed (rc={proc.returncode}):\n{proc.stdout}\n{proc.stderr}")
-    return project_dir
+    if init.returncode != 0:
+        pytest.fail(f"osprey init failed (rc={init.returncode}):\n{init.stdout}\n{init.stderr}")
+
+    build = _run_osprey(
+        ["build", "--repo", str(repo), "--skip-deps", "--skip-lifecycle"],
+        cwd=base,
+    )
+    if build.returncode != 0:
+        pytest.fail(f"osprey build failed (rc={build.returncode}):\n{build.stdout}\n{build.stderr}")
+    return repo
 
 
-def _copy_project(src: Path, dst: Path) -> Path:
+def _copy_repo(src: Path, dst: Path) -> Path:
     shutil.copytree(src, dst, symlinks=True)
     return dst
 
 
 @pytest.fixture(scope="module")
-def stripped_project(built_project: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Copy of the built project with the Repro-B tools stripped from
+def stripped_repo(built_repo: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Copy of the built repo with the Repro-B tools stripped from the render's
     ``settings.json`` ``permissions.allow`` — success can then only come from
     the worker's hook, never from settings (discriminating fixture)."""
-    project = _copy_project(built_project, tmp_path_factory.mktemp("parity_stripped") / "proj")
-    settings_path = project / ".claude" / "settings.json"
+    repo = _copy_repo(built_repo, tmp_path_factory.mktemp("parity_stripped") / "proj")
+    settings_path = repo / "build" / ".claude" / "settings.json"
     settings = json.loads(settings_path.read_text())
     before = settings.get("permissions", {}).get("allow", [])
     after = [
@@ -128,27 +155,28 @@ def stripped_project(built_project: Path, tmp_path_factory: pytest.TempPathFacto
         for entry in before
         if "channel-finder" not in entry
         and "submit_response" not in entry
-        and "data_list" not in entry
+        and "artifact_list" not in entry
         and not entry.startswith(("Task(", "Agent("))
     ]
     assert len(after) < len(before), "fixture did not strip anything — check settings.json"
     settings["permissions"]["allow"] = after
     settings_path.write_text(json.dumps(settings, indent=2))
-    return project
+    return repo
 
 
 @pytest.fixture(scope="module")
-def approval_off_project(built_project: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Copy of the built project with ``approval.enabled: false`` so the
-    facility approval hook's explicit-allow path fires deterministically."""
+def approval_off_repo(built_repo: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Copy of the built repo with ``approval.enabled: false`` in the render's
+    config so the facility approval hook's explicit-allow path fires
+    deterministically."""
     import yaml
 
-    project = _copy_project(built_project, tmp_path_factory.mktemp("parity_approval_off") / "proj")
-    config_path = project / "config.yml"
+    repo = _copy_repo(built_repo, tmp_path_factory.mktemp("parity_approval_off") / "proj")
+    config_path = repo / "build" / "config.yml"
     config = yaml.safe_load(config_path.read_text())
     config.setdefault("approval", {})["enabled"] = False
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
-    return project
+    return repo
 
 
 # ---------------------------------------------------------------------------
@@ -156,17 +184,19 @@ def approval_off_project(built_project: Path, tmp_path_factory: pytest.TempPathF
 # ---------------------------------------------------------------------------
 
 
-def _start_worker(project_dir: Path) -> tuple[subprocess.Popen, str]:
+def _start_worker(repo: Path) -> tuple[subprocess.Popen, str]:
     port = _free_port()
     proc = subprocess.Popen(
         [sys.executable, "-m", "osprey.mcp_server.dispatch_worker"],
-        cwd=str(project_dir),
+        cwd=str(repo),
         env={
             **os.environ,
             "DISPATCH_WORKER_PORT": str(port),
             "DISPATCH_WORKER_TOKEN": TOKEN,
-            "OSPREY_PROJECT_DIR": str(project_dir),
-            "CONFIG_FILE": str(project_dir / "config.yml"),
+            # Repo root + the render's config one level down, exactly as the
+            # dispatch_worker compose template wires the deployed worker.
+            "OSPREY_PROJECT_DIR": str(repo),
+            "CONFIG_FILE": str(repo / "build" / "config.yml"),
             "CLAUDECODE": "",
         },
         stdout=subprocess.PIPE,
@@ -179,9 +209,9 @@ def _start_worker(project_dir: Path) -> tuple[subprocess.Popen, str]:
 
 @pytest.fixture
 def worker(request) -> Iterator[str]:
-    """Start a real worker on the project fixture named by the test param."""
-    project_dir = request.getfixturevalue(request.param)
-    proc, url = _start_worker(project_dir)
+    """Start a real worker on the repo fixture named by the test param."""
+    repo = request.getfixturevalue(request.param)
+    proc, url = _start_worker(repo)
     try:
         yield url
     finally:
@@ -225,19 +255,57 @@ def _calls(run: dict, prefix: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("worker", ["built_project"], indirect=True)
+def test_probe_tool_is_discriminating(built_repo):
+    """The probe stays valid only while (a) settings.json allows it — else it
+    stops pinning the settings-allow bypass — and (b) no declared subagent
+    lists it — else a delegated call is legitimately allowed (Repro B's
+    feature) and the deny assertion becomes a bet on the model not delegating.
+    If (b) ever trips, pick a new probe from the settings allow-list that no
+    agent declares; do NOT weaken the deny assertion."""
+    from osprey.mcp_server.dispatch_worker.agent_surfaces import parse_project_agents
+
+    render = built_repo / "build"
+    settings = json.loads((render / ".claude" / "settings.json").read_text())
+    allow = settings.get("permissions", {}).get("allow", [])
+    assert PROBE_TOOL in allow, (
+        f"probe {PROBE_TOOL} is no longer settings-allowed — Repro A would no "
+        f"longer exercise the settings-allow bypass; pick a settings-allowed probe"
+    )
+
+    # Repro C's probe needs the same no-surface property for the same reason.
+    for probe in (PROBE_TOOL, "mcp__controls__archiver_read"):
+        offenders = {
+            name: sorted(surface)
+            for name, surface in parse_project_agents(render).items()
+            if surface is not None and probe in surface
+        }
+        assert not offenders, (
+            f"probe {probe} is now declared by subagent(s) {sorted(offenders)} — "
+            f"a delegated call would legitimately execute and its deny assertion "
+            f"goes flaky; pick a probe that no agent declares"
+        )
+
+
+@pytest.mark.parametrize("worker", ["built_repo"], indirect=True)
 def test_settings_allowed_tool_is_denied_when_trigger_excludes_it(worker):
-    """Pre-fix (red): data_list executed because settings.json allow-rules are
+    """Pre-fix (red): the probe executed because settings.json allow-rules are
     evaluated before can_use_tool (SDK never consults the callback for them).
-    Post-fix: the PreToolUse hook denies it — trigger list is the authority."""
+    Post-fix: the PreToolUse hook denies it — trigger list is the authority.
+
+    Fully specified, no-delegation prompt for the same reason as Repro C's:
+    the deny this test observes requires the model to actually attempt the
+    call. Delegated attempts are fine — the probe is in no agent's surface,
+    so the subagent-context deny fires and its marker matches too."""
     run = dispatch_and_wait(
         worker,
-        "Use the data_list tool to list the available data files, then summarize.",
+        "Call the session_log tool NOW, yourself — do not delegate to a "
+        "subagent and do not ask any clarifying questions. Attempt the tool "
+        "call immediately and report its result.",
         allowed_tools=["mcp__controls__channel_read"],
     )
 
-    attempts = _calls(run, "mcp__osprey_workspace__data_list")
-    assert attempts, f"agent never attempted data_list; text={run.get('text_output')!r}"
+    attempts = _calls(run, PROBE_TOOL)
+    assert attempts, f"agent never attempted session_log; text={run.get('text_output')!r}"
     for tc in attempts:
         assert _denied_by_policy(tc["result"]), (
             f"settings-allowed tool executed despite trigger exclusion: {tc}"
@@ -249,15 +317,15 @@ def test_settings_allowed_tool_is_denied_when_trigger_excludes_it(worker):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("worker", ["stripped_project"], indirect=True)
-def test_subagent_tools_work_in_settings_stripped_project(worker):
+@pytest.mark.parametrize("worker", ["stripped_repo"], indirect=True)
+def test_subagent_tools_work_in_settings_stripped_repo(worker):
     """Pre-fix (red): every channel-finder subagent call was denied by the flat
     trigger allowlist. Post-fix: the context-aware hook grants the subagent its
     declared tools:, in a fixture where settings.json cannot be the reason."""
     run = dispatch_and_wait(
         worker,
         "Find the channel address for the storage ring beam current.",
-        allowed_tools=["mcp__controls__channel_read", "mcp__osprey_workspace__data_list"],
+        allowed_tools=["mcp__controls__channel_read", "mcp__osprey_workspace__artifact_list"],
     )
 
     sub_calls = _calls(run, "mcp__channel-finder__") + _calls(
@@ -282,7 +350,7 @@ def test_subagent_tools_work_in_settings_stripped_project(worker):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("worker", ["approval_off_project"], indirect=True)
+@pytest.mark.parametrize("worker", ["approval_off_repo"], indirect=True)
 def test_approval_hook_allow_does_not_override_worker_deny(worker):
     """With approval disabled the facility hook would emit an explicit allow
     for mcp__controls__* (documented to override static permission lists, and

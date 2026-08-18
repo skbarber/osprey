@@ -1,6 +1,6 @@
 """Build Artifact Catalog — declarative catalog of all Claude Code build artifacts.
 
-Each build artifact produced by ``osprey build`` / ``osprey claude regen``
+Each build artifact produced by ``osprey build``
 is cataloged here with a canonical name, template path, output path, and
 metadata.  The catalog enables:
 
@@ -20,17 +20,27 @@ class BuildArtifact:
 
     Attributes:
         canonical_name: Stable identifier, e.g. ``"agents/channel-finder"``.
-        template_path: Relative to ``templates/claude_code/``, e.g.
+        template_path: Relative to ``templates/<template_root>/``, e.g.
             ``"claude/agents/channel-finder.md.j2"``.
         output_path: Relative to project root, e.g.
             ``".claude/agents/channel-finder.md"``.
         description: Human-readable, shown in ``osprey scaffold list``.
+        template_root: Subdirectory of ``templates/`` the ``template_path``
+            resolves against — ``"claude_code"`` for prompt artifacts (the
+            default), ``"services"`` for deploy-time service templates.
+        is_directory: True when the artifact is a whole directory copied
+            verbatim into the project (service compose templates), rather
+            than a single rendered file.  Directory artifacts are never
+            Jinja-rendered at build time — their ``.j2`` files are rendered
+            later, by ``osprey up``.
     """
 
     canonical_name: str
     template_path: str
     output_path: str
     description: str
+    template_root: str = "claude_code"
+    is_directory: bool = False
 
 
 def _get_default_artifacts() -> list[BuildArtifact]:
@@ -41,19 +51,19 @@ def _get_default_artifacts() -> list[BuildArtifact]:
             canonical_name="claude-md",
             template_path="CLAUDE.md.j2",
             output_path="CLAUDE.md",
-            description="CLAUDE.md system prompt (control-system persona)",
+            description="CLAUDE.md project instructions (control-system persona)",
         ),
         BuildArtifact(
             canonical_name="claude-md-ariel",
             template_path="CLAUDE.ariel.md.j2",
             output_path="CLAUDE.md",
-            description="CLAUDE.md system prompt (ARIEL logbook research persona)",
+            description="CLAUDE.md project instructions (ARIEL logbook research persona)",
         ),
         BuildArtifact(
             canonical_name="claude-md-channel-finder",
             template_path="CLAUDE.channel-finder.md.j2",
             output_path="CLAUDE.md",
-            description="CLAUDE.md system prompt (channel-finder assistant persona)",
+            description="CLAUDE.md project instructions (channel-finder assistant persona)",
         ),
         BuildArtifact(
             canonical_name="mcp-json",
@@ -160,6 +170,12 @@ def _get_default_artifacts() -> list[BuildArtifact]:
             description="Control system safety rules (protocol-aware)",
         ),
         BuildArtifact(
+            canonical_name="rules/test-ioc-safety",
+            template_path="claude/rules/test-ioc-safety.md.j2",
+            output_path=".claude/rules/test-ioc-safety.md",
+            description="Test-IOC port isolation rules (rendered only for EPICS-family control systems)",
+        ),
+        BuildArtifact(
             canonical_name="rules/timezone",
             template_path="claude/rules/timezone.md.j2",
             output_path=".claude/rules/timezone.md",
@@ -236,7 +252,13 @@ def _get_default_artifacts() -> list[BuildArtifact]:
             canonical_name="hooks/panels-context",
             template_path="claude/hooks/osprey_panels_context.py",
             output_path=".claude/hooks/osprey_panels_context.py",
-            description="SessionStart hook that injects the web terminal panel inventory into agent context",
+            description="SessionStart hook that injects the web surface (simple/expert) and panel inventory into agent context",
+        ),
+        BuildArtifact(
+            canonical_name="hooks/workspace-delta",
+            template_path="claude/hooks/osprey_workspace_delta.py",
+            output_path=".claude/hooks/osprey_workspace_delta.py",
+            description="UserPromptSubmit hook that reports web workspace changes since the agent's last turn",
         ),
         # ── Skills ──────────────────────────────────────────────────
         BuildArtifact(
@@ -270,6 +292,12 @@ def _get_default_artifacts() -> list[BuildArtifact]:
             description="Artifact Gallery demo showcase skill",
         ),
         BuildArtifact(
+            canonical_name="skills/demo-ui",
+            template_path="claude/skills/demo-ui/SKILL.md",
+            output_path=".claude/skills/demo-ui/SKILL.md",
+            description="Scripted web-workspace UI demonstration skill",
+        ),
+        BuildArtifact(
             canonical_name="skills/sim-scenarios",
             template_path="claude/skills/sim-scenarios/SKILL.md",
             output_path=".claude/skills/sim-scenarios/SKILL.md",
@@ -285,13 +313,13 @@ def _get_default_artifacts() -> list[BuildArtifact]:
             canonical_name="skills/writing-bluesky-plans",
             template_path="claude/skills/writing-bluesky-plans/SKILL.md",
             output_path=".claude/skills/writing-bluesky-plans/SKILL.md",
-            description="Author, validate, and launch a session-tier Bluesky scan plan",
+            description="Author, validate, and launch a session-tier Bluesky plan",
         ),
         BuildArtifact(
-            canonical_name="skills/operating-bluesky-scans",
-            template_path="claude/skills/operating-bluesky-scans/SKILL.md",
-            output_path=".claude/skills/operating-bluesky-scans/SKILL.md",
-            description="Stage, launch, and watch a registered Bluesky scan through the shared draft",
+            canonical_name="skills/operating-bluesky-plans",
+            template_path="claude/skills/operating-bluesky-plans/SKILL.md",
+            output_path=".claude/skills/operating-bluesky-plans/SKILL.md",
+            description="Stage, launch, and watch a registered Bluesky plan through the shared draft",
         ),
         # ── Output Styles ────────────────────────────────────────────
         BuildArtifact(
@@ -299,6 +327,107 @@ def _get_default_artifacts() -> list[BuildArtifact]:
             template_path="claude/output-styles/control-operator.md.j2",
             output_path=".claude/output-styles/control-operator.md",
             description="Communication style for the control assistant",
+        ),
+        # ── Service compose templates ────────────────────────────────
+        # Directory artifacts: copied verbatim from templates/services/ into
+        # <project>/services/<name>/ by `osprey build` (and `osprey init`),
+        # then Jinja-rendered by `osprey up`.  Build refreshes them
+        # from the framework unless claimed via `osprey scaffold claim`.
+        BuildArtifact(
+            canonical_name="services/postgresql",
+            template_path="postgresql",
+            output_path="services/postgresql",
+            description="PostgreSQL + pgvector compose template (ARIEL store)",
+            template_root="services",
+            is_directory=True,
+        ),
+        BuildArtifact(
+            canonical_name="services/archiver_recorder",
+            template_path="archiver_recorder",
+            output_path="services/archiver_recorder",
+            description="Archiver recorder compose template (runs on the VA image)",
+            template_root="services",
+            is_directory=True,
+        ),
+        BuildArtifact(
+            canonical_name="services/mongodb",
+            template_path="mongodb",
+            output_path="services/mongodb",
+            description="MongoDB compose template (archiver store)",
+            template_root="services",
+            is_directory=True,
+        ),
+        BuildArtifact(
+            canonical_name="services/openobserve",
+            template_path="openobserve",
+            output_path="services/openobserve",
+            description="OpenObserve telemetry backend compose template",
+            template_root="services",
+            is_directory=True,
+        ),
+        BuildArtifact(
+            canonical_name="services/event_dispatcher",
+            template_path="event_dispatcher",
+            output_path="services/event_dispatcher",
+            description="Event-dispatcher compose template + image context",
+            template_root="services",
+            is_directory=True,
+        ),
+        BuildArtifact(
+            canonical_name="services/qmd",
+            template_path="qmd",
+            output_path="services/qmd",
+            description="qmd search sidecar compose template + image context",
+            template_root="services",
+            is_directory=True,
+        ),
+        BuildArtifact(
+            canonical_name="services/dispatch_worker",
+            template_path="dispatch_worker",
+            output_path="services/dispatch_worker",
+            description="Dispatch-worker compose template",
+            template_root="services",
+            is_directory=True,
+        ),
+        BuildArtifact(
+            canonical_name="services/nextcloud_bridge",
+            template_path="nextcloud_bridge",
+            output_path="services/nextcloud_bridge",
+            description="Nextcloud Talk bridge compose template + image context",
+            template_root="services",
+            is_directory=True,
+        ),
+        BuildArtifact(
+            canonical_name="services/gchat_bridge",
+            template_path="gchat_bridge",
+            output_path="services/gchat_bridge",
+            description="Google Chat bridge compose template + image context",
+            template_root="services",
+            is_directory=True,
+        ),
+        BuildArtifact(
+            canonical_name="services/bluesky",
+            template_path="bluesky",
+            output_path="services/bluesky",
+            description="Bluesky bridge compose template + image context",
+            template_root="services",
+            is_directory=True,
+        ),
+        BuildArtifact(
+            canonical_name="services/bluesky_web",
+            template_path="bluesky_web",
+            output_path="services/bluesky_web",
+            description="Bluesky operator-facing web sidecar compose template",
+            template_root="services",
+            is_directory=True,
+        ),
+        BuildArtifact(
+            canonical_name="services/virtual_accelerator",
+            template_path="virtual_accelerator",
+            output_path="services/virtual_accelerator",
+            description="Virtual Accelerator soft-IOC compose template + image context",
+            template_root="services",
+            is_directory=True,
         ),
     ]
 

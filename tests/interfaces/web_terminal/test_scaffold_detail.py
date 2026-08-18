@@ -31,7 +31,7 @@ since those tests only assert that a `/api/scaffold` request fires), this
 suite needs real on-disk artifacts: ScaffoldGalleryService.list_artifacts()
 is filesystem-first and returns nothing for a project with no `.claude/`
 tree at all. So `_launch_web_terminal` here first runs a real
-`osprey build --preset hello-world` (matching the pattern already used by
+`osprey init --preset hello-world` + `osprey build` (matching the pattern used by
 the non-browser tests in test_scaffold_gallery_service.py /
 test_scaffold_gallery_env_vars.py) into `tmp_path`, then serves web_terminal
 with that directory as `project_cwd`.
@@ -52,6 +52,8 @@ import pytest
 from click.testing import CliRunner
 
 from osprey.cli.build_cmd import build
+from osprey.cli.init_cmd import init
+from tests.interfaces._panel_launch import publish_artifact_url
 from tests.interfaces.conftest import _run_app_server
 
 if TYPE_CHECKING:
@@ -74,8 +76,11 @@ pytestmark = [pytest.mark.browser, pytest.mark.slow]
 
 # Same rationale as test_osprey_drawer.py: the settings trigger carries
 # `data-drawer-trigger`, not the drawer component's own `[data-drawer]`
-# marker, so the warning gate below is the sole open path.
+# marker, so the warning gate below is the sole open path. It is the System
+# Settings row inside the header display-menu popover, so reaching it means
+# opening the display menu first.
 TRIGGER_SELECTOR = '[data-drawer-trigger="settings-drawer"]'
+DISPLAY_MENU_BTN_SELECTOR = "#display-menu-btn"
 DRAWER_SELECTOR = "#settings-drawer"
 BACKDROP_SELECTOR = "#drawer-backdrop"
 WARNING_PROCEED_SELECTOR = ".settings-warning-proceed"
@@ -101,22 +106,21 @@ VIEWPORT = {"width": 1280, "height": 800}
 
 @contextmanager
 def _launch_web_terminal(tmp_path, monkeypatch) -> Iterator[str]:
-    """Build a real hello-world project, then serve web_terminal against it."""
+    """Render a real hello-world deployment, then serve web_terminal against it.
+
+    The RENDER is what the server is pointed at — ``build/`` is the directory
+    holding the config, the manifest and the ``.claude/`` tree the scaffold
+    detail view reads.
+    """
     runner = CliRunner()
-    result = runner.invoke(
-        build,
-        [
-            "scaffold-detail-test",
-            "--preset",
-            "hello-world",
-            "--skip-deps",
-            "--skip-lifecycle",
-            "--output-dir",
-            str(tmp_path),
-        ],
-    )
+    repo = tmp_path / "scaffold-detail-test"
+
+    created = runner.invoke(init, [str(repo), "--preset", "hello-world", "--no-git"])
+    assert created.exit_code == 0, created.output
+
+    result = runner.invoke(build, ["--repo", str(repo), "--skip-deps", "--skip-lifecycle"])
     assert result.exit_code == 0, result.output
-    project_dir = tmp_path / "scaffold-detail-test"
+    project_dir = repo / "build"
 
     monkeypatch.chdir(project_dir)
     with (
@@ -129,8 +133,8 @@ def _launch_web_terminal(tmp_path, monkeypatch) -> Iterator[str]:
             return_value=({"artifacts"}, [], None),
         ),
         patch(
-            "osprey.interfaces.web_terminal.app._launch_artifact_server",
-            side_effect=lambda a: setattr(a.state, "artifact_server_url", "http://127.0.0.1:8086"),
+            "osprey.interfaces.web_terminal.app._launch_panel_server",
+            side_effect=publish_artifact_url(),
         ),
     ):
         from osprey.interfaces.web_terminal.app import create_app
@@ -160,7 +164,9 @@ def _goto(page: Page, base_url: str) -> None:
 
 
 def _open_settings_drawer(page: Page) -> None:
-    """Click the header trigger, proceeding past the first-time warning if shown."""
+    """Open the display menu, click its System Settings row, and proceed past
+    the first-time warning if shown."""
+    page.click(DISPLAY_MENU_BTN_SELECTOR)
     page.click(TRIGGER_SELECTOR)
     proceed = page.locator(WARNING_PROCEED_SELECTOR)
     try:

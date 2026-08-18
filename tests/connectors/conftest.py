@@ -8,30 +8,11 @@ skip cleanly when Docker is unavailable, matching the pattern used by
 ``tests/services/ariel_search/conftest.py``.
 """
 
-import logging
-import os
 from datetime import datetime, timedelta
 
 import pytest
 
-logger = logging.getLogger(__name__)
-
-
-def is_docker_available() -> bool:
-    """Return True if the Docker daemon is reachable.
-
-    Used to gate testcontainers-backed fixtures so that contributors
-    without a running Docker engine see a skip rather than an error.
-    """
-    try:
-        import docker
-
-        client = docker.from_env()
-        client.ping()
-        return True
-    except Exception as e:
-        logger.warning(f"Docker not available: {e}")
-        return False
+from tests._container_support import is_docker_available, start_or_skip, stop_quietly
 
 
 @pytest.fixture(scope="session")
@@ -59,25 +40,26 @@ def mongodb_container():
     collection_name = "test_archiver_collection"
     auth_db = "admin"
 
-    container = MongoDbContainer("mongo:7", username=username, password=password)
-    container.start()
-
-    import atexit
-
-    atexit.register(container.stop)
+    container = start_or_skip(
+        lambda: MongoDbContainer("mongo:7", username=username, password=password),
+        label="mongodb",
+    )
 
     host = container.get_container_host_ip()
     port = int(container.get_exposed_port(27017))
 
-    yield {
-        "host": host,
-        "port": port,
-        "username": username,
-        "password": password,
-        "auth_db": auth_db,
-        "db_name": db_name,
-        "collection_name": collection_name,
-    }
+    try:
+        yield {
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "auth_db": auth_db,
+            "db_name": db_name,
+            "collection_name": collection_name,
+        }
+    finally:
+        stop_quietly(container)
 
 
 @pytest.fixture(scope="function")
@@ -101,7 +83,7 @@ def mongodb_test_data(mongodb_container):
 
     start_date = datetime(2024, 1, 1, 0, 0, 0)
     end_date = datetime(2024, 1, 4, 0, 0, 0)
-    pv_names = ["BEAM:CURRENT", "BEAM:LIFETIME", "BEAM:ENERGY"]
+    channels = ["BEAM:CURRENT", "BEAM:LIFETIME", "BEAM:ENERGY"]
 
     documents = []
     current_date = start_date
@@ -122,7 +104,7 @@ def mongodb_test_data(mongodb_container):
     collection.create_index("date")
 
     yield {
-        "pv_names": pv_names,
+        "channels": channels,
         "start_date": start_date,
         "end_date": end_date,
         "document_count": len(documents),
@@ -133,7 +115,7 @@ def mongodb_test_data(mongodb_container):
 
 
 @pytest.fixture
-def mongodb_config(mongodb_container):
+def mongodb_config(mongodb_container, monkeypatch):
     """Provide a connector-ready config dict and set the password env var.
 
     Tests that need seeded data should also depend on ``mongodb_test_data``;
@@ -141,7 +123,7 @@ def mongodb_config(mongodb_container):
     error-path tests (missing config keys, etc.) don't pay seeding cost.
     """
     password_env = "MONGODB_TEST_PASSWORD"
-    os.environ[password_env] = mongodb_container["password"]
+    monkeypatch.setenv(password_env, mongodb_container["password"])
 
     config = {
         "host": mongodb_container["host"],
@@ -155,5 +137,3 @@ def mongodb_config(mongodb_container):
     }
 
     yield config
-
-    os.environ.pop(password_env, None)

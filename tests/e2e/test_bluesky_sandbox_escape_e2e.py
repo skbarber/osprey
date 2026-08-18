@@ -3,11 +3,12 @@ the authoring-sandbox feature's central invariant: an agent-authored
 session-tier plan can never reach real hardware unless it is validated AND
 that exact validated content is what actually launches.
 
-Deploys the VA-backed turn-key scan-stack (``tests/e2e/_orm_stack.py`` -- the
+Deploys the VA-backed turn-key plan-stack (``tests/e2e/_orm_stack.py`` -- the
 same real Virtual Accelerator + bluesky-bridge container pair
 ``test_orm_roundtrip.py`` uses) and drives the session-authoring HTTP surface
-(``POST /plans/session``, ``POST /plans/validate``, ``POST /runs`` ->
-``launch``) end to end against it, then reads a real corrector setpoint back
+(``POST /plans/session``, ``POST /plans/validate``, then the queue path
+``PATCH /draft`` -> ``POST /queue/items`` -> ``POST /queue/start``) end to end
+against it, then reads a real corrector setpoint back
 over Channel Access -- from this test process, independent of the bridge --
 to prove a rejected write never lands, not merely that the bridge's own HTTP
 responses claim it didn't.
@@ -21,7 +22,8 @@ independent CA read that never goes through the bridge at all.
 CRITICAL INTEGRATION CONTRACT (see ``plan_validation.py``'s module docstring
 and the P5 Phase 2 research digest): the bytes ``validate_plan``
 hashes for its validation record must be byte-identical to what the session
-directory's load gate (task 2.4) and the launch gate (task 2.5) re-hash from
+directory's load gate and the ENQUEUE gate (validation.py, called
+from the queue's ``POST /queue/items``) re-hash from
 disk. ``POST /plans/session`` writes the body once; ``POST /plans/validate``
 re-reads and hashes that SAME file -- never a body passed separately -- so
 "validated bytes == file bytes" is structural here, not a test convention
@@ -44,8 +46,10 @@ actually guarantees.
 
 Container safety: every docker invocation here names an exact
 container/image -- never a wildcard, never ``system prune``/``--volumes``.
-Teardown goes through ``osprey deploy down``, matching every other e2e in
-this directory. ``BRIDGE_PORT`` below is distinct from every sibling e2e
+Teardown goes through ``osprey down``, matching every other e2e in
+this directory, followed by exact-named removal of this project's own volumes
+(``tests/e2e/_volumes.py``): ``down`` keeps them by design, and a rerun must
+not inherit their state. ``BRIDGE_PORT`` below is distinct from every sibling e2e
 module's pinned port; the VA's Channel Access port is NOT freely overridable
 (see ``_orm_stack.VA_CA_PORT``'s docstring) so this test shares that fixed
 port with ``test_orm_roundtrip.py``/``test_va_substrate_equivalence.py`` --
@@ -89,7 +93,9 @@ from typing import Any
 
 import pytest
 
-from tests.e2e import _orm_stack
+from tests.e2e import _orm_stack, _queue_drive
+from tests.e2e._deploy_diagnostics import queue_stack_logs
+from tests.e2e._volumes import remove_project_volumes
 
 pytestmark = [
     pytest.mark.e2e,
@@ -103,6 +109,11 @@ pytestmark = [
 BRIDGE_PORT = 18105
 BRIDGE_URL = f"http://localhost:{BRIDGE_PORT}"
 
+#: Compose project this suite deploys under. Container names follow
+#: ``<project>-<service>``, so anything naming a deployed container derives it
+#: from here rather than repeating the literal.
+PROJECT_NAME = "sandbox-escape"
+
 BUILD_TIMEOUT_SEC = _orm_stack.BUILD_TIMEOUT_SEC
 DEPLOY_UP_TIMEOUT_SEC = 1200  # amd64-emulated VA image build is slow (minutes)
 HEALTH_TIMEOUT_SEC = 300.0
@@ -111,8 +122,8 @@ SCAN_TIMEOUT_SEC = 120.0
 # Three correctors total: one reserved exclusively as the escape/residual
 # probe TARGET (never launched in this test, by either the negative
 # or the obfuscation-residual case), two driven for real by the positive
-# author -> validate -> launch -> read round trip. Disjoint by
-# construction, so a run-order change can never let the positive scan's
+# author -> validate -> enqueue -> read round trip. Disjoint by
+# construction, so a run-order change can never let the positive run's
 # legitimate write be mistaken for evidence the negative case's write landed.
 CORRECTOR_COUNT = 3
 BPM_COUNT = 2
@@ -214,7 +225,7 @@ def build_plan(devices: dict[str, Any], params: PARAMS) -> Any:
 # orm-shaped (mirrors plans_core/orm.py's PARAMS/
 # build_plan in spirit, and now also its typing/logging imports verbatim --
 # see the module docstring's "GAP FOUND ... NOW FIXED" note): device-agnostic,
-# resolves correctors/detectors by string name against whatever `devices`
+# resolves correctors/bpms by string name against whatever `devices`
 # dict the bridge passes in. Authored via write_plan (which prepends
 # the generated PLAN_METADATA block), so only the author's own body -- no
 # PLAN_METADATA -- lives here.
@@ -234,10 +245,15 @@ def build_plan(devices: dict[str, Any], params: PARAMS) -> Any:
 # natively on Python 3.9+ without it -- see PEP 585), so this body simply
 # omits the future import; `typing`/`logging` have no such positional rule
 # and are used exactly as the shipped exemplar does.
+#
+# What this body mirrors is the exemplar's IMPORTS and module shape -- the
+# only thing the stage-1 allowlist this test exists to probe can see. It does
+# not carry the shipped plan's read-relative-restore sweep idiom, which adds
+# no import and so is invisible to that allowlist.
 _POSITIVE_PLAN_BODY = '''"""Session-authored positive plan body for the sandbox-escape e2e
 (tests/e2e/test_bluesky_sandbox_escape_e2e.py) -- mirrors plans_core/
 orm.py's PARAMS/build_plan, proving the author -> validate ->
-launch -> read path works end to end for a legitimately-authored
+enqueue -> read path works end to end for a legitimately-authored
 session plan, in the same deployed stack the negative case runs against.
 """
 
@@ -248,33 +264,45 @@ from bluesky import plan_stubs as bps
 from bluesky import preprocessors as bpp
 from pydantic import BaseModel, Field, model_validator
 
+from osprey.services.bluesky_bridge.plan_fields import (
+    MovableChannels,
+    ReadableChannels,
+    scan_metadata,
+)
+
 logger = logging.getLogger(__name__)
 
 
 class PARAMS(BaseModel):
-    correctors: list[str] = Field(..., min_length=1)
-    detectors: list[str] = Field(..., min_length=1)
+    correctors: MovableChannels = Field(..., min_length=1)
+    readbacks: ReadableChannels = Field(..., min_length=1)
     span_a: float = Field(..., gt=0, le=10.0)
     num: int = Field(..., ge=3)
 
     @model_validator(mode="after")
     def _disjoint(self) -> "PARAMS":
-        overlap = set(self.correctors) & set(self.detectors)
+        overlap = set(self.correctors) & set(self.readbacks)
         if overlap:
-            raise ValueError(f"correctors and detectors must be disjoint (overlap: {sorted(overlap)})")
+            raise ValueError(f"correctors and readbacks must be disjoint (overlap: {sorted(overlap)})")
         return self
 
 
 def build_plan(devices: dict[str, Any], params: PARAMS) -> Any:
     correctors = [(name, devices[name]) for name in params.correctors]
     corrector_devices = [corrector for _, corrector in correctors]
-    detector_devices = [devices[name] for name in params.detectors]
+    bpm_devices = [devices[name] for name in params.readbacks]
     step = (2 * params.span_a) / (params.num - 1)
     currents = [-params.span_a + i * step for i in range(params.num)]
-    all_devices = corrector_devices + detector_devices
+    all_devices = corrector_devices + bpm_devices
 
     @bpp.stage_decorator(all_devices)
-    @bpp.run_decorator()
+    @bpp.run_decorator(
+        md=scan_metadata(
+            movable=params.correctors,
+            readable=params.readbacks,
+            points=params.num * len(params.correctors),
+        )
+    )
     def _sweep():
         for name, corrector in correctors:
             try:
@@ -318,6 +346,50 @@ def _post(path: str, body: dict, headers: dict | None = None) -> tuple[int, dict
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
+def _patch(path: str, body: dict) -> tuple[int, Any]:
+    """A PATCH against the bridge (the shared draft is the only PATCH surface)."""
+    req = urllib.request.Request(  # noqa: S310
+        f"{BRIDGE_URL}{path}",
+        data=json.dumps(body).encode("utf-8"),
+        method="PATCH",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30.0) as resp:  # noqa: S310
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def _refusal_code(body: Any) -> Any:
+    """The machine-readable code off a refusal body (``{"detail": {"code": ...}}``).
+
+    ``None`` for any other shape, so an assertion reports the drifted body
+    rather than a ``KeyError`` from inside this helper.
+    """
+    detail = body.get("detail") if isinstance(body, dict) else None
+    return detail.get("code") if isinstance(detail, dict) else None
+
+
+def _enqueue_session_plan(plan_name: str, plan_args: dict) -> tuple[int, Any]:
+    """Stage ``plan_name`` in the shared draft and try to enqueue it.
+
+    The queue path takes plan name and args from the server-side draft snapshot
+    at a pinned revision, never from the enqueue body — so reaching the enqueue
+    gate at all means going through the draft first.
+    """
+    status, patched = _patch(
+        "/draft",
+        {
+            "plan_name": plan_name,
+            "plan_args_patch": plan_args,
+            "client_id": "sandbox-escape-e2e",
+        },
+    )
+    assert status == 200, f"PATCH /draft failed for {plan_name!r}: {status} {patched}"
+    return _post("/queue/items", {"draft_revision": patched["revision"]})
+
+
 def _wait_for_health(url: str, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     last_err = "(no response yet)"
@@ -333,19 +405,26 @@ def _wait_for_health(url: str, timeout: float) -> None:
     raise AssertionError(f"timed out after {timeout:.0f}s waiting for {url} (last: {last_err})")
 
 
-def _minted_token(project_dir: Path) -> str:
+def _minted_token(repo: Path) -> str:
     from osprey.utils.dotenv import parse_dotenv_file
 
-    env_path = project_dir / ".env"
+    env_path = repo / ".env"
     assert env_path.is_file(), f"no .env written at {env_path} — token was not minted"
     env = parse_dotenv_file(env_path)
     token = env.get("BLUESKY_LAUNCH_TOKEN")
-    assert token, "BLUESKY_LAUNCH_TOKEN missing/empty in the project .env"
+    assert token, "BLUESKY_LAUNCH_TOKEN missing/empty in the deployment repo's .env"
     return token
 
 
-def _channel_limits(project_dir: Path) -> dict[str, Any]:
-    return json.loads((project_dir / "data" / "channel_limits.json").read_text(encoding="utf-8"))
+def _channel_limits(repo: Path) -> dict[str, Any]:
+    """The limits database the deployed containers actually read.
+
+    ``control_system.limits_checking.database_path`` resolves against
+    ``CONFIG_FILE``'s directory, and the render points that at
+    ``<repo>/build/config.yml`` -- so the render's copy, not the operator-owned
+    source under ``<repo>/data/``, is the file whose channels the containers see.
+    """
+    return json.loads((repo / "build" / "data" / "channel_limits.json").read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +467,7 @@ def _caget(address: str, *, timeout: float = 5.0) -> float | None:
 # ---------------------------------------------------------------------------
 @dataclass
 class DeployedSandboxStack:
-    project_dir: Path
+    repo: Path
     escape_target_sp: str
     escape_target_rb: str
     positive_correctors: dict[str, tuple[str, str]]
@@ -400,22 +479,26 @@ def deployed_sandbox_stack(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[DeployedSandboxStack]:
     base = tmp_path_factory.mktemp("sandbox_escape_build")
-    project_dir = _orm_stack.build_project_subprocess(
-        "sandbox-escape", output_dir=base, bridge_port=BRIDGE_PORT, timeout=BUILD_TIMEOUT_SEC
+    # The deployment REPO: `osprey up` runs here, `.env` lives here, and the
+    # render `osprey build` produced is `<repo>/build`.
+    repo = _orm_stack.build_project_subprocess(
+        PROJECT_NAME, output_dir=base, bridge_port=BRIDGE_PORT, timeout=BUILD_TIMEOUT_SEC
     )
 
-    limits = _channel_limits(project_dir)
+    limits = _channel_limits(repo)
     correctors = _orm_stack.select_correctors(limits, count=CORRECTOR_COUNT)
     bpms = _orm_stack.select_bpms(limits, count=BPM_COUNT)
     escape_name, (escape_sp, escape_rb) = sorted(correctors.items())[0]
     positive_correctors = {name: pair for name, pair in correctors.items() if name != escape_name}
-    _orm_stack.write_scan_env(project_dir, correctors=correctors, bpms=bpms)
+    # Writes the repo root's `.env` — the deployment's whole secret store, and
+    # the file `osprey up` refuses to start without.
+    _orm_stack.write_substrate_env(repo, correctors=correctors, bpms=bpms)
 
     osprey_bin = _orm_stack.find_osprey_console_script()
 
     # Force fresh --dev builds so the deployed containers run CURRENT source
-    # (osprey deploy up does not pass --build to compose, so it would
-    # otherwise reuse a stale cached image). Exact-named images only.
+    # (osprey up does not pass --build to compose, so it would otherwise
+    # reuse a stale cached image). Exact-named images only.
     if not os.environ.get("E2E_REUSE_IMAGES"):
         subprocess.run(
             ["docker", "rmi", "-f", _orm_stack.va_image("sandbox-escape")],
@@ -430,8 +513,8 @@ def deployed_sandbox_stack(
 
     try:
         up = subprocess.run(
-            [str(osprey_bin), "deploy", "up", "-d", "--dev"],
-            cwd=str(project_dir),
+            [str(osprey_bin), "up", "-d", "--dev"],
+            cwd=str(repo),
             capture_output=True,
             text=True,
             timeout=DEPLOY_UP_TIMEOUT_SEC,
@@ -439,12 +522,20 @@ def deployed_sandbox_stack(
         )
         if up.returncode != 0:
             pytest.fail(
-                f"osprey deploy up -d --dev failed (rc={up.returncode}):\n"
+                f"osprey up -d --dev failed (rc={up.returncode}):\n"
                 f"--- stdout ---\n{up.stdout}\n--- stderr ---\n{up.stderr}"
             )
         _wait_for_health(f"{BRIDGE_URL}/health", HEALTH_TIMEOUT_SEC)
+        # HTTP readiness is not enqueue readiness -- the worker namespace an
+        # enqueue validates against exists only once the RE worker environment
+        # is open, and the bridge opens that off the readiness path. See
+        # `_queue_drive.wait_for_worker_environment`.
+        try:
+            _queue_drive.wait_for_worker_environment(BRIDGE_URL)
+        except AssertionError as exc:
+            pytest.fail(f"{exc}\n{queue_stack_logs(_orm_stack.project_prefix(PROJECT_NAME))}")
         yield DeployedSandboxStack(
-            project_dir=project_dir,
+            repo=repo,
             escape_target_sp=escape_sp,
             escape_target_rb=escape_rb,
             positive_correctors=positive_correctors,
@@ -452,16 +543,19 @@ def deployed_sandbox_stack(
         )
     finally:
         down = subprocess.run(
-            [str(osprey_bin), "deploy", "down"],
-            cwd=str(project_dir),
+            [str(osprey_bin), "down"],
+            cwd=str(repo),
             capture_output=True,
             text=True,
             timeout=300,
         )
         if down.returncode != 0:
             print(  # noqa: T201 - surface teardown issues in CI logs
-                f"osprey deploy down rc={down.returncode}\n{down.stdout}\n{down.stderr}"
+                f"osprey down rc={down.returncode}\n{down.stdout}\n{down.stderr}"
             )
+        # `osprey down` keeps volumes by design; drop this project's own so a
+        # rerun cannot inherit their state (see tests/e2e/_volumes.py).
+        remove_project_volumes(_orm_stack.project_prefix(PROJECT_NAME))
 
 
 # ---------------------------------------------------------------------------
@@ -485,8 +579,6 @@ def test_sandbox_escape_is_caught_and_no_write_reaches_the_ioc(
         {
             "name": _ESCAPE_PLAN_NAME,
             "description": "MUST-CATCH sandbox-escape probe (never meant to run)",
-            "category": "test",
-            "required_devices": [],
             "writes": True,
             "body": _escape_plan_body(target_sp, POISON_CURRENT),
         },
@@ -514,18 +606,53 @@ def test_sandbox_escape_is_caught_and_no_write_reaches_the_ioc(
             f"validation -- the session-tier load gate did not refuse it: {sorted(names)}"
         )
 
-    # --- gate (c): launch 409s (the launch-validation gate, task 2.5) ---
-    status, body = _post("/runs", {"plan_name": _ESCAPE_PLAN_NAME, "plan_args": {}})
-    assert status == 200, f"POST /runs failed: {status} {body}"
-    run_id = body["id"]
+    # --- gate (c): the execution gate refuses it ---
+    # The gate that mattered here was never "this URL 409s" — it was "an
+    # unvalidated plan cannot reach hardware". Execution moved from the bridge
+    # to the queue server, so this asserts BOTH halves of that move: the retired
+    # direct-execute route is gone and says so machine-readably, and the path
+    # that replaced it refuses the same plan for the same reason.
+    token = _minted_token(deployed_sandbox_stack.repo)
 
-    token = _minted_token(deployed_sandbox_stack.project_dir)
-    status, body = _post(f"/runs/{run_id}/launch", {}, headers={"X-Launch-Token": token})
-    assert status == 409, (
-        f"expected 409 launching an unvalidated session plan, got {status}: {body}"
+    # (c1) the retired route is an unconditional 410 -- never a silent 404, and
+    # never something a caller could mistake for "this run does not exist".
+    status, body = _post("/runs/not-a-real-run-id/launch", {}, headers={"X-Launch-Token": token})
+    assert status == 410, f"expected 410 Gone from the retired launch route, got {status}: {body}"
+    assert _refusal_code(body) == "use_the_queue", (
+        f"the retired route must say where the capability went: {body}"
     )
-    assert "validation record" in body.get("detail", ""), (
-        f"409 detail doesn't name the validation-record gate: {body}"
+
+    # (c2) the queue path cannot even be ENTERED with this plan. `POST
+    # /queue/items` takes the plan from the shared draft at a pinned revision,
+    # never from its own body, and the draft resolves a plan name against the
+    # SAME trust-resolved catalog gate (b) just proved this plan is absent
+    # from. So the escape plan is refused at composition — it is not
+    # composable, let alone queueable.
+    #
+    # This is a stronger statement than a 409 at enqueue, and it is the
+    # honest one for THIS plan: `session_plan_unvalidated` at enqueue is
+    # reachable only for a plan that WAS validated and then had its bytes
+    # change underneath the pin, which is a different scenario and is covered
+    # against a real queue server by
+    # tests/e2e/test_bluesky_queue_e2e.py::test_5_session_plan_with_stale_validation_is_refused_at_enqueue.
+    status, body = _patch(
+        "/draft",
+        {
+            "plan_name": _ESCAPE_PLAN_NAME,
+            "plan_args_patch": {},
+            "client_id": "sandbox-escape-e2e",
+        },
+    )
+    assert status == 422, (
+        f"an unvalidated session plan must not even be stageable in the draft, got {status}: {body}"
+    )
+
+    # And nothing named it ever reached the queue -- the refusals are not
+    # merely status codes on a surface that quietly accepted the work anyway.
+    status, queue = _get("/queue")
+    assert status == 200, f"GET /queue failed: {status} {queue}"
+    assert not any(item.get("name") == _ESCAPE_PLAN_NAME for item in queue["items"]), (
+        f"the escape plan is sitting in the queue despite every gate: {queue['items']}"
     )
 
     # --- the IOC probe: the IOC itself confirms nothing ever landed, whether
@@ -560,8 +687,6 @@ def test_obfuscated_residual_is_a_documented_known_uncaught_case(
         {
             "name": _RESIDUAL_PLAN_NAME,
             "description": "Known-uncaught obfuscation residual (never launched)",
-            "category": "test",
-            "required_devices": [],
             "writes": True,
             "body": _obfuscated_residual_plan_body(target_sp, POISON_CURRENT),
         },
@@ -589,8 +714,8 @@ def test_obfuscated_residual_is_a_documented_known_uncaught_case(
 
 
 # ---------------------------------------------------------------------------
-# Positive: author -> validate -> launch -> read, over the same
-# deployed stack. May flake on the launch->read leg (bounded scan timing);
+# Positive: author -> validate -> enqueue -> drain -> read, over the same
+# deployed stack. May flake on the drain->read leg (bounded run timing);
 # the negative case above stays strict.
 # ---------------------------------------------------------------------------
 @pytest.mark.flaky(reruns=2, only_rerun=["AssertionError"])
@@ -605,8 +730,6 @@ def test_session_plan_author_validate_launch_read_round_trip(
         {
             "name": _POSITIVE_PLAN_NAME,
             "description": "Legit session-authored orbit-response probe",
-            "category": "accelerator",
-            "required_devices": ["correctors", "detectors"],
             "writes": True,
             "body": _POSITIVE_PLAN_BODY,
         },
@@ -619,7 +742,7 @@ def test_session_plan_author_validate_launch_read_round_trip(
             "name": _POSITIVE_PLAN_NAME,
             "sample_args": {
                 "correctors": list(correctors)[:1],
-                "detectors": list(bpms)[:1],
+                "readbacks": list(bpms)[:1],
                 "span_a": 1.0,
                 "num": 3,
             },
@@ -640,17 +763,22 @@ def test_session_plan_author_validate_launch_read_round_trip(
 
     plan_args = {
         "correctors": list(correctors),
-        "detectors": list(bpms),
+        "readbacks": list(bpms),
         "span_a": SPAN_A,
         "num": NUM_POINTS,
     }
-    status, body = _post("/runs", {"plan_name": _POSITIVE_PLAN_NAME, "plan_args": plan_args})
-    assert status == 200, f"POST /runs failed: {status} {body}"
-    run_id = body["id"]
+    # Execution is the queue's: stage the plan in the shared draft, enqueue at
+    # the pinned revision (which mints the run id), then arm the queue. Same
+    # guarantees the retired two-step mint-then-launch flow had — the pinned
+    # revision and the launch token — with the plan running in the queue
+    # server's worker rather than in the bridge process.
+    status, body = _enqueue_session_plan(_POSITIVE_PLAN_NAME, plan_args)
+    assert status == 200, f"POST /queue/items failed: {status} {body}"
+    run_id = body["run_id"]
 
-    token = _minted_token(deployed_sandbox_stack.project_dir)
-    status, body = _post(f"/runs/{run_id}/launch", {}, headers={"X-Launch-Token": token})
-    assert status == 200, f"launch failed: {status} {body}"
+    token = _minted_token(deployed_sandbox_stack.repo)
+    status, body = _post("/queue/start", {}, headers={"X-Launch-Token": token})
+    assert status == 200, f"POST /queue/start failed: {status} {body}"
 
     deadline = time.monotonic() + SCAN_TIMEOUT_SEC
     status_body: dict = {}
@@ -660,7 +788,7 @@ def test_session_plan_author_validate_launch_read_round_trip(
             break
         time.sleep(0.5)
     assert status_body.get("status") == "completed", (
-        f"session_orbit_probe scan did not complete within {SCAN_TIMEOUT_SEC:.0f}s "
+        f"session_orbit_probe run did not complete within {SCAN_TIMEOUT_SEC:.0f}s "
         f"(status={status_body})"
     )
 

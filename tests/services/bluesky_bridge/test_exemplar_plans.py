@@ -1,5 +1,5 @@
-"""Coverage for the shipped accelerator plans (task 1.5):
-``plans_core/orm.py`` and ``plans_core/grid_scan.py``.
+"""Coverage for the shipped accelerator plans: ``plans_core/orm.py``,
+``plans_core/grid_scan.py``, and ``plans_core/orbit_bump_sweep.py``.
 
 Runs ONLY in a bluesky-capable environment — `bluesky`/`ophyd-async` are
 never installed in the main worktree venv, so every test here is skipped via
@@ -14,10 +14,10 @@ bluesky installed at all. To actually run this file:
 Two things are proven for each plan: (1) it registers through the real
 layered-directory loader (`plan_loader.get_facility_plans`) with valid
 metadata and `provenance == "shipped"` — i.e. the file satisfies the catalog
-contract, not a hand-built `PlanSpec`; and (2) its `build_plan` drives a real
-bluesky `RunEngine` (via `BlueskyPlanRunner`, mirroring
-`test_runengine_integration.py`'s harness) to completion against mock
-devices, emitting documents. `orm`'s own restore-in-`finally` abort-safety
+contract, not a hand-built `PlanSpec`; and (2) it drives a real bluesky
+`RunEngine` to completion against mock devices, emitting documents — through
+`bluesky_plan_drive.run_plan`, which wraps each plan exactly as the queueserver
+worker's namespace does, so what runs here is the production call shape. `orm`'s own restore-in-`finally` abort-safety
 (the FAILURE path) is covered separately by `test_builtin_plans.py`, which
 drives its generator directly rather than through this registration path.
 """
@@ -25,7 +25,6 @@ drives its generator directly rather than through this registration path.
 from __future__ import annotations
 
 import asyncio
-import time
 
 import pytest
 
@@ -34,15 +33,8 @@ ophyd_async = pytest.importorskip("ophyd_async")
 
 from osprey.services.bluesky_bridge import live_rows, plan_loader  # noqa: E402
 from osprey.services.bluesky_bridge.devices.mock import build_devices  # noqa: E402
-from osprey.services.bluesky_bridge.plan_runner_bluesky import BlueskyPlanRunner  # noqa: E402
 
-
-def _wait_until_idle(runner: BlueskyPlanRunner, timeout: float = 15.0) -> None:
-    deadline = time.monotonic() + timeout
-    while runner.is_run_active():
-        if time.monotonic() > deadline:
-            raise AssertionError("scan did not finish within the timeout")
-        time.sleep(0.05)
+from .bluesky_plan_drive import run_plan  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -80,6 +72,19 @@ def test_orm_and_grid_scan_register_as_shipped_with_valid_metadata() -> None:
     assert gs_spec.name == "grid_scan"
 
 
+def test_orbit_bump_sweep_registers_as_shipped_with_valid_metadata() -> None:
+    facility = plan_loader.get_facility_plans()
+
+    assert "orbit_bump_sweep" in facility.plans
+
+    spec = facility.plans["orbit_bump_sweep"]
+
+    assert spec.provenance == "shipped"
+    assert spec.metadata is not None
+    assert spec.metadata.writes is True
+    assert spec.name == "orbit_bump_sweep"
+
+
 # =========================================================================
 # RunEngine dry-run against mock devices: a real run, not a no-op
 # =========================================================================
@@ -89,36 +94,27 @@ def test_orm_and_grid_scan_register_as_shipped_with_valid_metadata() -> None:
 def orm_devices() -> dict:
     return asyncio.run(
         build_devices(
-            motor_names=["hcm1", "hcm2"],
-            detector_names=["bpm1", "bpm2"],
+            settable_names=["hcm1", "hcm2"],
+            readable_names=["bpm1", "bpm2"],
         )
     )
 
 
 def test_orm_plan_runs_to_completion_and_buffers_rows(orm_devices: dict) -> None:
     facility = plan_loader.get_facility_plans()
-    runner = BlueskyPlanRunner(devices=orm_devices, plans=facility.plans)
-    exec_config = {
-        "plan_name": "orm",
-        "plan_args": {
+    run_uid = run_plan(
+        "orm",
+        {
             "correctors": ["hcm1", "hcm2"],
-            "detectors": ["bpm1", "bpm2"],
+            "readbacks": ["bpm1", "bpm2"],
             "span_a": 2.0,
             "num": 3,
         },
-    }
+        devices=orm_devices,
+        plans=facility.plans,
+    )
 
-    assert runner.reinitialize(exec_config) is True
-    assert runner.current_state == "armed"
-
-    runner.start_run_thread()
-    _wait_until_idle(runner)
-
-    assert runner.error_message is None
-    assert runner.current_state == "completed"
-    assert runner.last_run_uid is not None
-
-    buf = live_rows.get(runner.last_run_uid)
+    buf = live_rows.get(run_uid)
     assert buf is not None
     # 2 correctors x 3 points each = one event (row) per (corrector, current).
     assert buf["total_seen"] == 6
@@ -126,7 +122,8 @@ def test_orm_plan_runs_to_completion_and_buffers_rows(orm_devices: dict) -> None
     for row in buf["rows"]:
         assert all(value is not None for value in row)
 
-    # Each corrector restored to 0 A after its own sweep.
+    # Each corrector restored to its pre-plan working point after its own
+    # sweep. These mock motors start at 0 A, so here that value is 0 A.
     assert asyncio.run(orm_devices["hcm1"].readback.get_value()) == 0.0
     assert asyncio.run(orm_devices["hcm2"].readback.get_value()) == 0.0
 
@@ -135,40 +132,96 @@ def test_orm_plan_runs_to_completion_and_buffers_rows(orm_devices: dict) -> None
 def gs_devices() -> dict:
     return asyncio.run(
         build_devices(
-            motor_names=["motor1", "motor2"],
-            detector_names=["det1"],
+            settable_names=["motor1", "motor2"],
+            readable_names=["det1"],
         )
     )
 
 
 def test_grid_scan_plan_runs_to_completion_and_buffers_rows(gs_devices: dict) -> None:
     facility = plan_loader.get_facility_plans()
-    runner = BlueskyPlanRunner(devices=gs_devices, plans=facility.plans)
-    exec_config = {
-        "plan_name": "grid_scan",
-        "plan_args": {
-            "detectors": ["det1"],
+    run_uid = run_plan(
+        "grid_scan",
+        {
+            "readbacks": ["det1"],
             "axes": [
                 {"setpoint": "motor1", "start": 0.0, "stop": 1.0, "num_points": 2},
                 {"setpoint": "motor2", "start": 0.0, "stop": 1.0, "num_points": 3},
             ],
         },
-    }
+        devices=gs_devices,
+        plans=facility.plans,
+    )
 
-    assert runner.reinitialize(exec_config) is True
-    assert runner.current_state == "armed"
-
-    runner.start_run_thread()
-    _wait_until_idle(runner)
-
-    assert runner.error_message is None
-    assert runner.current_state == "completed"
-    assert runner.last_run_uid is not None
-    assert runner.estimate_current_completion() == 1.0
-
-    buf = live_rows.get(runner.last_run_uid)
+    buf = live_rows.get(run_uid)
     assert buf is not None
     # 2 x 3 grid = 6 total points.
     assert buf["total_seen"] == 6
     assert len(buf["rows"]) == 6
     assert any("det1" in col for col in buf["columns"])
+
+
+@pytest.fixture
+def bump_devices() -> dict:
+    """Every channel the bump touches, all as mock settables.
+
+    The BPMs are settables, not readables, deliberately: `MockReadable` counts
+    up on every trigger, so a "BPM" built from one drifts on every read and
+    each step lands out of band — a fine device set for proving the noise
+    gate (the validator's role-built dry run does exactly that), but this
+    test's subject is the converged path's exact row layout and the verified
+    restore, and only `MockSettable`'s constant readback makes "converged"
+    exact rather than best-effort.
+    """
+    return asyncio.run(
+        build_devices(
+            settable_names=["hcm1", "hcm2", "hcm3", "bpm1", "bpm2", "bpm3"],
+            readable_names=[],
+        )
+    )
+
+
+def test_orbit_bump_sweep_plan_runs_to_completion_and_buffers_rows(bump_devices: dict) -> None:
+    """A zero-offset bump: the whole plan structure, no orbit response needed.
+
+    Mock devices move no beam, so the probe fits an identically zero response
+    and the run takes the demand gate's trivially-converged path — every
+    step's solution is zero, `solve_offsets` is never called. The profile is
+    still walked in full, which is what makes the row count below the real
+    pinned layout and not a shortened one.
+    """
+    facility = plan_loader.get_facility_plans()
+    run_uid = run_plan(
+        "orbit_bump_sweep",
+        {
+            "correctors": ["hcm1", "hcm2", "hcm3"],
+            "targets": [{"readback": "bpm1", "value": 0.0}],
+            "closure_readbacks": ["bpm2", "bpm3"],
+            "readbacks": [],
+            "num": 2,
+            "baseline_reads": 3,
+            "probe_amplitude": 0.1,
+            "tolerance": 0.01,
+            "max_trim_iterations": 1,
+            "best_effort": True,
+            "settle_s": 0.0,
+        },
+        devices=bump_devices,
+        plans=facility.plans,
+    )
+
+    buf = live_rows.get(run_uid)
+    assert buf is not None
+    # The pinned row layout: `baseline_reads` baseline rows, then exactly one
+    # row per amplitude step — `2 * num` of them for a monodirectional sweep
+    # (up to the peak and back down to zero). The probe and convergence reads
+    # are taken off the record and must contribute no rows at all.
+    assert buf["total_seen"] == 3 + 2 * 2
+    assert len(buf["rows"]) == 7
+    assert any("bpm1" in col for col in buf["columns"])
+
+    # Every corrector back on its pre-scan working point — 0 A for these mock
+    # motors — including via the terminal scale-0 step, which commands the
+    # recorded working points verbatim.
+    for name in ("hcm1", "hcm2", "hcm3"):
+        assert asyncio.run(bump_devices[name].readback.get_value()) == 0.0

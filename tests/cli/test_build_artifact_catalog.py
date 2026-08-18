@@ -114,23 +114,31 @@ class TestRegistryMatchesTemplateDirectory:
     """Verify that the registry matches the actual template files on disk."""
 
     def test_all_template_paths_exist(self):
-        """Every artifact's template_path must exist in the template directory."""
+        """Every artifact's template_path must exist under its template_root."""
         registry = BuildArtifactCatalog.default()
-        template_root = (
-            Path(__file__).parent.parent.parent / "src" / "osprey" / "templates" / "claude_code"
-        )
+        templates_dir = Path(__file__).parent.parent.parent / "src" / "osprey" / "templates"
 
         for art in registry.all_artifacts():
-            template_file = template_root / art.template_path
+            template_file = templates_dir / art.template_root / art.template_path
             assert template_file.exists(), (
                 f"Template {art.template_path} for artifact "
                 f"'{art.canonical_name}' not found at {template_file}"
             )
+            if art.is_directory:
+                assert template_file.is_dir(), (
+                    f"Directory artifact '{art.canonical_name}' must point at a directory"
+                )
 
     def test_no_unregistered_templates(self):
         """All files in the template directory should be registered.
 
-        Exemptions: __pycache__, .pyc, directories-only, __init__.py
+        Exemptions: __pycache__, .pyc, directories-only, __init__.py,
+        ``_terminology`` partials, and ``web-terminal-context/`` — the
+        web-terminal persona baseline. The catalog governs artifacts rendered
+        into ``.claude/`` and claimable via ``osprey scaffold claim``; base.md
+        is copied verbatim to ``docker/web-terminal-context/`` for deploy-time
+        seeding and never passes through the override machinery, so a catalog
+        entry for it would advertise a claim that the build ignores.
         """
         registry = BuildArtifactCatalog.default()
         template_root = (
@@ -147,6 +155,8 @@ class TestRegistryMatchesTemplateDirectory:
             if template_file.name == "__init__.py":
                 continue
             if "_terminology" in template_file.parts:
+                continue
+            if "web-terminal-context" in template_file.parts:
                 continue
 
             rel = str(template_file.relative_to(template_root))

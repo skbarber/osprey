@@ -1,29 +1,38 @@
 # control-assistant.yml
-# Full control system deployment — the standard starting point for facilities
-# operating a particle accelerator or beamline with EPICS or a mock backend.
+# The standard starting point for a facility running a particle accelerator or
+# beamline, on EPICS, the built-in simulator, or a mock backend.
 #
-# Copy this file to your own profile directory, rename it, and adjust the
-# config overrides, overlay paths, and MCP server definitions for your site.
+# `osprey init <facility> --preset control-assistant` writes this out as
+# <facility>/profile.yml, at the root of a repo you own. Edit it there; the
+# packaged preset is never touched.
+#
+# Every comment below is copied into that file, so it is written for whoever
+# opens their own profile.yml, not for a reader of this one. Keep them short:
+# two lines each. Anything longer belongs in the docs.
 
 name: Control Assistant
 
-# The data bundle provides the project skeleton (config.yml, registry, data
-# files, benchmark datasets, etc.).  "control_assistant" is the standard full
-# bundle that includes channel databases, benchmarks, and a logbook seed.
-data_bundle: control_assistant
+# Which packaged app this builds. "control_assistant" is the full one. Its data
+# files are copied into data/, and that copy is what the build uses from then on.
+app_template: control_assistant
 
-# Default LLM provider and model. Override here or via `osprey build`'s
-# --set provider=... / --set model=... flags; explicit --set overrides are
-# also forwarded to the persona projects auto-rendered at deploy time.
+# Which model answers. `osprey set provider=...` / `osprey set model=...` edit
+# these in place, keeping your comments.
 provider: anthropic
-model: claude-haiku-4-5
+model: haiku   # tier (haiku/sonnet/opus), or a model ID the provider serves
 
-# Channel-finder pipeline. Override via --set channel_finder_mode=in_context|middle_layer.
+# How the agent searches for channels. `osprey set channel_finder_mode=...`
+# also accepts in_context or middle_layer.
 channel_finder_mode: hierarchical
 
-# ── Artifact selection ───────────────────────────────────────────────────────
-# Each list entry is a short name resolved from the osprey artifact library.
-# Remove entries you do not need; add facility-specific artifacts via overlay.
+# Extra Python packages your agent needs. pymongo is required by the stored
+# archive declared under `va_archiver:` below.
+dependencies:
+  - pymongo>=4.0
+
+# ── What the agent can do ────────────────────────────────────────────────────
+# Each entry is a name from the OSPREY artifact library. Delete what you do not
+# need; add your own through an overlay.
 
 hooks:
   - hook-log          # Append every tool call to a structured JSONL audit log
@@ -35,7 +44,10 @@ hooks:
   - memory-guard      # Warn when context window approaches threshold
   - notebook-update   # Sync CLAUDE.md notebook after each session
   - cf-feedback-capture  # Capture channel-finder accuracy feedback for tuning
-  - config-drift      # Warn at session start when config.yml drifted from generated artifacts
+  - config-drift      # Warn at session start when the build is out of date
+  - focus-validate    # Strip stale artifact IDs from focus_state.txt on each prompt
+  - panels-context    # Tell the agent which web terminal panels exist
+  - workspace-delta   # Report web workspace changes since the agent's last turn
 
 rules:
   - safety              # Core safety rules: never write without approval
@@ -47,14 +59,17 @@ rules:
   - python-execution    # Rules governing Python executor sandbox usage
   - data-visualization  # Rules for producing control-room-ready plots
   - control-system-safety  # EPICS PV safety: alarm limits, soft-IOC guards
+  - test-ioc-safety     # Test-IOC port isolation (EPICS-family control systems only)
 
 skills:
   - diagnose        # Run a structured fault-diagnosis workflow
-  - setup-mode      # Toggle between interactive and automated operating modes
+  # setup-mode is left out on purpose: it can edit config.yml and .mcp.json,
+  # which is admin work. Add it to an admin-facing profile to turn it on.
   - session-report  # Summarise session actions and outcomes to the logbook
   - demo-gallery    # Launch guided capability demonstrations
-  - writing-bluesky-plans  # Author, validate, and launch a session-tier plan (requires the Bluesky MCP server)
-  - operating-bluesky-scans  # Stage, launch, and watch a registered scan through the shared draft (requires the Bluesky MCP server)
+  - demo-ui         # Run a scripted demo of the agent driving the web workspace
+  - writing-bluesky-plans  # Write, check and queue a plan (needs the Bluesky server)
+  - operating-bluesky-plans  # Stage, queue and watch a plan (needs the Bluesky server)
 
 agents:
   - channel-finder          # Semantic search over channel databases (hierarchical)
@@ -70,166 +85,185 @@ output_styles:
 web_panels:
   - ariel           # ARIEL search interface (past experiments, papers)
   - channel-finder  # Interactive channel-finder web UI
-  - okf             # KNOWLEDGE tab — browse the facility knowledge bundle
-  - events          # EVENTS dashboard tab (event dispatcher)
-  - plan       # Bluesky plan selection & execute
-  - results    # Live run results viewer
-  - system-health   # SYSTEM tab — framework health dashboard (sidecar-backed)
+  - okf             # KNOWLEDGE tab, for browsing the facility knowledge bundle
+  - system-health   # SYSTEM tab, a framework health dashboard
+  # The events and bluesky panels are declared in personas/readwrite.yml
+  # instead, so the read-only login is built without them.
 
-# ── Bluesky stack (turn-key, VA-backed) ─────────────────────────────────────────
-# The tutorial ships the FULL Bluesky-mediated Bluesky stack out of the box:
-# a Bluesky bridge (+ co-deployed Tiled catalog), a PyAT Virtual
-# Accelerator soft-IOC standing in for real EPICS hardware, and the
-# bluesky-panels sidecar that serves the two web_panels above. Each top-level
-# block below is an injector trigger (`_inject_bluesky`/`_inject_va`/
-# `_inject_bluesky_panels` in build_cmd.py) — it renders the corresponding
-# `services.<name>` compose service, appends to `deployed_services`, and (for
-# bluesky_panels) registers the `web.panels.<id>` URLs. Remove this section
-# (and the two panel ids above) to ship a Bluesky-free tutorial.
+# ── Scanning and simulated hardware ──────────────────────────────────────────
+# These three blocks give you a working plan setup with no real hardware: a
+# Bluesky bridge with a Tiled data catalog, a simulated accelerator that speaks
+# EPICS, and the web panels for both. Delete this section (and the bluesky
+# panel above) if you do not want it.
 bluesky:
   port: 8090
-  tiled_enabled: true      # co-deploys the Tiled catalog sidecar alongside the bridge
+  tiled_enabled: true      # also runs the Tiled data catalog
   tiled_port: 8091
-  # demo_runner intentionally omitted: the tutorial drives the bridge against
-  # the real VA soft-IOC over BLUESKY_EPICS_SUBSTRATE, not the mock demo runner.
 
 virtual_accelerator:
-  # MUST stay 5064 — config.yml.j2 hardcodes the VA gateway port at 5064
-  # (control_system.connector.virtual_accelerator.gateways.*.port is not
-  # templated from services.virtual_accelerator.port); changing this here
-  # would desync the connector from the deployed container.
+  # EPICS port the simulator serves on. The agent follows this value, so
+  # changing it moves both.
   port: 5064
 
-bluesky_panels:
+bluesky_web:
   port: 8095
 
-# ── Config overrides ─────────────────────────────────────────────────────────
-# These key.path entries are written into config.yml after the template renders.
-# Uncomment and set values appropriate for your facility.
+# ── Stored archive (MongoDB) ─────────────────────────────────────────────────
+# With this block, `osprey up` runs a real archive: a MongoDB store that is
+# seeded with history on the first deploy and records the machine from then on.
+# Without it, the agent invents plausible history when asked about the past.
+#
+# Every key is optional. These are the defaults, written out so you can see the
+# shape. Do not also set `archiver.mongodb_archiver.*` under `config:` below;
+# the build derives those keys from here and refuses a profile that has both.
+va_archiver:
+  # Where the agent reaches the store. `localhost` is this deployment's own;
+  # point it at another host to read someone else's archive.
+  host: localhost
+  retention_days: 30       # how far back the archive reaches
+  hot_span_hours: 48       # how much of it is kept at the dense sample rate
+  hot_cadence_sec: 10      # seconds between samples inside the hot span
+  tail_cadence_sec: 60     # and outside it (must be a whole multiple of the above)
+  recorder_cadence_sec: 10  # how often the recorder samples the machine
+  # A channel `osprey health` watches to check the archive is still recording:
+  # if this stops moving, history has quietly stopped. Point it at something on
+  # your machine that always changes; delete the key for no check at all.
+  freshness_channel: SR:DIAG:DCCT:01:CURRENT:RB
+
+# ── Everything else ──────────────────────────────────────────────────────────
+# One dotted `key.path` per line. Never write a nested block here: it would
+# replace the whole subtree and silently drop the keys beside it.
+#
+# This block is where configuration lives. build/config.yml is generated from
+# it and should never be hand-edited. `osprey set` writes here.
 config:
-  # The VA soft-IOC ships and is deployed as part of the turn-key Bluesky stack
-  # above, but control_system.type defaults to "mock" so a fresh tutorial
-  # project stays safe out of the box: the panels, plan catalog, and health
-  # dashboard all work, and no live/simulated hardware is touched. Note the
-  # mock connector does NOT track setpoints (its readbacks are a non-tracking
-  # simulation), so a settle-verified run will not COMPLETE on mock — mock is
-  # for browsing/UI. Flip this one line to "virtual_accelerator" to drive the
-  # deployed VA end-to-end (correctors move, BPMs read); use "epics" for live
-  # hardware.
-  control_system.type: mock
-  # Required for arming: a local-exec posture withholds the auto-minted
-  # BLUESKY_LAUNCH_TOKEN (see container_lifecycle.py's
-  # _local_exec_arming_unsafe) — container execution is what lets `osprey
-  # deploy up` mint the token safely.
-  execution.execution_method: container
-  # The Bluesky MCP server is off-by-default in the framework registry
-  # (default_enabled=False); opt in here so the tutorial's agent can author
-  # and launch scan plans out of the box.
+  # Which control system to talk to. "virtual_accelerator" is the built-in
+  # simulator and works out of the box; "epics" is real hardware; "mock" needs
+  # no containers but cannot complete a plan. `osprey set connector=epics`.
+  control_system.type: virtual_accelerator
+  # Use the archive declared by `va_archiver:` above. Declaring the block does
+  # not turn it on; without this line you would deploy a store and not read it.
+  archiver.type: mongodb_archiver
+  # Both servers are off by default in OSPREY. Turn them on so the agent can
+  # write and launch plans, and run read-only health checks.
   claude_code.servers.bluesky.enabled: true
-  # The system-health MCP server is likewise off-by-default in the framework
-  # registry (default_enabled=False); opt in here so the tutorial's agent can
-  # run read-only framework/stack health checks out of the box.
   claude_code.servers.health.enabled: true
   # system.timezone: America/Los_Angeles
-  # system.facility_name: My Facility
-  # EVENTS panel — surfaces the event-dispatcher dashboard as an in-terminal tab.
-  # URL defaults to the host-run dispatcher (127.0.0.1:8020); override
-  # EVENT_DISPATCHER_URL for containerized/remote web terminals.
-  web.panels.events.label: EVENTS
-  web.panels.events.url: "${EVENT_DISPATCHER_URL:-http://localhost:8020}"
-  web.panels.events.path: /dashboard
-  web.panels.events.health_endpoint: /health
-  # SCAN panels — the operator UI for the mediated Bluesky stack (plan selection &
-  # execute, live results), served by the bluesky-panels sidecar.
-  # URL defaults to the host-published sidecar port; override BLUESKY_PANELS_URL for
-  # a containerized/remote web terminal (same pattern as the EVENTS panel above).
-  web.panels.plan.label: PLAN
-  web.panels.plan.url: "${BLUESKY_PANELS_URL:-http://localhost:8095}"
-  web.panels.plan.path: /plan/
-  web.panels.results.label: RESULTS
-  web.panels.results.url: "${BLUESKY_PANELS_URL:-http://localhost:8095}"
-  web.panels.results.path: /results/
-  # ── Multi-user web-terminal stack (built-in) ───────────────────────────────
-  # The tutorial ships natively multi-user: `osprey deploy up` stands up nginx,
-  # the landing page, and one web-terminal container per roster user, alongside
-  # the scan stack above. Single-user onboarding is unchanged — `osprey web`
-  # never reads this block (only `osprey deploy` does), so a plain host-run
-  # terminal works at any time. To deploy backend services without the web
-  # tier, set `modules.web_terminals.enabled: false` in the rendered config.yml.
+  # Your facility's name, used in the agent's prompts and on the web landing
+  # page. Defaults to the deployment name.
+  # facility.name: My Facility
+  # Starting theme for every web terminal. Each browser can override it from
+  # the display menu.
+  web.theme: light
+  # ── Web terminals ──────────────────────────────────────────────────────────
+  # `osprey up` runs a landing page and one terminal per user listed below.
+  # `osprey web` ignores all of this, so a single terminal on your own machine
+  # works at any time. Set `modules.web_terminals.enabled: false` for backend
+  # services only.
   #
-  # Container-name prefix for the web stack: names are `<prefix>-nginx` /
-  # `<prefix>-web-<user>`, so this MUST be a non-empty valid Docker name start
-  # ([a-zA-Z0-9]). Keep it short and distinct from the project name (used for
-  # image tags). Set to your own facility abbreviation when you copy this preset.
+  # Short prefix for the web container names (`<prefix>-nginx`, `<prefix>-web-
+  # <user>`). Must start with a letter or digit. Use your facility's initials.
   facility.prefix: ca
-  # Landing-URL origin for the multi-user web stack: render refuses to build
-  # OSPREY_TERMINAL_LANDING_URL without deploy.fqdn once users are configured.
-  # 127.0.0.1 matches the single-trusted-host tutorial posture; set your
-  # browser-reachable hostname when deploying anywhere else.
+  # The hostname people open in a browser. 127.0.0.1 is your own machine; set
+  # your real hostname to reach it from anywhere else.
   deploy.fqdn: 127.0.0.1
-  # This MUST stay ONE literal dotted key — `modules.web_terminals` addressing
-  # the whole module subtree with a nested value. A nested `modules:` mapping
-  # under `config:` would wholesale-replace the rendered `modules` subtree,
-  # silently dropping any sibling module: config_writer applies each dotted key
-  # verbatim, setting only the addressed leaf (see utils/config_writer.py).
-  #
-  # `image_source: local` means `osprey deploy up` builds each persona's image
-  # itself from `project_path`; the referenced persona projects are auto-rendered
-  # from their `build_profile` preset before the build, so a bare `osprey build`
-  # of this preset plus `osprey deploy up` stands the whole stack up with no
-  # registry. Each persona's `project` equals its `project_path` basename — the
-  # invariant persona auto-render relies on to land the rendered project exactly
-  # where the catalog mounts it.
+  # Keep this as ONE dotted key. A nested `modules:` block here would replace
+  # the whole modules subtree and silently drop the others.
   modules.web_terminals:
     enabled: true
+    # No deploy block yet, so this is image_source's only home: build each
+    # terminal image here rather than pulling it from a registry.
     image_source: local
-    nginx_port: 9080            # public-facing reverse proxy / landing page
-    # Per-user port families: user i gets base + i in each family. Every
-    # companion panel gets its own family (the containers share the host
-    # network namespace, so per-user offsets are what prevent collisions);
-    # families omitted here fall back to registry defaults (registry/web.py).
-    # All families sit above the tutorial's own service ports (5064, 8020,
-    # 8090/8091/8095) so the two stacks never collide on one host.
+    nginx_port: 9080            # the landing page everyone opens first
+    # User number i gets base + i in each family below, so removing a user
+    # never shifts anyone else's ports. These all sit above this deployment's
+    # own service ports (5064, 8020, 8090/8091/8095) to avoid collisions.
     web_base_port: 9091           # first per-user web-terminal port
     artifact_base_port: 9291      # first per-user artifact-gallery port
     ariel_base_port: 9391         # first per-user ARIEL search port
     lattice_base_port: 9491       # first per-user lattice-dashboard port
     channel_finder_base_port: 9591  # first per-user channel-finder panel port
-    default_persona: readonly   # roster entries with no persona resolve here
+    default_persona: readonly   # used for any user below with no persona
+    # Every terminal below asks for a login (user alice: password alice, and
+    # so on — set in this repo's .env; rotate with `osprey users passwd`).
+    auth:
+      method: password
+      # Accepts login over plain HTTP, which fits 127.0.0.1 and nothing else.
+      # For any reachable host, delete this line and configure tls instead.
+      allow_insecure_http: true
+    # How the landing page is laid out. Omit this whole block and you get one
+    # section holding every entry below, headed "Terminals".
+    landing:
+      groups:
+        # `users` renders the roster. It also SPLITS it: any entry whose
+        # persona declares a `landing_group` (see `ariel` below) moves into a
+        # section of its own, drawn as an accent-edged panel underneath it.
+        # So the page reads people first, services after.
+        - type: users
+          label: Users
     users:
-      - alice                   # bare string → default_persona (readonly)
+      # One web terminal per entry. `index` pins that user's ports, `persona`
+      # picks their permissions from the list below, and `display_name` becomes
+      # the browser tab title, which is how you tell the terminals apart.
+      - name: alice
+        index: 0
+        persona: readwrite
+        display_name: "Control Room (Alice)"
       - name: bob
         index: 1
-        persona: readwrite
+        persona: readonly
+        display_name: "Read-Only View (Bob)"
+      # Not a person: a second product running beside them. Same machinery as
+      # any other entry — its own container, ports and volumes — but what is
+      # behind the card is the ARIEL logbook assistant, not a control terminal.
+      - name: ariel
+        index: 2
+        persona: ariel
+        display_name: "ARIEL Logbook Research"
+        # Read-only research service, open without a login on purpose.
+        login: false
     personas:
+      # `osprey build` builds one of these per file in personas/, into build/.
+      # `osprey up` builds nothing: if one is missing it stops and says so.
       readonly:
         project: control-assistant-readonly
-        project_path: ../control-assistant-readonly
+        project_path: build/control-assistant-readonly
         build_profile: control-assistant-readonly
       readwrite:
         project: control-assistant-readwrite
-        project_path: ../control-assistant-readwrite
+        project_path: build/control-assistant-readwrite
         build_profile: control-assistant-readwrite
+      ariel:
+        project: control-assistant-ariel
+        project_path: build/control-assistant-ariel
+        build_profile: control-assistant-ariel
+        # Puts this persona's users under their own landing-page heading
+        # instead of in with the people. Presentation only — it changes
+        # nothing about the container, its ports, or what it can do.
+        landing_group: Standalone deployments
 
-# ── Event dispatch (optional) ────────────────────────────────────────────────
-# Turns external events (webhooks) into headless agent runs. This ships a set of
-# control-system-free tutorial triggers so you can exercise the pipeline with a
-# single `curl` after `osprey deploy up`. Remove this block to disable dispatch.
+# ── Answering webhooks (optional) ────────────────────────────────────────────
+# Lets an outside system ask the agent a question over HTTP. The triggers that
+# ship need no control system, so a single `curl` after `osprey up` exercises
+# it. Delete this block to turn it off.
 dispatch:
-  triggers: tutorial_triggers.yml   # bundled with OSPREY; resolved at build time
+  triggers: tutorial_triggers.yml   # a path in this repo, or a bundled name
   worker_count: 1
   workspace_mode: isolated
   max_concurrent_runs: 2
   max_queue_depth: 50
 
 # ── Environment variables ────────────────────────────────────────────────────
-# Bearer tokens guarding the dispatcher's inbound webhook/dashboard auth
-# (EVENT_DISPATCHER_TOKEN) and the dispatcher→worker calls (DISPATCH_WORKER_TOKEN).
-# No defaults on purpose: the dispatch services fail closed on an unset token.
-# `osprey deploy up` auto-generates a strong random value for each unset token
-# into the project .env (and logs where), so a fresh deploy is secure by default
-# with zero editing. Set your own values in .env to override.
+# Passwords for the webhook service above. They have no defaults on purpose:
+# the service refuses to start without them. `osprey up` generates a strong
+# random value for each one into this repo's .env, so a new deployment is
+# secure with no editing. Put your own values in .env to override.
 env:
   required:
     - EVENT_DISPATCHER_TOKEN
     - DISPATCH_WORKER_TOKEN
+  # Demo login passwords for the terminals above, written into this repo's
+  # .env by `osprey init`. Edit them there — these are not secrets.
+  defaults:
+    OSPREY_AUTH_PW_ALICE: alice
+    OSPREY_AUTH_PW_BOB: bob

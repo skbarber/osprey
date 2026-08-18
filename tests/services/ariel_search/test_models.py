@@ -9,23 +9,10 @@ from osprey.services.ariel_search.models import (
     ARIELSearchResult,
     ARIELStatusResult,
     EmbeddingTableInfo,
-    IngestionEntryError,
-    IngestionProgress,
-    IngestionResult,
     MetadataSchema,
-    SearchMode,
     enhanced_entry_from_row,
     resolve_time_range,
 )
-
-
-class TestSearchMode:
-    """Tests for SearchMode enumeration."""
-
-    def test_mode_values(self) -> None:
-        """Test that all expected modes exist."""
-        assert SearchMode.KEYWORD.value == "keyword"
-        assert SearchMode.SEMANTIC.value == "semantic"
 
 
 class TestARIELSearchRequest:
@@ -35,7 +22,7 @@ class TestARIELSearchRequest:
         """Test basic request creation."""
         request = ARIELSearchRequest(query="test query")
         assert request.query == "test query"
-        assert request.modes == [SearchMode.KEYWORD]
+        assert request.modes == ["keyword"]
         assert request.time_range is None
         assert request.facility is None
         assert request.max_results == 10
@@ -47,13 +34,13 @@ class TestARIELSearchRequest:
         time_range = (now, now)
         request = ARIELSearchRequest(
             query="test query",
-            modes=[SearchMode.KEYWORD, SearchMode.SEMANTIC],
+            modes=["keyword", "semantic"],
             time_range=time_range,
             facility="ALS",
             max_results=50,
             include_images=True,
         )
-        assert request.modes == [SearchMode.KEYWORD, SearchMode.SEMANTIC]
+        assert request.modes == ["keyword", "semantic"]
         assert request.time_range == time_range
         assert request.facility == "ALS"
         assert request.max_results == 50
@@ -145,51 +132,6 @@ class TestARIELStatusResult:
         assert result.healthy is True
         assert result.database_connected is True
         assert result.entry_count == 127500
-
-
-class TestIngestionModels:
-    """Tests for ingestion-related models."""
-
-    def test_ingestion_entry_error(self) -> None:
-        """Test IngestionEntryError creation."""
-        error = IngestionEntryError(
-            entry_id="123",
-            error="Parse error",
-            raw_data='{"malformed":',
-        )
-        assert error.entry_id == "123"
-        assert error.error == "Parse error"
-        assert error.raw_data == '{"malformed":'
-
-    def test_ingestion_progress(self) -> None:
-        """Test IngestionProgress creation."""
-        progress = IngestionProgress(
-            total=1000,
-            processed=500,
-            succeeded=495,
-            failed=5,
-        )
-        assert progress.total == 1000
-        assert progress.processed == 500
-        assert progress.succeeded == 495
-        assert progress.failed == 5
-
-    def test_ingestion_result(self) -> None:
-        """Test IngestionResult creation."""
-        result = IngestionResult(
-            source_system="ALS eLog",
-            total_entries=1000,
-            succeeded=995,
-            failed=5,
-            errors=[IngestionEntryError(entry_id="1", error="Parse error")],
-            duration_seconds=45.5,
-        )
-        assert result.source_system == "ALS eLog"
-        assert result.total_entries == 1000
-        assert result.succeeded == 995
-        assert result.failed == 5
-        assert len(result.errors) == 1
-        assert result.duration_seconds == 45.5
 
 
 class TestEnhancedEntryFromRow:

@@ -8,14 +8,45 @@ without a container runtime.
 
 from __future__ import annotations
 
+import json
+import logging
 import subprocess
-import types
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from osprey.deployment import container_lifecycle
+from osprey.deployment.errors import UnmetPreconditionsError
 from osprey.deployment.web_terminals import postup_hooks, provision
+
+
+def _fake_popen(record):
+    """A ``subprocess.Popen`` stand-in for the watched capture path.
+
+    The dev-mode ``compose build`` runs with an ``on_line`` watcher, which
+    routes it through ``Popen`` rather than ``subprocess.run`` — so a test that
+    fakes only ``run`` would let the build escape to a real child. The stand-in
+    records the argv through ``record(cmd, env)``, yields no output, and exits
+    0, keeping the argv assertions blind to which of the two paths ran a call.
+    """
+
+    class FakePopen:
+        def __init__(self, cmd, env=None, **kwargs):
+            record(list(cmd), env)
+            self.stdout = iter(())
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def wait(self):
+            return 0
+
+    return FakePopen
 
 
 @pytest.fixture
@@ -38,12 +69,29 @@ def captured_argv(monkeypatch, tmp_path):
         container_lifecycle, "get_runtime_command", lambda config: ["docker", "compose"]
     )
 
-    def _fake_run(cmd, env=None, check=False):
+    def _fake_run(cmd, env=None, check=False, **kwargs):
         captured["cmd"] = cmd
         captured["env"] = env
+        return _FakeCompletedProcess(returncode=0)
 
     monkeypatch.setattr(container_lifecycle.subprocess, "run", _fake_run)
+    monkeypatch.setattr(
+        container_lifecycle.subprocess,
+        "Popen",
+        _fake_popen(lambda cmd, env: captured.update(cmd=cmd, env=env)),
+    )
     return captured
+
+
+def _addresses(cmd: list[str], compose_filename: str) -> bool:
+    """True when this argv's ``-f`` list names *compose_filename*.
+
+    The pinned invocation contract spells every ``-f`` as a repo-anchored
+    absolute path, so a plain ``filename in cmd`` membership does not hold.
+    Matched on the trailing path segment, which keeps ``docker-compose.yml``
+    from matching ``docker-compose.web.yml``.
+    """
+    return any(arg == compose_filename or arg.endswith("/" + compose_filename) for arg in cmd)
 
 
 def test_deploy_up_dev_mode_ups_no_build(captured_argv, tmp_path):
@@ -130,6 +178,29 @@ def test_process_env_token_not_written_to_dotenv(captured_argv, monkeypatch, tmp
     assert env.get("DISPATCH_WORKER_TOKEN")
 
 
+def test_tokens_are_minted_into_the_repo_root_not_the_cwd(
+    captured_argv, _clean_token_env, monkeypatch, tmp_path
+):
+    """The mint follows the config's repo, not wherever the command was typed.
+
+    Regression guard: the provisioners' ``env_path`` defaults to a cwd-relative
+    ``.env``, and this path left it unset while resolving the repo root a few
+    lines above. Run from any other directory and real secrets landed in a stray
+    file the stack never reads — the containers then start with their
+    fail-closed tokens unset, which looks secure and reports nothing.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    container_lifecycle.deploy_up(str(repo / "config.yml"), detached=True)
+
+    assert _parse_env(repo).get("EVENT_DISPATCHER_TOKEN")
+    assert not (elsewhere / ".env").exists()
+
+
 def test_non_dispatch_deploy_generates_no_tokens(monkeypatch, _clean_token_env, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
@@ -141,27 +212,29 @@ def test_non_dispatch_deploy_generates_no_tokens(monkeypatch, _clean_token_env, 
     monkeypatch.setattr(
         container_lifecycle, "get_runtime_command", lambda config: ["docker", "compose"]
     )
-    monkeypatch.setattr(container_lifecycle.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        container_lifecycle.subprocess, "run", lambda *a, **k: _FakeCompletedProcess()
+    )
 
     container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
 
     assert not (tmp_path / ".env").exists()
 
 
-def test_expose_refuses_empty_token(captured_argv, monkeypatch, tmp_path):
-    # A token explicitly set empty must not be auto-overwritten, and --expose must
-    # refuse rather than bind a fail-open server to 0.0.0.0.
+def test_an_exposed_deploy_refuses_an_empty_token(captured_argv, monkeypatch, tmp_path):
+    # A token explicitly set empty must not be auto-overwritten, and a deployment
+    # reachable off-host must refuse rather than bind a fail-open server to it.
     monkeypatch.setenv("EVENT_DISPATCHER_TOKEN", "")
     monkeypatch.delenv("DISPATCH_WORKER_TOKEN", raising=False)
 
-    with pytest.raises(RuntimeError, match="refusing to --expose"):
+    with pytest.raises(RuntimeError, match="reachable off-host with an empty token"):
         container_lifecycle.deploy_up(
             str(tmp_path / "config.yml"), detached=True, expose_network=True
         )
 
 
 # ---------------------------------------------------------------------------
-# Web-terminal reconcile (osprey deploy up, modules.web_terminals.enabled)
+# Web-terminal reconcile (osprey up, modules.web_terminals.enabled)
 # ---------------------------------------------------------------------------
 
 
@@ -176,7 +249,7 @@ def captured_web_runs(monkeypatch, tmp_path):
     here — but still records that it was called with the config.
 
     Defaults to registry mode (no ``image_source`` key), so a
-    ``.env.production`` marker is pre-written to ``tmp_path``:
+    ``.env.users`` marker is pre-written to ``tmp_path``:
     ``ensure_env_production``'s registry-mode branch only exists-checks (see
     its own tests), so without this every test using this fixture would hit
     its "not found" RuntimeError before ever reaching a compose call.
@@ -185,7 +258,7 @@ def captured_web_runs(monkeypatch, tmp_path):
     written: list = []
 
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".env.production").write_text("", encoding="utf-8")
+    (tmp_path / ".env.users").write_text("", encoding="utf-8")
     monkeypatch.setattr(
         container_lifecycle,
         "prepare_compose_files",
@@ -230,7 +303,7 @@ def test_web_deploy_writes_artifacts_and_includes_web_compose_file(captured_web_
     assert len(up_calls) == 1
     up_cmd = up_calls[0]["cmd"]
     assert "-f" in up_cmd
-    assert "docker-compose.web.yml" in up_cmd
+    assert _addresses(up_cmd, "docker-compose.web.yml")
 
 
 def test_web_deploy_always_runs_detached(captured_web_runs, tmp_path):
@@ -278,7 +351,7 @@ def test_services_only_deploy_is_unchanged(captured_argv, tmp_path):
     no pull step."""
     container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
 
-    assert "docker-compose.web.yml" not in captured_argv["cmd"]
+    assert not _addresses(captured_argv["cmd"], "docker-compose.web.yml")
     assert "pull" not in captured_argv["cmd"]
     assert "up" in captured_argv["cmd"]
 
@@ -380,9 +453,9 @@ def captured_combined_runs(monkeypatch, tmp_path):
     token_calls: list[dict] = []
 
     monkeypatch.chdir(tmp_path)
-    # Registry mode (default) -- pre-write .env.production so
+    # Registry mode (default) -- pre-write .env.users so
     # ensure_env_production's exists-check passes (see captured_web_runs).
-    (tmp_path / ".env.production").write_text("", encoding="utf-8")
+    (tmp_path / ".env.users").write_text("", encoding="utf-8")
     monkeypatch.setattr(
         container_lifecycle,
         "prepare_compose_files",
@@ -399,7 +472,7 @@ def captured_combined_runs(monkeypatch, tmp_path):
     monkeypatch.setattr(postup_hooks, "get_runtime_command", lambda config: ["docker", "compose"])
     monkeypatch.setattr(provision, "write_web_terminal_artifacts", lambda config, dest_dir=".": [])
 
-    def _fake_build(config, dev_mode, env):
+    def _fake_build(config, dev_mode, env, build_context=None):
         build_calls.append({"config": config, "dev_mode": dev_mode})
 
     monkeypatch.setattr(container_lifecycle, "_build_project_image", _fake_build)
@@ -414,6 +487,11 @@ def captured_combined_runs(monkeypatch, tmp_path):
         return _FakeCompletedProcess(returncode=0)
 
     monkeypatch.setattr(container_lifecycle.subprocess, "run", _fake_run)
+    monkeypatch.setattr(
+        container_lifecycle.subprocess,
+        "Popen",
+        _fake_popen(lambda cmd, env: calls.append({"cmd": cmd, "env": env})),
+    )
     return {"calls": calls, "build_calls": build_calls, "token_calls": token_calls}
 
 
@@ -424,24 +502,24 @@ def test_combined_services_and_web_deploy_two_detached_up_calls(captured_combine
     the directory of the FIRST `-f` file. compose_files (build/services/...)
     and docker-compose.web.yml (project root) are written to resolve against
     two DIFFERENT directories, so they must never be merged into one `-f ...
-    -f docker-compose.web.yml` argv -- a real `osprey deploy up` with both
+    -f docker-compose.web.yml` argv -- a real `osprey up` with both
     enabled failed immediately with "env file .../build/services/
-    .env.production not found" until this was split into two invocations.
+    .env.users not found" until this was split into two invocations.
     """
     container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=False)
 
     up_calls = [c for c in captured_combined_runs["calls"] if "up" in c["cmd"]]
     assert len(up_calls) == 2
 
-    services_up = [c["cmd"] for c in up_calls if "docker-compose.yml" in c["cmd"]]
-    web_up = [c["cmd"] for c in up_calls if "docker-compose.web.yml" in c["cmd"]]
+    services_up = [c["cmd"] for c in up_calls if _addresses(c["cmd"], "docker-compose.yml")]
+    web_up = [c["cmd"] for c in up_calls if _addresses(c["cmd"], "docker-compose.web.yml")]
     assert len(services_up) == 1
     assert len(web_up) == 1
 
     # The services and web compose files must never appear together in one
     # argv -- that merge is exactly what broke path resolution.
-    assert "docker-compose.web.yml" not in services_up[0]
-    assert "docker-compose.yml" not in web_up[0]
+    assert not _addresses(services_up[0], "docker-compose.web.yml")
+    assert not _addresses(web_up[0], "docker-compose.yml")
 
     for cmd in (services_up[0], web_up[0]):
         assert "-d" in cmd
@@ -454,11 +532,11 @@ def test_combined_services_up_gets_dev_build_web_up_never_does(captured_combined
 
     cmds = [c["cmd"] for c in captured_combined_runs["calls"]]
     up_calls = [c for c in cmds if "up" in c]
-    services_up = next(c for c in up_calls if "docker-compose.yml" in c)
-    web_up = next(c for c in up_calls if "docker-compose.web.yml" in c)
+    services_up = next(c for c in up_calls if _addresses(c, "docker-compose.yml"))
+    web_up = next(c for c in up_calls if _addresses(c, "docker-compose.web.yml"))
 
     # A standalone services `build` ran (services compose file, no `up`).
-    services_build = [c for c in cmds if c[-1] == "build" and "docker-compose.yml" in c]
+    services_build = [c for c in cmds if c[-1] == "build" and _addresses(c, "docker-compose.yml")]
     assert len(services_build) == 1
 
     # No `up --build` anywhere; the services `up` is explicitly --no-build.
@@ -485,7 +563,7 @@ def test_web_only_deploy_never_runs_a_services_up(captured_web_runs, tmp_path):
 
     up_calls = [c["cmd"] for c in captured_web_runs["calls"] if "up" in c["cmd"]]
     assert len(up_calls) == 1
-    assert "docker-compose.web.yml" in up_calls[0]
+    assert _addresses(up_calls[0], "docker-compose.web.yml")
 
 
 def test_combined_deploy_services_up_never_pulls(captured_combined_runs, tmp_path):
@@ -498,8 +576,8 @@ def test_combined_deploy_services_up_never_pulls(captured_combined_runs, tmp_pat
 
     pull_calls = [c["cmd"] for c in captured_combined_runs["calls"] if "pull" in c["cmd"]]
     assert len(pull_calls) == 1
-    assert "docker-compose.web.yml" in pull_calls[0]
-    assert "docker-compose.yml" not in pull_calls[0]
+    assert _addresses(pull_calls[0], "docker-compose.web.yml")
+    assert not _addresses(pull_calls[0], "docker-compose.yml")
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +607,7 @@ def test_web_deploy_callsenable_linger_in_post_up_hook(monkeypatch, tmp_path):
     """The post-up hook wires enable_linger(config, run_env) -- the same
     COMPOSE_PROJECT_NAME-pinned env the compose calls around it use."""
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".env.production").write_text("", encoding="utf-8")
+    (tmp_path / ".env.users").write_text("", encoding="utf-8")
     monkeypatch.setattr(
         container_lifecycle,
         "prepare_compose_files",
@@ -605,7 +683,7 @@ def _mode_wiring_collab(monkeypatch, tmp_path):
     verify_runtime_is_running, get_runtime_command, write_web_terminal_artifacts,
     and a captured subprocess.run that returns a 0-exit CompletedProcess stand-in
     (needed because run_verify_script inspects .returncode on every call it
-    makes, not just compose's). Deliberately does NOT pre-write .env.production
+    makes, not just compose's). Deliberately does NOT pre-write .env.users
     or .env -- each test supplies exactly what its mode needs to exercise
     ensure_env_production's own branches.
     """
@@ -615,13 +693,13 @@ def _mode_wiring_collab(monkeypatch, tmp_path):
     monkeypatch.setattr(provision, "get_runtime_command", lambda config: ["docker", "compose"])
     monkeypatch.setattr(postup_hooks, "get_runtime_command", lambda config: ["docker", "compose"])
     monkeypatch.setattr(provision, "write_web_terminal_artifacts", lambda config, dest_dir=".": [])
-    # Auto-render is a separate concern with its own dedicated tests below;
-    # keep it inert here so the mode-wiring tests exercise only the local/
-    # registry step ordering, never a real `osprey build` subprocess.
+    # The persona-render check is a separate concern with its own dedicated
+    # tests below; keep it inert here so the mode-wiring tests exercise only the
+    # local/registry step ordering rather than any repo's rendered state.
     monkeypatch.setattr(
         provision,
-        "auto_render_missing_personas",
-        lambda config, resolved_users, env, project_root=None: None,
+        "verify_persona_renders",
+        lambda config, resolved_users, repo_root=None: None,
     )
 
     def _fake_run(cmd, **kwargs):
@@ -642,13 +720,13 @@ def test_local_mode_never_emits_a_pull_argv(monkeypatch, tmp_path, _mode_wiring_
     cmds = [c["cmd"] for c in _mode_wiring_collab]
     assert not any("pull" in cmd for cmd in cmds)
     assert any("up" in cmd and "-d" in cmd for cmd in cmds)
-    # ensure_env_production generated .env.production from .env since neither
+    # ensure_env_production generated .env.users from .env since neither
     # was present -- local mode's own branch, exercised end-to-end here.
-    assert (tmp_path / ".env.production").is_file()
+    assert (tmp_path / ".env.users").is_file()
 
 
 def test_registry_mode_still_pulls(monkeypatch, tmp_path, _mode_wiring_collab):
-    (tmp_path / ".env.production").write_text("", encoding="utf-8")
+    (tmp_path / ".env.users").write_text("", encoding="utf-8")
     config = _web_terminals_config("registry")
     monkeypatch.setattr(container_lifecycle, "prepare_compose_files", lambda *a, **k: (config, []))
 
@@ -663,7 +741,7 @@ def test_up_hot_reloads_nginx_after_web_stack_up(monkeypatch, tmp_path, _mode_wi
     """`up -d` never restarts a running nginx whose bind-mounted config CONTENT
     changed (the container definition is unchanged), so the post-up hook must
     issue a `compose exec nginx nginx -s reload` — after the web stack's up."""
-    (tmp_path / ".env.production").write_text("", encoding="utf-8")
+    (tmp_path / ".env.users").write_text("", encoding="utf-8")
     config = _web_terminals_config("registry")
     monkeypatch.setattr(container_lifecycle, "prepare_compose_files", lambda *a, **k: (config, []))
 
@@ -682,7 +760,7 @@ def test_up_hot_reloads_nginx_after_web_stack_up(monkeypatch, tmp_path, _mode_wi
 def test_nginx_reload_failure_is_advisory(monkeypatch, tmp_path, _mode_wiring_collab):
     """A failing nginx reload (e.g. container still starting) warns but never
     fails a deploy that did reconcile."""
-    (tmp_path / ".env.production").write_text("", encoding="utf-8")
+    (tmp_path / ".env.users").write_text("", encoding="utf-8")
     config = _web_terminals_config("registry")
     monkeypatch.setattr(container_lifecycle, "prepare_compose_files", lambda *a, **k: (config, []))
 
@@ -698,7 +776,7 @@ def test_nginx_reload_failure_is_advisory(monkeypatch, tmp_path, _mode_wiring_co
 def test_registry_mode_raises_before_any_compose_call_when_env_production_missing(
     monkeypatch, tmp_path, _mode_wiring_collab
 ):
-    """Neither .env.production nor .env present -- ensure_env_production raises
+    """Neither .env.users nor .env present -- ensure_env_production raises
     its registry-mode "not found" error before compose ever runs."""
     config = _web_terminals_config("registry")
     monkeypatch.setattr(container_lifecycle, "prepare_compose_files", lambda *a, **k: (config, []))
@@ -715,30 +793,40 @@ def test_local_mode_unresolvable_persona_raises_before_any_compose_call(
     """A user referencing a persona absent from the catalog must raise via
     resolve_personas(strict=True) before build_persona_images or any compose
     call -- surfacing actionably instead of an opaque unbuilt-tag failure at
-    `compose up` (the reviewer integration note from task 3.2)."""
+    `compose up` (the reviewer integration note from task 3.2).
+
+    The collect-all pass now asks this question one step ahead of the
+    preflight that used to raise it, so the refusal arrives in the aggregate
+    frame. The persona is still named, which is the property that matters."""
     (tmp_path / ".env").write_text("FOO=bar\n", encoding="utf-8")
     config = _web_terminals_config(
         "local", users=[{"name": "alice", "index": 0, "persona": "no-such-persona"}]
     )
     monkeypatch.setattr(container_lifecycle, "prepare_compose_files", lambda *a, **k: (config, []))
 
-    with pytest.raises(ValueError, match="no-such-persona"):
+    with pytest.raises(UnmetPreconditionsError, match="no-such-persona"):
         container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=False)
 
     assert _mode_wiring_collab == []  # no compose subprocess ever ran
 
 
-def test_local_mode_calls_auto_render_then_ensure_env_production_then_build_then_compose(
+def test_local_mode_verifies_renders_then_ensure_env_production_then_build_then_compose(
     monkeypatch, tmp_path, _mode_wiring_collab
 ):
-    """The local-mode preflight order is load-bearing: auto-render any missing
-    persona project FIRST, then ensure_env_production, then build the image,
-    then compose. ensure_env_production's claude_code credential sweep reads
-    each rendered persona's config.yml, so on a first deploy it must run
-    after auto-render (and still before any compose call). A spy on
-    auto_render_missing_personas (overriding the fixture's inert stub)
-    proves the wiring line actually runs it -- and runs it BEFORE
-    build_persona_images, which needs the rendered context to exist."""
+    """The local-mode preflight order is load-bearing: check every persona has
+    the render `osprey build` wrote FIRST, then ensure_env_production, then
+    build the image, then compose. ensure_env_production's claude_code
+    credential sweep reads each rendered persona's config.yml, so a deploy
+    missing one has to be refused before that sweep runs (and long before any
+    compose call). A spy on verify_persona_renders (overriding the fixture's
+    inert stub) proves the wiring line actually runs it -- and runs it BEFORE
+    build_persona_images, which needs the rendered context to exist.
+
+    The collect-all pass asks the same render question once more, ahead of the
+    preflight, which is why the spy sees a third call. It only reads, so the
+    extra call changes nothing about the deployment -- and the preflight below
+    it still runs unchanged, which is the property the rest of this order
+    pins."""
     order: list[str] = []
     config = _web_terminals_config("local")
     monkeypatch.setattr(container_lifecycle, "prepare_compose_files", lambda *a, **k: (config, []))
@@ -749,8 +837,8 @@ def test_local_mode_calls_auto_render_then_ensure_env_production_then_build_then
     )
     monkeypatch.setattr(
         provision,
-        "auto_render_missing_personas",
-        lambda cfg, resolved_users, env, project_root=None: order.append("auto_render"),
+        "verify_persona_renders",
+        lambda cfg, resolved_users, repo_root=None: order.append("verify_persona_renders"),
     )
 
     def _fake_build(cfg, resolved_users, dev_mode, env):
@@ -765,15 +853,19 @@ def test_local_mode_calls_auto_render_then_ensure_env_production_then_build_then
 
     container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=False)
 
-    # The fail-fast deploy_up preflight runs auto_render + ensure_env_production
-    # once BEFORE the image-build stage, and deploy_up_web_terminals re-runs the
-    # same (idempotent) pair; then exactly three compose calls (the
-    # stale-container `rm -f` preflight, the web `up -d`, then the advisory
-    # nginx config reload; no deployed_services, no pull in local mode).
+    # The collect-all pass reads the renders first (and nothing else -- it
+    # probes .env.users generation rather than calling ensure_env_production).
+    # The fail-fast deploy_up preflight then runs the persona check +
+    # ensure_env_production once BEFORE the image-build stage, and
+    # deploy_up_web_terminals re-runs the same (idempotent) pair; then exactly
+    # three compose calls (the stale-container `rm -f` preflight, the web
+    # `up -d`, then the advisory nginx config reload; no deployed_services, no
+    # pull in local mode).
     assert order == [
-        "auto_render",
+        "verify_persona_renders",
+        "verify_persona_renders",
         "ensure_env_production",
-        "auto_render",
+        "verify_persona_renders",
         "ensure_env_production",
         "build_persona_images",
         "compose",
@@ -815,7 +907,7 @@ def test_local_mode_passes_resolve_personas_output_to_build_persona_images(
 
 
 def test_registry_mode_never_calls_build_persona_images(monkeypatch, tmp_path, _mode_wiring_collab):
-    (tmp_path / ".env.production").write_text("", encoding="utf-8")
+    (tmp_path / ".env.users").write_text("", encoding="utf-8")
     config = _web_terminals_config("registry")
     monkeypatch.setattr(container_lifecycle, "prepare_compose_files", lambda *a, **k: (config, []))
 
@@ -831,19 +923,20 @@ def test_registry_mode_never_calls_build_persona_images(monkeypatch, tmp_path, _
     assert build_calls == []
 
 
-def test_registry_mode_never_calls_auto_render(monkeypatch, tmp_path, _mode_wiring_collab):
-    """Auto-render is a local-mode-only step (registry mode pulls prebuilt
-    images) -- it must never run on the registry path, mirroring the
-    build_persona_images guard. A recording spy overrides the fixture's inert
-    stub so a stray call would be caught, not swallowed."""
-    (tmp_path / ".env.production").write_text("", encoding="utf-8")
+def test_registry_mode_never_verifies_persona_renders(monkeypatch, tmp_path, _mode_wiring_collab):
+    """The persona-render check is a local-mode-only step (registry mode pulls
+    prebuilt images and needs no render at all) -- it must never run on the
+    registry path, mirroring the build_persona_images guard. A recording spy
+    overrides the fixture's inert stub so a stray call would be caught, not
+    swallowed."""
+    (tmp_path / ".env.users").write_text("", encoding="utf-8")
     config = _web_terminals_config("registry")
     monkeypatch.setattr(container_lifecycle, "prepare_compose_files", lambda *a, **k: (config, []))
 
     render_calls = []
     monkeypatch.setattr(
         provision,
-        "auto_render_missing_personas",
+        "verify_persona_renders",
         lambda *a, **k: render_calls.append(a),
     )
 
@@ -892,7 +985,7 @@ def test_registry_mode_calls_ensure_env_production_before_pull_before_up(
 def test_post_up_hook_order_is_linger_then_seed_then_verify(
     monkeypatch, tmp_path, _mode_wiring_collab
 ):
-    (tmp_path / ".env.production").write_text("", encoding="utf-8")
+    (tmp_path / ".env.users").write_text("", encoding="utf-8")
     config = _web_terminals_config("registry")
     monkeypatch.setattr(container_lifecycle, "prepare_compose_files", lambda *a, **k: (config, []))
 
@@ -915,10 +1008,10 @@ def test_post_up_hook_order_is_linger_then_seed_then_verify(
 def test_deploy_up_runs_verify_script_when_present_ignoring_exit_code(
     monkeypatch, tmp_path, _mode_wiring_collab
 ):
-    """A nonzero verify.sh exit must not propagate out of `osprey deploy up` --
+    """A nonzero verify.sh exit must not propagate out of `osprey up` --
     advisory only, per the script's own convention and run_verify_script's
     contract."""
-    (tmp_path / ".env.production").write_text("", encoding="utf-8")
+    (tmp_path / ".env.users").write_text("", encoding="utf-8")
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir()
     verify_path = scripts_dir / "verify.sh"
@@ -945,7 +1038,7 @@ def test_deploy_up_runs_verify_script_when_present_ignoring_exit_code(
 def test_deploy_up_skips_verify_script_silently_when_absent(
     monkeypatch, tmp_path, _mode_wiring_collab
 ):
-    (tmp_path / ".env.production").write_text("", encoding="utf-8")
+    (tmp_path / ".env.users").write_text("", encoding="utf-8")
     config = _web_terminals_config("registry")
     monkeypatch.setattr(container_lifecycle, "prepare_compose_files", lambda *a, **k: (config, []))
 
@@ -1077,17 +1170,18 @@ def test_deploy_up_plain_pins_compose_project_name(captured_argv, tmp_path):
     assert captured_argv["env"]["COMPOSE_PROJECT_NAME"] == "unnamed-project"
 
 
-def _mock_down_config(monkeypatch, project_name):
-    """Wire deploy_down's config load to a fixed, normalized config dict."""
+def _mock_down_config(monkeypatch, project_name, extra=None):
+    """Wire deploy_down's config load to a fixed config dict.
+
+    ``extra`` is merged over the base dict, so a caller can add the config keys
+    its own branch turns on (e.g. ``modules.web_terminals``).
+    """
+    raw_config = {"project_name": project_name, "deployed_services": ["event_dispatcher"]}
+    raw_config.update(extra or {})
     monkeypatch.setattr(
         container_lifecycle,
-        "ConfigBuilder",
-        lambda p: types.SimpleNamespace(raw_config={"project_name": project_name}),
-    )
-    monkeypatch.setattr(
-        container_lifecycle,
-        "normalize_facility_config",
-        lambda raw: {"project_name": project_name, "deployed_services": ["event_dispatcher"]},
+        "load_project_config",
+        lambda p, **kwargs: raw_config,
     )
     monkeypatch.setattr(
         "osprey.deployment.compose_generator.find_existing_compose_files",
@@ -1098,73 +1192,36 @@ def _mock_down_config(monkeypatch, project_name):
     )
 
 
-def test_deploy_down_pins_compose_project_name(monkeypatch, tmp_path):
-    """deploy_down must target the same project it brought up — pinned, and via
-    execvpe (env-carrying), not the bare-env execvp."""
-    monkeypatch.chdir(tmp_path)
-    _mock_down_config(monkeypatch, "myproj")
-    captured: dict = {}
-    # Guard BOTH exec variants: the fix flips execvp -> execvpe, and an
-    # unpatched real execvp would replace the test process.
-    monkeypatch.setattr(
-        container_lifecycle.os, "execvp", lambda file, args: captured.update(args=args, env=None)
-    )
-    monkeypatch.setattr(
-        container_lifecycle.os,
-        "execvpe",
-        lambda file, args, env: captured.update(file=file, args=args, env=env),
-    )
-    container_lifecycle.deploy_down(str(tmp_path / "config.yml"))
-    assert captured["env"]["COMPOSE_PROJECT_NAME"] == "myproj"
-    assert "down" in captured["args"]
+# deploy_down's own compose invocation — the pin it carries and the web-stack
+# ordering around it — is covered against the captured-run seam in
+# tests/deployment/test_down_conversion.py, which owns the conversion. What is
+# only asserted here is the *negative* branch: a project with the module off
+# must not touch the web stack at all.
 
 
-def _capture_exec_and_web_down(monkeypatch):
-    """Record the services execvpe and any deploy_down_web_terminals call."""
-    captured: dict = {"web_down_order": None, "exec_order": None}
+def _capture_services_down_and_web_down(monkeypatch):
+    """Record the services compose ``down`` and any deploy_down_web_terminals call.
+
+    ``down`` no longer ``execvpe``-replaces the process; it runs through
+    ``run_captured`` and exits on the child's code, so the seam to patch is
+    ``container_lifecycle.run_captured`` and the caller must expect SystemExit.
+    """
+    captured: dict = {"web_down_order": None, "down_order": None}
     order = iter(range(100))
-    monkeypatch.setattr(
-        container_lifecycle.os,
-        "execvpe",
-        lambda file, args, env: captured.update(args=args, env=env, exec_order=next(order)),
-    )
+
+    def _fake_run_captured(cmd, **kwargs):
+        captured.update(args=list(cmd), env=kwargs.get("env"), down_order=next(order))
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(container_lifecycle, "run_captured", _fake_run_captured)
     monkeypatch.setattr(
         container_lifecycle,
         "deploy_down_web_terminals",
-        lambda config, env, env_file_args: captured.update(
+        lambda config, env, env_file_args, **kwargs: captured.update(
             web_down_config=config, web_down_order=next(order)
         ),
     )
     return captured
-
-
-def test_deploy_down_tears_down_web_stack_before_services(monkeypatch, tmp_path):
-    """With modules.web_terminals.enabled, deploy_down must run the web
-    stack's own `compose down` (deploy_up_web_terminals' mirror) BEFORE the
-    services execvpe replaces the process — the services `-f` list can never
-    carry docker-compose.web.yml (root-relative paths), so skipping this
-    leaves the fixed-name web/nginx containers running after every
-    `osprey deploy down`."""
-    monkeypatch.chdir(tmp_path)
-    _mock_down_config(monkeypatch, "myproj")
-    monkeypatch.setattr(
-        container_lifecycle,
-        "normalize_facility_config",
-        lambda raw: {
-            "project_name": "myproj",
-            "deployed_services": ["event_dispatcher"],
-            "modules": {"web_terminals": {"enabled": True}},
-        },
-    )
-    captured = _capture_exec_and_web_down(monkeypatch)
-
-    container_lifecycle.deploy_down(str(tmp_path / "config.yml"))
-
-    assert captured["web_down_order"] is not None, "web stack was never torn down"
-    assert captured["web_down_order"] < captured["exec_order"], (
-        "web-stack down must run before the process-replacing services down"
-    )
-    assert captured["web_down_config"]["project_name"] == "myproj"
 
 
 def test_deploy_down_skips_web_stack_when_module_disabled(monkeypatch, tmp_path):
@@ -1172,9 +1229,10 @@ def test_deploy_down_skips_web_stack_when_module_disabled(monkeypatch, tmp_path)
     web-stack invocation."""
     monkeypatch.chdir(tmp_path)
     _mock_down_config(monkeypatch, "myproj")
-    captured = _capture_exec_and_web_down(monkeypatch)
+    captured = _capture_services_down_and_web_down(monkeypatch)
 
-    container_lifecycle.deploy_down(str(tmp_path / "config.yml"))
+    with pytest.raises(SystemExit):
+        container_lifecycle.deploy_down(str(tmp_path / "config.yml"))
 
     assert captured["web_down_order"] is None
     assert "down" in captured["args"]
@@ -1224,7 +1282,9 @@ def test_rebuild_deployment_pins_compose_project_name(monkeypatch, tmp_path):
         container_lifecycle, "get_runtime_command", lambda config: ["docker", "compose"]
     )
     # The stale-container `rm -f` preflight lands on subprocess.run; swallow it.
-    monkeypatch.setattr(container_lifecycle.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        container_lifecycle.subprocess, "run", lambda *a, **k: _FakeCompletedProcess()
+    )
     captured: dict = {}
     monkeypatch.setattr(
         container_lifecycle.os,
@@ -1247,7 +1307,9 @@ def test_clean_deployment_pins_compose_project_name(monkeypatch, tmp_path):
     )
     envs: list = []
     monkeypatch.setattr(
-        compose_generator.subprocess, "run", lambda cmd, env=None, **k: envs.append(env)
+        compose_generator,
+        "run_captured",
+        lambda cmd, env=None, **k: envs.append(env) or _FakeCompletedProcess(),
     )
     compose_generator.clean_deployment(["docker-compose.yml"], {"project_name": "myproj"})
     assert envs, "clean_deployment ran no compose commands"
@@ -1284,7 +1346,14 @@ def test_deploy_up_dev_mode_splits_build_from_up(monkeypatch, tmp_path):
     )
     runs: list = []
     monkeypatch.setattr(
-        container_lifecycle.subprocess, "run", lambda cmd, env=None, **k: runs.append(cmd)
+        container_lifecycle.subprocess,
+        "run",
+        lambda cmd, env=None, **k: runs.append(cmd) or _FakeCompletedProcess(),
+    )
+    monkeypatch.setattr(
+        container_lifecycle.subprocess,
+        "Popen",
+        _fake_popen(lambda cmd, env: runs.append(cmd)),
     )
     container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True, dev_mode=True)
 
@@ -1314,7 +1383,14 @@ def test_rebuild_deployment_dev_mode_splits_build_from_up(monkeypatch, tmp_path)
     )
     runs: list = []
     monkeypatch.setattr(
-        container_lifecycle.subprocess, "run", lambda cmd, env=None, **k: runs.append(cmd)
+        container_lifecycle.subprocess,
+        "run",
+        lambda cmd, env=None, **k: runs.append(cmd) or _FakeCompletedProcess(),
+    )
+    monkeypatch.setattr(
+        container_lifecycle.subprocess,
+        "Popen",
+        _fake_popen(lambda cmd, env: runs.append(cmd)),
     )
     execd: dict = {}
     monkeypatch.setattr(
@@ -1357,7 +1433,7 @@ def test_rebuild_deployment_reconciles_web_terminals_stack(monkeypatch, tmp_path
     pre-delegation rebuild ran only the plain services path, so nginx and the
     persona containers never came back up after clean."""
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".env.production").write_text("", encoding="utf-8")
+    (tmp_path / ".env.users").write_text("", encoding="utf-8")
     monkeypatch.setattr(
         container_lifecycle,
         "prepare_compose_files",
@@ -1379,11 +1455,11 @@ def test_rebuild_deployment_reconciles_web_terminals_stack(monkeypatch, tmp_path
 
     monkeypatch.setattr(container_lifecycle.subprocess, "run", _fake_run)
     container_lifecycle.rebuild_deployment(str(tmp_path / "config.yml"))
-    assert any("docker-compose.web.yml" in c and "up" in c for c in calls)
+    assert any(_addresses(c, "docker-compose.web.yml") and "up" in c for c in calls)
 
 
 # ---------------------------------------------------------------------------
-# Stale-container preflight — self-healing `deploy up`
+# Stale-container preflight — self-healing `osprey up`
 #
 # An aborted deploy leaves containers wedged in created/exited state, and
 # Docker Desktop reserves published host ports at container CREATE time — so
@@ -1414,7 +1490,9 @@ def captured_plain_runs(monkeypatch, tmp_path):
         container_lifecycle, "get_runtime_command", lambda config: ["docker", "compose"]
     )
     monkeypatch.setattr(
-        container_lifecycle.subprocess, "run", lambda cmd, env=None, **k: calls.append(list(cmd))
+        container_lifecycle.subprocess,
+        "run",
+        lambda cmd, env=None, **k: calls.append(list(cmd)) or _FakeCompletedProcess(),
     )
     return calls
 
@@ -1428,7 +1506,7 @@ def test_deploy_up_runs_stale_container_preflight_before_up(captured_plain_runs,
     # Scoped to this deploy's own compose files — and it is `rm`, never a
     # `down` (which would stop running containers).
     rm_cmd = captured_plain_runs[rm_idx]
-    assert "docker-compose.yml" in rm_cmd
+    assert _addresses(rm_cmd, "docker-compose.yml")
     assert "down" not in rm_cmd
 
 
@@ -1466,12 +1544,12 @@ def test_combined_deploy_each_stack_gets_its_own_rm_preflight(captured_combined_
     cmds = [c["cmd"] for c in captured_combined_runs["calls"]]
     rm_calls = [c for c in cmds if c[-2:] == ["rm", "-f"]]
     assert len(rm_calls) == 2
-    assert any("docker-compose.yml" in c for c in rm_calls)
-    assert any("docker-compose.web.yml" in c for c in rm_calls)
+    assert any(_addresses(c, "docker-compose.yml") for c in rm_calls)
+    assert any(_addresses(c, "docker-compose.web.yml") for c in rm_calls)
     # The two stacks' files are never merged into one rm argv, and the
     # shared-project path never orphan-removes.
     for c in rm_calls:
-        assert not ("docker-compose.yml" in c and "docker-compose.web.yml" in c)
+        assert not (_addresses(c, "docker-compose.yml") and _addresses(c, "docker-compose.web.yml"))
     for c in cmds:
         assert "--remove-orphans" not in c
 
@@ -1481,7 +1559,7 @@ def test_web_services_dev_mode_splits_build_from_up(monkeypatch, tmp_path):
     never `up --build` in one call. Needs a non-empty deployed_services (the
     services block is guarded on it), which captured_web_runs lacks."""
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".env.production").write_text("", encoding="utf-8")
+    (tmp_path / ".env.users").write_text("", encoding="utf-8")
     monkeypatch.setattr(
         container_lifecycle,
         "prepare_compose_files",
@@ -1509,10 +1587,15 @@ def test_web_services_dev_mode_splits_build_from_up(monkeypatch, tmp_path):
         return _FakeCompletedProcess(returncode=0)
 
     monkeypatch.setattr(container_lifecycle.subprocess, "run", _fake_run)
+    monkeypatch.setattr(
+        container_lifecycle.subprocess,
+        "Popen",
+        _fake_popen(lambda cmd, env: runs.append(cmd)),
+    )
     container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True, dev_mode=True)
 
     # The services-stack invocations (the ones carrying the services compose file).
-    svc = [c for c in runs if "build/services/docker-compose.yml" in c]
+    svc = [c for c in runs if _addresses(c, "docker-compose.yml")]
     assert not any("up" in c and "--build" in c for c in svc)
     assert any(c[-1] == "build" for c in svc), [" ".join(c) for c in svc]
     assert any("up" in c and "--no-build" in c for c in svc), [" ".join(c) for c in svc]
@@ -1556,6 +1639,62 @@ def test_project_image_build_cmd_dev_adds_osprey_dev_build_arg():
 
 
 # ---------------------------------------------------------------------------
+# `--progress plain` on the project image build, docker only. The live build
+# view is parsed from BuildKit's plain stream; relying on `auto` degrading to
+# plain under the capture pipe would make that parse depend on undocumented
+# behaviour. Podman is excluded for the same reason `with_plain_progress`
+# excludes it: `podman build` has no such flag and would fail the deploy.
+# ---------------------------------------------------------------------------
+
+
+def test_project_image_build_cmd_pins_plain_progress_on_docker():
+    cmd = container_lifecycle._project_image_build_cmd(
+        {"project_name": "myfacility"}, "docker", "/proj"
+    )
+    assert cmd[cmd.index("--progress") + 1] == "plain"
+    assert cmd[-1] == "/proj"  # the flag lands ahead of the context, not after
+
+
+def test_project_image_build_cmd_omits_plain_progress_on_podman():
+    cmd = container_lifecycle._project_image_build_cmd(
+        {"project_name": "myfacility"}, "podman", "/proj"
+    )
+    assert "--progress" not in cmd
+    assert cmd[-1] == "/proj"
+
+
+# ---------------------------------------------------------------------------
+# The project image build is watched, labeled with its own tag. A single-image
+# build's BuildKit headers name no service (`#10 [ 2/13]`), so an unlabeled
+# model parses the whole build into nothing -- silently, with no error. The
+# assertion is therefore behavioural: feed the watcher a nameless header and
+# require the row to come back under the image tag.
+# ---------------------------------------------------------------------------
+
+
+def test_build_project_image_watches_the_build_under_its_image_tag(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(container_lifecycle, "get_runtime_command", lambda config: ["docker"])
+    calls = []
+    monkeypatch.setattr(
+        container_lifecycle,
+        "run_captured",
+        lambda cmd, **kwargs: calls.append(kwargs) or _FakeCompletedProcess(),
+    )
+    config = {"project_name": "myfacility", "deployed_services": ["dispatch_worker"]}
+
+    container_lifecycle._build_project_image(config, dev_mode=False, env={})
+
+    (kwargs,) = calls
+    watcher = kwargs["on_line"]
+    assert watcher is not None, "the project image build runs unwatched"
+    watcher("#10 [ 2/13] RUN pip install --no-cache-dir osprey-framework")
+    (row,) = watcher.model.snapshot()
+    assert row.service == "myfacility:local"
+    assert row.step == "2/13"
+
+
+# ---------------------------------------------------------------------------
 # _build_project_image -- OSPREY_DEV is keyed on ACTUAL wheel-staging success
 # (fail-closed). A --dev build whose wheel build/staging failed must NOT pass
 # the pin-relaxing OSPREY_DEV=1 arg: with an unreleased pin that arg would
@@ -1577,7 +1716,15 @@ def _project_image_dev_build_cmds(monkeypatch, tmp_path, staging_result):
         lambda project_root: staging_result,
     )
     calls = []
-    monkeypatch.setattr(container_lifecycle.subprocess, "run", lambda cmd, **k: calls.append(cmd))
+    # Stubbed at `run_captured`, not at `subprocess.run`: the build is watched
+    # (`on_line=`), and a watched capture reads the child through a pipe rather
+    # than writing it straight to the spool — so a `subprocess.run` stub would
+    # be walked straight past and this test would launch a real `docker build`.
+    monkeypatch.setattr(
+        container_lifecycle,
+        "run_captured",
+        lambda cmd, **k: calls.append(cmd) or _FakeCompletedProcess(),
+    )
     config = {"project_name": "myfacility", "deployed_services": ["dispatch_worker"]}
     container_lifecycle._build_project_image(config, dev_mode=True, env={})
     return calls
@@ -1609,7 +1756,9 @@ def test_build_project_image_dev_cleans_staged_wheel_and_manifest(monkeypatch, t
     monkeypatch.setattr(
         container_lifecycle, "_copy_local_framework_for_override", _fake_wheel_and_manifest_stage
     )
-    monkeypatch.setattr(container_lifecycle.subprocess, "run", lambda cmd, **k: None)
+    monkeypatch.setattr(
+        container_lifecycle, "run_captured", lambda cmd, **k: _FakeCompletedProcess()
+    )
     config = {"project_name": "myfacility", "deployed_services": ["dispatch_worker"]}
 
     container_lifecycle._build_project_image(config, dev_mode=True, env={})
@@ -1630,7 +1779,7 @@ def test_build_project_image_dev_cleans_staged_artifacts_on_build_failure(monkey
     def _failing_build(cmd, **k):
         raise subprocess.CalledProcessError(1, cmd)
 
-    monkeypatch.setattr(container_lifecycle.subprocess, "run", _failing_build)
+    monkeypatch.setattr(container_lifecycle, "run_captured", _failing_build)
     config = {"project_name": "myfacility", "deployed_services": ["dispatch_worker"]}
 
     with pytest.raises(subprocess.CalledProcessError):
@@ -1638,55 +1787,6 @@ def test_build_project_image_dev_cleans_staged_artifacts_on_build_failure(monkey
 
     assert list(tmp_path.glob("*.whl")) == []
     assert not (tmp_path / "osprey-local-requirements.txt").exists()
-
-
-# ---------------------------------------------------------------------------
-# _warn_unignored_build_dir -- --dev context-bloat guard (task 3.3). Warns when
-# the rendered project's build/ dir would be swept into the --dev build context
-# because .dockerignore doesn't exclude it; silent otherwise.
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def _captured_warnings(monkeypatch):
-    warnings: list = []
-    monkeypatch.setattr(
-        container_lifecycle.logger, "warning", lambda *a, **k: warnings.append((a, k))
-    )
-    return warnings
-
-
-def test_warn_unignored_build_dir_fires_when_build_present_and_unignored(
-    _captured_warnings, tmp_path
-):
-    """build/ exists and no .dockerignore (missing == not-matching) -> warn once."""
-    (tmp_path / "build").mkdir()
-    container_lifecycle._warn_unignored_build_dir(str(tmp_path))
-    assert len(_captured_warnings) == 1
-
-
-def test_warn_unignored_build_dir_fires_when_dockerignore_lacks_build(_captured_warnings, tmp_path):
-    """build/ exists, .dockerignore present but lists other paths -> still warn."""
-    (tmp_path / "build").mkdir()
-    (tmp_path / ".dockerignore").write_text("*.whl\n.venv/\n", encoding="utf-8")
-    container_lifecycle._warn_unignored_build_dir(str(tmp_path))
-    assert len(_captured_warnings) == 1
-
-
-def test_warn_unignored_build_dir_silent_when_build_absent(_captured_warnings, tmp_path):
-    container_lifecycle._warn_unignored_build_dir(str(tmp_path))
-    assert _captured_warnings == []
-
-
-@pytest.mark.parametrize("ignore_line", ["build/", "build"])
-def test_warn_unignored_build_dir_silent_when_dockerignore_excludes_build(
-    _captured_warnings, tmp_path, ignore_line
-):
-    """A matching build/ (or build) line in .dockerignore silences the warning."""
-    (tmp_path / "build").mkdir()
-    (tmp_path / ".dockerignore").write_text(f"*.whl\n{ignore_line}\n", encoding="utf-8")
-    container_lifecycle._warn_unignored_build_dir(str(tmp_path))
-    assert _captured_warnings == []
 
 
 # ---------------------------------------------------------------------------
@@ -1713,7 +1813,9 @@ def _wiring_calls(monkeypatch, tmp_path):
     monkeypatch.setattr(
         container_lifecycle, "get_runtime_command", lambda config: ["docker", "compose"]
     )
-    monkeypatch.setattr(container_lifecycle.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        container_lifecycle.subprocess, "run", lambda *a, **k: _FakeCompletedProcess()
+    )
     monkeypatch.setattr(
         container_lifecycle,
         "warn_if_project_stale",
@@ -1766,8 +1868,8 @@ def test_deploy_up_summarizes_even_when_nothing_deploys(_wiring_calls, monkeypat
 
 
 # ---------------------------------------------------------------------------
-# deploy_up ordering: the web-terminal preflight (persona auto-render +
-# .env.production credential gate) must run BEFORE the expensive project-image
+# deploy_up ordering: the web-terminal preflight (persona render check +
+# .env.users credential gate) must run BEFORE the expensive project-image
 # build -- a missing provider secret aborts in seconds, not after minutes of
 # docker build.
 # ---------------------------------------------------------------------------
@@ -1789,6 +1891,14 @@ def test_deploy_up_runs_web_terminal_preflight_before_image_build(monkeypatch, t
     monkeypatch.setattr(container_lifecycle, "verify_runtime_is_running", lambda config: (True, ""))
     monkeypatch.setattr(container_lifecycle, "_preflight_host_ports", lambda *a, **k: None)
     monkeypatch.setattr(container_lifecycle, "_ensure_service_tokens", lambda *a, **k: None)
+    # The collect-all pass sits ahead of the preflight and probes the same
+    # config; recorded rather than answered, so this test stays about ordering
+    # and is not also asserting on the (empty) roster it declares.
+    monkeypatch.setattr(
+        container_lifecycle,
+        "_collect_unmet_preconditions",
+        lambda *a, **k: order.append("collect"),
+    )
     monkeypatch.setattr(
         container_lifecycle,
         "preflight_web_terminals",
@@ -1808,7 +1918,7 @@ def test_deploy_up_runs_web_terminal_preflight_before_image_build(monkeypatch, t
 
     container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
 
-    assert order == ["preflight", "build_image", "web_up"]
+    assert order == ["collect", "preflight", "build_image", "web_up"]
 
 
 def test_deploy_up_no_web_terminals_skips_preflight(monkeypatch, tmp_path):
@@ -1836,10 +1946,969 @@ def test_deploy_up_no_web_terminals_skips_preflight(monkeypatch, tmp_path):
         "_build_project_image",
         lambda *a, **k: order.append("build_image"),
     )
-    monkeypatch.setattr(container_lifecycle.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        container_lifecycle.subprocess, "run", lambda *a, **k: _FakeCompletedProcess()
+    )
     monkeypatch.setattr(container_lifecycle, "log_endpoint_summary", lambda *a, **k: None)
 
     container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
 
     assert "preflight" not in order
     assert "build_image" in order
+
+
+class TestResolvePipSpec:
+    """The ``OSPREY_PIP_SPEC`` build arg must never name a nonexistent release.
+
+    A hand-maintained version literal used to let this emit
+    ``osprey-framework==<unreleased>``, which fails at pip resolve inside the
+    image build with no indication of why.
+    """
+
+    def test_operator_override_wins(self, monkeypatch):
+        monkeypatch.setenv("OSPREY_PIP_SPEC", "git+https://example.invalid/osprey@abc123")
+        assert (
+            container_lifecycle._resolve_pip_spec() == "git+https://example.invalid/osprey@abc123"
+        )
+
+    def test_release_pins_to_the_release(self, monkeypatch):
+        monkeypatch.delenv("OSPREY_PIP_SPEC", raising=False)
+        monkeypatch.setattr("osprey.version.is_release", lambda: True)
+        monkeypatch.setattr("osprey.version.get_release_version", lambda: "2026.6.2")
+
+        assert container_lifecycle._resolve_pip_spec() == "osprey-framework==2026.6.2"
+
+    def test_development_build_refuses_and_names_the_way_out(self, monkeypatch):
+        from osprey.deployment.errors import UnreleasedVersionPinError
+
+        monkeypatch.delenv("OSPREY_PIP_SPEC", raising=False)
+        monkeypatch.setattr("osprey.version.is_release", lambda: False)
+        monkeypatch.setattr("osprey.version.get_release_version", lambda: "2026.6.2")
+        monkeypatch.setattr(
+            "osprey.version.get_running_version", lambda: "2026.6.2.post783+g83fda5e60"
+        )
+
+        with pytest.raises(UnreleasedVersionPinError) as excinfo:
+            container_lifecycle._resolve_pip_spec()
+
+        assert "783 commits past v2026.6.2" in excinfo.value.reason
+        assert "--dev" in excinfo.value.remedy
+
+    def test_override_still_wins_from_a_development_build(self, monkeypatch):
+        """The escape hatch must not be gated behind being a release."""
+        monkeypatch.setenv("OSPREY_PIP_SPEC", "osprey-framework==2026.6.2")
+        monkeypatch.setattr("osprey.version.is_release", lambda: False)
+
+        assert container_lifecycle._resolve_pip_spec() == "osprey-framework==2026.6.2"
+
+    def test_dev_mode_does_not_refuse(self, monkeypatch):
+        """``--dev`` is used *from* a development checkout — it must not refuse.
+
+        The staged wheel is what the Dockerfile installs, so this spec is inert.
+        Gating it here would block the workflow the refusal message recommends.
+        """
+        monkeypatch.delenv("OSPREY_PIP_SPEC", raising=False)
+        monkeypatch.setattr("osprey.version.is_release", lambda: False)
+        monkeypatch.setattr("osprey.version.get_release_version", lambda: "2026.6.2")
+
+        assert container_lifecycle._resolve_pip_spec(dev_mode=True) == "osprey-framework==2026.6.2"
+
+    def test_dev_run_whose_wheel_staging_failed_still_refuses(self, monkeypatch):
+        """Callers pass the *effective* dev mode, which is False when staging failed.
+
+        That build installs from PyPI after all, so it must not quietly ship
+        released code in place of the checkout `--dev` was asked to test.
+        """
+        from osprey.deployment.errors import UnreleasedVersionPinError
+
+        monkeypatch.delenv("OSPREY_PIP_SPEC", raising=False)
+        monkeypatch.setattr("osprey.version.is_release", lambda: False)
+        monkeypatch.setattr("osprey.version.get_release_version", lambda: "2026.6.2")
+        monkeypatch.setattr(
+            "osprey.version.get_running_version", lambda: "2026.6.2.post783+g83fda5e60"
+        )
+
+        with pytest.raises(UnreleasedVersionPinError):
+            container_lifecycle._resolve_pip_spec(dev_mode=False)
+
+
+# ---------------------------------------------------------------------------
+# Staged archiver bring-up
+# ---------------------------------------------------------------------------
+
+
+class _FakeAdmin:
+    """``client.admin``, answering ``ping`` only after ``fail_times`` refusals."""
+
+    def __init__(self, fail_times: int = 0):
+        self.fail_times = fail_times
+        self.pings = 0
+
+    def command(self, name):
+        self.pings += 1
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            from pymongo.errors import ServerSelectionTimeoutError
+
+            raise ServerSelectionTimeoutError("store not up yet")
+        return {"ok": 1}
+
+
+class _FakeCollection:
+    """Just enough of a pymongo collection for the staged bring-up's own calls."""
+
+    def __init__(self, fail_pings: int = 0):
+        self.admin = _FakeAdmin(fail_pings)
+        self.dropped = False
+        # collection.database.client.admin is the path the health poll walks.
+        self.database = type("_Db", (), {"client": type("_Client", (), {"admin": self.admin})()})()
+
+    def drop(self):
+        self.dropped = True
+
+
+ARCHIVER_CONFIG = {
+    "deployed_services": ["mongodb", "archiver_recorder", "virtual_accelerator"],
+    "services": {"mongodb": {"compression": "zstd", "port_host": 27017}},
+    "va_archiver": {
+        "retention_days": 1,
+        "hot_span_hours": 1,
+        "hot_cadence_sec": 10,
+        "tail_cadence_sec": 60,
+    },
+    "archiver": {
+        "mongodb_archiver": {
+            "host": "localhost",
+            "port": 27017,
+            "name": "osprey_archiver",
+            "collection": "pv_history",
+            "auth": "admin",
+            "username": "osprey",
+            "password_env": "MONGO_ROOT_PASSWORD",
+            "timeout": 5,
+        }
+    },
+}
+
+
+@pytest.fixture
+def staged_archiver(monkeypatch, tmp_path):
+    """Drive ``deploy_up`` for an archiver project with every store call faked.
+
+    Records the compose argv in order (so the *sequence* of staged store, quiesce
+    and full bring-up is assertable) plus what the seeder was asked to do.
+    """
+    from osprey.simulation import apply as apply_mod
+    from osprey.simulation import archiver_seed
+
+    state: dict = {
+        "cmds": [],
+        "collection": _FakeCollection(),
+        "seeded": [],
+        "reapplied": [],
+        "fingerprint_state": archiver_seed.SeedState.ABSENT,
+        "differences": (),
+        "returncode": 0,
+    }
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("MONGO_ROOT_PASSWORD=s3cret\n")
+
+    monkeypatch.setattr(
+        container_lifecycle,
+        "prepare_compose_files",
+        lambda *a, **k: (dict(ARCHIVER_CONFIG), ["docker-compose.yml"]),
+    )
+    monkeypatch.setattr(container_lifecycle, "verify_runtime_is_running", lambda config: (True, ""))
+    monkeypatch.setattr(
+        container_lifecycle, "get_runtime_command", lambda config: ["docker", "compose"]
+    )
+    monkeypatch.setattr(container_lifecycle, "_ensure_service_tokens", lambda *a, **k: None)
+    monkeypatch.setattr(container_lifecycle, "_build_project_image", lambda *a, **k: None)
+    monkeypatch.setattr(container_lifecycle, "log_endpoint_summary", lambda *a, **k: None)
+
+    def _fake_run(cmd, env=None, check=False, **kwargs):
+        state["cmds"].append(list(cmd))
+        # A real CompletedProcess, because the quiesce checks its returncode.
+        # `returncode` models the *quiesce* specifically: every other compose
+        # call runs under check=True, so a blanket non-zero would abort the
+        # deploy before the behaviour under test is reached.
+        rc = state["returncode"] if "stop" in cmd else 0
+        return subprocess.CompletedProcess(list(cmd), rc)
+
+    monkeypatch.setattr(container_lifecycle.subprocess, "run", _fake_run)
+
+    # The seed inputs are a manifest read plus a machine-model load; both are
+    # exercised by their own module's tests, and neither belongs in an argv test.
+    monkeypatch.setattr(
+        container_lifecycle,
+        "_archiver_seed_inputs",
+        lambda config, project_dir: ([{"address": "SR:BPM1:X"}], None, {}),
+    )
+    monkeypatch.setattr(
+        container_lifecycle,
+        "_reapply_active_scenarios",
+        lambda config, project_dir, engine: state["reapplied"].append(project_dir),
+    )
+
+    @contextmanager
+    def _fake_collection(store):
+        state["store"] = store
+        yield state["collection"]
+
+    monkeypatch.setattr(apply_mod, "archiver_collection", _fake_collection)
+    monkeypatch.setattr(
+        archiver_seed,
+        "compare_fingerprint",
+        lambda collection, fingerprint: archiver_seed.FingerprintComparison(
+            state["fingerprint_state"], state["differences"]
+        ),
+    )
+
+    def _fake_seed_base(collection, channels, knobs, **kwargs):
+        state["seeded"].append({"channels": list(channels), "knobs": knobs, "kwargs": kwargs})
+        # The staged step reports on what it wrote, so hand back a real report.
+        return archiver_seed.SeedReport(documents=10, channels=len(channels))
+
+    monkeypatch.setattr(archiver_seed, "seed_base", _fake_seed_base)
+    return state
+
+
+def _verbs(cmds):
+    """The compose verb (plus service argument) of each recorded invocation.
+
+    Strips the runtime command and the leading option pairs — the invocation
+    contract's ``--project-directory``, plus ``-f``, ``--env-file`` and
+    ``--progress`` — which are the same on every invocation and only obscure
+    the ordering under test.
+    """
+    verbs = []
+    for cmd in cmds:
+        rest = list(cmd)
+        while rest and rest[0] in ("docker", "compose", "podman"):
+            rest.pop(0)
+        while rest and rest[0] in ("-f", "--env-file", "--progress", "--project-directory"):
+            del rest[:2]
+        verbs.append(" ".join(rest))
+    return verbs
+
+
+def test_staged_store_comes_up_before_the_full_bring_up(staged_archiver, tmp_path):
+    """The store is started alone first: the recorder must never race the seeder
+    into creating the collection with the wrong indexes."""
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
+
+    verbs = _verbs(staged_archiver["cmds"])
+    staged = verbs.index("up -d mongodb")
+    full = verbs.index("up --remove-orphans -d")
+    assert staged < full
+
+
+def test_reseed_quiesces_the_recorder_before_dropping_the_collection(staged_archiver, tmp_path):
+    """The recorder writes into the collection being dropped, so it is stopped
+    first. The following `up` restores it — nothing here has to undo the stop."""
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
+
+    verbs = _verbs(staged_archiver["cmds"])
+    assert verbs.index("stop archiver-recorder") < verbs.index("up --remove-orphans -d")
+    assert staged_archiver["collection"].dropped
+    assert len(staged_archiver["seeded"]) == 1
+
+
+def test_absent_fingerprint_seeds_after_a_volume_wipe(staged_archiver, tmp_path):
+    """`clean`/`rebuild` remove the volume, leaving no manifest — the same path a
+    first deploy takes, which is what makes a wiped store re-seed."""
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
+
+    assert len(staged_archiver["seeded"]) == 1
+    assert staged_archiver["reapplied"] == [tmp_path]
+
+
+def test_matching_fingerprint_skips_the_seed(staged_archiver, tmp_path):
+    """Unchanged knobs mean the stored archive already describes this profile:
+    nothing is dropped, written, or re-applied, and the recorder keeps running."""
+    from osprey.simulation.archiver_seed import SeedState
+
+    staged_archiver["fingerprint_state"] = SeedState.MATCH
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
+
+    verbs = _verbs(staged_archiver["cmds"])
+    assert "up -d mongodb" in verbs
+    assert "stop archiver-recorder" not in verbs
+    assert staged_archiver["seeded"] == []
+    assert staged_archiver["reapplied"] == []
+    assert not staged_archiver["collection"].dropped
+
+
+def test_mismatched_fingerprint_rebuilds_and_reapplies(staged_archiver, tmp_path):
+    """Changed knobs make the stored coverage wrong, so the base is rebuilt and
+    the active scenario set re-applied onto it — otherwise the deployment would
+    claim a fault whose history it had just erased."""
+    from osprey.simulation.archiver_seed import SeedState
+
+    staged_archiver["fingerprint_state"] = SeedState.MISMATCH
+    staged_archiver["differences"] = (("retention_days", 30, 1),)
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
+
+    assert staged_archiver["collection"].dropped
+    assert len(staged_archiver["seeded"]) == 1
+    assert staged_archiver["reapplied"] == [tmp_path]
+
+
+@pytest.mark.parametrize("state", ["ABSENT", "MISMATCH"])
+def test_drop_and_rebuild_always_implies_a_quiesced_recorder(staged_archiver, tmp_path, state):
+    """The invariant, stated once for every path that reaches it: a rebuild of
+    the base implies a quiesced recorder.
+
+    Not "mismatch quiesces and absent does not" — that conditional would leave
+    the absent path letting a writer run into a collection being dropped
+    underneath it. Stopping a service that was never started is a no-op, so the
+    unconditional rule is both simpler and strictly safer.
+    """
+    from osprey.simulation.archiver_seed import SeedState
+
+    staged_archiver["fingerprint_state"] = getattr(SeedState, state)
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
+
+    verbs = _verbs(staged_archiver["cmds"])
+    assert "stop archiver-recorder" in verbs
+    assert staged_archiver["collection"].dropped
+
+
+@pytest.mark.parametrize(
+    ("state", "expect_seed"),
+    [("MISMATCH", False), ("ABSENT", True)],
+)
+def test_keep_archiver_base_suppresses_only_the_mismatch_rebuild(
+    staged_archiver, tmp_path, state, expect_seed
+):
+    """The flag keeps an EXISTING base; it does not mean "never seed".
+
+    On a mismatch it preserves recorded history at the cost of honesty about the
+    new knobs. On an absent manifest — a first deploy, or a wiped volume — there
+    is no base to keep, so the seed must still happen; otherwise the flag would
+    silently leave the deployment with no history at all. This is also why
+    `rebuild` needs no flag of its own: it always lands on the absent path.
+    """
+    from osprey.simulation.archiver_seed import SeedState
+
+    staged_archiver["fingerprint_state"] = getattr(SeedState, state)
+    staged_archiver["differences"] = (("retention_days", 30, 1),)
+    container_lifecycle.deploy_up(
+        str(tmp_path / "config.yml"), detached=True, keep_archiver_base=True
+    )
+
+    assert bool(staged_archiver["seeded"]) is expect_seed
+    assert staged_archiver["collection"].dropped is expect_seed
+    assert ("stop archiver-recorder" in _verbs(staged_archiver["cmds"])) is expect_seed
+
+
+def test_seeder_authenticates_with_the_project_dotenv_password(staged_archiver, tmp_path):
+    """Read from the project's own `.env` by name — never from whatever the
+    ambient environment happens to export for another deployment's store."""
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
+
+    assert staged_archiver["store"]["password"] == "s3cret"
+
+
+def test_deploy_without_the_store_service_stages_nothing(captured_argv, monkeypatch, tmp_path):
+    """A project that reads a store someone else runs must never have its history
+    seeded by a local deploy."""
+    staged: list = []
+    monkeypatch.setattr(
+        container_lifecycle, "_stage_archiver_store", lambda *a, **k: staged.append(a)
+    )
+
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
+
+    assert staged == []
+
+
+def test_pymongo_preflight_aborts_before_any_container_work(monkeypatch, tmp_path):
+    """Naming the extra in seconds beats an ImportError after a minutes-long
+    image build, so the check sits beside the token mint, not at the seeder."""
+    import sys
+
+    ran: list = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        container_lifecycle,
+        "prepare_compose_files",
+        lambda *a, **k: (dict(ARCHIVER_CONFIG), ["docker-compose.yml"]),
+    )
+    monkeypatch.setattr(container_lifecycle, "verify_runtime_is_running", lambda config: (True, ""))
+    monkeypatch.setattr(container_lifecycle, "_ensure_service_tokens", lambda *a, **k: None)
+    monkeypatch.setattr(
+        container_lifecycle, "_build_project_image", lambda *a, **k: ran.append("build")
+    )
+    monkeypatch.setattr(
+        container_lifecycle.subprocess, "run", lambda *a, **k: ran.append("compose")
+    )
+    # A None entry in sys.modules is what an absent optional extra looks like to
+    # `import pymongo` — the import machinery raises ImportError without touching
+    # the installed package.
+    monkeypatch.setitem(sys.modules, "pymongo", None)
+
+    with pytest.raises(RuntimeError, match=r"osprey-framework\[archiver-mongodb\]"):
+        container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
+    assert ran == []
+
+
+def test_pymongo_preflight_is_silent_without_the_store_service():
+    """No archiver in the deploy, no dependency to demand."""
+    container_lifecycle._preflight_archiver_pymongo({"deployed_services": ["event_dispatcher"]})
+
+
+def test_health_poll_returns_once_the_store_answers(monkeypatch):
+    """A store on a fresh volume creates its admin user before it accepts
+    connections, so early refusals are expected rather than fatal."""
+    monkeypatch.setattr(container_lifecycle.time, "sleep", lambda seconds: None)
+    collection = _FakeCollection(fail_pings=3)
+
+    container_lifecycle._wait_for_archiver_store(
+        collection, time.monotonic() + container_lifecycle._ARCHIVER_HEALTH_TIMEOUT_S
+    )
+    assert collection.admin.pings == 4
+
+
+def test_health_poll_is_bounded(monkeypatch):
+    """An unreachable store fails the deploy with the store named, rather than
+    leaving `osprey up` polling forever."""
+    monkeypatch.setattr(container_lifecycle.time, "sleep", lambda seconds: None)
+    collection = _FakeCollection(fail_pings=10_000)
+
+    with pytest.raises(RuntimeError, match="did not become reachable"):
+        container_lifecycle._wait_for_archiver_store(collection, time.monotonic() - 1)
+
+
+def test_missing_store_password_aborts_with_the_variable_named(
+    staged_archiver, monkeypatch, tmp_path
+):
+    """Without the credential the store is created with, the seeder cannot open
+    the store it is staging — and the fix is a named variable."""
+    (tmp_path / ".env").write_text("")
+    monkeypatch.delenv("MONGO_ROOT_PASSWORD", raising=False)
+
+    with pytest.raises(RuntimeError, match="MONGO_ROOT_PASSWORD"):
+        container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
+
+
+def test_reapply_anchors_on_the_persisted_t0_not_a_fresh_one(monkeypatch, tmp_path):
+    """The re-apply must land on the anchor the running world is already on.
+
+    Minting a fresh T0 would slide the live VA's events, the seeded logbook and
+    the archive's event windows to an instant nobody asked for, as a side effect
+    of a deploy that was only supposed to rebuild the store. Reading the anchor
+    is `osprey.simulation.apply.persisted_scenario_anchor`'s job (and is tested
+    there); what this pins is that the deploy passes what it read straight
+    through to `apply_scenarios` as `now`.
+    """
+    from datetime import UTC, datetime
+
+    from osprey.simulation import apply as apply_mod
+
+    anchor = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+    forwarded: dict = {}
+
+    def _record(project_dir, names, **kwargs):
+        forwarded.update(names=names, **kwargs)
+        return apply_mod.ApplyResult(active=tuple(names), logbook_seeded=0, purged=False)
+
+    monkeypatch.setattr(apply_mod, "persisted_scenario_anchor", lambda config, project_dir: anchor)
+    monkeypatch.setattr(apply_mod, "apply_scenarios", _record)
+    engine = type("_Engine", (), {"active_scenarios": lambda self: ("nominal", "rf-thermal")})()
+
+    container_lifecycle._reapply_active_scenarios({}, tmp_path, engine)
+
+    assert forwarded["now"] == anchor
+    # The logbook is a knob change's business only if the narrative changed, and
+    # it did not — purging ARIEL here would destroy history nobody asked to touch.
+    assert forwarded["seed_logbook"] is False
+
+
+def _manifest_channel(address: str) -> dict:
+    """One manifest entry carrying the full per-channel schema the loader demands."""
+    return {
+        "address": address,
+        "ring": "SR",
+        "system": "diagnostics",
+        "family": "BPM",
+        "device": "1",
+        "field": "X",
+        "subfield": "",
+        "partition": "static-noisy",
+        "record_type": "ai",
+        "noise": 0.01,
+    }
+
+
+def test_seed_inputs_read_the_manifest_the_project_env_names(tmp_path):
+    """The seeded channel set is the manifest the VA and the recorder read, found
+    the way they find it — so seeded history covers exactly what the live half
+    serves rather than another facility's namespace.
+
+    The manifest lives in the RENDER's data dir (``build/data/simulation``):
+    the build generates it only there, and that is the directory the containers
+    mount as ``/data/simulation`` — the source ``data/`` zone never holds it."""
+    simulation_dir = tmp_path / "build" / "data" / "simulation"
+    simulation_dir.mkdir(parents=True)
+    (simulation_dir / "channel_manifest.json").write_text(
+        json.dumps({"channels": [_manifest_channel("SR:BPM1:X")]})
+    )
+    (tmp_path / ".env").write_text("VA_CHANNELS_FILE=channel_manifest.json\n")
+
+    channels, engine, boot_values = container_lifecycle._archiver_seed_inputs({}, tmp_path)
+
+    assert [c["address"] for c in channels] == ["SR:BPM1:X"]
+    # No machine model in this project: every channel is procedural, which is a
+    # valid configuration rather than a fault.
+    assert engine is None
+    assert boot_values == {}
+
+
+def test_reapply_without_a_machine_model_is_a_no_op(tmp_path):
+    """A store-only project has no scenarios to restore onto the rebuilt base."""
+    container_lifecycle._reapply_active_scenarios({}, tmp_path, None)
+
+
+def test_exported_password_is_used_when_the_dotenv_has_none(staged_archiver, monkeypatch, tmp_path):
+    """`osprey up` is the process that hands compose its environment.
+
+    When the password is exported rather than written to `.env`, the exported
+    value is what the store container is created with — so it is also what the
+    seeder must authenticate with. (`sim apply` deliberately does NOT do this: it
+    runs from anywhere and must not pick up a foreign deployment's credential.)
+    """
+    (tmp_path / ".env").write_text("")
+    monkeypatch.setenv("MONGO_ROOT_PASSWORD", "exported-not-written")
+
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
+
+    assert staged_archiver["store"]["password"] == "exported-not-written"
+
+
+def test_store_without_a_connection_block_seeds_nothing(
+    staged_archiver, monkeypatch, tmp_path, caplog
+):
+    """A project deploying the store but declaring no connection block cannot be
+    seeded. It says so and leaves the store to the normal bring-up rather than
+    guessing a host — an empty archive read honestly beats a wrong one."""
+    config = {key: value for key, value in ARCHIVER_CONFIG.items() if key != "archiver"}
+    monkeypatch.setattr(
+        container_lifecycle,
+        "prepare_compose_files",
+        lambda *a, **k: (config, ["docker-compose.yml"]),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
+
+    assert "archiver.mongodb_archiver" in caplog.text
+    verbs = _verbs(staged_archiver["cmds"])
+    assert "up -d mongodb" not in verbs
+    assert staged_archiver["seeded"] == []
+    assert not staged_archiver["collection"].dropped
+
+
+def test_authentication_is_retried_while_a_fresh_volume_initializes(monkeypatch):
+    """A FRESH volume refuses authentication before it has created its root user.
+
+    mongod accepts connections before it applies MONGO_INITDB_ROOT_PASSWORD, so a
+    probe landing in that window is refused by a store that is about to be
+    perfectly healthy. Treating that as terminal aborts the FIRST deploy of every
+    new project — intermittently, depending on which side of the race the probe
+    lands, which is the worst way for it to fail.
+    """
+    from pymongo.errors import OperationFailure
+
+    monkeypatch.setattr(container_lifecycle.time, "sleep", lambda seconds: None)
+    collection = _FakeCollection()
+    refusals = [3]
+
+    def _initializing(name):
+        collection.admin.pings += 1
+        if refusals[0] > 0:
+            refusals[0] -= 1
+            raise OperationFailure("Authentication failed.", code=18)
+        return {"ok": 1}
+
+    collection.admin.command = _initializing
+
+    container_lifecycle._wait_for_archiver_store(
+        collection,
+        time.monotonic() + container_lifecycle._ARCHIVER_HEALTH_TIMEOUT_S,
+        "osprey@localhost:27017",
+    )
+    assert collection.admin.pings == 4
+
+
+def test_authentication_failure_past_the_grace_window_fails_with_the_cause(monkeypatch):
+    """After the store has had time to initialize, the SAME error means the
+    stale-volume shape instead: a rotated password against a volume that keeps
+    the credentials it was created with. That will never succeed, so it fails
+    with the cause named rather than consuming the full reachability budget."""
+    from pymongo.errors import OperationFailure
+
+    monkeypatch.setattr(container_lifecycle.time, "sleep", lambda seconds: None)
+    # Collapse the grace window so the refusal is read as final immediately.
+    monkeypatch.setattr(container_lifecycle, "_ARCHIVER_AUTH_GRACE_S", 0.0)
+    collection = _FakeCollection()
+
+    def _refuse(name):
+        collection.admin.pings += 1
+        raise OperationFailure("Authentication failed.", code=18)
+
+    collection.admin.command = _refuse
+
+    with pytest.raises(RuntimeError, match="rejected the credentials"):
+        container_lifecycle._wait_for_archiver_store(
+            collection,
+            time.monotonic() + container_lifecycle._ARCHIVER_HEALTH_TIMEOUT_S,
+            "osprey@localhost:27017",
+        )
+    # Terminal on the first refusal once the grace window has passed — it will
+    # not start working, and the full budget would only delay the diagnosis.
+    assert collection.admin.pings == 1
+
+
+def test_a_non_auth_operation_failure_is_not_swallowed(monkeypatch):
+    """Only AuthenticationFailed gets the grace/stale-volume treatment; any other
+    server-side command failure propagates as itself rather than being retimed
+    into a credentials message that would misdirect the reader."""
+    from pymongo.errors import OperationFailure
+
+    monkeypatch.setattr(container_lifecycle.time, "sleep", lambda seconds: None)
+    collection = _FakeCollection()
+
+    def _fail(name):
+        raise OperationFailure("not authorized on admin", code=13)
+
+    collection.admin.command = _fail
+
+    with pytest.raises(OperationFailure, match="not authorized"):
+        container_lifecycle._wait_for_archiver_store(
+            collection, time.monotonic() + 5, "osprey@localhost:27017"
+        )
+
+
+def test_a_failed_reapply_names_the_command_that_fixes_it(monkeypatch, tmp_path):
+    """The manifest is already written by this point, so the next deploy reads
+    MATCH and skips both the reseed and this step — leaving a clean base under a
+    faulted machine forever. The error has to hand over the one command that
+    repairs it, because retrying the deploy will not."""
+    from osprey.simulation import apply as apply_mod
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("store went away")
+
+    monkeypatch.setattr(apply_mod, "apply_scenarios", _boom)
+    engine = type("_Engine", (), {"active_scenarios": lambda self: ("nominal", "rf-thermal")})()
+
+    with pytest.raises(RuntimeError, match=r"osprey sim apply rf-thermal") as caught:
+        container_lifecycle._reapply_active_scenarios({}, tmp_path, engine)
+
+    assert "shows a clean machine" in str(caught.value)
+    # The cause is chained rather than replaced — the original failure is what a
+    # maintainer needs, the recovery is what the operator needs.
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
+def test_a_recorder_that_will_not_stop_is_reported(staged_archiver, tmp_path, caplog):
+    """A recorder still running writes into the collection being dropped. The
+    rebuild is still right, but the breach of the quiesce invariant must be
+    visible rather than swallowed by a return code nobody reads."""
+    staged_archiver["returncode"] = 1
+
+    with caplog.at_level(logging.WARNING):
+        container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
+
+    assert "archiver-recorder" in caplog.text
+    # Reported, not fatal: the seed still ran.
+    assert len(staged_archiver["seeded"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [("snappy", "snappy"), (None, "zstd")],
+)
+def test_compression_comes_from_the_service_block_not_the_knobs(
+    staged_archiver, monkeypatch, tmp_path, configured, expected
+):
+    """The block compressor is a property of the SERVER, not of the archive's
+    shape, so it lives at `services.mongodb.compression` and deliberately not in
+    SeedKnobs. The seeder is handed it from that path, and it reaches the
+    fingerprint from there — which is what makes changing the compressor a
+    reported reseed rather than a store that is half one codec and half another.
+    """
+    config = dict(ARCHIVER_CONFIG)
+    config["services"] = {"mongodb": {"port_host": 27017}}
+    if configured is not None:
+        config["services"]["mongodb"]["compression"] = configured
+    monkeypatch.setattr(
+        container_lifecycle,
+        "prepare_compose_files",
+        lambda *a, **k: (config, ["docker-compose.yml"]),
+    )
+
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
+
+    assert staged_archiver["seeded"][0]["kwargs"]["compression"] == expected
+
+
+def test_the_auth_grace_sits_between_the_healthcheck_and_the_reachability_budget():
+    """The 15/45/180 ordering documented at ``_ARCHIVER_AUTH_GRACE_S`` IS the design.
+
+    Each constant is pinned somewhere already, but only in isolation: nothing
+    compared them, so moving the template's ``start_period`` — the one the
+    comment says "this has to move with it" — inverted the relationship
+    silently. Below the start_period, a fresh volume's normal root-user
+    creation is reported as a wrong password and the first deploy of every new
+    project aborts. Above the reachability budget, the grace never expires and
+    a genuinely stale volume burns the full budget for a diagnosis that was
+    available in seconds.
+    """
+    import re
+
+    import osprey
+
+    template = (
+        Path(osprey.__file__).parent
+        / "templates"
+        / "services"
+        / "mongodb"
+        / "docker-compose.yml.j2"
+    ).read_text(encoding="utf-8")
+
+    match = re.search(r"start_period:\s*(\d+)s", template)
+    assert match, "no healthcheck start_period found in the mongodb template"
+    start_period_s = float(match.group(1))
+
+    assert start_period_s < container_lifecycle._ARCHIVER_AUTH_GRACE_S, (
+        f"the auth grace ({container_lifecycle._ARCHIVER_AUTH_GRACE_S}s) must outlast the "
+        f"store's own healthcheck start_period ({start_period_s}s), or a fresh volume's "
+        "root-user creation is reported as a wrong password"
+    )
+    assert (
+        container_lifecycle._ARCHIVER_AUTH_GRACE_S < container_lifecycle._ARCHIVER_HEALTH_TIMEOUT_S
+    ), (
+        f"the auth grace ({container_lifecycle._ARCHIVER_AUTH_GRACE_S}s) must expire inside the "
+        f"reachability budget ({container_lifecycle._ARCHIVER_HEALTH_TIMEOUT_S}s), or a stale "
+        "volume burns the whole budget before saying so"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The shared half of the env chain, at the deploy path's other two read sites
+# ---------------------------------------------------------------------------
+# The deployment's environment is a two-file chain at the repo root —
+# ``.env.shared`` (committed defaults) below ``.env`` (host-local secrets).
+# Neither of the two provisioners below opens the first of those files: both
+# call ``parse_dotenv_file(env_path)``, which names the LOCAL one, and read
+# ``os.environ`` for everything else. So a value living only in the shared half
+# reaches them by one indirect route — the CLI entry point loads the whole chain
+# over ``os.environ`` before any deploy code runs.
+#
+# Each site gets both cells: the value in the shared file alone, and the same
+# value once that entry-point load has happened. The pair is the measurement.
+# What it records is pinned as observed, including where the observation is that
+# the shared half is not seen at all.
+
+#: Obviously-fake stand-ins throughout this section. None is a credential.
+SHARED_HALF_CREDENTIAL = "shared-half-fixture-credential"
+VOLUME_BORN_WITH = "the-credential-the-volume-was-born-with"
+CHAIN_PROJECT = "demo-deployment"
+
+
+def _write_shared_half(repo: Path, text: str) -> Path:
+    """Lay down the chain's committed-defaults file beside the local one."""
+    from osprey.utils.dotenv import ENV_SHARED_FILENAME
+
+    path = repo / ENV_SHARED_FILENAME
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _load_the_entry_point_chain(monkeypatch, repo: Path) -> None:
+    """Run the load ``osprey <verb>`` performs before it reaches any deploy code.
+
+    ``osprey.cli.main`` calls this first thing, cwd-rooted, with override
+    semantics, so by the time a provisioner runs ``os.environ`` carries the
+    merged chain. Reproduced verbatim rather than simulated with ``setenv``,
+    because what is being measured IS that this step is what makes the shared
+    half visible downstream.
+    """
+    import osprey.utils.config as config
+
+    monkeypatch.setattr(config, "_dotenv_shell_overrides", {})
+    monkeypatch.chdir(repo)
+    config.load_project_dotenv()
+
+
+class _StoreRuntime:
+    """Answers the two argv shapes the stale-volume preflight builds.
+
+    Argv-shaped rather than a mock of the probe: the subject is which questions
+    the deploy asks the runtime, so a stand-in that accepted anything would pass
+    while the real command was wrong.
+    """
+
+    def __init__(self, volumes: list[str], container_env: dict[str, dict[str, str]]):
+        self.volumes = volumes
+        self.container_env = container_env
+
+    def __call__(self, cmd, **kwargs):
+        argv = list(cmd)[1:]  # drop the runtime binary
+        if argv[:2] == ["volume", "ls"]:
+            return subprocess.CompletedProcess(list(cmd), 0, stdout="\n".join(self.volumes))
+        if argv[:2] == ["container", "inspect"]:
+            env = self.container_env.get(argv[2])
+            if env is None:
+                return subprocess.CompletedProcess(list(cmd), 1, stdout="")
+            lines = "\n".join(f"{k}={v}" for k, v in env.items())
+            return subprocess.CompletedProcess(list(cmd), 0, stdout=lines)
+        return subprocess.CompletedProcess(list(cmd), 0, stdout="")
+
+
+@pytest.fixture
+def store_preflight(monkeypatch, tmp_path):
+    """One store, one surviving volume whose container holds a different value.
+
+    The mismatch is the setup, not the assertion: whether the preflight *sees*
+    it is what each test below records.
+    """
+    monkeypatch.delenv("MONGO_ROOT_PASSWORD", raising=False)
+    monkeypatch.setattr(
+        container_lifecycle, "get_runtime_command", lambda config: ["docker", "compose"]
+    )
+    monkeypatch.setattr(
+        container_lifecycle.subprocess,
+        "run",
+        _StoreRuntime(
+            volumes=[f"{CHAIN_PROJECT}_archiver_mongodb_data"],
+            container_env={
+                f"{CHAIN_PROJECT}-archiver-mongodb": {
+                    "MONGO_INITDB_ROOT_PASSWORD": VOLUME_BORN_WITH
+                }
+            },
+        ),
+    )
+
+    def _run(repo: Path):
+        config = {"deployed_services": ["mongodb"], "project_name": CHAIN_PROJECT}
+        container_lifecycle._preflight_stale_store_volumes(config, set(), repo / ".env")
+
+    return _run
+
+
+def test_a_shared_only_store_credential_that_the_volume_rejects_is_not_caught(
+    store_preflight, tmp_path
+):
+    """The preflight's disagreement rule cannot see a shared-half credential.
+
+    ``.env.shared`` names a credential the surviving volume was never
+    initialized with, which is exactly the state this check exists to refuse.
+    It does not refuse it: the effective value it computes is empty (it parsed
+    the local ``.env``, which does not exist), and an empty value never
+    disagrees with anything. The deploy proceeds and the store's own
+    authentication failure arrives minutes later instead.
+
+    Pinned as it behaves. A change that makes this raise is a change in which
+    file the preflight reads — the signal, not a break.
+    """
+    _write_shared_half(tmp_path, f"MONGO_ROOT_PASSWORD={SHARED_HALF_CREDENTIAL}\n")
+
+    store_preflight(tmp_path)  # no refusal
+
+
+def test_the_same_shared_only_credential_is_refused_after_the_entry_point_chain_load(
+    store_preflight, monkeypatch, tmp_path
+):
+    """The route by which the shared half reaches the preflight at all.
+
+    Same files, same runtime answers, with the one step a real ``osprey up``
+    takes first. The chain load puts the shared value in ``os.environ``, the
+    effective value stops being empty, and the disagreement with the container
+    is found before anything starts.
+    """
+    _write_shared_half(tmp_path, f"MONGO_ROOT_PASSWORD={SHARED_HALF_CREDENTIAL}\n")
+
+    _load_the_entry_point_chain(monkeypatch, tmp_path)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        store_preflight(tmp_path)
+    message = str(excinfo.value)
+    assert "archiver_mongodb_data" in message
+    # The report names the store and the file, never either credential.
+    assert SHARED_HALF_CREDENTIAL not in message
+    assert VOLUME_BORN_WITH not in message
+
+
+#: A minimal machine whose channel names yield one corrector pair and one BPM —
+#: the least the substrate derivation accepts.
+_SUBSTRATE_LIMITS = {
+    "SR:MAG:HCM:01:CURRENT:SP": {"min": -10, "max": 10},
+    "SR:MAG:HCM:01:CURRENT:RB": {"min": -10, "max": 10},
+    "SR:DIAG:BPM:01:POSITION:X": {"min": -5, "max": 5},
+    "SR:DIAG:BPM:01:POSITION:Y": {"min": -5, "max": 5},
+}
+
+_SUBSTRATE_CONFIG = {
+    "deployed_services": ["bluesky", "virtual_accelerator"],
+    "control_system": {"type": "virtual_accelerator"},
+}
+
+
+@pytest.fixture
+def substrate_project(monkeypatch, tmp_path):
+    """A built project the substrate derivation can read devices out of."""
+    for var in ("BLUESKY_EPICS_SUBSTRATE", "BLUESKY_EPICS_SETPOINTS", "BLUESKY_EPICS_READBACKS"):
+        monkeypatch.delenv(var, raising=False)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "channel_limits.json").write_text(
+        json.dumps(_SUBSTRATE_LIMITS), encoding="utf-8"
+    )
+    return tmp_path / ".env"
+
+
+def _dotenv(path: Path) -> dict:
+    from osprey.utils.dotenv import parse_dotenv_file
+
+    return parse_dotenv_file(path) if path.is_file() else {}
+
+
+def test_a_substrate_var_only_the_shared_half_sets_is_derived_over(substrate_project, tmp_path):
+    """The "already set is left untouched" promise is scoped to the local file.
+
+    The docstring's promise is "in the process env or an existing ``.env``",
+    and that is literally what the code checks — so a device list an operator
+    committed to ``.env.shared`` is not seen, a derived one is appended to
+    ``.env``, and the appended line outranks the committed one in the chain.
+    The operator's setting is still in the file they put it in, and no longer
+    the value the bridge resolves.
+    """
+    _write_shared_half(tmp_path, "BLUESKY_EPICS_SETPOINTS=shared-half-device-list\n")
+
+    container_lifecycle._ensure_bluesky_substrate_env(_SUBSTRATE_CONFIG, env_path=substrate_project)
+
+    local = _dotenv(substrate_project)
+    assert local["BLUESKY_EPICS_SETPOINTS"], "the shared-only value did not reach the predicate"
+    assert local["BLUESKY_EPICS_SETPOINTS"] != "shared-half-device-list"
+
+
+def test_the_same_substrate_var_is_left_alone_after_the_entry_point_chain_load(
+    substrate_project, monkeypatch, tmp_path
+):
+    """The route again: the process-env mirror is what preserves the setting.
+
+    With the chain loaded, the committed device list is in ``os.environ``, the
+    ``k not in os.environ`` guard holds, and only the keys the operator did not
+    set are appended.
+    """
+    _write_shared_half(tmp_path, "BLUESKY_EPICS_SETPOINTS=shared-half-device-list\n")
+
+    _load_the_entry_point_chain(monkeypatch, tmp_path)
+    container_lifecycle._ensure_bluesky_substrate_env(_SUBSTRATE_CONFIG, env_path=substrate_project)
+
+    local = _dotenv(substrate_project)
+    assert "BLUESKY_EPICS_SETPOINTS" not in local
+    assert local.get("BLUESKY_EPICS_READBACKS")

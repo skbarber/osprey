@@ -12,18 +12,20 @@ import base64
 
 import pytest
 
-from osprey.cli import claude_code_resolver as resolver
-from osprey.cli.claude_code_resolver import (
+from osprey.build import claude_code_resolver as resolver
+from osprey.build.claude_code_resolver import (
     MANAGED_ENV_VARS,
     ClaudeCodeModelResolver,
     ClaudeCodeModelSpec,
 )
-from osprey.cli.claude_code_telemetry import (
+from osprey.build.claude_code_telemetry import (
     TELEMETRY_ENV_VARS,
+    ObservabilityCredentialError,
     TelemetryConfigError,
     _build_telemetry_env,
     _gate_is_on,
     _openobserve_host_override,
+    _running_in_container,
 )
 
 # ── on / off gating ──────────────────────────────────────────────
@@ -127,9 +129,11 @@ def test_tool_content_never_wired():
 
 
 @pytest.mark.parametrize("env_var,cfg_key", CONTENT_GATES)
-def test_each_content_gate_toggle_drops_exactly_one_key(env_var, cfg_key):
+def test_each_content_gate_toggle_zeroes_exactly_one_key(env_var, cfg_key):
+    """A disabled gate ships an explicit "0" — omission would let the CLI's
+    own fallback chain (e.g. ASSISTANT_RESPONSES ?? USER_PROMPTS) re-enable it."""
     env = _build_telemetry_env({"enabled": True, "endpoint": "http://c:4318", cfg_key: False})
-    assert env_var not in env
+    assert env[env_var] == "0"
     # every OTHER gate stays on
     for other_var, _other_key in CONTENT_GATES:
         if other_var != env_var:
@@ -285,6 +289,63 @@ def test_creds_failloud_on_unresolved_var(creds):
         _build_telemetry_env({"enabled": True, "backend": "openobserve", "openobserve": creds})
 
 
+@pytest.mark.parametrize(
+    "creds",
+    [
+        {"user": "${ZO_ROOT_USER_EMAIL}", "password": "p"},
+        {"user": "u", "password": "${ZO_ROOT_USER_PASSWORD}"},
+    ],
+)
+def test_creds_deferred_at_build_time_omit_header(creds, recwarn):
+    """``defer_unresolved_creds`` downgrades the hard failure to a warning.
+
+    A build renders a project whose telemetry credentials are supplied by the
+    *deployment* (the worker re-resolves them against its own .env at
+    agent-spawn — see dispatch_api). Aborting the build there would force every
+    such project to hand the builder production secrets. The header is omitted
+    rather than encoded from a placeholder, so nothing bogus is baked.
+    """
+    env = _build_telemetry_env(
+        {"enabled": True, "backend": "openobserve", "openobserve": creds},
+        defer_unresolved_creds=True,
+    )
+
+    assert "OTEL_EXPORTER_OTLP_HEADERS" not in env
+    # Telemetry itself stays configured — only the auth header is deferred.
+    assert env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
+    assert any("unresolved" in str(w.message) for w in recwarn)
+
+
+def test_creds_deferred_flag_does_not_excuse_missing_creds():
+    """Deferral covers an unresolved ${VAR}, not an absent credential.
+
+    A blank/missing credential is a config error at every stage — there is no
+    later resolution step that could fill it in.
+    """
+    with pytest.raises(ValueError):
+        _build_telemetry_env(
+            {"enabled": True, "backend": "openobserve", "openobserve": {"user": "u"}},
+            defer_unresolved_creds=True,
+        )
+
+
+def test_creds_default_still_fails_loud_for_runtime():
+    """The default is unchanged: spawn-time callers must still fail loud.
+
+    The dispatch worker re-resolves at agent-spawn with the deployment's own
+    .env; there is no later stage, so an unresolved cred there is terminal for
+    telemetry and must not be papered over.
+    """
+    with pytest.raises(ValueError):
+        _build_telemetry_env(
+            {
+                "enabled": True,
+                "backend": "openobserve",
+                "openobserve": {"user": "${ZO_ROOT_USER_EMAIL}", "password": "p"},
+            }
+        )
+
+
 def test_config_headers_merge_auth_wins():
     """Config headers are merged; computed auth wins on key collision."""
     env = _build_telemetry_env(
@@ -382,6 +443,52 @@ def test_resolve_container_endpoint(monkeypatch):
     assert spec.env_block["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://openobserve:5080/api/default"
 
 
+class TestContainerDetection:
+    """The marker files this module treats as "I am in a container".
+
+    Mirrors ``tests/health/test_derive.py``'s coverage of the twin helper in
+    ``osprey.health.derive``: the two are deliberate copies (health must not
+    import the build layer), so each needs its own guard or one drifts silently.
+    """
+
+    def test_docker_marker_detected(self, monkeypatch):
+        monkeypatch.delenv("OSPREY_IN_CONTAINER", raising=False)
+        monkeypatch.setattr("os.path.exists", lambda p: p == "/.dockerenv")
+        assert _running_in_container() is True
+
+    def test_podman_marker_detected(self, monkeypatch):
+        # Podman writes /run/.containerenv and no /.dockerenv, so a Docker-only
+        # probe read every podman deployment as a host and derived the
+        # localhost OpenObserve default from inside the container.
+        monkeypatch.delenv("OSPREY_IN_CONTAINER", raising=False)
+        monkeypatch.setattr("os.path.exists", lambda p: p == "/run/.containerenv")
+        assert _running_in_container() is True
+
+    def test_no_marker_is_a_host(self, monkeypatch):
+        monkeypatch.delenv("OSPREY_IN_CONTAINER", raising=False)
+        monkeypatch.setattr("os.path.exists", lambda p: False)
+        assert _running_in_container() is False
+
+    def test_operator_override_alone_is_enough(self, monkeypatch):
+        monkeypatch.setattr("os.path.exists", lambda p: False)
+        monkeypatch.setenv("OSPREY_IN_CONTAINER", "1")
+        assert _running_in_container() is True
+
+    def test_the_two_copies_probe_the_same_markers(self, monkeypatch):
+        """The health twin and this one must answer identically, marker for marker.
+
+        They are copies by design, which is exactly the arrangement that drifts:
+        this asserts agreement on every case rather than trusting two docstrings
+        to stay in sync.
+        """
+        from osprey.health.derive import _in_container
+
+        monkeypatch.delenv("OSPREY_IN_CONTAINER", raising=False)
+        for present in ("/.dockerenv", "/run/.containerenv", "/nothing"):
+            monkeypatch.setattr("os.path.exists", lambda p, hit=present: p == hit)
+            assert _running_in_container() == _in_container(), present
+
+
 def test_resolve_no_telemetry_leaves_env_block_clean():
     """Absent telemetry block == disabled; no OTEL vars leak into env_block."""
     spec = ClaudeCodeModelResolver.resolve({"provider": "anthropic"})
@@ -477,7 +584,7 @@ def test_resolve_consults_host_override(monkeypatch):
     "falsey", [False, "false", "False", "FALSE", "0", "no", "off", " false ", ""]
 )
 def test_falsey_gate_values_suppress(env_var, cfg_key, falsey):
-    """bool False AND false-y strings (incl. ${VAR:-false} -> "false") drop the gate."""
+    """bool False AND false-y strings (incl. ${VAR:-false} -> "false") zero the gate."""
     env = _build_telemetry_env(
         {
             "enabled": True,
@@ -486,7 +593,7 @@ def test_falsey_gate_values_suppress(env_var, cfg_key, falsey):
             cfg_key: falsey,
         }
     )
-    assert env_var not in env
+    assert env[env_var] == "0"
 
 
 @pytest.mark.parametrize("truthy", [True, "true", "True", "1", "yes"])
@@ -552,3 +659,129 @@ def test_telemetry_misconfig_raises_telemetry_config_error():
         )
     with pytest.raises(TelemetryConfigError):
         _build_telemetry_env({"enabled": True})
+
+
+# ── observability-credential error type ──────────────────────────
+
+
+def test_credential_error_subclass_chain():
+    """The credential type nests inside the general one, which nests inside ValueError.
+
+    Every existing handler catches one of the two outer types, so the narrower
+    type must stay a subclass of both or those handlers stop seeing the failure
+    they already handle today.
+    """
+    assert issubclass(ObservabilityCredentialError, TelemetryConfigError)
+    assert issubclass(ObservabilityCredentialError, ValueError)
+
+
+@pytest.mark.parametrize(
+    "openobserve",
+    [
+        {"user": "u"},
+        {"password": "p"},
+        {},
+        {"user": "", "password": ""},
+    ],
+    ids=["password-absent", "user-absent", "block-empty", "both-blank"],
+)
+def test_missing_or_blank_credential_raises_the_credential_type(openobserve):
+    """A credential the operator has to supply reports itself as a credential fault."""
+    with pytest.raises(ObservabilityCredentialError):
+        _build_telemetry_env(
+            {"enabled": True, "backend": "openobserve", "openobserve": openobserve}
+        )
+
+
+@pytest.mark.parametrize(
+    "openobserve",
+    [
+        {"user": "${STORE_USER}", "password": "p"},
+        {"user": "u", "password": "${STORE_PASSWORD}"},
+    ],
+    ids=["user-unresolved", "password-unresolved"],
+)
+def test_unresolved_credential_var_raises_the_credential_type(openobserve):
+    """An unresolved ${VAR} credential is the same kind of fault as a blank one.
+
+    Both are fixed by putting a value in the deployment's secret store, so both
+    carry the type whose remedy says so.
+    """
+    with pytest.raises(ObservabilityCredentialError):
+        _build_telemetry_env(
+            {"enabled": True, "backend": "openobserve", "openobserve": openobserve}
+        )
+
+
+def test_deferred_credential_still_raises_the_credential_type_when_absent():
+    """Deferral covers an unresolved ${VAR}; an absent credential keeps its type."""
+    with pytest.raises(ObservabilityCredentialError):
+        _build_telemetry_env(
+            {"enabled": True, "backend": "openobserve", "openobserve": {"user": "u"}},
+            defer_unresolved_creds=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "telemetry",
+    [
+        {"enabled": True, "backend": "jaeger"},
+        {"enabled": True},
+        {"enabled": True, "endpoint": "http://${COLLECTOR_HOST}:4318"},
+        {
+            "enabled": True,
+            "backend": "openobserve",
+            "protocol": "grpc",
+            "openobserve": {"user": "u", "password": "p"},
+        },
+    ],
+    ids=["no-endpoint-other-backend", "no-endpoint-no-backend", "unresolved-var", "grpc-derived"],
+)
+def test_endpoint_faults_keep_the_general_telemetry_type(telemetry):
+    """An endpoint fault is not a credential fault, and must not borrow its type.
+
+    A handler that offers a credential remedy would send the operator to the
+    secret store for a problem that lives in the endpoint config.
+    """
+    with pytest.raises(TelemetryConfigError) as caught:
+        _build_telemetry_env(telemetry)
+    assert not isinstance(caught.value, ObservabilityCredentialError)
+
+
+def test_existing_broad_handlers_still_catch_a_credential_fault():
+    """The callers that catch TelemetryConfigError or ValueError keep working."""
+    cfg = {"enabled": True, "backend": "openobserve", "openobserve": {"user": "u"}}
+    with pytest.raises(TelemetryConfigError):
+        _build_telemetry_env(cfg)
+    with pytest.raises(ValueError):
+        _build_telemetry_env(cfg)
+
+
+def test_deferred_var_credential_warns_not_raises_through_resolve(monkeypatch, recwarn):
+    """Pins the build-time catch site's reachability contract through resolve().
+
+    ``build_cmd.py``'s render call sets ``defer_unresolved_telemetry_creds=True``
+    around ``load_provider_spec()`` and catches ``ValueError``. An unresolved
+    ``${VAR}`` credential must warn rather than raise all the way through
+    ``resolve()`` — not just at the ``_build_telemetry_env``/
+    ``_openobserve_auth_header`` leaf — or the comment at that catch site goes
+    stale silently. A missing/blank credential is a separate arm (see
+    ``test_deferred_credential_still_raises_the_credential_type_when_absent``)
+    and keeps raising even when deferred.
+    """
+    monkeypatch.setattr(resolver, "_running_in_container", lambda: False)
+    spec = ClaudeCodeModelResolver.resolve(
+        {
+            "provider": "anthropic",
+            "telemetry": {
+                "enabled": True,
+                "backend": "openobserve",
+                "openobserve": {"user": "${STORE_USER}", "password": "p"},
+            },
+        },
+        defer_unresolved_telemetry_creds=True,
+    )
+    assert spec is not None
+    assert "OTEL_EXPORTER_OTLP_HEADERS" not in spec.env_block
+    assert spec.env_block["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
+    assert any("unresolved" in str(w.message) for w in recwarn)

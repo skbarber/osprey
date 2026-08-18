@@ -11,24 +11,28 @@
   "use strict";
 
   const STORAGE_KEY = "osprey-theme";
-  const VALID_IDS = ["apex-dark", "apex-light", "dark", "high-contrast-dark", "high-contrast-light", "light"];
+  const VALID_IDS = ["dark", "desy-dark", "desy-light", "high-contrast-dark", "high-contrast-light", "light", "retro-dark", "retro-light"];
   // Per-family {mode: id} map: DEFAULTS[family][mode]. Typed as a
   // Record (not the narrower literal shape object-literal inference would
   // give it) because resolveAuto() below indexes it with a general
   // `string` family, not just the exact DEFAULT_FAMILY literal.
   /** @type {Record<string, {dark?: string, light?: string}>} */
   const DEFAULTS = {
-    "apex": {
-      "dark": "apex-dark",
-      "light": "apex-light"
-    },
-    "osprey": {
+    "main": {
       "dark": "dark",
       "light": "light"
+    },
+    "desy": {
+      "dark": "desy-dark",
+      "light": "desy-light"
     },
     "high-contrast": {
       "dark": "high-contrast-dark",
       "light": "high-contrast-light"
+    },
+    "retro": {
+      "dark": "retro-dark",
+      "light": "retro-light"
     }
   };
   // id -> family, so a valid server-rendered data-theme id can supply the
@@ -36,16 +40,18 @@
   // render_theme_boot_js docstring in generator/emit_js.py.
   /** @type {Record<string, string>} */
   const FAMILY_BY_ID = {
-    "apex-dark": "apex",
-    "apex-light": "apex",
-    "dark": "osprey",
+    "dark": "main",
+    "desy-dark": "desy",
+    "desy-light": "desy",
     "high-contrast-dark": "high-contrast",
     "high-contrast-light": "high-contrast",
-    "light": "osprey"
+    "light": "main",
+    "retro-dark": "retro",
+    "retro-light": "retro"
   };
   // Fallback family for 'auto' when no server data-theme attribute is
   // present/valid: the first family declared in the manifest.
-  const DEFAULT_FAMILY = "osprey";
+  const DEFAULT_FAMILY = "main";
 
   /** @param {string|null} value @returns {value is string} */
   function isValidId(value) {
@@ -87,7 +93,7 @@
 
   // The server-rendered rung (finding I4): whatever data-theme already
   // sits on <html> when this script runs, e.g. stamped by the web server
-  // from config (Task 1.10). Read once so both the resolution candidate
+  // from config. Read once so both the resolution candidate
   // below and the no-clobber check at the end use the exact same value.
   function readServerTheme() {
     try {

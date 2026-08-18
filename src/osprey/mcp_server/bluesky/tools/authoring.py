@@ -26,12 +26,30 @@ Same conventions as ``read_tools.py``: ``async def``, JSON string return
 from __future__ import annotations
 
 import json
+import logging
 
 import anyio
 
 from osprey.mcp_server.bluesky.server import mcp
 from osprey.mcp_server.bluesky.server_context import _http_post_json, bridge_error_message
+from osprey.mcp_server.bluesky.tools.draft import _plans_panel_id
 from osprey.mcp_server.errors import make_error
+from osprey.mcp_server.http import notify_agent_activity
+
+logger = logging.getLogger("osprey.mcp_server.bluesky.tools.authoring")
+
+
+def _notify_authoring_activity(tool: str, detail: str | None) -> None:
+    """Sync body of the fire-and-forget activity emit (worker thread only).
+
+    Authoring a plan changes what the human's BLUESKY panel lists, so the
+    highlight targets that panel — the same id draft edits resolve, hence the
+    shared :func:`~osprey.mcp_server.bluesky.tools.draft._plans_panel_id`.
+    ``notify_agent_activity`` is blocking and the panel-id lookup reads
+    config.yml, so both stay off the event loop behind
+    ``anyio.to_thread.run_sync``.
+    """
+    notify_agent_activity(tool=tool, kind="panel", panel=_plans_panel_id(), detail=detail)
 
 
 # ---------------------------------------------------------------------------
@@ -40,36 +58,47 @@ from osprey.mcp_server.errors import make_error
 @mcp.tool()
 async def write_plan(
     name: str,
-    category: str,
-    required_devices: list[str],
     writes: bool,
     body: str,
     description: str = "",
 ) -> str:
     """Author a session-tier plan file on the bridge. Reaches NO hardware.
 
-    The bridge assembles a `PLAN_METADATA = {...}` block from
-    ``name``/``description``/``category``/``required_devices``/``writes`` and
-    prepends it to ``body`` (your own ``PARAMS`` + ``build_plan`` source, per
-    the layered directory catalog's file contract), writing the combined text
-    as one file. The bridge NEVER imports or execs this file — it is inert
-    until validate_plan passes it and, later, a human approves
-    launching it. Re-authoring an existing ``name`` overwrites the file and
-    invalidates any prior passing validation (its content hash changes).
+    The bridge assembles a `PLAN_METADATA = {...}` block from exactly
+    ``name``/``description``/``writes`` and prepends it to ``body`` (your own
+    ``PARAMS`` + ``build_plan`` source, per the layered directory catalog's
+    file contract), writing the combined text as one file. The bridge NEVER
+    imports or execs this file — it is inert until validate_plan passes it
+    and, later, a human approves launching it. Re-authoring an existing
+    ``name`` overwrites the file and invalidates any prior passing validation
+    (its content hash changes).
+
+    Which channels the plan touches is NOT declared here. Declare it in the
+    ``body``'s `PARAMS` model with the role-typed field helpers from
+    ``osprey.services.bluesky_bridge.plan_fields`` — ``MovableChannels`` /
+    ``ReadableChannels`` for a list field, ``MovableChannel`` /
+    ``ReadableChannel`` for one channel inside a nested model. Every consumer
+    (dry-run mocks, the pre-queue channel check, the devices your
+    ``build_plan`` is handed, the default figure) reads those fields, so an
+    undeclared channel is simply not available to the plan.
 
     Args:
         name: Plan name — must be a valid Python identifier; doubles as the
             on-disk file stem and the generated metadata's ``name`` field.
-        category: Free-text grouping shown to operators (e.g. "accelerator").
-        required_devices: Names of the `PARAMS` fields naming devices the
-            plan drives/reads (e.g. ``["correctors", "detectors"]``).
-        writes: Whether this plan moves a device (vs. read-only). Authoring
-            metadata only — has no effect on whether writes actually happen;
-            that is governed entirely by ``control_system.writes_enabled``.
+        writes: Whether this plan moves a channel (vs. reading only). Passing
+            true obliges the ``body`` to declare at least one movable channel
+            field; the load gate quarantines a plan that declares none. It has
+            no effect on whether writes actually happen; that is governed
+            entirely by ``control_system.writes_enabled``.
         body: Your plan's own source: a `PARAMS` pydantic model (optional)
             and a `build_plan(devices, params)` callable, exactly as a
-            directory-layer plan file needs — see the orm
-            exemplar plan for the expected shape.
+            directory-layer plan file needs — see the orm exemplar plan for
+            the expected shape. A ``writes: true`` plan that opens its own run
+            must declare its point count on that run:
+            ``md=scan_metadata(movable=..., readable=..., points=...)``
+            (also from ``plan_fields``) on the run decorator, so operators can
+            watch its progress. A plan delegating to a stock bluesky plan
+            inherits that stamp and needs nothing.
         description: Human-readable summary of what the plan does.
 
     Returns:
@@ -80,8 +109,6 @@ async def write_plan(
     payload = {
         "name": name,
         "description": description,
-        "category": category,
-        "required_devices": required_devices,
         "writes": writes,
         "body": body,
     }
@@ -92,9 +119,19 @@ async def write_plan(
             bridge_error_message(resp_body, status),
             [
                 "Check name is a valid Python identifier (used as the file stem).",
-                "Check category/required_devices/writes are present and well-typed.",
+                "Check writes is present and a bool — it and name/description are "
+                "the whole metadata contract.",
+                "Declare the channels in the body's PARAMS with the role-typed "
+                "field helpers (MovableChannels/ReadableChannels), not in this call.",
             ],
         )
+
+    # The file exists only past the rejection returns above: best-effort
+    # highlight of the panel that now lists it; must never alter the result.
+    try:
+        await anyio.to_thread.run_sync(_notify_authoring_activity, "write_plan", name)
+    except Exception as exc:
+        logger.debug("agent-activity emit failed (non-fatal): %s", exc)
     return json.dumps(resp_body)
 
 
@@ -116,7 +153,7 @@ async def validate_plan(
     in-process mock devices only, in a subprocess whose ``EPICS_CA_*``
     variables are neutralized; it never reaches a real device regardless of
     ``control_system.writes_enabled``. A passing validation is recorded by
-    content hash so the plan becomes loadable/launchable (tasks 2.4/2.5);
+    content hash so the plan becomes loadable and enqueueable;
     editing the file afterward changes its hash and drops the record, so it
     must be re-validated.
 
@@ -129,9 +166,15 @@ async def validate_plan(
             plan to completion.
 
     Returns:
-        JSON ``{"passed", "reasons", "content_hash"}``. ``reasons`` is empty
-        on a pass; on a failure it names every rejection from whichever stage
-        stopped the plan.
+        JSON ``{"passed", "reasons", "content_hash", "upload"}``. ``reasons``
+        is empty on a pass; on a failure it names every rejection from
+        whichever stage stopped the plan. ``upload`` is
+        ``{"uploaded", "reason", "detail"}`` and reports whether the bytes that
+        just passed were loaded into the queue worker's namespace — a pass with
+        ``uploaded: false`` is still a genuine pass (a deployment with no queue
+        server has nowhere to upload to), but the plan is not enqueueable until
+        an upload lands, so ``reason``/``detail`` are what to relay if a later
+        queue_add is refused with ``session_plan_not_in_namespace``.
     """
     payload = {"name": name, "sample_args": sample_args, "dry_run_timeout": dry_run_timeout}
     status, resp_body = await anyio.to_thread.run_sync(_http_post_json, "/plans/validate", payload)
@@ -143,4 +186,15 @@ async def validate_plan(
         )
     if status != 200:
         return make_error("bluesky_bridge_error", bridge_error_message(resp_body, status))
+
+    # A pass is what changes the plan's standing (loadable, enqueueable) and
+    # what the panel re-renders; a failed validation leaves everything as it
+    # was, so only a pass is reported.
+    if resp_body.get("passed"):
+        try:
+            await anyio.to_thread.run_sync(
+                _notify_authoring_activity, "validate_plan", f"validated {name}"
+            )
+        except Exception as exc:
+            logger.debug("agent-activity emit failed (non-fatal): %s", exc)
     return json.dumps(resp_body)

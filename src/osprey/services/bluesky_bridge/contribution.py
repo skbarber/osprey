@@ -4,15 +4,14 @@ This module is thin glue, not a contribution engine: it never opens a pull/merge
 request, never commits, and never touches ``plan_loader.py``'s directory
 layers or trust order. All it does is (1) refuse to hand off a session plan
 whose *current* on-disk content lacks a passing validation record — the same
-check the load gate (task 2.4) and launch gate (task 2.5) perform — and (2)
+check the load gate and the launch gate perform — and (2)
 copy that plan's exact bytes into a checkout of the repo that owns the target
 ``preset``/``facility`` plan directory, so the file is ready to ``git add``.
 
 **The contribution workflow this glue supports:**
 
-1. Author + validate a session plan (``write_plan`` /
-   ``validate_plan`` — task 2.3), then run it a few times via
-   ``launch_run`` until it looks worth keeping.
+1. Author + validate a session plan (``write_plan`` / ``validate_plan``),
+   then run it a few times via ``launch_run`` until it looks worth keeping.
 2. Call :func:`prepare_contribution` with the plan's ``name`` and a filesystem
    path to a checkout of the repo that owns the target catalog directory —
    one of the directories already listed in ``bluesky.plan_dirs`` (config.yml,
@@ -126,9 +125,9 @@ def prepare_contribution(name: str, catalog_dir: str | Path) -> ContributionRequ
         source_path=source_path,
         target_path=target_path,
         suggested_branch=f"feature/contribute-{name}-plan",
-        suggested_pr_title=f"Add {name} scan plan to the catalog",
+        suggested_pr_title=f"Add {name} plan to the catalog",
         suggested_pr_body=(
-            f"Contributes the session-authored `{name}` scan plan (validated "
+            f"Contributes the session-authored `{name}` plan (validated "
             f"content hash `{content_hash}`) to a permanent catalog plan.\n\n"
             "This file was authored and dry-run validated (mock devices only) "
             "in an OSPREY session; it has never run against real hardware. "

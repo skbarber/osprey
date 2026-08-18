@@ -11,7 +11,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
+# xdist_group("docker"): pins every container-starting test file onto one worker, so
+# a run has a single testcontainers session and a single ryuk reaper -- concurrent
+# reaper starts race the Docker daemon's port mapper. It also serializes the shared
+# database: the session ``database_url`` fixture prefers a running dev Postgres with
+# ONE shared ``ariel_test`` database over a per-worker container, so parallel workers
+# would otherwise collide on migrations/seed/truncate.
+pytestmark = [pytest.mark.integration, pytest.mark.asyncio, pytest.mark.xdist_group("docker")]
 
 
 class TestServiceIntegration:
@@ -194,7 +200,6 @@ class TestServiceSearchModes:
     ):
         """Service performs keyword search correctly."""
         from osprey.services.ariel_search.database.connection import create_connection_pool
-        from osprey.services.ariel_search.models import SearchMode
         from osprey.services.ariel_search.service import ARIELSearchService
 
         # Add test entry
@@ -211,7 +216,7 @@ class TestServiceSearchModes:
             repository=repository,
         )
 
-        result = await service.search("vacuum pump", mode=SearchMode.KEYWORD)
+        result = await service.search("vacuum pump", mode="keyword")
 
         # Should return result object
         assert result is not None

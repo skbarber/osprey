@@ -77,12 +77,22 @@ Build a database from CSV, then validate and preview:
 
 .. note::
 
-   ``build-database`` writes to ``data/processed/channel_database.json`` by
-   default, while the pipelines — and a bare ``validate`` / ``preview`` — read
-   the database referenced in ``config.yml`` (under
-   ``data/channel_databases/``). After building, either point the commands at
-   the new file with ``--database`` or update the config path — otherwise you
-   are silently validating the old database.
+   ``build-database`` writes into the **profile** the project was built from
+   (``processed/channel_database.json`` inside its ``data/`` tree), not into the
+   project — a generated database belongs beside the inputs it came from, and
+   survives a rebuild there. That deliberately marks the project stale; clear
+   the advisory by rebuilding:
+
+   .. code-block:: bash
+
+      osprey channel-finder build-database
+      osprey build
+
+   The pipelines — and a bare ``validate`` / ``preview`` — read the database
+   referenced in ``config.yml`` (under ``data/channel_databases/``). If you
+   built to a different name, either point the commands at it with
+   ``--database`` or update the config path; otherwise you are silently
+   validating the old database.
 
 
 Hierarchical Pipeline
@@ -127,7 +137,7 @@ Middle Layer Pipeline
 A React agent explores the database using query tools
 (``list_systems``, ``list_families``, ``inspect_fields``,
 ``list_channels``, ``get_common_names``, ``statistics``, ``validate``, and —
-when DuckDB is installed — ``query_channels``).
+when DuckDB is installed — ``run_sql``).
 
 The database follows MATLAB Middle Layer (MML) functional organization
 (System -> Family -> Field -> ChannelNames). Convert from MML exports:
@@ -182,7 +192,7 @@ Each pipeline is exposed to the agent through a dedicated MCP server
 (``channel_finder_in_context``, ``channel_finder_hierarchical``,
 ``channel_finder_middle_layer``). The active server is selected from
 ``channel_finder.pipeline_mode`` in ``config.yml`` and wired into the
-agent's artifacts when you run ``osprey build`` (or ``osprey claude regen``
+agent's artifacts when you run ``osprey build`` (or ``osprey build``
 after editing the config). There is no public Python
 ``find_channels(...)`` entry point — drive the resolver from natural
 language via the agent, or invoke the CLI directly:

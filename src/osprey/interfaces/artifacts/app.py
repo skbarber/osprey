@@ -10,8 +10,9 @@ import asyncio
 import json
 import re
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Collection
 from contextlib import asynccontextmanager
+from itertools import chain
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -19,9 +20,13 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
+from osprey.agent_runner.artifact_resolve import deployed_render_dir
 from osprey.interfaces._app_setup import configure_interface_app
 from osprey.interfaces.vendor import vendor_url
-from osprey.utils.timeseries import extract_timeseries_frame, lttb_downsample
+from osprey.utils.timeseries import (
+    downsample_channel_map,
+    extract_channel_series,
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -266,69 +271,19 @@ body {{
 <body>
 <script type="application/json" id="md-source">{md_json}</script>
 <div class="osprey-md-rendered" id="md-rendered"></div>
-<script>
-// Renders markdown from the embedded JSON source using marked + hljs + KaTeX.
-// Content originates from trusted local artifact files; marked.parse() and
-// katex.renderToString() both produce sanitized HTML output.
-(function() {{
-  var esc = function(s) {{
-    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;')
-            .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-  }};
-  var renderer = {{
-    code: function(args) {{
-      var src = args.text || '';
-      var lang = args.lang || '';
-      var highlighted = esc(src);
-      if (typeof hljs !== 'undefined' && src) {{
-        try {{
-          if (lang && hljs.getLanguage(lang)) {{
-            highlighted = hljs.highlight(src, {{ language: lang }}).value;
-          }} else {{
-            highlighted = hljs.highlightAuto(src).value;
-          }}
-        }} catch(e) {{}}
-      }}
-      return '<pre><code class="hljs' + (lang ? ' language-' + lang : '') +
-             '">' + highlighted + '</code></pre>';
-    }}
-  }};
-  marked.use({{ gfm: true, breaks: false, renderer: renderer }});
+<script type="module">
+// Renders markdown from the embedded JSON source through the gallery's
+// shared marked + hljs + KaTeX pipeline (md-render.js) — one algorithm for
+// the preview pane and this standalone page. Module scripts defer, so the
+// classic vendor <script> tags above have populated the marked/hljs/katex
+// globals by the time this runs.
+import {{ configureMarked, renderMathInMarkdown }} from '/static/js/md-render.js';
 
-  function renderMath(text) {{
-    if (typeof katex === 'undefined') return marked.parse(text);
-    var placeholders = [], idx = 0;
-    function ph(html) {{
-      var key = '\\x00MATH' + (idx++) + '\\x00';
-      placeholders.push({{ key: key, html: html }});
-      return key;
-    }}
-    function rk(expr, dm) {{
-      try {{
-        return katex.renderToString(expr.trim(), {{
-          displayMode: dm, throwOnError: false, strict: false
-        }});
-      }} catch(e) {{
-        return '<span class="katex-error">' + esc(expr) + '</span>';
-      }}
-    }}
-    text = text.replace(/\\$\\$([\\s\\S]+?)\\$\\$/g, function(_, e) {{ return ph(rk(e, true)); }});
-    text = text.replace(/(?<!\\$)(?<!\\d)\\$(?!\\$)(.+?)(?<!\\$)\\$(?!\\d)/g,
-      function(_, e) {{ return ph(rk(e, false)); }});
-    var html;
-    try {{ html = marked.parse(text); }}
-    catch(e) {{ html = '<p>' + esc(text) + '</p>'; }}
-    for (var i = 0; i < placeholders.length; i++) {{
-      html = html.replace(placeholders[i].key, placeholders[i].html);
-    }}
-    return html;
-  }}
-
-  var src = JSON.parse(document.getElementById('md-source').textContent);
-  // Safe: marked.parse() and katex.renderToString() produce sanitized HTML
-  // from trusted local artifact content (not user input from the web).
-  document.getElementById('md-rendered').innerHTML = renderMath(src);  // trusted content
-}})();
+configureMarked();
+const src = JSON.parse(document.getElementById('md-source').textContent);
+// Safe: marked.parse() and katex.renderToString() produce sanitized HTML
+// from trusted local artifact content (not user input from the web).
+document.getElementById('md-rendered').innerHTML = renderMathInMarkdown(src);  // trusted content
 </script>
 </body>
 </html>"""
@@ -432,17 +387,144 @@ class _SSEBroadcaster:
 MAX_TIMESERIES_FILE_BYTES = 200 * 1024 * 1024  # 200 MB
 
 
+def _union_timestamp_axis(series: dict[str, dict]) -> Collection:
+    """Every timestamp any channel carries, deduplicated — the table's row axis.
+
+    Shared by both response formats so ``format=chart``'s ``summary.row_count``
+    always matches ``format=table``'s ``total_rows``.
+    """
+    stamps = chain.from_iterable(data.get("timestamps", []) for data in series.values())
+    try:
+        return set(stamps)
+    except TypeError:
+        # An unhashable timestamp (a JSON array, say) cannot go in a set;
+        # dedupe by equality instead. `stamps` is one-shot, so rebuild it.
+        unique: list = []
+        for stamp in chain.from_iterable(data.get("timestamps", []) for data in series.values()):
+            if stamp not in unique:
+                unique.append(stamp)
+        return unique
+
+
+def _raise_duplicate_sample(channel: str, stamp: object) -> None:
+    """Reject two samples sharing one (timestamp, channel) cell."""
+    raise HTTPException(
+        status_code=500,
+        detail=(
+            f"Channel {channel!r} has more than one sample at timestamp {stamp!r}; "
+            "a table view has exactly one cell per channel per timestamp "
+            "and cannot represent both without silently discarding one."
+        ),
+    )
+
+
+class _EqualityMatchLookup:
+    """A channel's ``timestamp -> value`` lookup for unhashable timestamps.
+
+    Matches by ``==`` rather than by hash; duplicates are rejected eagerly in
+    the constructor, matching the hashable path.
+    """
+
+    __slots__ = ("_pairs",)
+
+    def __init__(self, channel: str, timestamps: list, values: list) -> None:
+        # strict=False: a timestamps/values length mismatch is tolerated, as
+        # on the fast path.
+        self._pairs = list(zip(timestamps, values, strict=False))
+        for i, (stamp, _val) in enumerate(self._pairs):
+            if any(stamp == earlier for earlier, _ in self._pairs[:i]):
+                _raise_duplicate_sample(channel, stamp)
+
+    def get(self, key: object, default: object = None) -> object:
+        for stamp, value in self._pairs:
+            if stamp == key:
+                return value
+        return default
+
+
+def _pivot_channel_series_to_table(
+    series: dict[str, dict],
+    *,
+    offset: int,
+    limit: int,
+) -> tuple[list[str], list, list[list], int]:
+    """Pivot per-channel series into aligned rows for table display.
+
+    Unions every channel's own timestamps into one sorted axis and looks up
+    each channel's value at each shared timestamp, leaving ``None`` where
+    that channel has no sample. Presentation-only; only the requested page's
+    rows are materialized. The returned ``columns`` is the very list each row
+    was indexed with — a header taken from any other response can disagree
+    with these rows.
+
+    Args:
+        series: Per-channel series as returned by ``extract_channel_series``.
+        offset: Index of the first row to return.
+        limit: Maximum rows to return.
+
+    Returns:
+        Tuple of (columns, index, data, total_rows) -- the channel names in
+        column order, the requested page's timestamps, its rows with one value
+        (or ``None``) per column, and the full row count the page was taken
+        from.
+
+    Raises:
+        HTTPException: if any channel has more than one sample at the same
+            timestamp label.
+    """
+    columns = list(series.keys())
+    value_by_channel: dict[str, dict | _EqualityMatchLookup] = {}
+    for ch, data in series.items():
+        timestamps = data.get("timestamps", [])
+        values = data.get("values", [])
+        # A dict of n pairs holds fewer than n entries iff a key repeated.
+        try:
+            by_ts: dict = dict(zip(timestamps, values, strict=False))
+        except TypeError:
+            # Unhashable timestamps can't key a dict; match by equality instead.
+            value_by_channel[ch] = _EqualityMatchLookup(ch, timestamps, values)
+            continue
+        if len(by_ts) != min(len(timestamps), len(values)):
+            # Re-walk the pairs to name the first repeated timestamp.
+            seen: set = set()
+            for ts, _val in zip(timestamps, values, strict=False):
+                if ts in seen:
+                    _raise_duplicate_sample(ch, ts)
+                seen.add(ts)
+        value_by_channel[ch] = by_ts
+
+    all_timestamps = _union_timestamp_axis(series)
+    try:
+        index = sorted(all_timestamps)
+    except TypeError:
+        # Mutually-incomparable timestamp types (e.g. int vs str) can't sort
+        # by `<`; a deterministic string order beats a 500.
+        index = sorted(all_timestamps, key=str)
+
+    total_rows = len(index)
+    page = index[offset : min(offset + limit, total_rows)]
+    rows = [[value_by_channel[ch].get(ts) for ch in columns] for ts in page]
+    return columns, page, rows, total_rows
+
+
 def create_app(workspace_root: Path | None = None) -> FastAPI:
     """Create the Artifact Gallery FastAPI application.
 
     Args:
-        workspace_root: Workspace root containing ``artifacts/`` dir.
-            Defaults to ``./_agent_data``.
+        workspace_root: Agent-data root containing the ``artifacts/`` dir.
+            REQUIRED in practice despite the ``None`` default: the store would
+            resolve the deployment's configured root on its own, but this
+            function also joins ``workspace_root`` directly (the focus file
+            below), so passing ``None`` raises ``TypeError`` rather than
+            defaulting. Every launch path passes it. Documented as-is rather
+            than papered over with a default that would change which directory
+            an existing caller's focus file lands in.
     """
     from osprey.interfaces.artifacts.store_watcher import StoreIndexWatcher
     from osprey.stores.artifact_store import (
         ArtifactEntry,
         ArtifactStore,
+        artifact_mutation_actor,
         register_artifact_delete_listener,
         register_artifact_listener,
         unregister_artifact_delete_listener,
@@ -451,9 +533,18 @@ def create_app(workspace_root: Path | None = None) -> FastAPI:
 
     store = ArtifactStore(workspace_root=workspace_root)
 
-    # Prime config and load custom artifact categories (if available)
+    # Prime config and load custom artifact categories (if available).
+    #
+    # Resolved through the ordinary config rule, not by looking for a
+    # `config.yml` INSIDE the agent-data root — no layout has ever written one
+    # there, so the `exists()` gate below was always false and the gallery
+    # silently never loaded a custom category. `OSPREY_CONFIG` is set on every
+    # launch path that starts this app, and resolve_config_path falls back to
+    # the render zone beneath the cwd otherwise.
     try:
-        config_path = (workspace_root or Path("_agent_data")) / "config.yml"
+        from osprey.utils.workspace import resolve_config_path
+
+        config_path = resolve_config_path()
         if config_path.exists():
             from osprey.utils.config import get_config_builder
 
@@ -499,6 +590,15 @@ def create_app(workspace_root: Path | None = None) -> FastAPI:
     )
 
     app.state.artifact_store = store
+    # The directory the AGENT ran in — where its Claude transcript lives.
+    # Resolved ONCE here rather than read from `Path.cwd()` per request: the
+    # in-process chat/web companion happens to be launched with that cwd, but
+    # the standalone `osprey artifacts` gallery is a uvicorn factory runnable
+    # from anywhere, and there the per-request read found no transcript and
+    # returned an empty audit trail — swallowed by the reader's own
+    # exception guard, so the /compose response was simply missing its
+    # provenance with nothing to say so.
+    app.state.agent_project_dir = deployed_render_dir()
     app.state.focused_artifact_id = None  # None = show latest
 
     focus_file = workspace_root / "focus_state.txt"
@@ -610,13 +710,14 @@ def create_app(workspace_root: Path | None = None) -> FastAPI:
 
         filepath = Path(data_file)
         if not filepath.is_absolute():
-            # data_file may be (a) a project-CWD-relative path like
-            # "_agent_data/artifacts/foo.json" (current ArtifactStore format),
-            # (b) a bare filename (legacy entries written before the format
-            # change), or (c) some other workspace-relative path. Try each
-            # candidate; the legacy DataContext path used absolute strings
-            # which are handled by the is_absolute() branch above.
+            # A store on disk holds every shape any OSPREY release ever wrote,
+            # so data_file may be (a) a repo-root-relative path like
+            # "var/agent_data/artifacts/foo.json" (the ArtifactStore format),
+            # (b) a bare filename, or (c) some other workspace-relative path.
+            # Try each candidate; the absolute strings a DataContext-era entry
+            # carries are handled by the is_absolute() branch above.
             candidates = [
+                store.repo_root / filepath,
                 store._workspace.parent / filepath,
                 store._store_dir / filepath,
                 store._workspace / filepath,
@@ -651,28 +752,40 @@ def create_app(workspace_root: Path | None = None) -> FastAPI:
             )
 
         raw = json.loads(filepath.read_bytes())
-        frame, query_meta = extract_timeseries_frame(raw)
-        columns = frame.get("columns", [])
-        index = frame.get("index", [])
-        rows = frame.get("data", [])
-        total_rows = len(index)
+        series, query_meta = extract_channel_series(raw)
 
         if format == "chart":
-            ds_index, ds_rows = lttb_downsample(index, rows, max_points)
+            channels_out = [
+                {
+                    "channel": record["channel"],
+                    "timestamps": record["timestamps"],
+                    "values": record["values"],
+                    "total_points": record["original_points"],
+                    "returned_points": record["returned_points"],
+                    "numeric": record["numeric"],
+                }
+                for record in downsample_channel_map(series, max_points)
+            ]
+            # Cross-channel totals are computed server-side: per-channel point
+            # sums disagree with the unioned row axis, and `row_count` is not
+            # derivable client-side at all.
             return {
-                "columns": columns,
-                "index": ds_index,
-                "data": ds_rows,
-                "total_rows": total_rows,
-                "downsampled": len(ds_index) < total_rows,
-                "returned_points": len(ds_index),
+                "channels": channels_out,
                 "metadata": query_meta,
+                "summary": {
+                    "total_points": sum(ch["total_points"] for ch in channels_out),
+                    "returned_points": sum(ch["returned_points"] for ch in channels_out),
+                    "downsampled": any(
+                        ch["returned_points"] < ch["total_points"] for ch in channels_out
+                    ),
+                    "row_count": len(_union_timestamp_axis(series)),
+                },
             }
 
-        # format == "table"
-        end = min(offset + limit, total_rows)
-        sliced_index = index[offset:end]
-        sliced_data = rows[offset:end]
+        # format == "table": pivot per-channel series onto a unioned row axis.
+        columns, sliced_index, sliced_data, total_rows = _pivot_channel_series_to_table(
+            series, offset=offset, limit=limit
+        )
         return {
             "columns": columns,
             "index": sliced_index,
@@ -764,7 +877,10 @@ def create_app(workspace_root: Path | None = None) -> FastAPI:
 
     @app.delete("/api/artifacts/{artifact_id}")
     async def delete_artifact(artifact_id: str):
-        deleted = store.delete_entry(artifact_id)
+        # This delete is a person clicking in the gallery, not the agent —
+        # tag it so store listeners don't report it as agent activity.
+        with artifact_mutation_actor("human"):
+            deleted = store.delete_entry(artifact_id)
         if not deleted:
             raise HTTPException(status_code=404, detail=f"Artifact {artifact_id} not found")
         return {"status": "ok", "artifact_id": artifact_id}
@@ -810,27 +926,6 @@ def create_app(workspace_root: Path | None = None) -> FastAPI:
         md_source = filepath.read_text(encoding="utf-8", errors="replace")
         html = _build_markdown_page(md_source, entry.title or entry.filename or "Markdown")
         return HTMLResponse(content=html)
-
-    @app.get("/api/notebooks/{artifact_id}/interactive")
-    async def interactive_notebook(artifact_id: str):
-        """Return JupyterLab URL for interactive notebook viewing."""
-        entry = store.get_entry(artifact_id)
-        if not entry:
-            raise HTTPException(status_code=404, detail=f"Artifact {artifact_id} not found")
-        if entry.artifact_type != "notebook":
-            raise HTTPException(status_code=400, detail="Artifact is not a notebook")
-
-        filepath = store.get_file_path(artifact_id)
-        if not filepath or not filepath.exists():
-            raise HTTPException(status_code=404, detail="Notebook file not found")
-
-        jupyter_path = f"artifacts/{entry.filename}"
-        jupyter_url = f"http://127.0.0.1:8088/doc/tree/{jupyter_path}"
-
-        return {
-            "jupyter_url": jupyter_url,
-            "artifact_id": artifact_id,
-        }
 
     # Logbook entry composer
     from osprey.interfaces.artifacts.logbook import logbook_router

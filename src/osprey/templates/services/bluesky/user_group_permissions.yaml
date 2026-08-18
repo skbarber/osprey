@@ -1,0 +1,76 @@
+# Plan/device permissions for the bluesky-queueserver RE Manager.
+#
+# WHY THIS FILE EXISTS AT ALL: the manager checks every queue item against the
+# permissions of the requesting user group, and `bluesky-queueserver-api`'s
+# default group is `primary`. With no permissions file the manager builds a
+# single `root` group, so every request from the bridge is rejected outright
+# with "Unknown user group: 'primary'" — plans that were scanned correctly and
+# exist in the worker namespace simply cannot be enqueued.
+#
+# WHY THE PLAN RULES ARE PERMISSIVE: this is not the safety boundary and must
+# not be mistaken for one. The worker namespace contains exactly the plans
+# OSPREY's own plan_loader put there (bounded by BLUESKY_PLAN_DIRS and
+# BLUESKY_EXCLUDED_PLANS), the plan names are generated from the facility
+# catalog and so cannot be enumerated here, and every write those plans perform
+# still passes the connector's per-put reference monitor and the bridge's
+# arming + limits facade. An allowlist of literal plan names here would go
+# stale the moment a facility adds a plan, and would buy nothing the catalog
+# does not already bound.
+#
+# WHAT IS ACTUALLY LOCKED DOWN: functions. `allowed_functions: []` would select
+# nothing, and because `root` acts as the preliminary filter for every group,
+# an empty list there would deny function execution globally. That would close
+# queueserver's `function_execute` API — arbitrary callables run in the worker
+# namespace, outside the plan path and outside every check named above. If some
+# future task genuinely needs another worker-side function, this is the line to
+# change, deliberately and with review; do not widen it as a debugging
+# shortcut.
+#
+# ONE DELIBERATE EXCEPTION: `preview_plan`, the pre-flight trajectory summary.
+# It is read-only — it iterates the plan's already-built message stream and
+# collects `{channel, target}` moves into a capped, JSON-serializable list; it
+# never issues a `Msg` of its own and never touches hardware. It runs before a
+# plan is queued, purely so the approval prompt can show what the plan intends
+# to move. Naming it here, in both groups, is what makes it reachable through
+# `function_execute` at all — everything else that API can reach stays closed.
+# The read-only claim rests on `preview_plan` itself yielding nothing; a plan
+# that wrote to hardware outside the yielded `Msg` stream during "preview"
+# would still be caught by the connector's per-put reference monitor and the
+# bridge's arming + limits facade, the same backstop every other write goes
+# through.
+#
+# Script upload (the session-plan path) is a separate API and is NOT gated by
+# these function rules.
+
+user_groups:
+  # `root` is required — the manager raises if it is missing — and acts as the
+  # preliminary filter applied to every other group.
+  root:
+    allowed_plans:
+      - null # Allow all plans present in the worker namespace.
+    forbidden_plans:
+      - ":^_" # Never expose private names.
+    allowed_devices:
+      - null # Allow all devices the startup script built.
+    forbidden_devices:
+      - ":^_:?.*"
+    allowed_functions:
+      - "preview_plan" # The one deliberate exception. See the note above.
+    forbidden_functions:
+      - null
+
+  # `primary` is the group `bluesky-queueserver-api` sends by default, so this
+  # is the group the bridge's QueueBackend actually operates as.
+  primary:
+    allowed_plans:
+      - ":.*"
+    forbidden_plans:
+      - null
+    allowed_devices:
+      - ":?.*:depth=5"
+    forbidden_devices:
+      - null
+    allowed_functions:
+      - "preview_plan" # Must match root — root is the preliminary filter.
+    forbidden_functions:
+      - null

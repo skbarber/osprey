@@ -1,13 +1,9 @@
-"""MCP server lifecycle: startup timing, logging redirect, and entry point."""
+"""MCP server lifecycle: startup timing, logging setup, and entry point."""
 
 import logging
 import sys
 import time
 from contextlib import contextmanager
-from pathlib import Path
-
-from rich.console import Console
-from rich.logging import RichHandler
 
 logger = logging.getLogger("osprey.mcp_server.startup")
 
@@ -35,53 +31,6 @@ def startup_timer(label: str):
             file=sys.stderr,
             flush=True,
         )
-
-
-def redirect_logging_to_stderr() -> None:
-    """Pre-install a RichHandler that writes to *stderr* on the root logger.
-
-    MCP servers communicate over stdio — stdout is reserved for JSON-RPC
-    messages.  The framework's ``_setup_rich_logging()`` (in
-    ``osprey.utils.logger``) creates a ``RichHandler`` that writes to
-    *stdout* by default, which corrupts the MCP transport.
-
-    By installing a stderr-based ``RichHandler`` first, the framework's
-    ``_setup_rich_logging()`` sees an existing ``RichHandler`` and skips
-    its own registration, keeping stdout clean for MCP.
-
-    Call this **before** ``create_server()`` in every MCP ``__main__.py``.
-    """
-    root = logging.getLogger()
-
-    # Guard: only install once
-    for handler in root.handlers:
-        if isinstance(handler, RichHandler):
-            return
-
-    root.setLevel(logging.INFO)
-
-    console = Console(
-        stderr=True,
-        force_terminal=True,
-        width=120,
-        color_system="truecolor",
-    )
-
-    handler = RichHandler(
-        console=console,
-        rich_tracebacks=True,
-        markup=True,
-        show_path=False,
-        show_time=True,
-        show_level=True,
-        tracebacks_show_locals=False,
-    )
-
-    root.addHandler(handler)
-
-    # Suppress noisy third-party loggers
-    for lib in ["httpx", "httpcore", "requests", "urllib3", "LiteLLM"]:
-        logging.getLogger(lib).setLevel(logging.WARNING)
 
 
 def prime_config_builder() -> None:
@@ -115,18 +64,52 @@ def prime_config_builder() -> None:
             logger.warning("ConfigBuilder priming failed (non-fatal): %s", exc)
 
 
-def initialize_workspace_singletons(workspace_root: Path) -> None:
-    """Initialize ArtifactStore singleton for a workspace."""
+def initialize_workspace_singletons() -> None:
+    """Initialize the ArtifactStore singleton on the SHARED data root.
+
+    The artifact store is served by long-lived daemons (the artifact gallery)
+    that read the shared ``var/agent_data/`` root. Session isolation is handled
+    at the index level via ``ArtifactEntry.session_id`` — never in the store
+    path. Rooting the store at the session-relocated path
+    (``resolve_agent_data_root`` appends ``sessions/<id>/`` when
+    ``OSPREY_SESSION_ID`` is set) would make a session's artifacts invisible
+    to the gallery.
+
+    Also subscribes the artifact-activity listeners, so every save and delete
+    an MCP server performs shows up in the Web Terminal. Registration is
+    idempotent — this function runs more than once in a process under test.
+
+    The listeners are armed per PROCESS, not per store instance: they hang off
+    the ArtifactStore class, so every store built in a process that called this
+    emits. Code paths that run in their own process (dispatch ingest, retention
+    sweeps, a separately launched gallery) never call this and stay silent.
+
+    .. warning::
+        That process boundary is not guaranteed. ``ServerLauncher`` can start
+        the artifact gallery IN-THREAD inside this very process — the store
+        auto-launches it on first save when no other process owns the port
+        (``artifact_store.py`` save paths → ``ensure_artifact_server``). In
+        that topology a HUMAN deleting an artifact in the gallery UI fires the
+        same delete listener, and the activity frame is attributed to the
+        agent. Telling the two apart needs origin plumbing through the store or
+        the gallery route; until then this is a known limitation, recorded here
+        rather than papered over with a thread-name guess.
+    """
+    from osprey.mcp_server.artifact_activity import register_artifact_activity_listeners
     from osprey.stores.artifact_store import initialize_artifact_store
+    from osprey.utils.workspace import resolve_shared_data_root
 
     with startup_timer("workspace_singletons"):
-        initialize_artifact_store(workspace_root=workspace_root)
+        initialize_artifact_store(workspace_root=resolve_shared_data_root())
+        register_artifact_activity_listeners()
 
 
 def run_mcp_server(server_module: str) -> None:
     """Shared entry point for all MCP servers.
 
-    Handles dotenv loading, stderr logging redirect, and server startup.
+    Handles dotenv loading, logging setup, and server startup. MCP servers speak
+    JSON-RPC over stdio, so stdout must carry nothing but protocol frames;
+    ``configure_logging()`` routes every record to stderr.
 
     Args:
         server_module: Dotted path to the module containing ``create_server()``.
@@ -143,11 +126,12 @@ def run_mcp_server(server_module: str) -> None:
     t_total = time.perf_counter()
 
     from osprey.mcp_env import load_dotenv_from_project
+    from osprey.utils.logger import configure_logging
 
     with startup_timer("dotenv_load"):
         load_dotenv_from_project()
 
-    redirect_logging_to_stderr()
+    configure_logging()
 
     with startup_timer("import_server_module"):
         mod = import_module(server_module)

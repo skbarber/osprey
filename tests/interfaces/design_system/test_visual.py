@@ -48,6 +48,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
 import osprey.interfaces.design_system as design_system_pkg
+from tests.interfaces._panel_launch import publish_artifact_url
 from tests.interfaces.conftest import _apply_all, _run_app_server
 
 if TYPE_CHECKING:
@@ -115,8 +116,8 @@ def _hub_live_server(workspace_dir: Path, artifact_server_url: str) -> Iterator[
             return_value=({"artifacts"}, [], None),
         ),
         patch(
-            "osprey.interfaces.web_terminal.app._launch_artifact_server",
-            side_effect=lambda a: setattr(a.state, "artifact_server_url", artifact_server_url),
+            "osprey.interfaces.web_terminal.app._launch_panel_server",
+            side_effect=publish_artifact_url(artifact_server_url),
         ),
     ]
     with _apply_all(patches):
@@ -158,7 +159,10 @@ def _create_dispatch_dashboard_app() -> FastAPI:
 # Stand one up the same way the dispatch dashboard does — a minimal real app
 # serving the genuine render output — so the baseline exercises the real
 # deploy render path, not a hand-built HTML fixture. Two users with distinct
-# personas (alice->operator, bob->physicist) so both persona sublabels appear.
+# personas (alice->operator, bob->physicist) so both persona sublabels appear,
+# plus a third whose persona declares a ``landing_group`` — so the baseline
+# also covers the labelled users section and the standalone-deployments tray
+# (accent-edged panel, badge suppressed because roster name == persona name).
 # ---------------------------------------------------------------------------
 
 _MULTI_USER_LANDING_CONFIG = {
@@ -173,13 +177,24 @@ _MULTI_USER_LANDING_CONFIG = {
             "ariel_base_port": 8300,
             "lattice_base_port": 8400,
             "default_persona": "operator",
+            "landing": {"groups": [{"type": "users", "label": "Users"}]},
             "personas": {
                 "operator": {"project": "demo-operator"},
                 "physicist": {"project": "demo-physicist"},
+                "ariel": {
+                    "project": "demo-ariel",
+                    "landing_group": "Standalone deployments",
+                },
             },
             "users": [
                 {"name": "alice", "index": 0, "persona": "operator"},
                 {"name": "bob", "index": 1, "persona": "physicist"},
+                {
+                    "name": "ariel",
+                    "index": 2,
+                    "persona": "ariel",
+                    "display_name": "ARIEL Logbook Research",
+                },
             ],
         }
     },
@@ -219,6 +234,18 @@ class VisualTarget:
     # the baseline shows the actual working interface.
     dismiss_welcome: bool = False
     wait_selector: str | None = None
+    # The web-terminal hub now boots a dockview workspace (dock-workspace.js)
+    # whose default artifacts panel docks as an overlay iframe (dock-iframe.js).
+    # Unlike the pre-dock split, the grid and its overlay settle a beat after the
+    # rail renders, so ``dock_shell`` targets wait for the dockview grid AND the
+    # auto-docked artifacts overlay iframe to be on screen before the screenshot —
+    # otherwise the baseline can capture a half-built (empty) grid.
+    dock_shell: bool = False
+    # UI-mode axis. Mode-aware surfaces capture the full theme x mode matrix
+    # (baseline ``{name}_{theme}_{mode}.png``); ``(None,)`` keeps a surface on
+    # the theme-only pair with the original ``{name}_{theme}.png`` names (the
+    # hub's static session/safety pages have no mode-dependent layout).
+    modes: tuple[str | None, ...] = (None,)
 
 
 def _artifacts_server(tmp_path: Path):
@@ -255,10 +282,19 @@ def _multi_user_landing_server(tmp_path: Path):
     return _run_app_server(_create_multi_user_landing_app())
 
 
+def _okf_panel_server(tmp_path: Path):
+    from osprey.interfaces.okf_panel.app import create_app
+
+    # Reuse the okf_panel suite's on-disk fixture bundle so the baseline shows
+    # a populated tree + document instead of the guarded not-configured shell.
+    bundle = Path(__file__).parents[1] / "okf_panel" / "fixtures" / "bundle"
+    return _run_app_server(create_app(str(bundle)))
+
+
 # ---------------------------------------------------------------------------
 # Scan panels (Phase-6 operator interfaces): unlike every other target above,
 # the sidecar has no ``create_app()`` factory — it's a single module-level
-# FastAPI singleton (see ``osprey.services.bluesky_panels.app``) that mounts both
+# FastAPI singleton (see ``osprey.interfaces.bluesky_web.app``) that mounts both
 # panel bundles (plan/results) plus the shared design-system
 # assets in one process. Import the app object directly and hand it to
 # ``_run_app_server`` the same way the other targets hand it a freshly
@@ -268,10 +304,10 @@ def _multi_user_landing_server(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def _bluesky_panels_server(tmp_path: Path):
-    from osprey.services.bluesky_panels.app import app as bluesky_panels_app
+def _bluesky_web_server(tmp_path: Path):
+    from osprey.interfaces.bluesky_web.app import app as bluesky_web_app
 
-    return _run_app_server(bluesky_panels_app)
+    return _run_app_server(bluesky_web_app)
 
 
 @contextmanager
@@ -291,13 +327,21 @@ def _web_terminal_static_page_server(tmp_path: Path):
     return _web_terminal_hub_server(tmp_path)
 
 
+# The full expert/simple pair every mode-aware surface captures.
+MODES: tuple[str, ...] = ("expert", "simple")
+
 TARGETS: list[VisualTarget] = [
     VisualTarget(
         "web_terminal_hub",
         _web_terminal_hub_server,
         path="/",
         dismiss_welcome=True,
-        wait_selector='button[data-panel-id="artifacts"]',
+        # Scope to the rail button: overlay iframes now also carry
+        # data-panel-id="artifacts" in the docked shell, so the bare attribute
+        # selector is ambiguous.
+        wait_selector='button.panel-rail-button[data-panel-id="artifacts"]',
+        dock_shell=True,
+        modes=MODES,
     ),
     VisualTarget(
         "web_terminal_session",
@@ -309,33 +353,41 @@ TARGETS: list[VisualTarget] = [
         _web_terminal_static_page_server,
         path="/static/safety.html",
     ),
-    VisualTarget("artifacts_gallery", _artifacts_server, path="/"),
-    VisualTarget("ariel", _ariel_server, path="/"),
-    VisualTarget("channel_finder", _channel_finder_server, path="/"),
+    VisualTarget("artifacts_gallery", _artifacts_server, path="/", modes=MODES),
+    VisualTarget("ariel", _ariel_server, path="/", modes=MODES),
+    VisualTarget("channel_finder", _channel_finder_server, path="/", modes=MODES),
     # D14/D15 regression guard: embedded mode must hide the standalone logo +
     # theme switcher (component self-hides via body.embedded) while keeping
     # the pipeline switcher + nav usable — see channel-finder-narrowing.
-    VisualTarget("channel_finder_embedded", _channel_finder_server, path="/?embedded=true"),
-    VisualTarget("lattice_dashboard", _lattice_dashboard_server, path="/"),
+    VisualTarget(
+        "channel_finder_embedded",
+        _channel_finder_server,
+        path="/?embedded=true",
+        modes=MODES,
+    ),
+    VisualTarget("lattice_dashboard", _lattice_dashboard_server, path="/", modes=MODES),
+    VisualTarget(
+        "okf_panel",
+        _okf_panel_server,
+        path="/",
+        wait_selector="#tree",
+        modes=MODES,
+    ),
     # Dispatch dashboard has no live dispatcher backend behind it here, so it
     # renders its genuine no-data empty state — a legitimate, stable baseline.
-    VisualTarget("dispatch_dashboard", _dispatch_dashboard_server, path="/"),
-    # Scan panels (Phase-6): mounted at /plan, /results by the
-    # sidecar (see ``_PANEL_MOUNTS`` in ``osprey.services.bluesky_panels.app``);
-    # each wait_selector is a static top-level element present in the shell's
-    # initial markup (not injected by JS), so it attaches even though no
-    # bridge is running behind this sidecar and every panel's fetch fails.
+    VisualTarget("dispatch_dashboard", _dispatch_dashboard_server, path="/", modes=MODES),
+    # The scan panel: one bundle at /bluesky, with /plan and /results kept as
+    # deprecated aliases for one release (see ``_PANEL_MOUNTS`` in
+    # ``osprey.interfaces.bluesky_web.app``). The wait_selector is a static
+    # top-level element present in the shell's initial markup (not injected by
+    # JS), so it attaches even though no bridge is running behind this sidecar
+    # and every panel's fetch fails.
     VisualTarget(
-        "scan_panel_plan",
-        _bluesky_panels_server,
-        path="/plan/",
+        "scan_panel_bluesky",
+        _bluesky_web_server,
+        path="/bluesky/",
         wait_selector="#plan-tree",
-    ),
-    VisualTarget(
-        "scan_panel_results",
-        _bluesky_panels_server,
-        path="/results/",
-        wait_selector="#run-picker",
+        modes=MODES,
     ),
 ]
 
@@ -408,40 +460,69 @@ def _assert_matches_baseline(name: str, png_bytes: bytes, regen: bool) -> None:
 
 @pytest.mark.parametrize("target", TARGETS, ids=[t.name for t in TARGETS])
 def test_visual_snapshot(tmp_path, chromium_browser, target: VisualTarget, pytestconfig) -> None:
-    """Capture `target` in every theme and diff each against its baseline."""
+    """Capture `target` in every theme (x mode, when mode-aware) and diff each."""
     regen = bool(pytestconfig.getoption("--regen-baselines"))
 
     with target.server_factory(tmp_path) as base_url:
         for theme in THEMES:
-            page = chromium_browser.new_page(viewport=VIEWPORT)
-            try:
-                # target.path may already carry its own query string (e.g.
-                # channel_finder_embedded's "/?embedded=true"), so `theme`
-                # must be appended with "&" rather than blindly with "?".
-                separator = "&" if "?" in target.path else "?"
-                page.goto(
-                    f"{base_url}{target.path}{separator}theme={theme}",
-                    wait_until="domcontentloaded",
-                    timeout=15_000,
-                )
-                if target.wait_selector:
-                    expect(page.locator(target.wait_selector)).to_be_attached(timeout=10_000)
-                if target.dismiss_welcome:
-                    page.locator("#welcome-dismiss").click(timeout=15_000)
-                # Let async init (panel health polling, SSE-driven layout,
-                # font swaps) settle before the screenshot.
-                page.wait_for_timeout(600)
+            for mode in target.modes:
+                page = chromium_browser.new_page(viewport=VIEWPORT)
+                try:
+                    # target.path may already carry its own query string (e.g.
+                    # channel_finder_embedded's "/?embedded=true"), so `theme`
+                    # must be appended with "&" rather than blindly with "?".
+                    separator = "&" if "?" in target.path else "?"
+                    url = f"{base_url}{target.path}{separator}theme={theme}"
+                    if mode is not None:
+                        url += f"&mode={mode}"
+                    page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+                    if target.wait_selector:
+                        expect(page.locator(target.wait_selector)).to_be_attached(timeout=10_000)
+                    if target.dismiss_welcome:
+                        page.locator("#welcome-dismiss").click(timeout=15_000)
+                    if target.dock_shell:
+                        # The dockview grid settles a beat after the rail renders;
+                        # wait for it so the baseline captures the built layout,
+                        # not a half-constructed (empty) grid.
+                        expect(page.locator(".dv-groupview").first).to_be_visible(timeout=10_000)
+                        # The auto-docked service overlay is expert-only. Simple
+                        # mode over an empty agent workspace boots chat-only by
+                        # design (panel-manager.js's `workspaceSuppressed`: simple
+                        # + /api/panels workspace_has_artifacts false => no
+                        # placeholder is ever created), and these fixtures always
+                        # build a fresh, empty workspace. Waiting for the overlay
+                        # in that mode waits for something that correctly never
+                        # arrives; the chat-only shell IS the state to capture.
+                        if mode != "simple":
+                            expect(
+                                page.locator(
+                                    '.dock-iframe-overlay iframe[data-panel-id="artifacts"]'
+                                )
+                            ).to_be_visible(timeout=10_000)
+                    # Let async init (panel health polling, SSE-driven layout,
+                    # font swaps) settle before the screenshot.
+                    page.wait_for_timeout(600)
 
-                applied_theme = page.evaluate("document.documentElement.getAttribute('data-theme')")
-                assert applied_theme == theme, (
-                    f"{target.name}: expected data-theme={theme!r}, got {applied_theme!r}"
-                )
+                    applied_theme = page.evaluate(
+                        "document.documentElement.getAttribute('data-theme')"
+                    )
+                    assert applied_theme == theme, (
+                        f"{target.name}: expected data-theme={theme!r}, got {applied_theme!r}"
+                    )
+                    if mode is not None:
+                        applied_mode = page.evaluate(
+                            "document.documentElement.getAttribute('data-ui-mode')"
+                        )
+                        assert applied_mode == mode, (
+                            f"{target.name}: expected data-ui-mode={mode!r}, got {applied_mode!r}"
+                        )
 
-                png_bytes = page.screenshot()
-            finally:
-                page.close()
+                    png_bytes = page.screenshot()
+                finally:
+                    page.close()
 
-            _assert_matches_baseline(f"{target.name}_{theme}", png_bytes, regen)
+                suffix = f"_{theme}" if mode is None else f"_{theme}_{mode}"
+                _assert_matches_baseline(f"{target.name}{suffix}", png_bytes, regen)
 
 
 @pytest.mark.parametrize("theme", THEMES)
@@ -464,8 +545,12 @@ def test_visual_multi_user_landing(tmp_path, chromium_browser, theme, pytestconf
         try:
             page.goto(base_url, wait_until="domcontentloaded", timeout=15_000)
             # Both persona-badged user cards must be present before the shot, so
-            # the baseline is guaranteed to show the operator/physicist sublabels.
+            # the baseline is guaranteed to show the operator/physicist sublabels
+            # (ariel's is suppressed: roster name == persona name), and the
+            # standalone-deployments tray must be on screen so every baseline
+            # shows the grouped layout, not just the flat roster.
             expect(page.locator(".landing-card-sublabel")).to_have_count(2, timeout=10_000)
+            expect(page.locator(".landing-tray")).to_have_count(1, timeout=10_000)
             page.wait_for_timeout(300)
             png_bytes = page.screenshot()
         finally:

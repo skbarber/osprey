@@ -11,11 +11,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from datetime import datetime
 
+    from osprey.services.ariel_search import ARIELConfig
     from osprey.services.ariel_search.models import EnhancedLogbookEntry
 
 
@@ -36,6 +38,7 @@ class IngestResult:
 @dataclass
 class WatchOnceResult:
     entries_added: int
+    entries_updated: int
     entries_failed: int
     duration_seconds: float
     since: datetime | None
@@ -80,6 +83,34 @@ class SyncResult:
     was_initial_ingest: bool
 
 
+@dataclass
+class QmdResyncResult:
+    """Outcome of one qmd markdown-mirror resync pass.
+
+    Attributes:
+        scanned: Rows the changed-entry scan examined.
+        written: Files created or replaced because their content differed.
+        unchanged: Rows whose file already held exactly the rendered bytes, so
+            nothing was written and no mtime moved.
+        failed: Rows that could not be mirrored (unmirrorable identifier or a
+            filesystem error); each is logged and the pass continues.
+        removed: Files deleted by the ``rebuild`` wipe; always zero otherwise.
+        rebuild: Whether this pass wiped the mirror and re-exported everything.
+        mirror_path: Absolute mirror root the pass wrote into.
+        watermark: Highest ``updated_at`` observed, which becomes the starting
+            point of the next pass. ``None`` when the scan matched no rows.
+    """
+
+    scanned: int
+    written: int
+    unchanged: int
+    failed: int
+    removed: int
+    rebuild: bool
+    mirror_path: str
+    watermark: datetime | None
+
+
 # ---------------------------------------------------------------------------
 # Service functions
 # ---------------------------------------------------------------------------
@@ -87,15 +118,46 @@ class SyncResult:
 _ProgressCb = Callable[[str], None] | None
 
 
+def _postgresql_services() -> dict:
+    """Return the ``services.postgresql`` mapping from the loaded config.
+
+    The CLI hands these functions the ``ariel`` section alone, but a config
+    that leaves ``ariel.database.uri`` unset derives its DSN from the Postgres
+    the project actually runs — so the block is read here rather than threaded
+    through every command signature.
+
+    A caller that supplies its own ``ariel`` section without a project on disk
+    (tests, an embedding host) gets an empty block and the shipped Postgres
+    defaults, rather than a crash about a missing config.yml.
+    """
+    from osprey.utils.config import get_config_value
+
+    try:
+        return get_config_value("services.postgresql", {}) or {}
+    except FileNotFoundError:
+        return {}
+
+
+def _ariel_config(config_dict: dict) -> ARIELConfig:
+    """Build an :class:`ARIELConfig` from a CLI-supplied ``ariel`` section.
+
+    Every operation below needs the Postgres block alongside the section it was
+    handed, so the pairing lives here rather than at each call site.
+    """
+    from osprey.services.ariel_search import ARIELConfig
+
+    return ARIELConfig.from_dict(config_dict, _postgresql_services())
+
+
 async def get_status(config_dict: dict) -> dict:
     """Return ARIEL service status as a plain dict."""
-    from osprey.services.ariel_search import ARIELConfig, create_ariel_service
+    from osprey.services.ariel_search import create_ariel_service
 
     if not config_dict:
         return {"status": "error", "message": "ARIEL not configured"}
 
     try:
-        config = ARIELConfig.from_dict(config_dict)
+        config = _ariel_config(config_dict)
         service = await create_ariel_service(config)
         async with service:
             healthy, message = await service.health_check()
@@ -132,6 +194,7 @@ async def get_status(config_dict: dict) -> dict:
                 "search_modules": {
                     "keyword": config.is_search_module_enabled("keyword"),
                     "semantic": config.is_search_module_enabled("semantic"),
+                    "hybrid": config.is_search_module_enabled("hybrid"),
                 },
             }
 
@@ -141,7 +204,7 @@ async def get_status(config_dict: dict) -> dict:
             return {
                 "status": "error",
                 "message": "Cannot connect to the ARIEL database. "
-                "Make sure the database is running: osprey deploy up",
+                "Make sure the database is running: osprey up",
             }
         return {"status": "error", "message": msg}
 
@@ -151,11 +214,10 @@ async def run_migrate(
     progress: _ProgressCb = None,
 ) -> None:
     """Run database migrations."""
-    from osprey.services.ariel_search import ARIELConfig
     from osprey.services.ariel_search.database.connection import create_connection_pool
     from osprey.services.ariel_search.database.migrations import run_migrations
 
-    config = ARIELConfig.from_dict(config_dict)
+    config = _ariel_config(config_dict)
 
     if progress:
         progress(f"Connecting to database: {config.database.uri.split('@')[-1]}")
@@ -189,12 +251,12 @@ async def run_sync(
     """
     import copy
 
-    from osprey.services.ariel_search import ARIELConfig, create_ariel_service
+    from osprey.services.ariel_search import create_ariel_service
     from osprey.services.ariel_search.database.connection import create_connection_pool
     from osprey.services.ariel_search.database.migrations import run_migrations
     from osprey.services.ariel_search.ingestion.scheduler import IngestionScheduler
 
-    config = ARIELConfig.from_dict(config_dict)
+    config = _ariel_config(config_dict)
 
     # Step 1: Migrate
     if progress:
@@ -216,13 +278,13 @@ async def run_sync(
     # (the scheduler default skips when no prior run exists)
     sync_dict = copy.deepcopy(config_dict)
     sync_dict.setdefault("ingestion", {}).setdefault("watch", {})["require_initial_ingest"] = False
-    sync_config = ARIELConfig.from_dict(sync_dict)
+    sync_config = _ariel_config(sync_dict)
 
     service = await create_ariel_service(sync_config)
     async with service:
         scheduler = IngestionScheduler(config=sync_config, repository=service.repository)
         if progress:
-            source = sync_config.ingestion.source_url if sync_config.ingestion else "unknown"
+            source = sync_config.ingestion.source_url or "unknown"
             progress(f"Polling for new entries (source: {source})...")
 
         poll_result = await scheduler.poll_once(limit=limit)
@@ -261,7 +323,7 @@ async def run_ingest(
     progress: _ProgressCb = None,
 ) -> IngestResult:
     """Ingest logbook entries from a source."""
-    from osprey.services.ariel_search import ARIELConfig, create_ariel_service
+    from osprey.services.ariel_search import create_ariel_service
     from osprey.services.ariel_search.enhancement import create_enhancers_from_config
     from osprey.services.ariel_search.ingestion import get_adapter
 
@@ -270,7 +332,7 @@ async def run_ingest(
     config_dict["ingestion"]["source_url"] = source
     config_dict["ingestion"]["adapter"] = adapter
 
-    config = ARIELConfig.from_dict(config_dict)
+    config = _ariel_config(config_dict)
     adapter_instance = get_adapter(config)
 
     if progress:
@@ -370,7 +432,7 @@ async def run_watch(
     import asyncio
     import signal
 
-    from osprey.services.ariel_search import ARIELConfig, create_ariel_service
+    from osprey.services.ariel_search import create_ariel_service
     from osprey.services.ariel_search.ingestion.scheduler import IngestionScheduler
 
     if source or adapter:
@@ -386,7 +448,7 @@ async def run_watch(
             config_dict["ingestion"] = {}
         config_dict["ingestion"]["poll_interval_seconds"] = interval
 
-    config = ARIELConfig.from_dict(config_dict)
+    config = _ariel_config(config_dict)
 
     if not config.ingestion or not config.ingestion.source_url:
         raise ValueError(
@@ -409,6 +471,7 @@ async def run_watch(
 
             return WatchOnceResult(
                 entries_added=result.entries_added,
+                entries_updated=result.entries_updated,
                 entries_failed=result.entries_failed,
                 duration_seconds=result.duration_seconds,
                 since=result.since,
@@ -426,8 +489,419 @@ async def run_watch(
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda: asyncio.ensure_future(scheduler.stop()))
 
-        await scheduler.start()
+        # Every loop iteration re-exports the entries that changed outside the
+        # enhancement pipeline before it polls for new ones. The scheduler owns
+        # the loop, so the pre-step is attached to the call it makes each pass
+        # rather than to a loop this function can see.
+        inner_poll_once = scheduler.poll_once
+
+        async def _poll_once_with_resync(*args: Any, **kwargs: Any):
+            await resync_qmd_mirror_best_effort(config_dict, progress)
+            return await inner_poll_once(*args, **kwargs)
+
+        scheduler.poll_once = _poll_once_with_resync  # type: ignore[method-assign]
+
+        await scheduler.run_forever()
         return None
+
+
+# ---------------------------------------------------------------------------
+# qmd markdown-mirror resync
+# ---------------------------------------------------------------------------
+
+#: File at the mirror root holding the last resync watermark, as an ISO-8601
+#: UTC timestamp. Dot-prefixed so the sidecar skips it as a corpus document.
+QMD_WATERMARK_NAME = ".qmd-resync-watermark"
+
+#: Rows fetched per page while scanning for changed entries. Bounds the memory
+#: a rebuild of a large logbook needs without making the scan chatty.
+QMD_RESYNC_PAGE_SIZE = 500
+
+
+def _qmd_mirror_root(config: ARIELConfig) -> Path:
+    """Resolve the configured qmd mirror root to an absolute directory.
+
+    Resolution goes through the exporter's own rule, so the resync and the
+    enhancement module that normally writes the mirror cannot land on different
+    directories from the same config value.
+
+    Args:
+        config: Resolved ARIEL configuration with ``qmd_export`` enabled.
+
+    Returns:
+        Absolute path to the mirror root. The directory need not exist.
+
+    Raises:
+        ValueError: If ``enhancement_modules.qmd_export.mirror_path`` is unset.
+            An enabled exporter with nowhere to write is a broken config, not a
+            reason to silently skip the mirror.
+    """
+    from osprey.services.ariel_search.enhancement.qmd_export import resolve_mirror_path
+
+    module_config = config.get_enhancement_module_config("qmd_export") or {}
+    raw = module_config.get("mirror_path")
+    if not raw:
+        raise ValueError(
+            "ariel.enhancement_modules.qmd_export.mirror_path is required when "
+            "the qmd_export module is enabled"
+        )
+    return resolve_mirror_path(raw)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Replace ``path`` with ``text`` atomically.
+
+    The content lands in a temp file beside the target, so the rename stays on
+    one filesystem and a reader sees either the old file or the whole new one.
+
+    Args:
+        path: Destination file. Its parent directory must already exist.
+        text: Full file content, UTF-8 encoded.
+
+    Raises:
+        OSError: If the temp file cannot be written or renamed. The temp file
+            is removed first, leaving ``path`` untouched.
+    """
+    import os
+    import tempfile
+
+    fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except BaseException:
+        Path(temp_name).unlink(missing_ok=True)
+        raise
+
+
+def _read_qmd_watermark(mirror_root: Path) -> datetime | None:
+    """Read the resync watermark stored at the mirror root.
+
+    Args:
+        mirror_root: Mirror root directory, which may not exist yet.
+
+    Returns:
+        The stored timestamp as an aware UTC ``datetime``, or ``None`` when no
+        watermark exists or the stored value cannot be parsed. Both cases fall
+        back to a full scan, which is correct but slower -- never wrong.
+    """
+    from datetime import UTC, datetime
+
+    marker = mirror_root / QMD_WATERMARK_NAME
+    try:
+        raw = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+    try:
+        moment = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+
+
+def _write_qmd_watermark(mirror_root: Path, moment: datetime) -> None:
+    """Store the resync watermark at the mirror root.
+
+    Args:
+        mirror_root: Mirror root directory. It is created if missing.
+        moment: Highest ``updated_at`` the pass observed.
+
+    Raises:
+        OSError: If the watermark cannot be written. A pass that exported rows
+            but could not record where it stopped must fail loudly, because the
+            silent alternative is re-exporting from the old watermark forever.
+    """
+    mirror_root.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(mirror_root / QMD_WATERMARK_NAME, f"{moment.isoformat()}\n")
+
+
+def _touch_qmd_marker(mirror_root: Path) -> bool:
+    """Advance the sidecar's freshness marker at the mirror root.
+
+    Uses the exporter's marker name, because a resync and an enhancer write
+    that are seen as different files would leave the sidecar polling one of
+    them.
+
+    Args:
+        mirror_root: Mirror root directory. It is created if missing.
+
+    Returns:
+        ``True`` if the marker was rewritten. A failure returns ``False``
+        rather than raising: the exported documents are already on disk, so the
+        sidecar's interval sweep still finds them, just later.
+    """
+    from datetime import UTC, datetime
+
+    from osprey.services.ariel_search.enhancement.qmd_export import TOUCH_MARKER_NAME
+    from osprey.utils.logger import get_logger
+
+    try:
+        mirror_root.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(
+            mirror_root / TOUCH_MARKER_NAME,
+            f"{datetime.now(UTC).isoformat()}\n",
+        )
+    except OSError as e:
+        get_logger("ariel").warning(
+            f"Could not update the qmd freshness marker in {mirror_root}: {e} "
+            "-- the sidecar will pick the changes up on its next sweep"
+        )
+        return False
+    return True
+
+
+def _wipe_qmd_mirror(mirror_root: Path) -> int:
+    """Delete every mirrored document under the mirror root.
+
+    Only the shard tree goes: dot-prefixed entries at the root are the
+    watermark and the freshness marker, which are bookkeeping rather than
+    corpus. This is what makes ``--rebuild`` able to drop files for entries
+    that no longer exist in Postgres.
+
+    Args:
+        mirror_root: Mirror root directory, which may not exist.
+
+    Returns:
+        Number of markdown files removed.
+    """
+    import shutil
+
+    if not mirror_root.is_dir():
+        return 0
+
+    removed = 0
+    for child in mirror_root.iterdir():
+        if child.name.startswith("."):
+            continue
+        if child.is_dir():
+            removed += sum(1 for _ in child.rglob("*.md"))
+            shutil.rmtree(child)
+        else:
+            if child.suffix == ".md":
+                removed += 1
+            child.unlink()
+    return removed
+
+
+async def _fetch_changed_page(
+    cur: Any,
+    watermark: datetime | None,
+    cursor_key: tuple[datetime, str] | None,
+    page_size: int,
+) -> list[Any]:
+    """Fetch one page of entries at or after the watermark.
+
+    Pages are keyset-paginated on ``(updated_at, entry_id)`` so a rebuild of a
+    large logbook never holds more than one page in memory and never skips a
+    row because an earlier page shifted under it.
+
+    Args:
+        cur: Open ``dict_row`` cursor.
+        watermark: Lower bound for the first page, inclusive. Ties are re-read
+            deliberately -- the byte-compare writer makes a re-read of an
+            unchanged row free, and the inclusive bound means a row sharing the
+            watermark's timestamp can never be skipped.
+        cursor_key: Last ``(updated_at, entry_id)`` of the previous page, or
+            ``None`` for the first page.
+        page_size: Maximum rows to return.
+
+    Returns:
+        The page's rows, ordered by ``(updated_at, entry_id)``.
+    """
+    if cursor_key is not None:
+        await cur.execute(
+            """
+            SELECT * FROM enhanced_entries
+            WHERE (updated_at, entry_id) > (%s, %s)
+            ORDER BY updated_at, entry_id
+            LIMIT %s
+            """,
+            [cursor_key[0], cursor_key[1], page_size],
+        )
+    elif watermark is not None:
+        await cur.execute(
+            """
+            SELECT * FROM enhanced_entries
+            WHERE updated_at >= %s
+            ORDER BY updated_at, entry_id
+            LIMIT %s
+            """,
+            [watermark, page_size],
+        )
+    else:
+        await cur.execute(
+            """
+            SELECT * FROM enhanced_entries
+            ORDER BY updated_at, entry_id
+            LIMIT %s
+            """,
+            [page_size],
+        )
+    return list(await cur.fetchall())
+
+
+async def run_qmd_resync(
+    config_dict: dict,
+    rebuild: bool = False,
+    page_size: int = QMD_RESYNC_PAGE_SIZE,
+    progress: _ProgressCb = None,
+) -> QmdResyncResult | None:
+    """Re-export entries whose rows changed outside the enhancement loop.
+
+    The markdown mirror is normally written by the ``qmd_export`` enhancement
+    module as entries flow through ingestion. Several mutation paths write
+    straight to ``enhanced_entries`` and never reach an enhancer, so this pass
+    is what keeps the mirror honest: it scans for rows changed since the stored
+    watermark, re-renders each one through the byte-compare writer, and moves
+    the watermark forward.
+
+    Bookkeeping-only churn is therefore free. A row whose ``updated_at`` moved
+    without its content changing renders to the same bytes, the writer leaves
+    the file alone, and the sidecar's next scan finds nothing to re-embed.
+
+    Args:
+        config_dict: Raw ``ariel`` config section.
+        rebuild: Wipe the mirror and re-export every entry. This is the only
+            pass that removes files for entries that no longer exist, so it is
+            what recovers a mirror after ``osprey ariel purge``.
+        page_size: Rows per scan page.
+        progress: Optional progress sink.
+
+    Returns:
+        A :class:`QmdResyncResult`, or ``None`` when the ``qmd_export`` module
+        is not enabled and there is no mirror to keep.
+
+    Raises:
+        ValueError: If ``qmd_export`` is enabled without a ``mirror_path``.
+    """
+    from psycopg.rows import dict_row
+
+    from osprey.services.ariel_search.database.connection import create_connection_pool
+    from osprey.services.ariel_search.enhancement.qmd_export.writer import write_entry
+    from osprey.utils.logger import get_logger
+
+    logger = get_logger("ariel")
+
+    config = _ariel_config(config_dict)
+    if not config.is_enhancement_module_enabled("qmd_export"):
+        return None
+
+    mirror_root = _qmd_mirror_root(config)
+    removed = 0
+    watermark = None
+    if rebuild:
+        removed = _wipe_qmd_mirror(mirror_root)
+        # Drop the old bound too. A rebuild that finds nothing -- the shape of a
+        # rebuild right after a purge -- must not leave a watermark behind that
+        # would make the next incremental pass skip everything older than it.
+        (mirror_root / QMD_WATERMARK_NAME).unlink(missing_ok=True)
+    else:
+        watermark = _read_qmd_watermark(mirror_root)
+
+    if progress:
+        scope = "full rebuild" if rebuild else f"changed since {watermark or 'the beginning'}"
+        progress(f"Resyncing qmd mirror at {mirror_root} ({scope})...")
+
+    scanned = written = unchanged = failed = 0
+    highest: datetime | None = None
+    cursor_key: tuple[datetime, str] | None = None
+
+    pool = await create_connection_pool(config.database)
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                while True:
+                    rows = await _fetch_changed_page(cur, watermark, cursor_key, page_size)
+                    page_key = cursor_key
+
+                    for row in rows:
+                        entry = dict(row)
+                        scanned += 1
+                        moment = entry.get("updated_at")
+                        if moment is not None:
+                            page_key = (moment, str(entry.get("entry_id", "")))
+                            if highest is None or moment > highest:
+                                highest = moment
+                        try:
+                            if write_entry(mirror_root, entry):
+                                written += 1
+                            else:
+                                unchanged += 1
+                        except (ValueError, OSError) as e:
+                            failed += 1
+                            logger.warning(f"Could not mirror entry {entry.get('entry_id')!r}: {e}")
+
+                    if len(rows) < page_size:
+                        break
+                    if page_key == cursor_key:
+                        # A full page advanced nothing, which only happens when
+                        # every row in it carried a NULL updated_at. Those sort
+                        # last, so there is no key to page past them with.
+                        logger.warning(
+                            "Stopping the qmd resync scan: a full page of entries "
+                            "carried no updated_at timestamp"
+                        )
+                        break
+                    cursor_key = page_key
+    finally:
+        await pool.close()
+
+    if written:
+        _touch_qmd_marker(mirror_root)
+    if highest is not None:
+        _write_qmd_watermark(mirror_root, highest)
+
+    if progress:
+        progress(
+            f"  qmd mirror: {written} written, {unchanged} unchanged, "
+            f"{failed} failed of {scanned} scanned"
+        )
+
+    return QmdResyncResult(
+        scanned=scanned,
+        written=written,
+        unchanged=unchanged,
+        failed=failed,
+        removed=removed,
+        rebuild=rebuild,
+        mirror_path=str(mirror_root),
+        watermark=highest,
+    )
+
+
+async def resync_qmd_mirror_best_effort(
+    config_dict: dict,
+    progress: _ProgressCb = None,
+) -> QmdResyncResult | None:
+    """Run :func:`run_qmd_resync` as a pre-step that cannot fail its caller.
+
+    Ingest and watch run this before doing their own work. Their job is getting
+    entries into Postgres; a mirror that cannot be written is worth a warning,
+    not an aborted ingestion.
+
+    Args:
+        config_dict: Raw ``ariel`` config section.
+        progress: Optional progress sink, used only when something was written.
+
+    Returns:
+        The pass result, or ``None`` when the module is disabled or the pass
+        failed.
+    """
+    from osprey.utils.logger import get_logger
+
+    try:
+        result = await run_qmd_resync(config_dict)
+    except Exception as e:  # noqa: BLE001 -- a mirror problem must not stop ingestion.
+        get_logger("ariel").warning(f"qmd mirror resync failed, continuing: {e}")
+        return None
+
+    if result is not None and result.written and progress:
+        progress(f"qmd mirror: re-exported {result.written} entries changed outside ingestion")
+    return result
 
 
 async def run_enhance(
@@ -438,10 +912,10 @@ async def run_enhance(
     progress: _ProgressCb = None,
 ) -> EnhanceResult:
     """Run enhancement modules on entries."""
-    from osprey.services.ariel_search import ARIELConfig, create_ariel_service
+    from osprey.services.ariel_search import create_ariel_service
     from osprey.services.ariel_search.enhancement import create_enhancers_from_config
 
-    config = ARIELConfig.from_dict(config_dict)
+    config = _ariel_config(config_dict)
     enhancers = create_enhancers_from_config(config)
     if module:
         enhancers = [e for e in enhancers if e.name == module]
@@ -505,9 +979,9 @@ async def run_enhance(
 
 async def list_models(config_dict: dict) -> list[dict]:
     """Return embedding model info as a list of dicts."""
-    from osprey.services.ariel_search import ARIELConfig, create_ariel_service
+    from osprey.services.ariel_search import create_ariel_service
 
-    config = ARIELConfig.from_dict(config_dict)
+    config = _ariel_config(config_dict)
     service = await create_ariel_service(config)
     async with service:
         tables = await service.repository.get_embedding_tables()
@@ -541,15 +1015,31 @@ def _entry_summary(entry: dict) -> dict:
 
 
 async def run_search(config_dict: dict, query: str, mode: str, limit: int) -> dict:
-    """Execute a search query and return the result as a dict."""
-    from osprey.services.ariel_search import ARIELConfig, SearchMode, create_ariel_service
+    """Execute a search query and return the result as a dict.
+
+    Args:
+        config_dict: Raw ``ariel`` config section.
+        query: Search query text.
+        mode: Search module name, e.g. ``"keyword"``. Case and surrounding
+            whitespace are normalized; whether the name is registered and
+            enabled is decided by the search service.
+        limit: Maximum number of entries to return.
+
+    Returns:
+        Result dict, or ``{"error": ...}`` when the search could not run.
+    """
+    from osprey.services.ariel_search import create_ariel_service
+    from osprey.services.ariel_search.models import normalize_search_mode
 
     if not config_dict:
         return {"error": "ARIEL not configured"}
 
-    config = ARIELConfig.from_dict(config_dict)
+    config = _ariel_config(config_dict)
 
-    search_mode = SearchMode[mode.upper()]
+    try:
+        search_mode = normalize_search_mode(mode)
+    except ValueError as e:
+        return {"error": str(e)}
 
     try:
         service = await create_ariel_service(config)
@@ -564,7 +1054,7 @@ async def run_search(config_dict: dict, query: str, mode: str, limit: int) -> di
                 "query": query,
                 "answer": result.answer,
                 "sources": list(result.sources),
-                "search_modes": [m.value for m in result.search_modes_used],
+                "search_modes": list(result.search_modes_used),
                 "reasoning": result.reasoning,
                 "entries": [_entry_summary(e) for e in result.entries],
             }
@@ -573,7 +1063,7 @@ async def run_search(config_dict: dict, query: str, mode: str, limit: int) -> di
         if "connection" in msg.lower() or "connect" in msg.lower():
             return {
                 "error": "Cannot connect to the ARIEL database. "
-                "Make sure the database is running: osprey deploy up"
+                "Make sure the database is running: osprey up"
             }
         if "relation" in msg and "does not exist" in msg:
             return {
@@ -594,11 +1084,11 @@ async def run_reembed(
     progress: _ProgressCb = None,
 ) -> ReembedResult:
     """Re-embed entries with a new or existing model."""
-    from osprey.services.ariel_search import ARIELConfig, create_ariel_service
+    from osprey.services.ariel_search import create_ariel_service
     from osprey.services.ariel_search.database.migrations import model_to_table_name
     from osprey.services.ariel_search.enhancement.text_embedding import TextEmbeddingMigration
 
-    config = ARIELConfig.from_dict(config_dict)
+    config = _ariel_config(config_dict)
     table_name = model_to_table_name(model)
 
     if dry_run:
@@ -749,7 +1239,7 @@ async def run_quickstart(
     progress: _ProgressCb = None,
 ) -> QuickstartResult:
     """Run the complete ARIEL quickstart sequence."""
-    from osprey.services.ariel_search import ARIELConfig, create_ariel_service
+    from osprey.services.ariel_search import create_ariel_service
     from osprey.services.ariel_search.database.connection import create_connection_pool
     from osprey.services.ariel_search.database.migrations import run_migrations
     from osprey.services.ariel_search.enhancement import create_enhancers_from_config
@@ -764,7 +1254,7 @@ async def run_quickstart(
         config_dict["ingestion"]["source_url"] = source
         config_dict["ingestion"]["adapter"] = "generic_json"
 
-    config = ARIELConfig.from_dict(config_dict)
+    config = _ariel_config(config_dict)
 
     if progress:
         progress("Checking database connection...")
@@ -859,10 +1349,9 @@ async def run_quickstart(
 
 async def get_purge_info(config_dict: dict) -> PurgeInfo:
     """Get current counts for purge confirmation display."""
-    from osprey.services.ariel_search import ARIELConfig
     from osprey.services.ariel_search.database.connection import create_connection_pool
 
-    config = ARIELConfig.from_dict(config_dict)
+    config = _ariel_config(config_dict)
     pool = await create_connection_pool(config.database)
 
     try:
@@ -883,12 +1372,30 @@ async def get_purge_info(config_dict: dict) -> PurgeInfo:
     return PurgeInfo(entry_count=entry_count, embedding_tables=embedding_tables)
 
 
+async def _unrecord_embedding_migration(cur) -> None:
+    """Remove the text_embedding row from the migration bookkeeping table.
+
+    Purging drops the migration-owned ``text_embeddings_*`` tables; leaving the
+    migration recorded as applied would make a subsequent ``osprey ariel
+    migrate`` a silent no-op, so the tables would never be recreated.
+    """
+    await cur.execute(
+        """
+        DO $$ BEGIN
+            IF EXISTS (SELECT 1 FROM information_schema.tables
+                       WHERE table_schema = 'public' AND table_name = 'ariel_migrations') THEN
+                DELETE FROM ariel_migrations WHERE name = 'text_embedding';
+            END IF;
+        END $$
+        """
+    )
+
+
 async def execute_purge(config_dict: dict, embeddings_only: bool, progress: _ProgressCb = None):
     """Execute the actual purge operation."""
-    from osprey.services.ariel_search import ARIELConfig
     from osprey.services.ariel_search.database.connection import create_connection_pool
 
-    config = ARIELConfig.from_dict(config_dict)
+    config = _ariel_config(config_dict)
     pool = await create_connection_pool(config.database)
 
     try:
@@ -904,6 +1411,7 @@ async def execute_purge(config_dict: dict, embeddings_only: bool, progress: _Pro
                         await cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE")  # noqa: S608
                         if progress:
                             progress(f"  Dropped {table}")
+                    await _unrecord_embedding_migration(cur)
                     if progress:
                         progress("\n✓ Embedding tables purged. Entries preserved.")
                 else:
@@ -916,10 +1424,34 @@ async def execute_purge(config_dict: dict, embeddings_only: bool, progress: _Pro
                     embedding_tables = [r[0] for r in await cur.fetchall()]
                     for table in embedding_tables:
                         await cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE")  # noqa: S608
+                    await _unrecord_embedding_migration(cur)
                     if progress:
                         progress("\n✓ All ARIEL data purged.")
     finally:
         await pool.close()
+
+
+async def logbook_entry_count(config_dict: dict) -> int:
+    """How many entries the logbook currently holds.
+
+    The question a caller has to answer before writing anything it did not
+    author: an empty logbook is one nothing is lost by seeding, and a non-empty
+    one is history — an operator's own entries, or a narrative already seeded and
+    since edited — that no automated step may overwrite. Migrations must already
+    have run (call :func:`run_migrate` first).
+
+    Args:
+        config_dict: ARIEL config dict (``ARIELConfig.from_dict`` shape).
+
+    Returns:
+        The total number of entries.
+    """
+    from osprey.services.ariel_search import create_ariel_service
+
+    config = _ariel_config(config_dict)
+    service = await create_ariel_service(config)
+    async with service:
+        return await service.repository.count_entries()
 
 
 async def seed_logbook_entries(
@@ -944,9 +1476,9 @@ async def seed_logbook_entries(
     Returns:
         The number of entries seeded.
     """
-    from osprey.services.ariel_search import ARIELConfig, create_ariel_service
+    from osprey.services.ariel_search import create_ariel_service
 
-    config = ARIELConfig.from_dict(config_dict)
+    config = _ariel_config(config_dict)
     service = await create_ariel_service(config)
     count = 0
     async with service:

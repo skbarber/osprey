@@ -1,21 +1,23 @@
 """Bounded live-row buffer for run data still in flight or just completed.
 
-Task 2.2's ``GET /runs/{id}/data`` route needs a source of truth for run data
-before (or in place of) a Tiled server: the scan itself runs inside this
-bridge process (``runs.do_launch`` owns the runner/RunEngine), so this
-module subscribes a plain-dict document callback to that same RunEngine and
-keeps translated rows in a bounded, run_uid-keyed buffer. Real RunEngine
-wiring lands in task 2.7 (``real-runengine-integration``) — this module is
-deliberately import-clean of bluesky so it can be built and unit-tested with
-synthetic documents beforehand. Generalizes the concept in BELLA's
+The ``GET /runs/{id}/data`` route needs a source of truth for run data before
+(or in place of) a Tiled server. Scans run in the queueserver worker, which
+publishes its document stream over 0MQ; the bridge's document plane
+(``document_plane.py``) subscribes to that stream and feeds the plain-dict
+callback below, which keeps translated rows in a bounded buffer. This module is
+deliberately import-clean of bluesky, so it can be unit-tested with synthetic
+documents and no worker at all. Generalizes the concept in BELLA's
 ``services/experiment_config/live_rows.py``: this version has no
 GEECS-specific legacy column mapping, and explicitly RETAINS completed runs
-rather than evicting at a small run count, so a read arriving after the scan
+rather than evicting at a small run count, so a read arriving after the plan
 finishes still succeeds without a Tiled server.
 
 Document handling (bluesky's plain-dict document protocol):
 
-- ``start``: begins a new buffer for ``doc["uid"]``, marked partial.
+- ``start``: begins a new buffer for ``doc["uid"]`` — or for the recorder's
+  explicit ``key``, when the caller keys buffers by something other than the
+  RunEngine's own uid (see :class:`LiveRowRecorder`) — marked partial, and
+  stamped with the recorder's opaque ``plan`` value if it was given one.
 - ``event``: each event's ``doc["data"]`` becomes one row; columns are
   discovered incrementally in first-seen order across events. A key seen for
   the first time extends the column list and backfills every already-stored
@@ -24,14 +26,15 @@ Document handling (bluesky's plain-dict document protocol):
   records ``None`` for it.
 - ``stop``: flips ``partial`` to ``False``. This is the ONLY thing that ends
   the "still filling in" state — a buffer that never gets a stop doc (e.g.
-  the process crashed mid-scan) stays partial forever, which is the honest
+  the process crashed mid-run) stays partial forever, which is the honest
   answer.
 
 Bounding uses two independent knobs:
 
-- ``_MAX_ROWS_PER_RUN``: a hard cap on stored rows per run, so a runaway scan
+- ``_MAX_ROWS_PER_RUN``: a hard cap on stored rows per run, so a runaway plan
   cannot grow the buffer without limit. ``total_seen`` keeps counting every
-  event past this cap — Task 2.2's ``row_count`` reports this *true* total
+  event past this cap — the ``row_count`` on the run-data route reports this
+  *true* total
   even when the tail beyond the cap was never stored (a documented trade-off
   for a pathological never-ending run, not the common case).
 - ``_MAX_RUNS``: number of run buffers retained at all, oldest-evicted
@@ -60,16 +63,23 @@ logger = logging.getLogger(__name__)
 # completed run must stay readable well past its own completion.
 _MAX_RUNS = 50
 # Hard per-run row storage cap — a safety valve against a runaway/never-ending
-# scan, not a normal-case limit (see `total_seen` above).
+# plan, not a normal-case limit (see `total_seen` above).
 _MAX_ROWS_PER_RUN = 10_000
 
 _lock = Lock()
-# run_uid -> {"columns": [...], "rows": [[...], ...], "partial": bool, "total_seen": int}
+# run_uid -> {"columns": [...], "rows": [[...], ...], "partial": bool,
+#             "total_seen": int, "plan": Any | None}
 _buffers: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
 
 def get(run_uid: str) -> dict[str, Any] | None:
-    """A snapshot of the live buffer for *run_uid* (or None if unknown)."""
+    """A snapshot of the live buffer for *run_uid* (or None if unknown).
+
+    ``columns`` and ``rows`` are copies, so a caller cannot reach back into the
+    buffer through them. ``plan`` is whatever the recorder was handed and is
+    returned by reference — this module never inspects or mutates it, and
+    neither may a caller.
+    """
     with _lock:
         buf = _buffers.get(run_uid)
         if buf is None:
@@ -79,6 +89,7 @@ def get(run_uid: str) -> dict[str, Any] | None:
             "rows": [list(row) for row in buf["rows"]],
             "partial": buf["partial"],
             "total_seen": buf["total_seen"],
+            "plan": buf["plan"],
         }
 
 
@@ -91,12 +102,31 @@ def _clear() -> None:
 class LiveRowRecorder:
     """Bluesky document callback recording rows into the bounded live buffer.
 
-    One instance per launched run (mirrors BELLA's contract): subscribe it to
-    the RunEngine between ``reinitialize()`` and ``start_run_thread()``
-    (task 2.7) so the start doc is never missed.
+    One instance per run (mirrors BELLA's contract): it must see the run's
+    start document, so it is opened at that document rather than partway
+    through the stream.
+
+    Args:
+        key: Buffer key to record under, instead of the start document's own
+            ``uid``. The document plane (``document_plane.py``) sets it to the
+            OSPREY run id carried in the start document, because a run executed
+            in the queueserver container has a RunEngine uid the bridge never
+            chose and cannot map back to the item an operator enqueued. Left
+            ``None``, the run uid IS the identity the read path looks up —
+            which is the honest key for a run that carries no OSPREY id.
+        plan: Which plan produced this run, carried alongside its rows so a
+            reader that has only a run id can tell what the columns mean. The
+            value is opaque here: this module stores it and hands it back in
+            :func:`get`, and never interprets, validates, or copies it. The
+            document plane extracts it from the start document (mirroring
+            ``key``), which keeps this module testable with synthetic
+            documents. ``None`` for a run whose start document carried no plan
+            stamp — an honest "not known", never a placeholder.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, key: str | None = None, plan: Any | None = None) -> None:
+        self._key = key
+        self._plan = plan
         self._uid: str | None = None
 
     def __call__(self, name: str, doc: dict[str, Any]) -> None:
@@ -108,16 +138,22 @@ class LiveRowRecorder:
             elif name == "stop":
                 self._on_stop(doc)
         except Exception:
-            # RunEngine thread — a recorder bug must never touch the scan.
+            # RunEngine thread — a recorder bug must never touch the plan.
             logger.warning("live-row recorder failed on %r doc", name, exc_info=True)
 
     def _on_start(self, doc: dict[str, Any]) -> None:
-        uid = doc.get("uid")
+        uid = self._key or doc.get("uid")
         if not uid:
             return
         self._uid = uid
         with _lock:
-            _buffers[uid] = {"columns": [], "rows": [], "partial": True, "total_seen": 0}
+            _buffers[uid] = {
+                "columns": [],
+                "rows": [],
+                "partial": True,
+                "total_seen": 0,
+                "plan": self._plan,
+            }
             _buffers.move_to_end(uid)
             while len(_buffers) > _MAX_RUNS:
                 _buffers.popitem(last=False)

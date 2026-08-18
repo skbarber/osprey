@@ -1,5 +1,5 @@
 {
-  "_comment": "Single source of truth for the model-matrix e2e scope (issue #259). The custom matrix runners (run_e2e_for_model.sh) build their pytest --ignore list from `excluded_files` here, and check_e2e_coverage.py validates at startup that the runner covers the FULL tests/e2e/ kit except these explicit exclusions — emitting a warning otherwise. Edit exclusions HERE, not in the runner scripts.",
+  "_comment": "Single source of truth for the model-matrix e2e scope (issue #259). The custom matrix runners (run_e2e_for_model.sh) build their pytest --ignore list from `excluded_files` here, and check_e2e_coverage.py validates at startup that the runner covers the FULL tests/e2e/ kit except these explicit exclusions — emitting a warning otherwise. Edit exclusions HERE, not in the runner scripts. Every test NOT excluded here must carry exactly one benchmark-lane marker (agentic_benchmark = capability score, harness_benchmark = harness-integrity score) — enforced by check_e2e_coverage.py --check-lanes at cell startup and by tests/benchmark/test_matrix_lanes.py in CI.",
   "suite_root": "tests/e2e",
   "excluded_files": [
     {
@@ -53,6 +53,114 @@
     {
       "path": "tests/e2e/test_dispatch_tutorial.py",
       "reason": "Exercises the dispatch pipeline (webhook -> dispatcher -> worker -> SDK round-trip -> persistence), not model capability — the agent task is hello-world level (one-sentence reply, summarize a payload, save a stub report), so any responding model passes and it measures nothing about the model-under-test. Compounding this, its build fixture is pinned to als-apg/haiku and ignores OSPREY_E2E_FORCE_MODEL; under CBORG cells the als-apg key is shimmed to CBORG, so the worker agent hits the real als-apg endpoint with a wrong credential and hangs to the 300s worker timeout — a fixed ~3-test infra penalty per cell."
+    },
+    {
+      "path": "tests/e2e/test_archiver_world_e2e.py",
+      "reason": "Full-stack Docker deploy (VA + mongodb store + recorder) asserting seed duration, store size, a setpoint round-trip and document counts; no LLM call anywhere, so it measures nothing about the model-under-test. Also needs Docker, which the bench box lacks."
+    },
+    {
+      "path": "tests/e2e/test_bluesky_catalog_e2e.py",
+      "reason": "Real-container bluesky-bridge deploy driven via raw HTTP (plan catalog discovery + launch/read); no LLM call anywhere."
+    },
+    {
+      "path": "tests/e2e/test_bluesky_deploy.py",
+      "reason": "Docker build/deploy smoke for the minimum bluesky stack (bridge + RE manager + Redis): loopback bind, unpublished manager/Redis ports, token and control-plane keypair mint, image content, and the browse-only capability refusal — all via docker + raw HTTP; no LLM."
+    },
+    {
+      "path": "tests/e2e/test_bluesky_web_deploy.py",
+      "reason": "VA + bridge + bluesky-web sidecar container stack exercised via raw HTTP; neither service calls an LLM."
+    },
+    {
+      "path": "tests/e2e/test_bluesky_queue_e2e.py",
+      "reason": "Full queue-stack container proof (VA + bridge + queueserver + Redis + Tiled + bluesky-web sidecar) driven entirely over raw HTTP and docker exec — capability, arming, serial drain, session plans, abort, restart durability, mock flip, network/0MQ isolation. No agent session runs and nothing here contacts a model, so it measures nothing about the model-under-test."
+    },
+    {
+      "path": "tests/e2e/test_bluesky_sandbox_escape_e2e.py",
+      "reason": "Authoring-sandbox validator/load-gate/launch-gate proofs using hardcoded plan bodies over HTTP plus independent Channel Access reads; no agent session runs."
+    },
+    {
+      "path": "tests/e2e/test_deploy_lifecycle.py",
+      "reason": "Real-container deploy-lifecycle mechanics (up/seed/users remove/users prune/reset); no LLM anywhere."
+    },
+    {
+      "path": "tests/e2e/test_deploy_writeback_e2e.py",
+      "reason": "Real-container proof that deploy-minted secrets survive a wipe-and-rebuild of the repo's build/ zone; drives `osprey build`/`osprey up` and reads two upstream stores directly, with no LLM anywhere."
+    },
+    {
+      "path": "tests/e2e/test_dispatch_allowlist_parity.py",
+      "reason": "Build fixture pinned to als-apg/haiku via subprocess `osprey build`; the dispatch worker never passes through _apply_e2e_overrides, so OSPREY_E2E_FORCE_MODEL is ignored — same fixture pattern and CBORG wrong-credential hang as test_dispatch_tutorial.py."
+    },
+    {
+      "path": "tests/e2e/test_dispatch_deploy_render.py",
+      "reason": "Pure `osprey build` compose-template rendering — no Docker, no provider token, no LLM call of any kind."
+    },
+    {
+      "path": "tests/e2e/test_dispatch_overlay_visibility.py",
+      "reason": "Full Docker image build + deploy (dockerbuild marker; skips without Docker), and the in-container agent runs the baked-in als-apg/haiku project config, so OSPREY_E2E_FORCE_MODEL cannot reach it."
+    },
+    {
+      "path": "tests/e2e/test_bump_roundtrip.py",
+      "reason": "Non-agentic orbit-bump round-trip: the test drives the deployed VA+bridge stack over raw HTTP and checks closure, restore and figure parity against the stored data — no LLM call anywhere."
+    },
+    {
+      "path": "tests/e2e/test_grid_scan_roundtrip.py",
+      "reason": "Non-agentic HTTP round-trip against a Docker-deployed VA+bridge stack; the test itself drives POST /runs and asserts grid data shape — no LLM call anywhere."
+    },
+    {
+      "path": "tests/e2e/test_in_context_backend.py",
+      "reason": "Own hardcoded provider/model axis (als-apg/cborg/anthropic env-key preference with fixed haiku wire ids) — bypasses OSPREY_E2E_FORCE_MODEL."
+    },
+    {
+      "path": "tests/e2e/test_nextcloud_talk_bridge_e2e.py",
+      "reason": "Runs against a pinned, PRIVATE ghcr Nextcloud + Talk fixture image; the module never builds or pulls it and skips outright when it is absent from the local store, so on the bench box this file contributes nothing but skips. Its substance is the two-party wire contract with a real Talk server (room-type rules, mention filter, poll cursor, restart recovery), asserted through the dispatch engine's persisted run_id rather than through anything the model says — an adapter-integrity proof, not a model-capability signal."
+    },
+    {
+      "path": "tests/e2e/test_openobserve_telemetry.py",
+      "reason": "Docker deploy + synthetic OTLP ingest with no LLM; the one live-agent smoke hardcodes als-apg/haiku in config and never routes through the model-under-test."
+    },
+    {
+      "path": "tests/e2e/test_orm_roundtrip.py",
+      "reason": "Non-agentic ORM round-trip: the test constructs the orm plan request over HTTP and cross-checks the response matrix against the lattice model oracle — no LLM call anywhere."
+    },
+    {
+      "path": "tests/e2e/test_tiled_roundtrip.py",
+      "reason": "Deploy/persistence smoke: demo grid_scan over HTTP, bridge container restart, identical-data assertion via the Tiled catalog — no LLM call anywhere."
+    },
+    {
+      "path": "tests/e2e/test_two_shape_boot.py",
+      "reason": "Two-shape container boot of the dispatch pair (bridge and host namespace): asserts network topology, env-chain precedence inside the worker, and listening-socket bind addresses. No LLM call anywhere, and the two image builds would cost every matrix cell minutes for no model signal."
+    },
+    {
+      "path": "tests/e2e/test_va_substrate_equivalence.py",
+      "reason": "Virtual Accelerator + Bluesky bridge container substrate proofs (CA reads/writes, scan plans, fault divergence) — no LLM at all."
+    },
+    {
+      "path": "tests/e2e/test_gchat_bridge_e2e.py",
+      "reason": "Needs a container runtime, the Pub/Sub emulator image and the `gchat` extra, and skips outright without any of them, so on the bench box it contributes nothing but skips. Its substance is the two-party wire contract with a real Pub/Sub queue (space-type rules, mention filter, exactly-once claim, restart recovery), asserted through the dispatch engine's persisted run_id rather than through anything the model says; the agentic half runs against a build fixture pinned to als-apg/haiku that ignores OSPREY_E2E_FORCE_MODEL, the same fixture pattern as test_dispatch_tutorial.py."
+    },
+    {
+      "path": "tests/e2e/fixtures/test_gchat_fixture_smoke.py",
+      "reason": "Boot smoke for the Google Chat bridge's own test fixtures (loopback HTTP fakes and the Pub/Sub emulator container) — it asserts that the fixtures answer, never runs an agent, and contacts no model."
+    },
+    {
+      "path": "tests/e2e/web_terminals/test_auth_perimeter.py",
+      "reason": "Builds the real auth-sidecar image and drives one `osprey up`, then asserts over plain HTTP that the login perimeter refuses and admits; no LLM anywhere, and the image build would cost every matrix cell minutes for no model signal."
+    },
+    {
+      "path": "tests/e2e/web_terminals/test_loopback_chokepoint.py",
+      "reason": "No LLM anywhere: launches `osprey web` with --shell true (PTY runs /usr/bin/true, never spawns an agent) and asserts TCP bind behavior via raw socket connects."
+    },
+    {
+      "path": "tests/e2e/web_terminals/test_prefix_routing.py",
+      "reason": "Fully in-process FastAPI TestClient checks of URL-prefix routing/injection plus rendered-nginx text assertions; no LLM or agent session anywhere."
+    },
+    {
+      "path": "tests/e2e/web_terminals/test_scaffold_render_roundtrip.py",
+      "reason": "Deterministic deploy-generator checks: render/lint library calls plus an `osprey scaffold` CLI subprocess; no LLM involved."
+    },
+    {
+      "path": "tests/e2e/web_terminals/test_skills_overlay_discovery.py",
+      "reason": "Runs the claude CLI with a deliberately bogus API key and reads only the pre-model stream-json init record's skills list — no model is ever contacted."
     }
   ],
   "baseline_expected_run_min": 15

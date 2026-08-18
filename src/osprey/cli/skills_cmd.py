@@ -4,10 +4,15 @@ Copies bundled skills from inside the installed wheel to a target
 ``.claude/skills/`` directory using ``importlib.resources`` so it works in both
 editable and installed (zipped) wheel modes.
 
-The default target is ``~/.claude/skills/`` (global, available in any Claude
-Code session). With ``--target``, the skill can be installed into a specific
-``.claude/skills/`` directory — used by the osprey-build-interview skill to drop
-``osprey-build-deploy`` into a freshly generated facility profile repo.
+The default target is ``~/.claude/skills/`` (global, available in any agent
+session). With ``--target``, the skill goes into a specific ``.claude/skills/``
+directory instead, scoping it to one repo.
+
+``osprey-build-interview`` is the one skill covering a deployment's own
+lifetime: what the repo's ``profile.yml`` should say, its ``deploy:`` block
+included, and the build it feeds. There is deliberately no operate-time
+counterpart: a runbook is worth shipping only once it describes the verbs a
+reader actually has.
 """
 
 from __future__ import annotations
@@ -20,9 +25,10 @@ from pathlib import Path
 
 import click
 
+from .output import fail, report, warn
+
 _SKILL_SOURCES: dict[str, str] = {
     "osprey-build-interview": "templates/skills/osprey-build-interview",
-    "osprey-build-deploy": "templates/skills/osprey-build-deploy",
     "osprey-contribute": "templates/skills/osprey-contribute",
     "osprey-pre-commit": "templates/skills/osprey-pre-commit",
     "osprey-release": "templates/skills/osprey-release",
@@ -52,9 +58,8 @@ def install(name: str, target: Path | None) -> None:
     """Install a bundled skill into <target>/<name>/.
 
     \b
-    Currently supported skills:
+    Bundled skills:
       osprey-build-interview  Author OSPREY build profiles (global)
-      osprey-build-deploy     Operate a facility profile repo's deploy pipeline
       osprey-contribute       Walk a contributor through the GitHub Flow journey
       osprey-pre-commit       Run quick / ci / premerge check scripts at the right gate
       osprey-release          Cut a CalVer release: bump PR, tag, verify publish
@@ -66,9 +71,10 @@ def install(name: str, target: Path | None) -> None:
     previous version of the skill is never lost.
     """
     if name not in _SKILL_SOURCES:
-        click.echo(
-            f"Unknown skill '{name}'. Available: {sorted(_SKILL_SOURCES)}",
-            err=True,
+        fail(
+            f"Unknown skill '{name}'",
+            f"Available: {', '.join(sorted(_SKILL_SOURCES))}",
+            "Name one of those, or run `osprey skills install --help`.",
         )
         sys.exit(1)
 
@@ -80,7 +86,7 @@ def install(name: str, target: Path | None) -> None:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         backup = skills_dir / f"{name}.bak.{ts}"
         install_path.rename(backup)
-        click.echo(f"Warning: existing '{name}' moved to {backup}", err=True)
+        warn(f"Replaced an existing '{name}'", f"The previous copy is at {backup}")
     elif install_path.exists():
         install_path.rmdir()
 
@@ -88,4 +94,4 @@ def install(name: str, target: Path | None) -> None:
     with as_file(src_traversable) as src_path:
         shutil.copytree(src_path, install_path)
 
-    click.echo(f"Installed '{name}' to {install_path}")
+    report(f"Installed '{name}' to {install_path}")

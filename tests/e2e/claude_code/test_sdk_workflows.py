@@ -38,6 +38,7 @@ class TestClaudeCodeSDKIntegration:
     # Test 1 — Smoke test: single tool call observability
     # -------------------------------------------------------------------
 
+    @pytest.mark.harness_benchmark
     @pytest.mark.flaky(
         reruns=2, reruns_delay=5
     )  # live SDK/provider smoke; absorb rare transient query errors
@@ -50,7 +51,7 @@ class TestClaudeCodeSDKIntegration:
         Uses a simple prompt that triggers a single MCP tool call
         (channel_find) to prove the observability pipeline works.
         """
-        project_dir = init_project(tmp_path, "sdk-smoke-test", provider="als-apg")
+        repo = init_project(tmp_path, "sdk-smoke-test", provider="als-apg")
 
         prompt = (
             "Use the channel_find tool to search for BPM channels. "
@@ -58,10 +59,14 @@ class TestClaudeCodeSDKIntegration:
         )
 
         result = await run_sdk_query(
-            project_dir,
+            repo,
             prompt,
             max_turns=5,
-            max_budget_usd=0.25,
+            # 0.50 matches the suite's smoke-test tier (safety/feedback tests).
+            # The old 0.25 cap was tuned hair-thin: a normal run costs ~$0.25
+            # and gateway cost accounting varies a fraction of a cent, enough
+            # to hard-error the query on budget rather than fail an assertion.
+            max_budget_usd=0.50,
         )
 
         # -- Debug output --
@@ -94,7 +99,7 @@ class TestClaudeCodeSDKIntegration:
 
         # Cost should be reasonable for a simple query
         if result.cost_usd is not None:
-            budget = 0.25 * e2e_budget_scale()
+            budget = 0.50 * e2e_budget_scale()
             assert result.cost_usd < budget, (
                 f"Smoke test cost ${result.cost_usd:.4f} — exceeded ${budget:.2f} budget"
             )
@@ -108,6 +113,7 @@ class TestClaudeCodeSDKIntegration:
     # where it stops after an intermediate sub-agent result. The deterministic
     # assertions below are correct (a real regression fails all reruns); the
     # rerun only absorbs that rare LLM nondeterminism.
+    @pytest.mark.agentic_benchmark
     @pytest.mark.flaky(reruns=2, reruns_delay=5)
     @pytest.mark.slow
     @pytest.mark.requires_api
@@ -121,7 +127,7 @@ class TestClaudeCodeSDKIntegration:
 
         Three layers of contract:
           1. Deterministic: ``archiver_read`` was called and a PNG
-             artifact exists in the project tree.
+             artifact exists somewhere in the deployment repo.
           2. Semantic (LLM judge): the agent fetched the requested
              channel data and produced a plot from it — the judge
              decides whether ``execute``, ``create_static_plot``, or
@@ -129,7 +135,7 @@ class TestClaudeCodeSDKIntegration:
              test prescribing a specific tool.
           3. Cost: under $1.00 budget.
         """
-        project_dir = init_project(tmp_path, "sdk-archiver-plot", provider="als-apg")
+        repo = init_project(tmp_path, "sdk-archiver-plot", provider="als-apg")
 
         prompt = (
             "Use the archiver_read tool to retrieve data for channels "
@@ -140,7 +146,7 @@ class TestClaudeCodeSDKIntegration:
         )
 
         result = await run_sdk_query(
-            project_dir,
+            repo,
             prompt,
             max_turns=15,
             max_budget_usd=1.0,
@@ -163,9 +169,9 @@ class TestClaudeCodeSDKIntegration:
         archiver_calls = result.tools_matching("archiver_read")
         assert len(archiver_calls) > 0, f"archiver_read not called. Tools used: {result.tool_names}"
 
-        png_files = find_png_files(project_dir)
+        png_files = find_png_files(repo)
         assert len(png_files) > 0, (
-            "No PNG files found in the project — agent did not produce a plot."
+            "No PNG files found in the deployment repo — agent did not produce a plot."
         )
         print(f"  PNG files: {[p.name for p in png_files]}")
 
@@ -212,6 +218,7 @@ class TestClaudeCodeSDKIntegration:
     # the weakest model. 15/15 local passes; one CI miss where the orchestrator
     # stopped after channel-finder without calling archiver_read. Rerun absorbs
     # that stochastic miss without weakening the strict assertions below.
+    @pytest.mark.agentic_benchmark
     @pytest.mark.flaky(reruns=2, reruns_delay=5)
     @pytest.mark.slow
     @pytest.mark.requires_api
@@ -231,7 +238,7 @@ class TestClaudeCodeSDKIntegration:
              regardless of whether plotting went through ``execute``,
              ``create_static_plot``, or another visualizer tool.
         """
-        project_dir = init_project(tmp_path, "sdk-bpm-pipeline", provider="als-apg")
+        repo = init_project(tmp_path, "sdk-bpm-pipeline", provider="als-apg")
 
         prompt = (
             "Give me a timeseries and a correlation plot of all horizontal "
@@ -241,7 +248,7 @@ class TestClaudeCodeSDKIntegration:
         )
 
         result = await run_sdk_query(
-            project_dir,
+            repo,
             prompt,
             max_turns=25,
             max_budget_usd=2.0,
@@ -281,7 +288,7 @@ class TestClaudeCodeSDKIntegration:
         assert len(archiver_calls) > 0, f"archiver_read not called. Tools used: {result.tool_names}"
 
         # At least one PNG artifact was created
-        png_files = find_png_files(project_dir)
+        png_files = find_png_files(repo)
         assert len(png_files) > 0, "No PNG files found — agent did not produce plots."
         print(f"  PNG files: {[p.name for p in png_files]}")
 
@@ -337,6 +344,7 @@ class TestClaudeCodeSDKIntegration:
     # Multi-step agentic pipeline (archiver -> data-visualizer subagent). Same
     # stochastic-miss class as the other pipeline tests; rerun absorbs the rare
     # LLM nondeterminism while the strict viz/3D-code assertions still gate.
+    @pytest.mark.agentic_benchmark
     @pytest.mark.flaky(reruns=2, reruns_delay=5)
     @pytest.mark.slow
     @pytest.mark.requires_api
@@ -354,7 +362,7 @@ class TestClaudeCodeSDKIntegration:
 
         Cost budget: $2.00
         """
-        project_dir = init_project(tmp_path, "sdk-3d-scatter", provider="als-apg")
+        repo = init_project(tmp_path, "sdk-3d-scatter", provider="als-apg")
 
         prompt = (
             "Use archiver_read to retrieve data for channels "
@@ -367,7 +375,7 @@ class TestClaudeCodeSDKIntegration:
         )
 
         result = await run_sdk_query(
-            project_dir,
+            repo,
             prompt,
             max_turns=25,
             max_budget_usd=2.0,

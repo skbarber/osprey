@@ -55,7 +55,7 @@ After editing, regenerate the Osprey agent configuration:
 
 .. code-block:: bash
 
-   osprey claude regen
+   osprey build
 
 The server will appear in ``.mcp.json`` and its permissions will be added
 to ``.claude/settings.json``.
@@ -158,6 +158,13 @@ Key points:
   the ``mcp`` instance.
 * Tool modules are imported inside ``create_server()`` so that
   ``@mcp.tool()`` decorators run after context is ready.
+* Log through the standard ``logging`` module and leave handler setup to
+  ``run_mcp_server()``, which calls ``osprey.configure_logging()`` on your
+  behalf.  Every log line goes to stderr; stdout belongs to the JSON-RPC
+  transport, so a ``print()`` there will break the client connection.  Anything
+  embedding Osprey outside an entry point — a notebook, a script — must call
+  ``osprey.configure_logging()`` itself to see log output; importing the
+  framework configures nothing.
 
 
 Step 3: Register Tools
@@ -235,7 +242,7 @@ Important ``ServerDefinition`` fields:
     Use ``_APPROVAL`` for human-in-the-loop on safety-critical tools and
     ``_post_error()`` for standard error guidance.
 
-After adding the entry, run ``osprey claude regen`` to regenerate the Osprey
+After adding the entry, run ``osprey build`` to regenerate the Osprey
 agent configuration.  The server will appear in ``.mcp.json``.
 
 

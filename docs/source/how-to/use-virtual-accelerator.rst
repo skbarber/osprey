@@ -13,8 +13,10 @@ behind the storage-ring lattice channels, so correctors move and BPMs respond.
    - What the Virtual Accelerator is (and is not)
    - The three-state ``control_system.type`` switch
    - Pointing a project at the soft-IOC the stack already deploys
+   - Switching back to the mock, and why plans go browse-only there
    - How ``osprey sim apply`` scenarios behave in Virtual Accelerator mode
-   - Write limits, and the archiver live-vs-history divergence
+   - Write limits
+   - The stored archive the stack deploys, and the one pairing it refuses
 
    **Prerequisites:** Docker (or Podman) installed; the Control Assistant
    tutorial project (see :doc:`/getting-started/control-assistant`).
@@ -31,15 +33,15 @@ backends, selected by a single ``control_system.type`` value:
 
    * - ``type``
      - Backend
-   * - ``mock`` *(default)*
+   * - ``mock``
      - The in-process simulation. No container, no network — every channel
-       returns a synthesized value. This is the tutorial's default and needs no
-       setup.
-   * - ``virtual_accelerator``
+       returns a synthesized value. The fallback for environments with no
+       containers to depend on; plans are browse-only there (below).
+   * - ``virtual_accelerator`` *(default)*
      - A containerized PyAT soft-IOC serving real EPICS Channel Access. Storage-
        ring magnet setpoints drive a live lattice and BPM readbacks respond;
        every other channel is composed by the same simulation engine the mock
-       uses. Requires the container (below).
+       uses. The tutorial's default, and deployed as part of its stack.
    * - ``epics``
      - Production EPICS, pointed at the facility gateway. Untouched by this
        guide.
@@ -51,40 +53,85 @@ exactly as it does the mock or a real machine; only the backend changes.
 Quickstart
 ==========
 
-The Control Assistant stack **already deploys** the Virtual Accelerator: the
-preset's ``virtual_accelerator:`` block renders a compose service, so
-``osprey deploy up`` brings the soft-IOC up alongside the rest of the stack.
-What ships pointed at ``mock`` is the *connector*, not the container — so
-switching backends is a config change, not a new deployment.
+The Control Assistant stack ships pointed at the Virtual Accelerator and
+**already deploys** it: the preset's ``virtual_accelerator:`` block renders a
+compose service, so ``osprey up`` brings the soft-IOC up alongside the
+rest of the stack and the connector is already talking to it. There is nothing
+to switch on.
 
 .. code-block:: bash
 
-   # 1. Point the project at the soft-IOC it already deploys
-   osprey config set-control-system virtual_accelerator
+   osprey up   # brings up the soft-IOC with the rest of the stack
+   osprey web         # the agent talks to real Channel Access
 
-   # 2. Re-deploy so the running services pick up the new connector
-   osprey deploy up
+``osprey up`` brings up more than the soft-IOC. Because the preset also
+declares a ``va_archiver:`` block, the deploy stands up the machine's **archive**
+next to it — a MongoDB store and a recorder service — and seeds it before the
+rest of the stack starts. See `The archive`_ below.
 
-   # 3. Run the assistant as usual — the agent now talks to real Channel Access
-   osprey web
-
-The very first ``osprey deploy up`` that includes the Virtual Accelerator
+The very first ``osprey up`` that includes the Virtual Accelerator
 builds its container image from source (compiling PyAT and the soft-IOC), so
 expect it to take several minutes — it is building, not hanging. Later deploys
 reuse the image.
 
-Switch back to the mock at any time with
-``osprey config set-control-system mock``. The ``epics`` block keeps its
-production values throughout.
+If your deployment came from a preset or profile that selects a different
+connector, point it at the soft-IOC explicitly:
+
+.. code-block:: bash
+
+   osprey set connector=virtual_accelerator
+   osprey build
+   osprey up
 
 .. note::
 
-   Step 2 is what makes the switch take effect for **deployed services**.
-   ``set-control-system`` edits the project's ``config.yml``, but services do
-   not read that file directly — each gets a copy staged into its own directory
-   at deploy time. A purely local ``osprey web`` run picks the change up
-   immediately; anything already running in a container does not, until you
-   re-deploy. No image rebuild is involved either way.
+   All three steps matter. ``osprey set`` writes the setting into
+   ``profile.yml``; ``osprey build`` carries it into ``build/``, where each
+   service gets its own copy of the rendered config; ``osprey up`` starts what
+   was just rendered. Anything already running in a container keeps the old
+   setting until you restart it. No image rebuild is involved.
+
+**The archive has to come first.** On a deployment created from the
+``control-assistant`` preset the switch just works: the preset declares where the
+archive lives, so the deployment already reads a real store. On one with no
+archive of its own — still reading the mock archiver, which makes its history
+up as it is asked for it — the build **refuses** the profile, and says what to
+do instead: point ``archiver.type`` at a store this deployment writes
+(``mongodb_archiver`` for the store the preset deploys), or stay on ``mock`` for
+an honestly storeless deployment. `The honesty rule`_ below explains why.
+
+Switching back to the mock
+==========================
+
+An environment with no containers to depend on can run the tutorial on the
+in-process simulation instead:
+
+.. code-block:: bash
+
+   osprey set connector=mock
+   osprey build
+   osprey up
+
+Read one consequence before you do: **plans become browse-only.** The mock
+does not settle-wait a corrector's readback against its setpoint, which every
+plan needs between grid points, so a plan started there would never
+complete. Rather than let one start and hang, the stack refuses earlier — plans
+can still be listed, authored, validated and staged into the shared draft, but
+the queue will not hold them, and both the panels and the agent report a
+browse-only deployment with the exact command that flips it back. Everything
+that is not a plan — channel reads and writes, the archiver, the Channel
+Finder — works as before. The ``epics`` block keeps its production values
+throughout.
+
+The archive follows the flip on its own. The recorder records **only** a virtual
+accelerator, so on ``mock`` it stops writing and idles; it re-reads the project's
+``config.yml`` every 30 seconds, so the change takes effect within one poll and
+no restart or rebuild is involved. Nothing is deleted — the history already in
+the store stays readable, it simply stops growing, and it ages out under the
+retention window as usual. ``osprey health`` will report the archive as **stale**
+(a warning, not an error) once the newest sample is older than the freshness
+threshold, which is the honest answer to "is this archive still being written".
+Flipping back to ``virtual_accelerator`` restarts recording within a poll too.
 
 Connecting to the IOC
 =====================
@@ -117,7 +164,9 @@ The image is defined under ``docker/virtual-accelerator/``; see its
    that the container mounts read-only. It defaults to the *packaged preset's*
    copy, **not** your project — so with no argument, ``osprey sim apply`` in
    your project writes a scenario file the running IOC never sees. Pass your
-   project's directory explicitly to use its scenarios:
+   project's directory explicitly to use its scenarios (the script then also
+   mounts the sibling ``_agent_data/simulation`` state directory, which is what
+   makes scenario switches reach the IOC):
 
    .. code-block:: bash
 
@@ -127,16 +176,19 @@ Scenarios
 =========
 
 ``osprey sim apply <scenario>`` works in Virtual Accelerator mode exactly as it
-does for the mock. Applying a scenario writes the project's ``active_scenarios``
-file; the in-container engine polls it and, within about a second, composed
-channel values reflect the new scenario. One behavioral difference from the
-mock: in VA mode a scenario switch only refreshes the engine-composed channels
-— setpoints you wrote during the session live in the IOC's own records and
-**survive** the switch. (In mock mode, written values are reset.)
+does for the mock. Applying a scenario writes the project's
+``_agent_data/simulation/active_scenarios`` file; the in-container engine polls
+it and, within about a second, composed channel values reflect the new scenario.
+One behavioral difference from the mock: in VA mode a scenario switch only
+refreshes the engine-composed channels — setpoints you wrote during the session
+live in the IOC's own records and **survive** the switch. (In mock mode, written
+values are reset.)
 
-This assumes the IOC is reading the same project's ``data/simulation``. That is
-automatic for the deployed service; if you launched the container by hand, see
-the warning under `Running from a source checkout`_.
+The container mounts two of the project's directories: ``data/simulation`` for
+the machine model (rebuilt from your profile on every build) and
+``_agent_data/simulation`` for that scenario state (written while the system
+runs). Both are automatic for the deployed service; if you launched the
+container by hand, see the warning under `Running from a source checkout`_.
 
 Write limits
 ============
@@ -155,19 +207,127 @@ connector.
    from ``channel_limits.json`` is not blocked. Range enforcement covers listed
    channels; it is not a closed allowlist here.
 
-Archiver: live values vs. history
-==================================
+The archive
+===========
 
-The mock archiver synthesizes channel *history* from ``machine.json``. That
-history is independent of the Virtual Accelerator's live physics:
+A simulated machine still needs somewhere to keep what its channels did, and the
+stack deploys one. ``osprey up`` brings up two more containers beside the
+soft-IOC:
 
-- In **mock** mode, a channel's live value and its archived history are both
-  synthesized from ``machine.json`` — they agree by construction.
-- In **virtual_accelerator** mode, live storage-ring readbacks come from the PyAT
-  lattice (a corrector write recomputes the orbit), while the archiver's history
-  is still the synthetic ``machine.json`` series.
+- **the store** — a MongoDB service (``archiver-mongodb`` on the deployment's
+  network, published on host port 27017 by default), holding one collection of
+  timestamped samples;
+- **the recorder** — a small service that reads the running machine on a fixed
+  cadence and writes what answered into that collection.
 
-So in Virtual Accelerator mode a lattice channel's **live value and its archived
-history can diverge in meaning**: the live value reflects real simulated physics,
-the history does not. This is expected — a VA-backed archiver is a separate,
-future addition.
+The project's archiver connector (``archiver.type: mongodb_archiver``) reads
+history back out of the same collection, so what the agent plots is what the
+deployment recorded.
+
+What history is there
+---------------------
+
+Two halves of one timeline, and the deploy makes both true before you ask
+anything of them.
+
+**The seeded past.** The first deploy writes a base series for every channel the
+machine serves, covering the whole retention window — at the shipped defaults,
+**30 days back**, of which the most recent **48 hours** are sampled every
+10 seconds and the rest every 60. The values are generated, but they are
+generated the way the live machine generates its own: each channel's history is
+built around the same baseline the soft-IOC boots it at, with excursions scaled
+to that channel's own noise. Nothing invents an event nobody would find in the
+live machine.
+
+Writing it takes a minute or two on a first deploy, and the deploy says so as it
+goes ("seeding archive: N documents written across N channels", every 15 seconds
+or so), then reports the span and the document count when it finishes. Later
+deploys check the archive against the knobs now in force and skip the seed when
+it already covers them.
+
+**The recorded present.** From then on the recorder samples the machine every
+10 seconds and stores what answered. A setpoint you write is readable out of the
+archive within about half a minute. A channel that did not answer contributes
+nothing — a gap in the archive is the honest record of a channel that was not
+answering, never a value carried forward.
+
+The join between the two is meant to be invisible: seeded samples and recorded
+samples land on the same timestamps and around the same baselines, so where the
+seed ends and recording begins there is noise, not a step an operator would
+rightly chase.
+
+Retention is enforced by the store itself: dense samples expire after the hot
+span, the coarse ones after the retention window, so a long-running deployment
+stays bounded rather than growing forever. The collection is zstd-compressed;
+the project's end-to-end test budgets the seeded store at under 2 GiB on disk at
+these defaults.
+
+.. note::
+
+   Every number above is a knob in the build profile's ``va_archiver:`` block —
+   ``retention_days``, ``hot_span_hours``, the cadences — not a constant in the
+   code. Changing one is a profile edit and a rebuild; the next
+   ``osprey up`` notices the archive no longer describes what the profile
+   asks for and reseeds it. See :doc:`build-profiles`.
+
+What the archive will not claim
+-------------------------------
+
+Ask for a window older than the archive reaches and you get **no points** —
+not a plausible-looking series stretched to fill the request. ``get_metadata``
+likewise reports the oldest and newest samples the collection really holds,
+rather than the window the profile declared. The archive never claims more than
+it has.
+
+The honesty rule
+================
+
+There is one configuration this stack refuses: a ``virtual_accelerator`` control
+system paired with the **mock archiver** — or with no archiver set at all, which
+resolves to the same thing.
+
+The reason is what the two do differently. The Virtual Accelerator serves
+channels that move for modelled reasons: you step a corrector, the orbit
+responds. The mock archiver does not store anything; it synthesizes a
+plausible-looking history at read time, for questions nobody recorded the answer
+to. Put them together and the agent reports a past that never happened, next to a
+present that did — with nothing connecting the two, so the fiction can never be
+caught by disagreeing with the machine it claims to describe.
+
+The pairing is refused at every point it can be created:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 66
+
+   * - Where
+     - What happens
+   * - ``osprey build``
+     - The build refuses the profile, and names the profile keys to change: add
+       a ``va_archiver:`` block (which is what makes the store exist) and set
+       ``config: {archiver.type: mongodb_archiver}``.
+   * - ``osprey up`` / ``restart``
+     - The deploy aborts before starting anything, and names the ``config.yml``
+       edit: set ``type:`` under ``archiver:`` to a connector reading a store
+       this stack writes, or set ``type:`` under ``control_system:`` back to
+       ``mock``.
+   * - MCP server startup
+     - The server refuses to start on such a ``config.yml``, so a file
+       hand-edited after the build cannot quietly bring the pairing back.
+   * - ``osprey validate``
+     - Reports the same refusal without building anything, so the pairing is
+       caught the moment it is written into ``profile.yml`` rather than at
+       deploy time.
+
+Two pairings that look similar are perfectly legal, because nothing lies in
+either: **mock control system + mock archiver** is the honestly storeless
+deployment (nothing is claimed to be real), and **EPICS + mock archiver** is a
+real machine that simply has no archive attached yet.
+
+.. warning::
+
+   ``config.yml`` is read as **nested sections**. A top-level dotted line like
+   ``archiver.type: mongodb_archiver`` added at the top of the file configures
+   nothing at all — the archiver is whatever the ``archiver:`` section says.
+   The refusal messages call this out when they find such a line, rather than
+   reporting the key as merely unset.

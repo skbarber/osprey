@@ -1,5 +1,6 @@
 """Base Provider Interface for AI Model Access."""
 
+import os
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -24,6 +25,13 @@ class BaseProvider(ABC):
         requires_model_id: Whether provider requires model ID specification
         supports_proxy: Whether provider supports HTTP proxy configuration
         default_base_url: Default API endpoint URL if applicable
+        base_url_env_var: Name of an env var that, when set, overrides every
+            other base_url source (explicit argument, config, default) for this
+            provider — the runtime lever for redirecting an already-deployed
+            system at a different gateway without a rebuild. None disables the
+            override (the default; providers opt in explicitly so the name
+            never collides with an env var another layer owns, e.g.
+            ANTHROPIC_BASE_URL).
         default_model_id: Default model recommended for general use (used in templates)
         health_check_model_id: Cheapest/fastest model for health checks
         available_models: List of available model IDs for this provider
@@ -53,6 +61,16 @@ class BaseProvider(ABC):
     requires_model_id: bool = NotImplemented
     supports_proxy: bool = NotImplemented
     default_base_url: str | None = None
+    base_url_env_var: str | None = None  # Env var overriding all base_url sources (opt-in)
+    # Whether a missing base_url resolves to default_base_url. Opt-in: for most
+    # providers litellm derives the endpoint from the model prefix, and forcing a
+    # default would redirect them. A provider turns this on when a config that
+    # omits base_url means "the default I declare" — openai-compatible routes
+    # (which would otherwise fall through to api.openai.com) and local servers on
+    # a well-known port. Declaring a default_base_url without this flag makes that
+    # default unreachable through get_chat_completion, which rejects the call for a
+    # missing base_url before any adapter body runs.
+    apply_default_base_url_fallback: bool = False
     default_model_id: str | None = None  # Default model for templates/general use
     health_check_model_id: str | None = None  # Cheapest model for health checks
     available_models: list[str] = []  # List of available models for this provider
@@ -72,6 +90,63 @@ class BaseProvider(ABC):
     #   False -> use OSPREY's prompt-based JSON fallback
     #   None  -> defer to litellm.supports_response_schema() (auto-detect)
     supports_native_structured_output: bool | None = None
+
+    @classmethod
+    def effective_base_url(cls, base_url: str | None) -> str | None:
+        """Resolve the base_url actually used: env override > caller value > default.
+
+        Lives on the base class because two callers must agree on the answer: the
+        adapter that finally calls the endpoint, and whatever validates
+        :attr:`requires_base_url` before it. When only the adapter knew this rule,
+        a provider carrying a perfectly good :attr:`default_base_url` still failed
+        validation for "missing" base_url, and the default it declared was
+        unreachable — visible only once the env override was removed.
+
+        Args:
+            base_url: The caller's value, usually from deployment config. May be
+                ``None``.
+
+        Returns:
+            The URL this provider will use, or ``None`` when it has no source for
+            one — which is the only case a ``requires_base_url`` provider should
+            be rejected for.
+        """
+        if cls.base_url_env_var:
+            override = os.environ.get(cls.base_url_env_var)
+            if override:
+                return override
+        if cls.apply_default_base_url_fallback:
+            return base_url or cls.default_base_url
+        return base_url
+
+    @classmethod
+    def require_effective_base_url(cls, base_url: str | None) -> str:
+        """Same resolution as :meth:`effective_base_url`, but never ``None``.
+
+        For adapters that build a request URL in their own body: they need a
+        ``str``, and the rule they must apply is the one
+        :meth:`effective_base_url` implements. A local
+        ``base_url or self.default_base_url`` looks equivalent and is not — it
+        skips the env override, and it disagrees with the ``requires_base_url``
+        check in :mod:`osprey.models.completion`, which then rejects the call
+        before the adapter body ever runs.
+
+        Args:
+            base_url: The caller's value, usually from deployment config. May be
+                ``None``.
+
+        Returns:
+            The URL this provider will call.
+
+        Raises:
+            ValueError: When no source supplies one — the same condition
+                :func:`osprey.models.completion.get_chat_completion` rejects,
+                reported with the same wording.
+        """
+        resolved = cls.effective_base_url(base_url)
+        if not resolved:
+            raise ValueError(f"Base URL required for {cls.name}")
+        return resolved
 
     @abstractmethod
     def execute_completion(

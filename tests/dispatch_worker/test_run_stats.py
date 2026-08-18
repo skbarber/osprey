@@ -95,11 +95,11 @@ def test_pop_is_idempotent():
 def _stub_osprey_helpers(monkeypatch):
     """Stub the deferred OSPREY helpers so run_dispatch runs without a project."""
     monkeypatch.setattr(
-        "osprey.interfaces.web_terminal.operator_session.build_clean_env",
+        "osprey.agent_runner.clean_env.build_clean_env",
         lambda **kw: {},
     )
     monkeypatch.setattr(
-        "osprey.interfaces.web_terminal.sdk_context.build_system_prompt",
+        "osprey.agent_runner.sdk_context.build_system_prompt",
         lambda *a, **k: "system",
     )
     monkeypatch.setattr(
@@ -117,7 +117,7 @@ def _result_message(cost_usd: float, num_turns: int) -> ResultMessage:
 
 @pytest.mark.asyncio
 async def test_run_dispatch_increments_per_tool_use(monkeypatch, _stub_osprey_helpers):
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         yield AssistantMessage(
             content=[
                 ToolUseBlock(id="t1", name="Read", input={}),
@@ -128,7 +128,7 @@ async def test_run_dispatch_increments_per_tool_use(monkeypatch, _stub_osprey_he
         yield AssistantMessage(content=[ToolUseBlock(id="t3", name="Grep", input={})], model="m")
         yield _result_message(cost_usd=0.1, num_turns=2)
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
 
     result = await sdk_runner.run_dispatch(
         "go", ["Read", "Grep"], event_queue=asyncio.Queue(), run_id="run-xyz"
@@ -145,14 +145,14 @@ async def test_run_dispatch_counts_beyond_retained_cap(monkeypatch, _stub_osprey
     """num_tool_calls stays truthful past the retained tool_calls cap."""
     monkeypatch.setattr(sdk_runner, "_MAX_TOOL_CALLS", 2)
 
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         for i in range(5):
             yield AssistantMessage(
                 content=[ToolUseBlock(id=f"t{i}", name="Read", input={})], model="m"
             )
         yield _result_message(cost_usd=0.1, num_turns=5)
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
 
     result = await sdk_runner.run_dispatch(
         "go", ["Read"], event_queue=asyncio.Queue(), run_id="run-cap"
@@ -165,11 +165,11 @@ async def test_run_dispatch_counts_beyond_retained_cap(monkeypatch, _stub_osprey
 
 @pytest.mark.asyncio
 async def test_run_dispatch_without_run_id_creates_no_entry(monkeypatch, _stub_osprey_helpers):
-    async def fake_query(prompt, options):
+    async def fake_query(options, project_dir, prompt):
         yield AssistantMessage(content=[ToolUseBlock(id="t1", name="Read", input={})], model="m")
         yield _result_message(cost_usd=0.1, num_turns=1)
 
-    monkeypatch.setattr(sdk_runner, "query", fake_query)
+    monkeypatch.setattr(sdk_runner, "_stream_with_ready_mcp", fake_query)
 
     await sdk_runner.run_dispatch("go", ["Read"], event_queue=asyncio.Queue())
 

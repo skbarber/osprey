@@ -15,8 +15,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from osprey import bluesky_tool_names as bsky
+from osprey.utils.workspace import RENDERED_CONFIG_RELPATH
 
 logger = logging.getLogger(__name__)
+
+#: ``OSPREY_CONFIG`` / ``CONFIG_FILE`` value for every framework server, as an
+#: unresolved template — :func:`_resolve_placeholder` substitutes
+#: ``{project_root}`` at render time. The env vars themselves are the runtime
+#: contract every server reads and are deliberately untouched; only the path
+#: they carry moved, from the repo root into the render zone beside it.
+RENDERED_CONFIG_ENV_VALUE = f"{{project_root}}/{RENDERED_CONFIG_RELPATH}"
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +68,10 @@ class ServerDefinition:
     is_external: bool = False
     external_command: str | None = None
     external_args: list[str] = field(default_factory=list)
-    url: str | None = None  # HTTP/SSE transport URL (mutually exclusive with command)
+    url: str | None = None  # Remote transport URL (mutually exclusive with command)
+    # Wire transport for URL servers: "http" (streamable-HTTP) or "sse"
+    # (legacy Server-Sent Events). Meaningless for stdio servers.
+    transport: str = "http"
     port: int | None = (
         None  # Host/container port for HTTP servers; informational for non-Claude consumers
     )
@@ -116,8 +127,8 @@ FRAMEWORK_SERVERS: dict[str, ServerDefinition] = {
         name="controls",
         module="osprey.mcp_server.control_system",
         env={
-            "OSPREY_CONFIG": "{project_root}/config.yml",
-            "CONFIG_FILE": "{project_root}/config.yml",
+            "OSPREY_CONFIG": RENDERED_CONFIG_ENV_VALUE,
+            "CONFIG_FILE": RENDERED_CONFIG_ENV_VALUE,
             "EPICS_CA_ADDR_LIST": "${EPICS_CA_ADDR_LIST:-}",
         },
         permissions_allow=["channel_limits"],
@@ -146,8 +157,8 @@ FRAMEWORK_SERVERS: dict[str, ServerDefinition] = {
         # config as claude_code.servers.<name>.extends: phoebus — see build_extended_server().
         default_enabled=False,
         env={
-            "OSPREY_CONFIG": "{project_root}/config.yml",
-            "CONFIG_FILE": "{project_root}/config.yml",
+            "OSPREY_CONFIG": RENDERED_CONFIG_ENV_VALUE,
+            "CONFIG_FILE": RENDERED_CONFIG_ENV_VALUE,
             # Full-URL override of the in-JVM bridge (default 127.0.0.1:7979).
             "PHOEBUS_BRIDGE_URL": "${PHOEBUS_BRIDGE_URL:-http://127.0.0.1:7979}",
             # Instance identity — tools tag UI signals with it (open_panel →
@@ -179,8 +190,8 @@ FRAMEWORK_SERVERS: dict[str, ServerDefinition] = {
         name="python",
         module="osprey.mcp_server.python_executor",
         env={
-            "OSPREY_CONFIG": "{project_root}/config.yml",
-            "CONFIG_FILE": "{project_root}/config.yml",
+            "OSPREY_CONFIG": RENDERED_CONFIG_ENV_VALUE,
+            "CONFIG_FILE": RENDERED_CONFIG_ENV_VALUE,
         },
         permissions_allow=[],
         permissions_ask=["execute"],
@@ -196,11 +207,11 @@ FRAMEWORK_SERVERS: dict[str, ServerDefinition] = {
         name="osprey_workspace",
         module="osprey.mcp_server.workspace",
         env={
-            "OSPREY_CONFIG": "{project_root}/config.yml",
+            "OSPREY_CONFIG": RENDERED_CONFIG_ENV_VALUE,
             # osprey.utils.config reads CONFIG_FILE (not OSPREY_CONFIG); set both
             # so the server resolves config even when launched with a CWD other
             # than the project dir (e.g. the dispatch worker's /app WORKDIR).
-            "CONFIG_FILE": "{project_root}/config.yml",
+            "CONFIG_FILE": RENDERED_CONFIG_ENV_VALUE,
         },
         permissions_allow=[
             "facility_description",
@@ -208,9 +219,8 @@ FRAMEWORK_SERVERS: dict[str, ServerDefinition] = {
             "list_windows",
             "manage_window",
             "submit_response",
-            "data_list",
-            "data_read",
-            "data_delete",
+            "artifact_list",
+            "artifact_read",
             "artifact_get",
             "artifact_focus",
             "artifact_export",
@@ -232,7 +242,14 @@ FRAMEWORK_SERVERS: dict[str, ServerDefinition] = {
             "lattice_refresh",
             "lattice_set_baseline",
             "list_panels",
-            "switch_panel",
+            # The on-screen axis: both halves are reversible in one operator
+            # click, so neither is worth a prompt. The rail axis
+            # (add_panel_to_rail/remove_panel_from_rail) is deliberately absent —
+            # taking a panel off the rail costs the operator the ability to
+            # launch it back, which is worth asking about.
+            "open_panel",
+            "close_panel",
+            "arrange_workspace",
         ],
         permissions_ask=["setup_patch"],
         hooks_pre=[
@@ -247,14 +264,15 @@ FRAMEWORK_SERVERS: dict[str, ServerDefinition] = {
         name="ariel",
         module="osprey.mcp_server.ariel",
         env={
-            "OSPREY_CONFIG": "{project_root}/config.yml",
+            "OSPREY_CONFIG": RENDERED_CONFIG_ENV_VALUE,
             # See osprey_workspace: osprey.utils.config reads CONFIG_FILE.
-            "CONFIG_FILE": "{project_root}/config.yml",
+            "CONFIG_FILE": RENDERED_CONFIG_ENV_VALUE,
             "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY:-}",
         },
         permissions_allow=[
             "keyword_search",
             "semantic_search",
+            "hybrid_search",
             "sql_query",
             "entries_by_ids",
             "browse",
@@ -276,7 +294,7 @@ FRAMEWORK_SERVERS: dict[str, ServerDefinition] = {
         name="osprey_facility_knowledge",
         module="osprey.mcp_server.facility_knowledge",
         env={
-            "OSPREY_CONFIG": "{project_root}/config.yml",
+            "OSPREY_CONFIG": RENDERED_CONFIG_ENV_VALUE,
         },
         permissions_allow=["capabilities", "list_concepts", "read_concept", "search"],
         permissions_ask=["draft_concept"],
@@ -296,8 +314,8 @@ FRAMEWORK_SERVERS: dict[str, ServerDefinition] = {
         # facility-side Bluesky bridge process (mirrors phoebus's opt-in reasoning).
         default_enabled=False,
         env={
-            "OSPREY_CONFIG": "{project_root}/config.yml",
-            "CONFIG_FILE": "{project_root}/config.yml",
+            "OSPREY_CONFIG": RENDERED_CONFIG_ENV_VALUE,
+            "CONFIG_FILE": RENDERED_CONFIG_ENV_VALUE,
             "BLUESKY_BRIDGE_URL": "${BLUESKY_BRIDGE_URL:-http://127.0.0.1:8090}",
             "BLUESKY_LAUNCH_TOKEN": "${BLUESKY_LAUNCH_TOKEN:-}",
         },
@@ -306,11 +324,13 @@ FRAMEWORK_SERVERS: dict[str, ServerDefinition] = {
         permissions_allow=[
             bsky.GET_RUN,
             bsky.LIST_PLANS,
+            bsky.LIST_DEVICES,
             bsky.LIST_RUNS,
             bsky.GET_RUN_DATA,
-            # Draft tools (task 2.1) never touch hardware — editing the shared
-            # plan draft only stages what a future launch_run/Launch plan click
-            # might run, so like the read tools above they need no approval
+            bsky.GET_RUN_FIGURE,
+            # Draft tools never touch hardware — editing the shared
+            # plan draft only stages what a future queue_add or in-panel
+            # Add-to-queue click might queue, so like the read tools above they need no approval
             # prompt and carry no _WRITES_CHECK hook. clear_draft is
             # nonetheless auto-classified side-effecting by
             # agent_runner.write_tools (matches bsky.DESTRUCTIVE_MARKERS'
@@ -320,28 +340,48 @@ FRAMEWORK_SERVERS: dict[str, ServerDefinition] = {
             bsky.GET_DRAFT,
             bsky.SET_DRAFT,
             bsky.CLEAR_DRAFT,
+            # Queue reads: queue_list reads the queue the manager
+            # holds, queue_status reads whether this deployment can execute at
+            # all. Neither mutates anything, and queue_status in particular is
+            # what an agent should call BEFORE composing a plan — putting an
+            # approval prompt on that question would train operators to click
+            # through prompts that never precede motion.
+            *bsky.QUEUE_READ_TOOLS,
         ],
-        # launch_run starts a real scan; stop_run is the safe direction
-        # and must never be kill-switch-blocked, so it carries approval only.
-        # write_plan/validate_plan (task 2.3) reach NO hardware
+        # queue_add and queue_start are the arming pair (bsky.ARMING_TOOLS):
+        # adding hands an item to a queue that may already be draining, and
+        # starting drains it — both carry _WRITES_CHECK plus approval.
+        # queue_stop (halt the queue after the running item) and stop_run
+        # (abort the plan already in motion) are the safe direction and must
+        # never be kill-switch-blocked, so they carry approval only; queue_stop's
+        # one arming case (cancel=true, which withdraws a pending halt) is gated
+        # in-tool and again at the bridge, because attaching _WRITES_CHECK here
+        # would also block a PLAIN stop whenever writes are disabled — exactly
+        # when halting matters most. stop_run has no arming case at all: it is
+        # ungated end to end, at the tool and at the bridge.
+        # write_plan/validate_plan reach NO hardware
         # either way: write_plan only writes a file (never imports/execs
         # it), and validate_plan's dry run drives mock devices only, in a
         # subprocess with EPICS_CA_* neutralized — both work identically whether
         # control_system.writes_enabled is on or off, so like stop_run neither
         # carries _WRITES_CHECK. They get their own (distinct, independently
-        # allowlistable) short-names rather than reusing launch_run/stop_run's
+        # allowlistable) short-names rather than reusing the queue tools'
         # tier, since an operator may want to permit authoring/validating plan
-        # bodies without also auto-approving launch_run/stop_run, or vice versa.
+        # bodies without also auto-approving queue_add/queue_start, or vice versa.
         permissions_ask=[
-            bsky.LAUNCH_RUN,
+            *bsky.QUEUE_CONTROL_TOOLS,
             bsky.STOP_RUN,
             bsky.WRITE_PLAN,
             bsky.VALIDATE_PLAN,
         ],
         hooks_pre=[
+            *(
+                HookRule(matcher=bsky.matcher(tool), hooks=[_WRITES_CHECK, _APPROVAL])
+                for tool in bsky.ARMING_TOOLS
+            ),
             HookRule(
-                matcher=bsky.matcher(bsky.LAUNCH_RUN),
-                hooks=[_WRITES_CHECK, _APPROVAL],
+                matcher=bsky.matcher(bsky.QUEUE_STOP),
+                hooks=[_APPROVAL],
             ),
             HookRule(
                 matcher=bsky.matcher(bsky.STOP_RUN),
@@ -372,9 +412,9 @@ FRAMEWORK_SERVERS: dict[str, ServerDefinition] = {
         # cannot steer the read at call time, so there is nothing to gate.
         default_enabled=False,
         env={
-            "OSPREY_CONFIG": "{project_root}/config.yml",
+            "OSPREY_CONFIG": RENDERED_CONFIG_ENV_VALUE,
             # See osprey_workspace: osprey.utils.config reads CONFIG_FILE.
-            "CONFIG_FILE": "{project_root}/config.yml",
+            "CONFIG_FILE": RENDERED_CONFIG_ENV_VALUE,
         },
         permissions_allow=["health_check"],
         permissions_ask=["health_check_full"],
@@ -384,9 +424,9 @@ FRAMEWORK_SERVERS: dict[str, ServerDefinition] = {
         name="channel-finder",
         module="osprey.mcp_server.channel_finder_{channel_finder_pipeline}",
         env={
-            "OSPREY_CONFIG": "{project_root}/config.yml",
+            "OSPREY_CONFIG": RENDERED_CONFIG_ENV_VALUE,
             # See osprey_workspace: osprey.utils.config reads CONFIG_FILE.
-            "CONFIG_FILE": "{project_root}/config.yml",
+            "CONFIG_FILE": RENDERED_CONFIG_ENV_VALUE,
         },
         condition="channel_finder_pipeline",
         # permissions_allow is populated dynamically from
@@ -413,11 +453,11 @@ CHANNEL_FINDER_TOOLS_BY_PIPELINE: dict[str, list[str]] = {
         "list_channels",
         "list_families",
         "list_systems",
-        "query_channels",
+        "run_sql",
         "statistics",
         "validate",
     ],
-    "in_context": ["query_channels"],
+    "in_context": ["ask_channels"],
 }
 
 
@@ -506,8 +546,9 @@ def resolve_servers(claude_code_config: dict, ctx: dict) -> list[dict]:
 
     Returns:
         List of plain dicts, each representing one server with keys:
-        name, enabled, command, args, env, permissions_allow, permissions_ask,
-        fixed_allow, hooks_pre, hooks_post, is_custom.
+        name, enabled, url, transport (``"http"``/``"sse"`` for URL servers,
+        ``None`` for stdio), command, args, env, permissions_allow,
+        permissions_ask, fixed_allow, hooks_pre, hooks_post, is_custom.
     """
     servers: dict[str, ServerDefinition] = {
         k: copy.deepcopy(v) for k, v in FRAMEWORK_SERVERS.items()
@@ -560,8 +601,8 @@ def resolve_servers(claude_code_config: dict, ctx: dict) -> list[dict]:
             # Custom server
             if not spec.get("command") and not spec.get("url"):
                 # Never emit a broken {"command": ""} entry into .mcp.json —
-                # e.g. a legacy 'phoebus2: {enabled: true}' spec left over from
-                # when phoebus2 was a framework server.
+                # e.g. a 'phoebus2: {enabled: true}' spec naming a server no
+                # framework entry defines.
                 logger.warning(
                     "Server %r has none of 'extends'/'command'/'url' — skipping "
                     "(a second framework-server instance is declared via "
@@ -569,7 +610,9 @@ def resolve_servers(claude_code_config: dict, ctx: dict) -> list[dict]:
                     name,
                 )
                 continue
-            servers[name] = _custom_server_from_spec(name, spec)
+            custom = _custom_server_from_spec(name, spec)
+            if custom is not None:
+                servers[name] = custom
 
     # ── Build output dicts ────────────────────────────────────
     result = []
@@ -727,9 +770,38 @@ def build_extended_server(name: str, spec: dict) -> ServerDefinition | None:
     return clone
 
 
-def _custom_server_from_spec(name: str, spec: dict) -> ServerDefinition:
-    """Build a ServerDefinition from a new-format config spec."""
+#: Valid ``transport`` values for URL-based custom servers.
+VALID_TRANSPORTS = ("http", "sse")
+
+
+def _custom_server_from_spec(name: str, spec: dict) -> ServerDefinition | None:
+    """Build a ServerDefinition from a new-format config spec.
+
+    Returns ``None`` (after a logged warning) for an invalid ``transport``
+    value — silently defaulting a typo like ``trasnport: ssse`` to HTTP would
+    ship a server that can never connect, so the spec is rejected loudly
+    instead (matches the missing-command/url handling in resolve_servers).
+    """
     perms = spec.get("permissions", {})
+
+    transport = spec.get("transport", "http")
+    if spec.get("url"):
+        if transport not in VALID_TRANSPORTS:
+            logger.warning(
+                "Server %r has invalid transport %r — must be one of %s; skipping",
+                name,
+                transport,
+                "/".join(VALID_TRANSPORTS),
+            )
+            return None
+    elif "transport" in spec:
+        # A command server is structurally stdio — there is no transport choice.
+        logger.warning(
+            "Server %r declares 'transport' but launches via 'command' — stdio "
+            "servers have no transport choice; ignoring the key",
+            name,
+        )
+        transport = "http"
 
     # Resolve pre-tool-use hook presets
     hooks_pre: list[HookRule] = []
@@ -753,6 +825,7 @@ def _custom_server_from_spec(name: str, spec: dict) -> ServerDefinition:
         external_command=spec.get("command", ""),
         external_args=spec.get("args", []),
         url=spec.get("url"),
+        transport=transport,
         port=spec.get("port"),
         permissions_allow=perms.get("allow", []),
         permissions_ask=perms.get("ask", []),
@@ -794,6 +867,9 @@ def _server_to_dict(sdef: ServerDefinition, ctx: dict) -> dict:
         "name": sdef.name,
         "enabled": sdef.default_enabled,
         "url": url,
+        # Transport only means something for URL servers; None for stdio so a
+        # consumer can never mistake a command server for an HTTP one.
+        "transport": sdef.transport if url else None,
         "command": command,
         "args": args,
         "env": env,

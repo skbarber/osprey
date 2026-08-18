@@ -17,7 +17,7 @@ _PER_CELL_URI = "postgresql://ariel:ariel@localhost:5432/ariel_gpt-oss-20b_seed1
 def _write_config(tmp_path, uri: str = _DEFAULT_ARIEL_DB_URI):
     """Write a minimal rendered config.yml with an ARIEL DB uri line."""
     (tmp_path / "config.yml").write_text(
-        f"ariel:\n  database:\n    uri: {uri}\n  default_max_results: 10\n",
+        f"ariel:\n  database:\n    uri: {uri}\n",
         encoding="utf-8",
     )
     return tmp_path / "config.yml"
@@ -33,7 +33,7 @@ def test_override_rewrites_uri_when_env_set(tmp_path, monkeypatch):
 
     text = config_path.read_text(encoding="utf-8")
     assert _PER_CELL_URI in text
-    # The bare default must no longer stand alone as the configured uri.
+    # The bare default must not stand alone as the configured uri.
     assert f"uri: {_DEFAULT_ARIEL_DB_URI}\n" not in text
 
 

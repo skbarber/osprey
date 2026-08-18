@@ -7,6 +7,7 @@ import pytest
 
 from osprey.deployment.web_terminals.render import render_web_terminals
 from osprey.registry.mcp import HOOK_PRESETS, resolve_agents, resolve_servers
+from osprey.utils.workspace import DEFAULT_AGENT_DATA_BASE_DIR
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -14,10 +15,17 @@ from osprey.registry.mcp import HOOK_PRESETS, resolve_agents, resolve_servers
 
 
 def _base_ctx(**overrides):
-    """Build a minimal template context for testing."""
+    """Build a minimal template context for testing.
+
+    ``agent_data_root`` is part of the minimum because the render funnel
+    guarantees it to every Claude Code template; a context without it renders
+    the permission globs against an empty string, which is valid JSON naming
+    nothing.
+    """
     ctx = {
         "project_root": "/tmp/test-project",
         "current_python_env": "/usr/bin/python3",
+        "agent_data_root": DEFAULT_AGENT_DATA_BASE_DIR,
     }
     ctx.update(overrides)
     return ctx
@@ -77,13 +85,13 @@ class TestResolveServers:
         assert s["permissions_ask"] == ["write_data"]
         assert s["is_custom"] is True
 
-    def test_resolve_custom_server_url_transport(self):
-        """Custom URL/SSE server resolves with url field, empty command."""
+    def test_resolve_custom_server_url_defaults_to_http_transport(self):
+        """A URL server without a transport key resolves as streamable-HTTP."""
         ctx = _base_ctx()
         cfg = {
             "servers": {
                 "remote-api": {
-                    "url": "http://remote:8001/sse",
+                    "url": "http://remote:8001/mcp",
                     "permissions": {"allow": ["search"], "ask": []},
                 }
             }
@@ -92,11 +100,70 @@ class TestResolveServers:
         remote = [s for s in servers if s["name"] == "remote-api"]
         assert len(remote) == 1
         s = remote[0]
-        assert s["url"] == "http://remote:8001/sse"
+        assert s["url"] == "http://remote:8001/mcp"
+        assert s["transport"] == "http"
         assert s["command"] == ""
         assert s["args"] == []
         assert s["permissions_allow"] == ["search"]
         assert s["is_custom"] is True
+
+    def test_resolve_custom_server_sse_transport(self):
+        """transport: sse on a URL server carries through to the resolved dict."""
+        ctx = _base_ctx()
+        cfg = {
+            "servers": {
+                "legacy-api": {
+                    "transport": "sse",
+                    "url": "http://remote:8001/sse",
+                }
+            }
+        }
+        servers = resolve_servers(cfg, ctx)
+        (s,) = [s for s in servers if s["name"] == "legacy-api"]
+        assert s["transport"] == "sse"
+        assert s["url"] == "http://remote:8001/sse"
+
+    def test_resolve_custom_server_invalid_transport_skipped(self, caplog):
+        """An invalid transport value rejects the server loudly (no silent http)."""
+        ctx = _base_ctx()
+        cfg = {
+            "servers": {
+                "typo-api": {
+                    "transport": "ssse",
+                    "url": "http://remote:8001/mcp",
+                }
+            }
+        }
+        with caplog.at_level("WARNING"):
+            servers = resolve_servers(cfg, ctx)
+        assert not [s for s in servers if s["name"] == "typo-api"]
+        assert "invalid transport" in caplog.text
+
+    def test_resolve_custom_server_transport_on_stdio_ignored(self, caplog):
+        """A command server declaring transport keeps working; the key is ignored loudly."""
+        ctx = _base_ctx()
+        cfg = {
+            "servers": {
+                "my-server": {
+                    "transport": "sse",
+                    "command": "node",
+                    "args": ["server.js"],
+                }
+            }
+        }
+        with caplog.at_level("WARNING"):
+            servers = resolve_servers(cfg, ctx)
+        (s,) = [s for s in servers if s["name"] == "my-server"]
+        assert s["command"] == "node"
+        assert s["transport"] is None
+        assert "no transport choice" in caplog.text
+
+    def test_resolve_stdio_servers_have_no_transport(self):
+        """Framework (stdio) servers resolve with transport None, never 'http'."""
+        servers = resolve_servers({}, _base_ctx())
+        for s in servers:
+            if not s["url"]:
+                assert s["transport"] is None
 
     def test_resolve_conditional_server_enabled(self):
         """channel_finder_pipeline in ctx → channel-finder server enabled."""
@@ -117,7 +184,7 @@ class TestResolveServers:
         ctx = _base_ctx()
         servers = resolve_servers({}, ctx)
         controls = [s for s in servers if s["name"] == "controls"][0]
-        assert controls["env"]["OSPREY_CONFIG"] == "/tmp/test-project/config.yml"
+        assert controls["env"]["OSPREY_CONFIG"] == "/tmp/test-project/build/config.yml"
         # Shell variables ${...} are preserved
         assert controls["env"]["EPICS_CA_ADDR_LIST"] == "${EPICS_CA_ADDR_LIST:-}"
 
@@ -132,12 +199,33 @@ class TestResolveServers:
         """
         ctx = _base_ctx(channel_finder_pipeline="hierarchical")
         servers = resolve_servers({}, ctx)
-        expected = "/tmp/test-project/config.yml"
+        expected = "/tmp/test-project/build/config.yml"
         for name in ("controls", "python", "osprey_workspace", "ariel", "health", "channel-finder"):
             srv = [s for s in servers if s["name"] == name][0]
             assert srv["env"].get("CONFIG_FILE") == expected, (
                 f"{name} must set CONFIG_FILE={expected!r}, got {srv['env'].get('CONFIG_FILE')!r}"
             )
+
+    def test_workspace_panel_tools_allow_split(self):
+        """Only the workspace-scoped panel verbs are auto-approved.
+
+        The split is not "read-only versus mutating": ``open_panel`` adds a rail
+        entry when it opens a non-member, and ``arrange_workspace`` adds
+        membership for a tiles request and prunes it for a preset. It is scope
+        and reversibility — these act on the workspace the operator is already
+        looking at, and every effect is undoable from the rail or the Layouts
+        menu, so a prompt per call would only break the one-call arrange flow.
+        The rail verbs are the exception: ``remove_panel_from_rail`` costs the
+        operator the ability to launch the panel back, and ``register_panel``
+        adds a proxied upstream, so those stay behind a prompt. This pins that
+        split rather than leaving it to the order of a list literal.
+        """
+        ctx = _base_ctx()
+        servers = resolve_servers({}, ctx)
+        workspace = [s for s in servers if s["name"] == "osprey_workspace"][0]
+        allow = set(workspace["permissions_allow"])
+        assert {"list_panels", "open_panel", "close_panel", "arrange_workspace"} <= allow
+        assert allow.isdisjoint({"add_panel_to_rail", "remove_panel_from_rail", "register_panel"})
 
     def test_health_server_entry(self):
         """The health server is an opt-in, read-only server.
@@ -339,8 +427,8 @@ class TestExtendsServers:
         # identity for UI signals, e.g. open_panel → panel_focus) — auto-set
         # to the clone's own name, not inherited from the template.
         assert p2["env"] == {
-            "OSPREY_CONFIG": "/tmp/test-project/config.yml",
-            "CONFIG_FILE": "/tmp/test-project/config.yml",
+            "OSPREY_CONFIG": "/tmp/test-project/build/config.yml",
+            "CONFIG_FILE": "/tmp/test-project/build/config.yml",
             "PHOEBUS_BRIDGE_URL": "${PHOEBUS2_BRIDGE_URL:-http://127.0.0.1:7980}",
             "OSPREY_SERVER_NAME": "phoebus2",
         }
@@ -853,7 +941,7 @@ class TestTemplateRendering:
         `osprey.deployment.web_terminals.render`, a module that never reads
         `claude_code.servers` and is never invoked by this project-level `.mcp.json`
         pipeline. A project's own custom `url`-transport server must keep rendering
-        its `{type: "http", url: ...}` entry exactly as before, both on its own
+        its `{type: "http", url: ...}` entry verbatim, both on its own
         (this assertion) and with a sibling facility config that carries the
         default (or omitted) web-terminals topology present in the same overall
         config (the `render_web_terminals()` call below, which must not raise and
@@ -912,9 +1000,10 @@ class TestTemplateRendering:
         assert "ask" in data["permissions"]
         # Check a sample allow entry
         allow = data["permissions"]["allow"]
-        assert '"Read(_agent_data/**)"' not in allow  # Not double-quoted
-        assert "Read(_agent_data/**)" in allow
-        assert "mcp__osprey_workspace__data_read" in allow
+        root = DEFAULT_AGENT_DATA_BASE_DIR
+        assert f'"Read({root}/**)"' not in allow  # Not double-quoted
+        assert f"Read({root}/**)" in allow
+        assert "mcp__osprey_workspace__artifact_read" in allow
         # Check ask entries
         ask = data["permissions"]["ask"]
         assert "mcp__controls__channel_write" in ask
@@ -1033,7 +1122,7 @@ class TestTemplateRendering:
         assert p2["command"] == "/usr/bin/python3"
         assert p2["args"] == ["-m", "osprey.mcp_server.phoebus"]
         assert p2["env"]["PHOEBUS_BRIDGE_URL"] == "${PHOEBUS2_BRIDGE_URL:-http://127.0.0.1:7980}"
-        assert p2["env"]["OSPREY_CONFIG"] == "/tmp/test-project/config.yml"
+        assert p2["env"]["OSPREY_CONFIG"] == "/tmp/test-project/build/config.yml"
 
     def test_render_hook_config_json_with_extends(self, template_manager):
         """hook_config.json: both phoebus prefixes land in server_prefixes and

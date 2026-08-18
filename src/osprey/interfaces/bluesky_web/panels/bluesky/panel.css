@@ -1,0 +1,1866 @@
+/*
+ * BLUESKY panel — token-only styling (mirrors design_system/panels/reference).
+ * Every color/spacing value below resolves through a var(--…) design token
+ * from tokens.css; no raw hex literals anywhere in this file.
+ *
+ * Aesthetic: control-room instrument. Dense name-first sidebar (status is a
+ * single dot), a dominant detail pane, mono identifiers/values, hairline
+ * separators, and a live mono "readout" next to the launch action. The queue
+ * reads as a dense ordered list; the running item gets the one piece of chrome
+ * that moves (its progress bar); the results view pairs the raw table with the
+ * run's figure.
+ *
+ * Layout, outside in: the panel chrome, then the view switcher, then the
+ * persistent status strip (queue state + the two halts — on screen for every
+ * view), then exactly one of the three view containers.
+ */
+
+/* Several containers below carry `display: flex/grid`, which would otherwise
+ * win over the `hidden` attribute's default `display: none` (the panel toggles
+ * `hidden` in JS to switch views and to show/hide the empty state, detail body,
+ * tab panels, and readout). This guard makes the attribute authoritative
+ * regardless of layout display. */
+[hidden] {
+  display: none !important;
+}
+
+body {
+  margin: 0;
+  padding: 14px;
+  font-family: var(--font-display);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+/* `height`, NOT `min-height`.
+ *
+ * This column is the scroll container's parent. Under `min-height` it grows
+ * past the viewport whenever a view's content is tall, which takes `.view`
+ * (`flex: 1 1 auto`) with it — and a scroll container that has grown to fit its
+ * own content has nothing left to scroll. The overflow lands on `<body>`
+ * instead, which is `overflow-y: hidden` when embedded, so the excess is simply
+ * clipped and unreachable. A fixed height keeps the column at the viewport and
+ * hands the overflow to `.view-scroll`, where it belongs.
+ *
+ * The `- 28px` is `body`'s 14px padding, top and bottom. Embedded, that padding
+ * is dropped (the host frame supplies its own gutter), so the column is a full
+ * viewport — the two rules have to agree, or the panel is either short by the
+ * padding or overflowing by it. */
+.panel {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 28px);
+}
+body.embedded { padding: 0; }
+body.embedded .panel { height: 100vh; }
+
+.panel-chrome {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-default);
+}
+body.embedded .panel-chrome { display: none; }
+
+.panel-chrome h1 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.panel-chrome .panel-kicker {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.muted {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* ---- View switcher (Plans | Queue | Results) ----
+ *
+ * The panel describes these three to the web-terminal hub as a `nav`
+ * contribution, so an embedded panel gets ONE header. This in-body strip is
+ * NOT a redundant copy: `contributeHeader` is a no-op standalone, and the hub
+ * collapses a service tile's bar to zero height in Simple mode — in both cases
+ * the contributed strip does not exist and this is the only way to navigate.
+ * It is therefore hidden in exactly one case: embedded AND Expert.
+ *
+ * Deliberately `.panel-tabs`/`.panel-tab`, not the `.tabs`/`.tab` the Plans
+ * detail pane already uses for Parameters/Source — those are a different strip
+ * with different rules (Simple mode hides them). */
+.panel-tabs {
+  display: flex;
+  gap: 2px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--border-default);
+}
+html:not([data-ui-mode="simple"]) body.embedded .panel-tabs { display: none; }
+
+.panel-tab {
+  font-family: var(--font-display);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 7px 13px;
+  margin-bottom: -1px;
+  cursor: pointer;
+}
+.panel-tab:hover { color: var(--text-primary); }
+.panel-tab.active {
+  color: var(--color-accent-light);
+  border-bottom-color: var(--color-accent-light);
+}
+.panel-tab:focus-visible {
+  outline: none;
+  color: var(--text-primary);
+}
+
+/* ---- Persistent status strip ----
+ *
+ * Queue state plus the two halts, on screen for EVERY view and in every UI
+ * mode. Nothing here is ever contributed to the tile bar: the hub collapses
+ * that bar in Simple mode, and a halt that disappears with the chrome is not a
+ * halt. "Start queue" is not here either — it lives inside the Queue view,
+ * because arming a queue is a deliberate act. */
+.status-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-default);
+}
+.status-strip-spacer { flex: 1 1 auto; }
+
+/* `body.embedded` zeroes the body padding so the scrolling views can meet the
+   tile edges — but this strip is a fixed header band, not scrolling content,
+   and it had no inset of its own: standalone, the body padding was quietly
+   providing one. Embedded, that left the badge against the frame's left edge
+   and the emergency halt touching the top-right corner, while the card content
+   below it sat at a comfortable inset — the mismatch that made the strip look
+   misplaced and the halts look oversized. Restoring the inset here (rather
+   than un-zeroing the body) keeps the views themselves edge-to-edge. */
+body.embedded .status-strip {
+  padding-top: 10px;
+  padding-left: 14px;
+  padding-right: 14px;
+}
+
+/* ---- View containers ---- */
+
+.view {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+/* The Plans view is a full-height two-pane browser. */
+.view-plans {
+  display: flex;
+  flex-direction: column;
+}
+/* Queue and Results are scrolling documents held to a reading measure. The
+   width is what keeps `#results-table` and the figure plots (both `min-width:
+   480px`) full-width rather than squeezed into a column. */
+.view-scroll {
+  display: block;
+  overflow-y: auto;
+  width: 100%;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+/* ---- Banners ---- */
+.banner {
+  font-size: 12.5px;
+  border-radius: 6px;
+  padding: 8px 11px;
+  margin: 0 0 10px;
+  border: 1px solid transparent;
+}
+.banner-ok {
+  color: var(--color-success);
+  background: var(--success-tint-08);
+  border-color: var(--color-success);
+}
+.banner-warn {
+  color: var(--color-accent-secondary-light);
+  background: var(--accent-secondary-tint-08);
+  border-color: var(--color-accent-secondary);
+}
+.banner-err {
+  color: var(--color-error);
+  background: var(--error-tint-08);
+  border-color: var(--color-error);
+}
+.banner-info {
+  color: var(--color-accent-light);
+  background: var(--accent-tint-06);
+  border-color: var(--border-accent);
+}
+
+/* ---- Buttons ---- */
+.btn {
+  flex: none;
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-on-accent);
+  background: var(--color-accent-light);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 7px 14px;
+  cursor: pointer;
+}
+.btn:hover:not(:disabled),
+.btn:focus-visible:not(:disabled) {
+  background: var(--color-accent);
+}
+.btn:disabled {
+  cursor: not-allowed;
+  color: var(--text-muted);
+  background: var(--bg-panel);
+  border-color: var(--border-default);
+}
+.btn.confirm {
+  background: var(--color-accent-secondary);
+  color: var(--color-on-accent);
+}
+.btn.confirm:hover:not(:disabled) {
+  background: var(--color-accent-secondary-hover);
+}
+/* The Plans footer's pair sits alone at the bottom of a wide pane and carries
+   the roomier padding it always had; the strip's and the Queue view's buttons
+   sit in dense rows and keep the tighter base above. */
+.foot-actions .btn { padding: 8px 18px; }
+
+
+/* =========================================================================
+   Plans view
+   ========================================================================= */
+
+/* ---- Two-pane browser ---- */
+/* Two panes divided by a live splitter. No `gap` here: the 12px gutter is
+   made by the splitter's own margins (below), so the handle sits INSIDE the
+   gutter instead of adding a third column to it — the spacing reads exactly
+   as it did when this was a fixed grid. */
+.browser {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+}
+
+/* No gutter: the panes sit flush and the splitter is the only thing between
+   them, so the grip pill reads as attached to the browser's edge rather than
+   floating in a gap. The same arrangement as every other two-pane surface in
+   the product — see design_system/css/base.css. */
+
+/* ---- Sidebar: dense file browser ---- */
+.sidebar {
+  /* Starting width; panel.js overrides flex-basis/max-width inline once the
+     operator drags the splitter, and restores that width on later loads. */
+  flex: 0 0 224px;
+  max-width: 224px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+}
+.sidebar-head {
+  padding: 8px;
+  border-bottom: 1px solid var(--border-default);
+}
+/* The plan filter is contributed to the tile bar as a `search` item, but only
+   while the Plans view is showing AND the shell is in Expert — Simple collapses
+   that bar and deliberately ENLARGES a search box. So the in-body one hides
+   under exactly the same condition as the view switcher above: embedded AND
+   Expert, and nowhere else. */
+html:not([data-ui-mode="simple"]) body.embedded .sidebar-head { display: none; }
+
+.search {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: 5px;
+  padding: 5px 8px;
+}
+.search:focus-visible {
+  outline: none;
+  border-color: var(--color-accent-light);
+}
+.search::placeholder { color: var(--text-muted); }
+
+.tree {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px;
+}
+.sidebar-note {
+  padding: 10px;
+  margin: 0;
+}
+
+/* Provenance folders (native <details>/<summary>) */
+.folder { margin-bottom: 2px; }
+.folder-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  list-style: none;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  user-select: none;
+}
+.folder-summary::-webkit-details-marker { display: none; }
+.folder-summary:hover { color: var(--text-secondary); }
+.folder-summary::before {
+  content: '▸';
+  font-size: 9px;
+  transition: transform 0.12s ease;
+}
+.folder[open] > .folder-summary::before { transform: rotate(90deg); }
+.folder-name { flex: 1; }
+.folder-count { font-size: 10px; }
+
+.folder-items {
+  display: flex;
+  flex-direction: column;
+  padding: 1px 0 4px;
+}
+
+/* One plan = one compact, name-first row; status is a single dot. */
+.plan-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-left: 2px solid transparent;
+  border-radius: 0 4px 4px 0;
+  padding: 5px 8px 5px 10px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.plan-row:hover,
+.plan-row:focus-visible {
+  background: var(--accent-tint-06);
+  outline: none;
+}
+.plan-row.selected {
+  background: var(--accent-tint-10);
+  border-left-color: var(--color-accent-light);
+}
+.plan-row-name {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plan-row.selected .plan-row-name { font-weight: 600; }
+
+/* Status dots (shared by sidebar rows and the detail status line) */
+.dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+.dot.ok   { background: var(--color-success); }
+.dot.warn { background: var(--color-accent-secondary); }
+.dot.err  { background: var(--color-error); }
+
+/* ---- Detail pane ---- */
+.detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  box-shadow: var(--shadow-panel);
+}
+.detail-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.detail-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.detail-head {
+  padding: 12px 16px 0;
+  border-bottom: 1px solid var(--border-default);
+}
+.detail-id {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.detail-title {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.status-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.detail-desc {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+#session-note { margin: 4px 0 0; }
+
+/* ---- Plan draft: bound indicator, bind affordance, agent-edit note ---- */
+.draft-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+  min-height: 0;
+}
+.draft-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-success);
+  background: var(--success-tint-08);
+  border: 1px solid var(--color-success);
+  border-radius: 5px;
+  padding: 3px 8px;
+}
+.draft-discard-btn {
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  padding: 1px 7px;
+  cursor: pointer;
+}
+.draft-discard-btn:hover,
+.draft-discard-btn:focus-visible {
+  color: var(--color-error);
+  border-color: var(--color-error);
+  outline: none;
+}
+/* Armed (second click deletes the shared draft): the danger colour is no
+   longer only a hover hint. */
+.draft-discard-btn.confirm {
+  color: var(--color-on-accent);
+  background: var(--color-error);
+  border-color: var(--color-error);
+}
+.draft-affordance {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-accent-light);
+  background: var(--accent-tint-10);
+  border: 1px solid var(--border-accent);
+  border-radius: 5px;
+  padding: 3px 9px;
+  cursor: pointer;
+}
+.draft-affordance:hover,
+.draft-affordance:focus-visible {
+  background: var(--accent-tint-20);
+  outline: none;
+}
+.draft-agent-note {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-accent-secondary-light);
+}
+/* Agent-draft banner: "agent drafted <plan> — View draft". Replaces the
+ * passive affordance while active (draft-client suppresses the affordance
+ * whenever the banner shows) and reads as the agent-activity accent family
+ * (same family as .agent-flash), a step stronger than the affordance's
+ * subtle tint: solid accent edge + filled action button. Lives inside
+ * .draft-status, so Simple mode hides it with the rest of the draft chrome. */
+.agent-draft-banner {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-accent-light);
+  background: var(--accent-tint-12);
+  border: 1px solid var(--border-accent);
+  border-left: 3px solid var(--color-accent);
+  border-radius: 5px;
+  padding: 3px 9px;
+}
+.agent-draft-banner-view {
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-on-accent);
+  background: var(--color-accent);
+  border: 1px solid var(--color-accent);
+  border-radius: 4px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+.agent-draft-banner-view:hover,
+.agent-draft-banner-view:focus-visible {
+  background: var(--color-accent-light);
+  border-color: var(--color-accent-light);
+  outline: none;
+}
+
+/* Field-level flash on a landed draft edit now uses the shared design-system
+ * agent-activity flash (`.agent-flash` from /design-system/css/highlight.css,
+ * linked in index.html; fired via flashElement in draft-client.js). */
+
+/* Tab strip */
+.tabs {
+  display: flex;
+  gap: 2px;
+  margin-top: 10px;
+}
+.tab {
+  font-family: var(--font-display);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 7px 11px;
+  margin-bottom: -1px;
+  cursor: pointer;
+}
+.tab:hover { color: var(--text-primary); }
+.tab.active {
+  color: var(--color-accent-light);
+  border-bottom-color: var(--color-accent-light);
+}
+.tab:focus-visible {
+  outline: none;
+  color: var(--text-primary);
+}
+
+.tabpanel {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 16px;
+}
+
+/* Source viewer */
+.source {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  padding: 12px;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ---- Parameter form: 2-D grid ---- */
+.param-form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.param-empty {
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.form-row {
+  display: grid;
+  grid-template-columns: repeat(var(--cols, 1), minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.param-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.field-label {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+.field-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.field-required { color: var(--color-error); }
+.field-help {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+.field-control { min-width: 0; }
+
+.field-input {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-default);
+  border-radius: 5px;
+  padding: 6px 8px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.field-input:focus-visible {
+  outline: none;
+  border-color: var(--color-accent-light);
+}
+select.field-input { cursor: pointer; }
+
+/* Toggle switch (visually-hidden native checkbox drives the track) */
+.switch {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  padding: 5px 0;
+}
+.switch-input {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+}
+.switch-track {
+  display: inline-flex;
+  align-items: center;
+  width: 32px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--neutral-tint-08);
+  border: 1px solid var(--border-default);
+  padding: 1px;
+  box-sizing: border-box;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.switch-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+.switch-input:checked + .switch-track {
+  background: var(--accent-tint-10);
+  border-color: var(--color-accent-light);
+}
+.switch-input:checked + .switch-track .switch-thumb {
+  transform: translateX(14px);
+  background: var(--color-accent-light);
+}
+.switch-input:focus-visible + .switch-track {
+  border-color: var(--color-accent-light);
+}
+
+/* Chip editor (arrays of scalars — device lists) */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  min-height: 34px;
+  padding: 4px 6px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-default);
+  border-radius: 5px;
+  cursor: text;
+}
+.chips:focus-within { border-color: var(--color-accent-light); }
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+  background: var(--accent-tint-06);
+  border: 1px solid var(--border-accent);
+  border-radius: 4px;
+  padding: 2px 4px 2px 7px;
+}
+.chip-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  padding: 0;
+  cursor: pointer;
+}
+.chip-x:hover { color: var(--color-error); }
+.chips-input {
+  flex: 1;
+  min-width: 110px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+  background: transparent;
+  border: none;
+  padding: 3px 2px;
+}
+.chips-input:focus { outline: none; }
+.chips-input::placeholder { color: var(--text-muted); }
+
+/* Channel list (arrays of scalars, x-widget: channel-list — long instrument
+ * lists). Entries stack one per row in a fixed-height scroll region with a
+ * live count header, so tens of correctors/BPMs stay readable. */
+.channel-list {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-default);
+  border-radius: 5px;
+  overflow: hidden;
+}
+.channel-list:focus-within { border-color: var(--color-accent-light); }
+.channel-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border-default);
+}
+.channel-count {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.channel-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.channel-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px 3px 10px;
+  border-bottom: 1px solid var(--border-default);
+}
+.channel-item:last-child { border-bottom: none; }
+.channel-item:hover { background: var(--accent-tint-06); }
+.channel-name {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chan-x {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  padding: 0;
+  cursor: pointer;
+}
+.chan-x:hover { color: var(--color-error); background: var(--error-tint-08); }
+.channel-add {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+  background: transparent;
+  border: none;
+  border-top: 1px solid var(--border-default);
+  padding: 6px 8px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.channel-add:focus { outline: none; }
+.channel-add::placeholder { color: var(--text-muted); }
+
+/* Segmented control (small enums, x-widget: segmented — e.g. sweep direction).
+ * Every option is a visible, mutually-exclusive button. */
+.segmented {
+  display: inline-flex;
+  padding: 2px;
+  gap: 2px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+}
+.segmented-option {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.segmented-option:hover:not(.active) { color: var(--text-primary); }
+.segmented-option.active {
+  color: var(--color-on-accent);
+  background: var(--color-accent-light);
+}
+.segmented-option:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--color-accent-light);
+}
+
+/* Editable table (arrays of flat objects — e.g. grid axes) */
+.table-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+.obj-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  /* border-radius on tables needs separate handling; keep it simple with
+     overflow on a wrapper-less table via clip. */
+  overflow: clip;
+}
+.obj-table th {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  text-align: left;
+  color: var(--text-muted);
+  padding: 7px 10px 5px;
+  border-bottom: 1px solid var(--border-default);
+}
+.obj-table th .field-required { margin-left: 2px; }
+.obj-table td {
+  padding: 3px 4px;
+  border-bottom: 1px solid var(--border-default);
+}
+.obj-table tbody tr:last-child td { border-bottom: none; }
+.obj-table tbody tr:hover { background: var(--accent-tint-06); }
+.obj-table .field-input {
+  background: transparent;
+  border-color: transparent;
+  padding: 5px 7px;
+}
+.obj-table .field-input:hover { border-color: var(--border-default); }
+.obj-table .field-input:focus-visible {
+  border-color: var(--color-accent-light);
+  background: var(--bg-primary);
+}
+/* Column widths follow the schema type (`columnKind` in schema-form.js), because
+   the DOM cannot tell the columns apart on its own: every cell holds an
+   <input>, and an input's intrinsic width is the same ~20-character UA default
+   whatever its type, so `table-layout: auto` alone hands all four columns an
+   equal share — a PV name truncating beside a two-digit point count.
+
+   `width: 1%` is the shrink-to-fit idiom: under auto layout a percentage below
+   a column's min-content width resolves back *up* to min-content, so these
+   columns end up exactly as wide as their contents need and every remaining
+   pixel falls to the untouched free-text column. */
+.obj-table th.col-num, .obj-table td.col-num,
+.obj-table th.col-bool, .obj-table td.col-bool,
+.obj-table th.col-enum, .obj-table td.col-enum {
+  width: 1%;
+}
+
+/* Room for a signed four-decimal setpoint (-0.0125) plus the input's own
+   padding and border — the value decides the column, not the header above it,
+   which is free to wrap onto a second line. */
+.obj-table td.col-num .field-input {
+  width: calc(7ch + 16px);
+  min-width: 0;
+}
+
+/* Wrapped headers ("NUM / POINTS") sit on the same baseline as their unwrapped
+   neighbours instead of floating above them. */
+.obj-table th { vertical-align: bottom; }
+
+/* Spin buttons are ~15px of the input's own width and appear on hover/focus —
+   in a column sized to the value they would clip the digits at exactly the
+   moment you reach for the field. Keyboard up/down still step the value, so no
+   way of entering a number is lost. Scoped to the table: full-width number
+   fields elsewhere in the form keep their spinners. */
+.obj-table td.col-num .field-input {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+.obj-table td.col-num .field-input::-webkit-outer-spin-button,
+.obj-table td.col-num .field-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* A floor under the flexing column so a narrow panel squeezes it to a still-
+   readable width and then scrolls, rather than crushing it to nothing. */
+.obj-table td.col-text .field-input { min-width: 12ch; }
+.table-field { overflow-x: auto; }
+
+.th-x, .td-x { width: 30px; }
+.td-x { text-align: center; }
+
+.row-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  padding: 0;
+  cursor: pointer;
+}
+.row-x:hover { color: var(--color-error); background: var(--error-tint-08); }
+
+.table-add {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--color-accent-light);
+  background: transparent;
+  border: 1px dashed var(--border-accent);
+  border-radius: 5px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.table-add:hover { background: var(--accent-tint-06); }
+
+/* Fallback stacked array editor (non-flat items) */
+.array-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+.array-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+.array-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+.array-row-body {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+/* Nested object */
+.object-field {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ---- Detail footer: readout + launch ---- */
+.detail-foot {
+  padding: 10px 16px 12px;
+  border-top: 1px solid var(--border-default);
+}
+.foot-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.foot-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.readout {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-accent-light);
+}
+.footnote {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+#unvalidated-note { font-family: var(--font-mono); }
+
+/* Secondary footer action (Reset): same geometry as .btn, deliberately
+   quieter than the primary Add-to-queue so the consequential action reads
+   first. */
+.btn-quiet {
+  color: var(--text-secondary);
+  background: transparent;
+  border-color: var(--border-default);
+}
+.btn-quiet:hover:not(:disabled),
+.btn-quiet:focus-visible:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--neutral-tint-08);
+}
+
+.foot-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+/* Launched-run banner: the fact, then the action that switches the workspace
+   to the BLUESKY panel where the queue and the run's rows live. */
+.launch-banner-text { margin-right: 8px; }
+.launch-run-link {
+  font-family: var(--font-display);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--color-success);
+  background: transparent;
+  border: 1px solid var(--color-success);
+  border-radius: 5px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.launch-run-link:hover,
+.launch-run-link:focus-visible {
+  background: var(--success-tint-08);
+}
+
+/* The Discard confirm note: a warn banner, but it sits inside the draft row's
+   flow rather than the footer's, so it carries the row's tighter spacing. */
+#draft-discard-note { margin: 6px 0 0; }
+
+code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--neutral-tint-08);
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+
+/* =========================================================================
+   Queue + Results views
+   ========================================================================= */
+
+.card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  padding: 16px 18px;
+  margin-bottom: 16px;
+  box-shadow: var(--shadow-panel);
+}
+.card h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+#history-card h2,
+.card > h2:first-child {
+  margin-bottom: 10px;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.card-head-spacer { flex: 1 1 auto; }
+
+/* ---- Badges (mirrors the design-system reference panel) ---- */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+.badge.ok {
+  color: var(--color-success);
+  background: var(--success-tint-08);
+  border-color: var(--color-success);
+}
+.badge.warn {
+  color: var(--color-accent-secondary-light);
+  background: var(--accent-secondary-tint-08);
+  border-color: var(--color-accent-secondary);
+}
+.badge.err {
+  color: var(--color-error);
+  background: var(--error-tint-08);
+  border-color: var(--color-error);
+}
+.badge.info {
+  color: var(--color-accent-light);
+  background: var(--accent-tint-06);
+  border-color: var(--border-accent);
+}
+
+.icon-btn {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  padding: 4px 7px;
+  cursor: pointer;
+}
+.icon-btn:hover:not(:disabled),
+.icon-btn:focus-visible:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--border-accent);
+}
+.icon-btn:disabled {
+  cursor: not-allowed;
+  color: var(--text-muted);
+  opacity: 0.5;
+}
+.icon-remove:hover:not(:disabled) {
+  color: var(--color-error);
+  border-color: var(--color-error);
+}
+
+.queue-note,
+.run-note {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+/* The armed withdrawal's consequence sentence — the caution family, matching
+   the button it explains. */
+.stop-note {
+  color: var(--color-accent-secondary-light);
+}
+
+/* ---- Running item ---- */
+
+.running {
+  border: 1px solid var(--border-accent);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: var(--accent-tint-06);
+}
+
+.running.selected { border-color: var(--color-accent-light); }
+
+.running-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.running-kicker {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-accent-light);
+}
+
+.progress {
+  height: 6px;
+  margin-top: 8px;
+  border-radius: 999px;
+  background: var(--neutral-tint-08);
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: var(--color-accent-light);
+}
+/* Unknown denominator: the bar sweeps instead of sitting at a number it does
+   not know. Never rendered as 0% — a plan with no predicted point count is
+   running normally, and a zeroed bar reads as a stalled plan. */
+.progress.indeterminate .progress-fill {
+  animation: progress-sweep 1.4s ease-in-out infinite;
+  transform-origin: left center;
+}
+@keyframes progress-sweep {
+  0%   { transform: scaleX(0.15) translateX(0); }
+  50%  { transform: scaleX(0.45) translateX(120%); }
+  100% { transform: scaleX(0.15) translateX(560%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .progress.indeterminate .progress-fill {
+    animation: none;
+    transform: scaleX(0.3);
+  }
+}
+
+.progress-label {
+  margin: 6px 0 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* ---- Queue + history lists ---- */
+
+.queue-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.queue-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border-default);
+}
+.queue-row:last-child { border-bottom: none; }
+.queue-row:has(button.queue-label:hover) { background: var(--neutral-tint-08); }
+.queue-row.selected {
+  background: var(--accent-tint-06);
+  box-shadow: inset 2px 0 0 var(--color-accent-light);
+}
+
+.queue-position {
+  flex: none;
+  min-width: 20px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: right;
+}
+
+/* The selectable half of a row is a real <button> (see panel.js), stripped
+   back to a text block: that keeps the queue keyboard-reachable and
+   screen-reader announceable without a roving-tabindex of our own. A row with
+   nothing to open renders the same markup as a <span>. */
+.queue-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+button.queue-label { cursor: pointer; }
+button.queue-label:disabled { cursor: default; }
+button.queue-label:focus-visible {
+  outline: 2px solid var(--border-accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+.queue-name {
+  font-size: 13px;
+  color: var(--text-primary);
+}
+.queue-params {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-actions {
+  flex: none;
+  display: flex;
+  gap: 4px;
+}
+
+.queue-empty {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* ---- Results: meta, empty state, table, figure ---- */
+
+.run-meta {
+  margin: 0 0 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.run-meta strong {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+.meta-part + .meta-part::before {
+  content: " · ";
+  color: var(--border-default);
+}
+
+.empty-state {
+  border: 1px dashed var(--border-default);
+  border-radius: 8px;
+  padding: 24px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.empty-state.error {
+  color: var(--color-error);
+  border-color: var(--color-error);
+}
+
+/* ---- Results: the data section ----
+ *
+ * Sits BELOW the figure and stays collapsed until asked for. The summary row
+ * carries the row count and the export side by side; the table itself only
+ * exists in the DOM's flow once the disclosure is open. */
+
+#data-card {
+  margin-top: 16px;
+  border-top: 1px solid var(--border-default);
+  padding-top: 12px;
+}
+
+/* The export is positioned OUT of the flow rather than laid beside the
+ * disclosure. As a flex sibling it would claim its own column, which narrows
+ * the expanded table by the button's width and leaves it visibly inset from
+ * the figure above it. Taking it out of the flow lets the disclosure — and so
+ * the table — run the full width of the card, with the button parked on the
+ * summary line where it reads as belonging to that row. */
+.data-head {
+  position: relative;
+}
+
+.export-btn {
+  position: absolute;
+  top: 0;
+  right: 0;
+}
+
+.table-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  /* Reserves the button's lane so the summary text can never slide under it. */
+  padding: 5px 140px 5px 0;
+  cursor: pointer;
+  user-select: none;
+  /* Both are needed to retire the default disclosure triangle across engines;
+   * the one drawn below replaces it so it can sit on the text baseline. */
+  list-style: none;
+}
+.table-summary::-webkit-details-marker {
+  display: none;
+}
+
+.table-summary::before {
+  content: '';
+  flex: none;
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 6px solid var(--text-muted);
+  transition: transform 120ms ease;
+}
+.table-details[open] > .table-summary::before {
+  transform: rotate(90deg);
+}
+.table-summary:hover::before {
+  border-left-color: var(--text-secondary);
+}
+
+.table-summary-label {
+  font-family: var(--font-display);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.table-summary-count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* The save outcome. Deliberately quiet — it reports a completed action, and
+ * `.error` is the only state that raises its voice. */
+.export-note {
+  margin: 8px 0 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.export-note.error {
+  color: var(--color-error);
+}
+
+/* Prints only when the window is genuinely withholding rows, and sits BELOW
+ * the table it qualifies (hence the top margin) so it reads as a footnote to
+ * what was just shown rather than a header over it. */
+.table-note {
+  margin: 8px 0 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* Bounded height is what makes this a preview rather than a page-lengthening
+ * dump — and it is also what finally makes `#results-table thead th`'s
+ * `position: sticky` do anything, since sticky needs a scroll container with a
+ * height to stick within. */
+.table-scroll {
+  overflow: auto;
+  max-height: 42vh;
+  margin-top: 4px;
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+}
+
+#results-table {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 480px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+#results-table th,
+#results-table td {
+  padding: 6px 10px;
+  text-align: right;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border-default);
+}
+#results-table th:first-child,
+#results-table td:first-child {
+  text-align: left;
+  color: var(--text-muted);
+}
+#results-table thead th {
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+}
+#results-table tbody tr:last-child td {
+  border-bottom: none;
+}
+#results-table tbody tr:hover {
+  background: var(--neutral-tint-08);
+}
+
+/* ---- Results figure ----
+ *
+ * `figure-renderer.js` owns everything inside `#figure-panels`: one
+ * `<section class="figure-panel" data-mark="lines|heatmap|bars">` per panel,
+ * each holding a title, an inline `<svg class="figure-plot">` (or a
+ * `.figure-empty` line in its place), a legend and its annotations.
+ *
+ * The renderer sets every color as an SVG presentation attribute read from the
+ * live theme, and re-reads the theme on each render. So nothing here paints:
+ * these rules are layout and typography only, and both themes come out right
+ * because the colors never came from this file in the first place. */
+
+#figure-card {
+  margin-top: 14px;
+}
+
+/* The figure-level provenance line ("live data · still filling in"). Mono and
+   quiet, the same readout treatment as `.table-note` — deliberately unlike
+   `#run-note` above it, which is prose about the run RECORD in the display
+   font. The two can be on screen at once saying unrelated things, and the
+   typography is what keeps them from reading as one paragraph. */
+.figure-note {
+  margin: 0 0 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+#figure-panels {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* Each panel scrolls its OWN plot: a wide heatmap must not drag the line plot
+   sideways with it, and the page body must never scroll horizontally — the
+   `overflow-x` is what stops a plot at its 480px floor from reaching the body.
+   Title, legend and annotations ride inside that scroll box; they wrap to the
+   visible width, so on a narrow host only the plot is actually pushed out. */
+.figure-panel {
+  overflow-x: auto;
+  padding: 10px 12px 12px;
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  background: var(--chart-plot-bg);
+}
+
+.figure-panel-title {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+/* Below ~480px of usable width the plot stops shrinking and the panel scrolls
+   instead — the same floor `#results-table` holds, and for the same reason:
+   axis labels squeezed past it are decoration, not a reading. The viewBox
+   carries the aspect ratio, so `height: auto` sizes the box. */
+.figure-plot {
+  display: block;
+  width: 100%;
+  min-width: 480px;
+  height: auto;
+}
+
+/* Axis text: family only. Sizes and fills arrive as presentation attributes
+   from the renderer's theme read, and are left alone. */
+.figure-tick {
+  font-family: var(--font-mono);
+}
+.figure-axis-title {
+  font-family: var(--font-display);
+}
+
+.figure-legend {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 10px 0 0;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.figure-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.figure-legend .swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+/* What the plot could not show: decimation and gap counts. Quiet, but never
+   hidden — they are the plot's honesty, not its footnotes. */
+.figure-annotations {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.figure-annotations li + li {
+  margin-top: 2px;
+}
+
+/* Colorbar: the heatmap's value scale, with its numbers. A heatmap without one
+   is unreadable — the reader can see which cells differ but not by how much,
+   nor which side of zero they are on. The strip's gradient is written inline by
+   the renderer from the live palette (negative hue → transparent → positive
+   hue), so it tracks the theme without this file naming a colour. */
+.figure-colorbar {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  margin-top: 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.figure-colorbar-label {
+  font-family: var(--font-display);
+  color: var(--text-muted);
+}
+.figure-colorbar-scale {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.figure-colorbar-strip {
+  width: 180px;
+  height: 10px;
+  border-radius: 2px;
+  border: 1px solid var(--border-default);
+}
+.figure-colorbar-zero {
+  color: var(--text-muted);
+}
+
+/* A cell with no reading. Hatched rather than left as background, because
+   background is now what a genuine ZERO looks like. */
+.figure-cell-missing {
+  pointer-events: all;
+}
+
+/* Section: detail demoted below the figure's findings, one panel at a time. */
+.figure-section {
+  margin-top: 14px;
+  border-top: 1px solid var(--border-default);
+  padding-top: 10px;
+}
+.figure-section-summary {
+  cursor: pointer;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--font-display);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.figure-section-summary:hover {
+  color: var(--text-primary);
+}
+.figure-section-count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* Picker: which series a panel draws, or which panel a section shows. Chips
+   rather than a <select> because the current choice has to be visible at a
+   glance — a closed select hides exactly the thing the reader is comparing. */
+.figure-picker {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 4px;
+}
+.figure-picker-label,
+.figure-picker-note {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.figure-picker-note {
+  font-family: var(--font-mono);
+}
+.figure-picker-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.figure-chip {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 8px;
+  border-radius: 3px;
+  border: 1px solid var(--border-default);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.figure-chip:hover,
+.figure-chip:focus-visible {
+  color: var(--text-primary);
+  border-color: var(--border-accent);
+}
+.figure-chip.selected {
+  color: var(--text-primary);
+  border-color: var(--color-accent-light);
+  background: var(--accent-tint-08);
+}
+
+/* Stands in for the plot when a panel has nothing plottable yet. Styled as an
+   ordinary quiet line, NOT as an error: a run still filling in, and a default
+   view that declined to render, are both normal states. */
+.figure-empty {
+  margin: 0;
+  padding: 20px 0;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* =========================================================================
+   Narrow hosts + UI-mode axis
+   ========================================================================= */
+
+/* ---- Narrow hosts: stack panes, collapse form columns ---- */
+@media (max-width: 700px) {
+  /* Stacked: no side-by-side split to resize. The !important beats the
+     inline flex-basis/max-width plans-view.js writes while dragging —
+     otherwise a split chosen at a wide viewport would pin the stacked band's
+     height. */
+  .browser { flex-direction: column; }
+  .sidebar {
+    flex-basis: auto !important;
+    max-width: none !important;
+  }
+  .browser > .osprey-splitter { display: none; }
+  .panel { min-height: 0; }
+  .tree { max-height: 36vh; }
+  .form-row { grid-template-columns: 1fr; }
+  .foot-row { flex-direction: column; align-items: stretch; }
+}
+
+/* ---- UI-mode axis: Simple (operator-facing) deltas ----
+ *
+ * Expert stays pixel-identical: every rule below is gated on
+ * html[data-ui-mode="simple"]. Simple keeps the operator's job — pick a plan,
+ * set the essential parameters, add it to the queue, then watch what it does —
+ * and strips the expert scaffolding: the Source (raw code) tab, the
+ * shared-draft binding chrome, the trust/provenance internals (sidebar status
+ * dots, provenance folder headers, the detail status line), the connector-
+ * arming footnote, the raw data table, the mono run-meta line, and the
+ * per-item parameter summaries. Validation still
+ * surfaces in plain language: the unvalidated-note, the launch-outcome banner,
+ * the draft-rejected banner and the root error all stay visible, and the live
+ * parameter readout is kept as friendly guidance. Add-to-queue is promoted to
+ * a single full-width primary affordance. Token-only, both themes.
+ *
+ * The view switcher and the status strip are NOT touched here: Simple is
+ * exactly the mode in which the hub's tile bar is collapsed, so the in-body
+ * strip is the only navigation, and the halts must survive every mode.
+ */
+
+/* Flatten the sidebar to a plain plan list: no trust dots, no provenance
+ * folder headers (the <details> stay open, so their rows show ungrouped). */
+html[data-ui-mode="simple"] .plan-row .dot,
+html[data-ui-mode="simple"] .folder-summary {
+  display: none;
+}
+
+/* Drop the expert detail scaffolding. */
+html[data-ui-mode="simple"] .tabs,
+html[data-ui-mode="simple"] .status-line,
+html[data-ui-mode="simple"] #session-note,
+html[data-ui-mode="simple"] .draft-status,
+html[data-ui-mode="simple"] #draft-discard-note,
+html[data-ui-mode="simple"] #draft-unknown-banner,
+html[data-ui-mode="simple"] .detail-foot .footnote {
+  display: none;
+}
+
+/* Drop the queue/results internals. The figure is NOT among them: its titles,
+   axes and annotations are the plain-language answer to "what did the run do",
+   which is exactly what Simple keeps. */
+html[data-ui-mode="simple"] #run-meta,
+html[data-ui-mode="simple"] #table-card,
+html[data-ui-mode="simple"] .queue-params {
+  display: none;
+}
+
+/* Promote Add-to-queue to a single, prominent, full-width primary action,
+ * with Reset stacked beneath it as the quiet escape hatch. The capability
+ * banner is NOT hidden here: "this deployment cannot execute plans" is the
+ * plain-language explanation for a disabled button, which Simple needs more
+ * than Expert does, not less. */
+html[data-ui-mode="simple"] .foot-row,
+html[data-ui-mode="simple"] .foot-actions {
+  flex-direction: column;
+  align-items: stretch;
+}
+html[data-ui-mode="simple"] #queue-add-btn {
+  width: 100%;
+  font-size: 15px;
+  padding: 12px 18px;
+}

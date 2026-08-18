@@ -35,13 +35,20 @@ def stat_signature(path: Path) -> tuple[int, int] | None:
     return (st.st_mtime_ns, st.st_size)
 
 
-def disk_signature(config_path: str | Path | None) -> tuple[Any, Any]:
-    """Stat ``config.yml`` and its sibling ``.env`` as one config-change probe.
+def disk_signature(config_path: str | Path | None) -> tuple[Any, ...]:
+    """Stat ``config.yml`` and the deployment's env chain as one change probe.
+
+    The chain files are the ones at the REPO ROOT, not siblings of the config:
+    the config is a render under ``build/``, which no build writes an ``.env``
+    into. Every chain member is statted — ``.env.shared`` included — because an
+    edit to the shared defaults changes the environment the checks answer from
+    exactly the way an edit to ``.env`` does.
 
     Resolves *config_path* (or the CLI default via
-    :func:`osprey.utils.workspace.resolve_config_path` when ``None``) and returns
-    the pair of per-file :func:`stat_signature` values the breaker/validity checks
-    compare across cycles. A changed pair forces a refresh regardless of age.
+    :func:`osprey.utils.workspace.resolve_config_path` when ``None``) and
+    returns the per-file :func:`stat_signature` values the breaker/validity
+    checks compare across cycles as one opaque tuple. A changed tuple forces a
+    refresh regardless of age.
     """
     if config_path is not None:
         path = Path(config_path)
@@ -49,4 +56,12 @@ def disk_signature(config_path: str | Path | None) -> tuple[Any, Any]:
         from osprey.utils.workspace import resolve_config_path
 
         path = resolve_config_path()
-    return (stat_signature(path), stat_signature(path.parent / ".env"))
+    # Same rule as `loader.HealthConfigLoader.load` — deliberately, and
+    # through the same helper. A signature that stats different files
+    # than the loader watches is a cache that never invalidates.
+    from osprey.utils.workspace import deployment_env_chain
+
+    return (
+        stat_signature(path),
+        *(stat_signature(env_path) for env_path in deployment_env_chain(path)),
+    )

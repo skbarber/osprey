@@ -92,7 +92,7 @@ def _apply_e2e_overrides(spec: Any) -> Any:
     tier_to_model = dict(spec.tier_to_model)
     env_block = dict(spec.env_block)
     if force_model:
-        from osprey.cli.claude_code_resolver import TIER_MODEL_ENV_VARS
+        from osprey.build.claude_code_resolver import TIER_MODEL_ENV_VARS
 
         for tier in tier_to_model:
             tier_to_model[tier] = force_model
@@ -109,27 +109,51 @@ def _apply_e2e_overrides(spec: Any) -> Any:
     return dataclasses.replace(spec, tier_to_model=tier_to_model, env_block=env_block)
 
 
+def _secrets_dir(project_dir: Path) -> Path:
+    """The directory whose ``.env`` holds the secrets *project_dir*'s config needs.
+
+    Callers here hand over the RENDER — ``<repo>/build``, the directory holding
+    ``config.yml``. Secrets are not in it and must not be: ``.env`` is the
+    durable secrets zone at the repo root, deliberately outside the zone every
+    ``osprey build`` wipes. Reading ``.env`` beside the config therefore reads
+    nothing at all, leaving ``${VAR}`` expansion with ``os.environ`` alone —
+    which is why a provider whose ``base_url``/``api_key`` lives only in the
+    repo's ``.env`` resolved to a literal placeholder here while the same
+    deployment authenticated fine under ``osprey chat``.
+
+    Resolved through the helper the runtime resolves a repo root with, so a flat
+    directory that holds its own ``config.yml`` still answers itself — the
+    previous behaviour, kept for every caller that passes one.
+    """
+    from osprey.utils.workspace import repo_root_for_config
+
+    return repo_root_for_config(Path(project_dir) / "config.yml")
+
+
 def _resolve_project_spec(project_dir: Path, *, provider: str | None = None) -> Any:
     """Return the project's ``ClaudeCodeModelSpec`` or ``None``.
 
-    Reads ``config.yml`` and runs the same resolver ``osprey claude chat``
+    Reads ``config.yml`` and runs the same resolver ``osprey chat``
     uses, so test routing matches production exactly.  Surfaces any unexpected
     error (missing config, YAML parse failure, resolver import failure) rather
     than masking it as ``None``.
 
     Args:
-        project_dir: Path to an initialized OSPREY project.
+        project_dir: Path to an initialized OSPREY project — the render holding
+            ``config.yml``.
         provider: When given, overrides ``claude_code.provider`` in the loaded
             config before resolving — used by cross-provider model sweeps in
             the benchmark runner.
     """
-    from osprey.cli.claude_code_resolver import load_provider_spec
+    from osprey.build.claude_code_resolver import load_provider_spec
 
     # load_provider_spec reads config.yml and expands ${VAR} in provider config
     # (e.g. a custom provider's base_url: ${ARGO_PROD_URL}) against an
-    # os.environ + project .env overlay before resolving. The e2e/benchmark
+    # os.environ + project .env overlay before resolving. The overlay is taken
+    # from the repo's secrets zone (see _secrets_dir), which is the same pairing
+    # the dispatch worker and `osprey chat` read the spec with. The e2e/benchmark
     # override is applied last so it still wins (and is inert in production).
-    spec = load_provider_spec(project_dir, provider=provider)
+    spec = load_provider_spec(project_dir, env_dir=_secrets_dir(project_dir), provider=provider)
     return _apply_e2e_overrides(spec)
 
 
@@ -169,8 +193,10 @@ def provider_env_for_project(project_dir: Path, *, provider: str | None = None) 
           401s. For proxy providers (cborg/als-apg) the two var names differ;
           for anthropic-direct they coincide.
 
-        A project-level ``.env`` is honoured first, so a freshly-configured key
-        overrides a stale shell export (mirrors ``inject_provider_env``).
+        The deployment's ``.env`` — at the repo root, not beside the config
+        being read (see :func:`_secrets_dir`) — is honoured first, so a
+        freshly-configured key overrides a stale shell export (mirrors
+        ``inject_provider_env``).
     """
     spec = _resolve_project_spec(project_dir, provider=provider)
     if spec is None:
@@ -181,12 +207,13 @@ def provider_env_for_project(project_dir: Path, *, provider: str | None = None) 
         )
     env: dict[str, str] = dict(spec.env_block)
 
-    # Overlay a project-level .env so freshly-configured keys win over stale
+    # Overlay the deployment's .env so freshly-configured keys win over stale
     # shell exports; strictly a superset of reading os.environ alone. Uses the
-    # shared overlay helper (no circular import: resolver never imports primitives).
-    from osprey.cli.claude_code_resolver import _env_lookup
+    # shared overlay helper (no circular import: resolver never imports primitives),
+    # against the repo's secrets zone rather than the render — see _secrets_dir.
+    from osprey.build.claude_code_resolver import _env_lookup
 
-    lookup: dict[str, str] = _env_lookup(project_dir)
+    lookup: dict[str, str] = _env_lookup(_secrets_dir(project_dir))
 
     if spec.auth_secret_env:
         secret = lookup.get(spec.auth_secret_env)
@@ -224,7 +251,7 @@ class SDKWorkflowResult:
     system_messages: list[SystemMessage] = field(default_factory=list)
     result: ResultMessage | None = None
     # Authoritative MCP server snapshot from ``ClaudeSDKClient.get_mcp_status()``
-    # captured just before the prompt is sent (see ``_await_mcp_ready``). Each entry
+    # captured just before the prompt is sent (see ``await_mcp_ready``). Each entry
     # is an ``McpServerStatus`` object (SDK) or raw dict: {name, status, tools, ...}.
     # Empty when the runner used the one-shot ``query()`` path with no client to poll.
     # This is the ground-truth infra-vs-model discriminator: a failure where the
@@ -613,7 +640,7 @@ _MCP_READY_TIMEOUT_S = float(os.environ.get("OSPREY_E2E_MCP_READY_TIMEOUT", "20"
 _MCP_READY_POLL_S = 0.3
 
 
-def _expected_mcp_servers(project_dir: Path) -> set[str]:
+def expected_mcp_servers(project_dir: Path) -> set[str]:
     """The MCP server names a project declares in ``.mcp.json`` — the set the
     readiness barrier waits for. Returns an empty set if the file is unreadable."""
     try:
@@ -623,7 +650,7 @@ def _expected_mcp_servers(project_dir: Path) -> set[str]:
     return set(cfg.get("mcpServers", {}).keys())
 
 
-async def _await_mcp_ready(
+async def await_mcp_ready(
     client: ClaudeSDKClient,
     expected: set[str],
     *,

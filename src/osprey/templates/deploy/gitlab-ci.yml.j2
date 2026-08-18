@@ -1,0 +1,218 @@
+{%- set _tokens = ([ctx.registry_token_var] if ctx.registry_token_var else [])
+                  + [ssh_key_var]
+                  + (ctx.external_projects | map(attribute='token_env_var') | select | list) -%}
+{%- set _col = 4 + (_tokens | map('length') | max) + 12 -%}
+{%- set _cont = '#' ~ (' ' * (_col - 1)) -%}
+# =============================================================================
+# {{ ctx.facility_name }} — deployment pipeline
+# =============================================================================
+# osprey-scaffold: deploy/gitlab-ci
+# osprey-version: {{ ctx.osprey_version }}
+#
+# Emitted by `osprey scaffold ci` from the `deploy:` block in {{ profile_path }}.
+# Re-run that command after editing the block; the marker line above is what
+# makes re-emission safe, so a file without it is treated as hand-written and
+# left alone unless you pass --force.
+#
+# Facility-specific jobs go in ci-extra.yml, which this pipeline includes. That
+# file is yours — the scaffolder creates it once and never writes it again.
+#
+# Project-level CI/CD variables this pipeline reads (Settings -> CI/CD ->
+# Variables; mask and protect {{ 'it' if _tokens | length == 1 else 'all of them' }}):
+#
+{% if ctx.registry_token_var %}
+#   {{ ctx.registry_token_var.ljust(_col - 4) }}Registry credential. Named by the profile's
+{{ _cont }}`deploy.registry.token_env_var`, declared under its
+{{ _cont }}`env.required`, and never written into a file here.
+{% endif %}
+#   {{ ssh_key_var.ljust(_col - 4) }}Private key (File type) for the deploy-host
+{{ _cont }}account in `deploy.host`. CI-only: it
+{{ _cont }}authenticates the deploy job and is never part
+{{ _cont }}of the deployment's own environment.
+{% for project in ctx.external_projects if project.token_env_var %}
+#   {{ project.token_env_var.ljust(_col - 4) }}Pull credential for the external project
+{{ _cont }}`{{ project.name }}`, named by `deploy.external_projects`.
+{% endfor %}
+#
+{% if ctx.registry_url %}
+# Images are pushed to `{{ ctx.registry_url }}` and pulled from there by the
+# deploy host, so the registry credential above is read by both halves.
+{% else %}
+# The deploy host builds its own images (`deploy.image_source: local`), so this
+# pipeline needs no registry credential at all.
+{% endif %}
+#
+# No secret is ever read into an artifact. The deploy host keeps its own .env —
+# the facility's secrets stay where the repo says they live.
+# =============================================================================
+
+include:
+  # Facility-owned jobs, layered on top of everything below. Guarded by
+  # `exists` so a repo that deleted the file still has a valid pipeline.
+  - local: ci-extra.yml
+    rules:
+      - exists:
+          - ci-extra.yml
+
+stages:
+  - validate
+{% if ctx.has_images_stage %}
+  - images
+{% endif %}
+  - deploy
+
+variables:
+{% if ctx.registry_url %}
+  # deploy.registry.url, split into the half `docker login` takes and the
+  # whole prefix an image name carries.
+  REGISTRY_HOST: {{ ctx.registry_host }}
+  REGISTRY: {{ ctx.registry_url }}
+{% endif %}
+  DEPLOY_HOST: {{ ctx.deploy_host }}
+  DEPLOY_USER: {{ ctx.deploy_user }}
+  DEPLOY_PATH: {{ ctx.deploy_path }}
+
+# -----------------------------------------------------------------------------
+# Stage 1 — the source zone still renders.
+#
+# Runs on every commit and needs no credentials: it proves {{ profile_path }} is
+# well-formed and that build/ can be rendered from it, which is the failure a
+# facility most wants to hear about before the deploy window, not during it.
+# -----------------------------------------------------------------------------
+render-build:
+  stage: validate
+  image: python:3.11-slim
+  before_script:
+    # The floor the profile itself declares (requires_osprey_version), so the
+    # pipeline can never run an OSPREY that does not understand it.
+    - pip install --no-cache-dir "{{ ctx.requirement }}"
+  script:
+    - osprey validate
+    - osprey build --skip-lifecycle --skip-deps
+  artifacts:
+    paths:
+      - {{ build_dir }}/
+    expire_in: 1 week
+{% if ctx.service_images %}
+
+# -----------------------------------------------------------------------------
+# Stage 2 — one image per facility-owned service that carries a Dockerfile.
+#
+# The build context is the service directory in the source zone, not the
+# rendered copy under {{ build_dir }}/: the sources are the facility's, and
+# building them does not depend on the render succeeding. Services the framework
+# ships (openobserve, the virtual accelerator) are not built here — they come
+# from their own upstreams.
+# -----------------------------------------------------------------------------
+.service-image:
+  stage: images
+  image: docker:27
+  services:
+    - docker:27-dind
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "${{ ctx.registry_token_var }}" "$REGISTRY_HOST"
+  script:
+    - docker build -t "$REGISTRY/$SERVICE:$CI_COMMIT_SHORT_SHA" "services/$SERVICE"
+    - docker push "$REGISTRY/$SERVICE:$CI_COMMIT_SHORT_SHA"
+    # :latest is what the deploy host pulls, so it moves only on the default
+    # branch — a feature branch can build and push an image without any
+    # chance of it reaching production.
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        docker tag "$REGISTRY/$SERVICE:$CI_COMMIT_SHORT_SHA" "$REGISTRY/$SERVICE:latest"
+        docker push "$REGISTRY/$SERVICE:latest"
+      fi
+{% for service in ctx.service_images %}
+
+image:{{ service }}:
+  extends: .service-image
+  variables:
+    SERVICE: {{ service }}
+{% endfor %}
+{% endif %}
+{% if ctx.external_projects %}
+
+# -----------------------------------------------------------------------------
+# Another project's images, checked here rather than on the deploy host.
+#
+# The host pulls these itself, with its own copy of the same token; a token that
+# has expired is the one failure that would otherwise surface mid-deploy, so the
+# pipeline proves each one still works while there is still time to rotate it.
+# -----------------------------------------------------------------------------
+{% for project in ctx.external_projects %}
+
+external:{{ project.name }}:
+  stage: images
+  image: docker:27
+  services:
+    - docker:27-dind
+  script:
+{% if project.token_env_var %}
+    - docker login -u "$CI_REGISTRY_USER" -p "${{ project.token_env_var }}" "{{ project.url.split('/')[0] }}"
+{% endif %}
+    - docker pull "{{ project.url }}/{{ project.image }}"
+{% endfor %}
+{% endif %}
+
+# -----------------------------------------------------------------------------
+# Stage {{ 3 if ctx.has_images_stage else 2 }} — deploy.
+#
+# Manual and default-branch only: this is the single gate between a green
+# pipeline and a running control-room service. `resource_group` serializes it
+# so two operators pressing the button cannot interleave on the host.
+#
+# The host re-renders from the same commit rather than unpacking the artifact
+# above, so what runs is reproducible from git alone. `git reset --hard` moves
+# only what git tracks — the deployment's own .env and {{ state_dir }}/ are git-ignored by
+# the repo's .gitignore, so the host's secrets and the agent's memory survive
+# every deploy by construction. That is why nothing here copies files onto the
+# host: an rsync of the working tree would have to be trusted not to delete
+# them.
+#
+# `osprey users env` turns the host's .env into the runtime secrets
+# file the web-terminal containers read, before any container starts. `--output`
+# is what makes that safe, and it is not optional: without it the command writes
+# the assembled secrets to stdout, which here is the job log. It also creates
+# the file at mode 0600 from its first byte, which a shell redirect would not —
+# on a shared deploy host the difference is every other account being able to
+# read the deployment's credentials. The file lands at the repo root, where
+# compose reads it, and .gitignore keeps it out of git — so the next deploy's
+# `git reset --hard` leaves it alone.
+#
+{% if ctx.runs_verify_on_up %}
+# `osprey up` runs {{ verify_path }} afterwards on its own — the deploy's
+# health report needs no job of its own.
+{% else %}
+# `osprey up` does NOT run {{ verify_path }} for this deployment: the post-up
+# hook that runs it belongs to the web tier, which this profile does not
+# enable. Nothing here probes the deployment — run the script on the deploy
+# host by hand for a health report.
+{% endif %}
+# -----------------------------------------------------------------------------
+deploy:
+  stage: deploy
+  image: alpine:3.20
+  needs:
+    - render-build
+  before_script:
+    - apk add --no-cache openssh-client git
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - cp "${{ ssh_key_var }}" ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+    - ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+  script:
+    - |
+      ssh "$DEPLOY_USER@$DEPLOY_HOST" bash -euo pipefail <<REMOTE
+      cd $DEPLOY_PATH
+      git fetch --prune origin
+      git reset --hard $CI_COMMIT_SHA
+      osprey build
+      osprey users env --output {{ users_env_name }}
+      osprey up -d
+      REMOTE
+  environment:
+    name: production
+    url: https://$DEPLOY_HOST
+  resource_group: production
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual

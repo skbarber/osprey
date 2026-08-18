@@ -10,10 +10,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 from click.testing import CliRunner
 
+from osprey.cli import build_profile_presets
 from osprey.cli.build_cmd import build
 from osprey.cli.build_profile import (
+    _load_preset_raw,
     _preset_exists,
     _presets_dir,
     list_presets,
@@ -133,29 +136,24 @@ def test_extends_preset_chain_via_intermediate_file(tmp_path: Path) -> None:
     assert resolved.data_bundle == "hello_world"
 
 
-def test_build_from_profile_extending_preset_succeeds(runner: CliRunner, tmp_path: Path) -> None:
-    """End-to-end: build from a profile whose ``extends:`` references a preset by name."""
-    profile = tmp_path / "p.yml"
-    profile.write_text("extends: hello-world\nname: ExtTest\n")
-    result = runner.invoke(
-        build,
-        [
-            "smoke",
-            str(profile),
-            "--skip-deps",
-            "--skip-lifecycle",
-            "--output-dir",
-            str(tmp_path),
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    project_dir = tmp_path / "smoke"
-    assert (project_dir / "config.yml").exists()
-    # Manifest records this as a profile-sourced build, not preset.
-    import json
+def test_build_from_a_repo_whose_profile_extends_a_preset_by_name(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """End-to-end: a deployment repo's ``profile.yml`` with ``extends: hello-world``
+    (a bare preset name) builds through the real render pipeline, not just
+    through ``resolve_build_profile`` in isolation — so a mistake in how the
+    build wires preset resolution into the zero-argument render would show up
+    here even if the resolver itself still behaved correctly on its own."""
+    repo = tmp_path / "ext-repo"
+    repo.mkdir()
+    (repo / "profile.yml").write_text("extends: hello-world\nname: ExtTest\n", encoding="utf-8")
 
-    manifest = json.loads((project_dir / ".osprey-manifest.json").read_text())
-    assert manifest["build_args"]["source"] == "profile"
+    result = runner.invoke(build, ["--repo", str(repo), "--skip-deps", "--skip-lifecycle"])
+
+    assert result.exit_code == 0, result.output
+    config = yaml.safe_load((repo / "build" / "config.yml").read_text(encoding="utf-8"))
+    # The preset's own provider flowed through the extends chain into the render.
+    assert config["claude_code"]["provider"] == "anthropic"
 
 
 def test_presets_dir_returns_directory_with_known_presets() -> None:
@@ -164,3 +162,33 @@ def test_presets_dir_returns_directory_with_known_presets() -> None:
     assert presets.is_dir()
     files = {p.name for p in presets.glob("*.yml")}
     assert "hello-world.yml" in files
+
+
+def test_load_preset_raw_invalid_yaml_raises_build_profile_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preset file with invalid YAML raises `BuildProfileError` naming the preset."""
+    from osprey.errors import BuildProfileError
+
+    monkeypatch.setattr(build_profile_presets, "_presets_dir", lambda: tmp_path)
+    (tmp_path / "broken.yml").write_text("name: [unterminated\n", encoding="utf-8")
+    with pytest.raises(BuildProfileError) as exc:
+        _load_preset_raw("broken")
+    msg = str(exc.value)
+    assert "Invalid YAML" in msg
+    assert "broken" in msg
+
+
+def test_load_preset_raw_non_mapping_yaml_raises_build_profile_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preset file whose YAML parses to a list (not a mapping) is rejected."""
+    from osprey.errors import BuildProfileError
+
+    monkeypatch.setattr(build_profile_presets, "_presets_dir", lambda: tmp_path)
+    (tmp_path / "listy.yml").write_text("- one\n- two\n", encoding="utf-8")
+    with pytest.raises(BuildProfileError) as exc:
+        _load_preset_raw("listy")
+    msg = str(exc.value)
+    assert "must be a YAML mapping" in msg
+    assert "listy" in msg

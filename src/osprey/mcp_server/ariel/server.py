@@ -58,20 +58,12 @@ def parse_date_filters(
     Returns:
         Tuple of (parsed_start, parsed_end), either may be None.
     """
-    from osprey.utils.config import get_facility_timezone
+    from osprey.utils.config import localize_facility
 
-    parsed_start = datetime.fromisoformat(start_date) if start_date else None
-    parsed_end = datetime.fromisoformat(end_date) if end_date else None
-
-    # Localize naive datetimes to facility timezone
-    if parsed_start and parsed_start.tzinfo is None:
-        tz = get_facility_timezone()
-        parsed_start = parsed_start.replace(tzinfo=tz)
-    if parsed_end and parsed_end.tzinfo is None:
-        tz = get_facility_timezone()
-        parsed_end = parsed_end.replace(tzinfo=tz)
-
-    return parsed_start, parsed_end
+    return (
+        localize_facility(datetime.fromisoformat(start_date) if start_date else None),
+        localize_facility(datetime.fromisoformat(end_date) if end_date else None),
+    )
 
 
 def build_entry_url(entry_id: str | None, source_system: str | None = None) -> "str | None":
@@ -172,15 +164,18 @@ def create_server() -> FastMCP:
     prime_config_builder()
     initialize_ariel_context()
 
-    workspace_root = resolve_workspace_root()
-    logger.info("ARIEL workspace root: %s", workspace_root)
-    initialize_workspace_singletons(workspace_root)
+    # Session working root used by other tools at call time; the artifact
+    # store itself is rooted at the shared data root inside
+    # initialize_workspace_singletons().
+    logger.info("ARIEL workspace root: %s", resolve_workspace_root())
+    initialize_workspace_singletons()
 
     # Import tool modules (each registers itself via @mcp.tool())
     from osprey.mcp_server.ariel.tools import (  # noqa: F401
         browse,
         capabilities,
         entry,
+        hybrid_search,
         keyword_search,
         publish,
         semantic_search,

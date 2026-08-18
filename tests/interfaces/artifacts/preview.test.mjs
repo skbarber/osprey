@@ -122,8 +122,8 @@ describe('renderPreview: per-type viewport dispatch', () => {
     ['html', 'iframe.preview-iframe-light'],
     ['plot_png', 'img'],
     ['image', 'img'],
-    ['markdown', '#md-viewport.md-preview-container'],
-    ['json', '#json-viewport.json-viewer'],
+    ['markdown', '.md-preview-container'],
+    ['json', '.json-viewer'],
     ['text', 'iframe.preview-iframe-dark'],
   ])('artifact_type "%s" renders %s', (artifact_type, selector) => {
     setSelectedArtifact(makeArtifact({ artifact_type }));
@@ -176,7 +176,7 @@ describe('renderPreview: per-type viewport dispatch', () => {
     expect(link.textContent).toContain('blob.bin');
   });
 
-  test('timeseries data (metadata.data_type) renders the ts-viewport container and fires onTimeseriesNeeded', () => {
+  test('timeseries data (metadata.data_type) renders the timeseries container and fires onTimeseriesNeeded', () => {
     const artifact = makeArtifact({
       artifact_type: 'plot_html',
       metadata: { data_type: 'timeseries', data_file: 'x.parquet' },
@@ -186,7 +186,7 @@ describe('renderPreview: per-type viewport dispatch', () => {
     const renderer = createPreviewRenderer(callbacks);
     renderer.renderPreview();
 
-    const tsEl = document.getElementById('ts-viewport');
+    const tsEl = document.querySelector('.preview-viewport .ts-viewport-container');
     expect(tsEl).not.toBeNull();
     expect(callbacks.onTimeseriesNeeded).toHaveBeenCalledTimes(1);
     expect(callbacks.onTimeseriesNeeded.mock.calls[0][0]).toBe(tsEl);
@@ -200,7 +200,7 @@ describe('renderPreview: per-type viewport dispatch', () => {
     const renderer = createPreviewRenderer(callbacks);
     renderer.renderPreview();
 
-    expect(document.getElementById('ts-viewport')).not.toBeNull();
+    expect(document.querySelector('.preview-viewport .ts-viewport-container')).not.toBeNull();
     expect(callbacks.onTimeseriesNeeded).toHaveBeenCalledTimes(1);
   });
 });
@@ -283,14 +283,14 @@ describe('renderPreview: delete flow', () => {
 });
 
 describe('renderPreview: copy path', () => {
-  test('copies the _agent_data path and toggles a "copied" class', async () => {
+  test('copies the agent-data path and toggles a "copied" class', async () => {
     vi.useFakeTimers();
     setSelectedArtifact(makeArtifact());
     createPreviewRenderer(makeCallbacks()).renderPreview();
 
     const btn = byId('preview-copy-path');
     btn.click();
-    await vi.waitFor(() => expect(window.navigator.clipboard.writeText).toHaveBeenCalledWith('_agent_data/artifacts/beam_profile.png'));
+    await vi.waitFor(() => expect(window.navigator.clipboard.writeText).toHaveBeenCalledWith('var/agent_data/artifacts/beam_profile.png'));
 
     expect(btn.classList.contains('copied')).toBe(true);
     vi.advanceTimersByTime(1500);
@@ -385,6 +385,26 @@ describe('fullscreen mode', () => {
     const renderer = createPreviewRenderer(callbacks);
     renderer.exitFullscreen();
     expect(callbacks.onFullscreenExit).not.toHaveBeenCalled();
+  });
+
+  test('clearing the selection while fullscreen exits fullscreen (no stranded chrome-less pane)', () => {
+    // fullscreen-mode hides the header, sidebar and splitter (gallery.css),
+    // so every exit affordance lives inside the preview content. If the
+    // selection clears while fullscreen — Delete from the fullscreen header,
+    // or an agent-side artifact_deleted SSE — the empty placeholder renders
+    // with the body class still set: no sidebar, no header, no Back button.
+    const callbacks = makeCallbacks();
+    const renderer = createPreviewRenderer(callbacks);
+    renderer.enterFullscreen(makeArtifact());
+    expect(renderer.isFullscreen()).toBe(true);
+
+    setSelectedArtifact(null);
+    renderer.renderPreview();
+
+    expect(renderer.isFullscreen()).toBe(false);
+    expect(document.body.classList.contains('fullscreen-mode')).toBe(false);
+    expect(callbacks.onFullscreenExit).toHaveBeenCalledTimes(1);
+    expect(byId('preview-empty').classList.contains('hidden')).toBe(false);
   });
 
   test('noteNewArtifactArrival/updateNewArtifactBadge track and display the "N new" count', () => {

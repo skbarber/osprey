@@ -12,11 +12,17 @@ import os
 
 import click
 
+from osprey.cli.altitude import lift_gate
 from osprey.cli.styles import Messages, Styles, console
 
 
 def _setup_config(project: str | None):
     """Resolve and set CONFIG_FILE from project path.
+
+    Resolution is :func:`osprey.cli.project_utils.resolve_config_path`'s, so this
+    group reads the same config ``osprey health`` reports on from the same
+    stance: the render of the deployment repo enclosing the working directory,
+    or the flat config of a rendered project directory named outright.
 
     Args:
         project: Optional project directory path.
@@ -30,26 +36,23 @@ def _setup_config(project: str | None):
     if not os.path.exists(config_path):
         raise click.ClickException(
             f"Configuration file not found: {config_path}\n"
-            "Run 'osprey build my-project --preset hello-world' to create a project, "
-            "or use --project to specify the project directory."
+            "No built deployment was found there, and no deployment repo encloses it. "
+            "Run 'osprey init my-project --preset hello-world' to create one, then "
+            "'osprey build' from inside it, or name a project with --project."
         )
     os.environ["CONFIG_FILE"] = str(config_path)
 
 
-def _initialize_registry(verbose: bool = False):
-    """Initialize the Osprey registry with appropriate logging.
+def _initialize_registry():
+    """Initialize the Osprey registry without its start-up chatter.
 
-    Args:
-        verbose: If True, show detailed initialization logs.
+    Sets no logger levels of its own: what a run renders is the CLI's altitude
+    policy, applied once for every command. The named loggers below are silenced
+    for the duration of this call only — registry wiring narrates each component
+    it loads, and that transcript belongs to ``-v``, not to a database command
+    that happens to need a registry first.
     """
-    import logging
-
     from osprey.registry import initialize_registry
-
-    if not verbose:
-        logging.getLogger("osprey").setLevel(logging.WARNING)
-        logging.getLogger("channel_finder").setLevel(logging.WARNING)
-
     from osprey.utils.log_filter import quiet_logger
 
     with quiet_logger(
@@ -62,12 +65,62 @@ def _initialize_registry(verbose: bool = False):
         initialize_registry(silent=True)
 
 
+# Where a generated channel database lands inside a data tree. The build copies
+# the profile's data tree onto the project's ``data/``, so one relative path
+# names the file in both places — writing it into the profile is enough for the
+# next build to deploy it.
+_GENERATED_DB_RELPATH = ("processed", "channel_database.json")
+
+
+def _profile_data_root(project_dir):
+    """The data tree of the profile a project was built from, if one resolves.
+
+    Resolves the profile the way the build does — ``extends`` chain followed,
+    persona delta merged over its root, everything anchored at the profile root
+    — rather than reading the one YAML file the manifest names. A generated
+    database has to land where the *build* will read it from, and a raw read
+    sees neither an inherited ``data:`` nor the root a delta belongs to.
+
+    Args:
+        project_dir: Project root whose manifest names the profile.
+
+    Returns:
+        The profile's data tree, or ``None`` when the project names no profile
+        (preset-built, or a manifest that is absent or names none), the profile
+        file is gone, it
+        cannot be read, or the resolved profile declares no ``data:`` tree at
+        all — every one of which is a normal state the caller falls back from
+        rather than an error to raise. Never a guessed ``<root>/data``: a
+        directory the build does not read is worse than an honest fallback,
+        because the caller would announce it as deployable.
+    """
+    from osprey.cli.build_profile_document import _read_profile_document
+    from osprey.cli.build_profile_merge import resolve_profile_document
+    from osprey.cli.build_profile_model import BuildProfile
+    from osprey.cli.templates.manifest import manifest_profile_path
+    from osprey.errors import BuildProfileError
+
+    profile_file = manifest_profile_path(project_dir)
+    if profile_file is None or not profile_file.is_file():
+        return None
+
+    try:
+        raw = _read_profile_document(profile_file)
+        if not isinstance(raw, dict):
+            return None
+        document = resolve_profile_document(raw, profile_file)
+    except (BuildProfileError, OSError):
+        return None
+
+    declared = document.raw.get("data")
+    return BuildProfile(name="", data=declared).resolved_data_root(document.root_dir)
+
+
 @click.group("channel-finder")
 @click.option(
     "--project",
-    "-p",
     type=click.Path(exists=True, file_okay=False, dir_okay=True),
-    help="Project directory (default: current directory or OSPREY_PROJECT env var)",
+    help="Deployment repo or rendered project directory. Default: the repo enclosing cwd.",
 )
 @click.option("--verbose", "-v", is_flag=True, default=False, help="Enable verbose logging")
 @click.pass_context
@@ -88,6 +141,11 @@ def channel_finder(ctx, project: str | None, verbose: bool):
     ctx.ensure_object(dict)
     ctx.obj["project"] = project
     ctx.obj["verbose"] = verbose
+    if verbose:
+        # The group's own --verbose lifts the CLI altitude gate for this run, so
+        # every subcommand under it renders its transcript rather than only
+        # warnings and errors. Idempotent, and a no-op when nothing is gated.
+        lift_gate()
 
 
 @channel_finder.command("build-database")
@@ -100,8 +158,11 @@ def channel_finder(ctx, project: str | None, verbose: bool):
 @click.option(
     "--output",
     type=click.Path(dir_okay=False),
-    default="data/processed/channel_database.json",
-    help="Output JSON file (default: data/processed/channel_database.json)",
+    default=None,
+    help=(
+        "Output JSON file (default: processed/channel_database.json inside the "
+        "profile's data tree, or the project's data/ tree when no profile resolves)"
+    ),
 )
 @click.option(
     "--use-llm",
@@ -121,11 +182,29 @@ def channel_finder(ctx, project: str | None, verbose: bool):
     default=",",
     help="CSV field delimiter (default: ',')",
 )
-def build_database(csv: str, output: str, use_llm: bool, config_path: str | None, delimiter: str):
+@click.pass_context
+def build_database(
+    ctx, csv: str, output: str | None, use_llm: bool, config_path: str | None, delimiter: str
+):
     """Build a channel database from a CSV file.
 
     Reads a CSV with columns: address, description, family_name, instances, sub_channel.
     Rows with family_name are grouped into templates; rows without are standalone channels.
+
+    The database is written into the profile the project was built from, not
+    into the project: the profile is the source of truth, so a generated
+    database belongs beside the inputs it came from and survives a rebuild.
+    That deliberately marks the built project stale, and the sequence is meant
+    to run to completion:
+
+    \b
+      build-database   -> writes the database into the profile
+      (project reports its build as stale)
+      osprey build     -> copies the profile's data tree into the project
+      (advisory clears)
+
+    The staleness advisory is the reminder that the new database has not been
+    deployed yet — it is not a problem to fix.
 
     Examples:
 
@@ -142,8 +221,27 @@ def build_database(csv: str, output: str, use_llm: bool, config_path: str | None
         build_database as do_build,
     )
 
+    from .project_utils import resolve_project_path
+
     csv_path = Path(csv)
-    output_path = Path(output)
+    project_dir = resolve_project_path(ctx.obj.get("project"))
+
+    wrote_to_profile = False
+    if output:
+        output_path = Path(output)
+    else:
+        data_root = _profile_data_root(project_dir)
+        wrote_to_profile = data_root is not None
+        if data_root is None:
+            console.print(
+                Messages.warning(
+                    "No profile data tree resolved for this project — writing into the "
+                    "project's data tree. The next 'osprey build' regenerates that "
+                    "tree and overwrites this database; pass --output to keep it elsewhere."
+                )
+            )
+            data_root = project_dir / "data"
+        output_path = data_root.joinpath(*_GENERATED_DB_RELPATH)
 
     try:
         do_build(
@@ -156,6 +254,14 @@ def build_database(csv: str, output: str, use_llm: bool, config_path: str | None
     except Exception as e:
         console.print(f"\n{Messages.error(str(e))}")
         raise click.Abort() from None
+
+    if wrote_to_profile:
+        console.print(
+            Messages.info(
+                "Next step: the project now reports its build as stale — run "
+                "'osprey build' to deploy the new database."
+            )
+        )
 
 
 @channel_finder.command("validate")
@@ -188,11 +294,16 @@ def validate(ctx, database: str | None, verbose: bool, pipeline: str | None):
       osprey channel-finder validate --verbose
       osprey channel-finder validate --pipeline hierarchical
     """
+    if verbose:
+        # Lifts the altitude gate for this run, on top of the detailed
+        # statistics the flag already asks ``run_validation`` for.
+        lift_gate()
+
     project = ctx.obj.get("project")
 
     try:
         _setup_config(project)
-        _initialize_registry(verbose=False)
+        _initialize_registry()
     except click.ClickException:
         if not database:
             raise
@@ -273,7 +384,7 @@ def preview(
     if not database:
         try:
             _setup_config(project)
-            _initialize_registry(verbose=False)
+            _initialize_registry()
         except click.ClickException:
             raise
 
@@ -512,7 +623,7 @@ def _parse_query_indices(queries_spec: str, total: int) -> list[int]:
     "--model",
     required=True,
     help=(
-        "LiteLLM-form ``provider/wire_id`` (e.g. anthropic/claude-haiku-4-5, "
+        "LiteLLM-form provider/wire_id (e.g. anthropic/claude-haiku-4-5, "
         "ollama/gemma3:4b). The provider determines auth and routing; the "
         "wire id is forwarded upstream. Saved BenchmarkRun.model records "
         "the exact string for reproducibility."
@@ -576,6 +687,13 @@ def benchmark(
       osprey channel-finder benchmark --model ollama/gemma3:4b --queries 0:5
       osprey channel-finder benchmark --model anthropic/claude-haiku-4-5 --runs-per-query 3
     """
+    if verbose:
+        # One half of what --verbose means here: the altitude gate is lifted, so
+        # this run's records are rendered instead of only its warnings. The
+        # other half is the level floor set below, which is what lets the
+        # framework's DEBUG records be emitted in the first place.
+        lift_gate()
+
     import asyncio
     import logging
     from pathlib import Path
@@ -587,14 +705,22 @@ def benchmark(
         BenchmarkRunner,
     )
 
-    # Resolve project directory
-    project_dir = Path(ctx.obj.get("project") or os.getcwd())
-    config_path = project_dir / "config.yml"
+    from .project_utils import project_config_path, resolve_project_path
+
+    # The group's one resolution rule, not a third spelling of it: the repo
+    # enclosing the working directory, or the project directory named outright.
+    config_path = project_config_path(resolve_project_path(ctx.obj.get("project")))
     if not config_path.exists():
         raise click.ClickException(
-            f"config.yml not found in {project_dir}\n"
-            "Run this from an OSPREY project directory or use --project."
+            f"config.yml not found: {config_path}\n"
+            "Run this from a built deployment repo, or name one with --project."
         )
+
+    # The runner reads `config.yml` at its own root, so it is handed the
+    # directory holding the config — the `build/` render on a host, the project
+    # directory itself in a container. Its outputs land beside it for the same
+    # reason: a benchmark result is exhaust from that render, not repo source.
+    project_dir = config_path.parent
 
     out_directory = (
         Path(output_dir) if output_dir else project_dir / "data" / "benchmarks" / "results"
@@ -613,7 +739,10 @@ def benchmark(
     indices = _parse_query_indices(queries, len(all_queries))
 
     if verbose:
-        logging.basicConfig(level=logging.DEBUG)
+        # A level floor, and only that: raising the framework logger is what
+        # lets its DEBUG records be emitted at all. Whether an emitted record
+        # reaches the terminal is the CLI's altitude policy — the gate lifted at
+        # the top of this body.
         logging.getLogger("osprey").setLevel(logging.DEBUG)
 
     console.print(

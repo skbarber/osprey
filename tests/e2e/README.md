@@ -61,6 +61,26 @@ Running e2e tests together with unit tests can cause:
 - Service initialization conflicts
 - Async fixture lifecycle issues
 
+## Benchmark-lane markers (required for matrix-scope tests)
+
+The model-benchmark matrix (`scripts/benchmark/`) scores two lanes separately,
+declared by a pytest marker on every e2e test that is not in the matrix
+exclusion list (`scripts/benchmark/matrix_e2e_config.json`):
+
+- `@pytest.mark.agentic_benchmark` — the test is a genuine model-capability
+  task: the agent must choose and sequence tools, reason about results, and
+  produce an answer the assertions (or an LLM judge) actually evaluate. A weak
+  model plausibly fails it.
+- `@pytest.mark.harness_benchmark` — an agent runs, but the assertion is
+  model-independent OSPREY behavior (safety hook fires, write is blocked,
+  audit record written). Any responding model passes it.
+
+**When you add an e2e test**, either mark it with exactly one of these or add
+its file to the exclusion config with a reason. The lane gate
+(`scripts/benchmark/check_e2e_coverage.py --check-lanes`, also run as a unit
+test in `tests/benchmark/test_matrix_lanes.py` and at matrix-cell startup)
+fails on unmarked in-scope tests.
+
 ## Test Categories
 
 ### Tutorial Workflows (`test_tutorials.py`)
@@ -147,6 +167,68 @@ manual ``purge && ingest`` step, and no stale/wrong-preset DB footgun: each test
 reseeds deterministically at setup. A running ARIEL Postgres at 5432 is still
 required (the seed has to land somewhere); only the seeding is automatic.
 
+## Scan-stack e2e family (VA + bluesky bridge + Tiled)
+
+These deploy a real stack — virtual accelerator, bluesky bridge, Tiled — and
+drive it. They are heavy (Docker builds, minutes each), so each gets its own CI
+lane rather than riding the bulk `e2e-tests` job, which `--ignore`s every one of
+them. The map below records which lane **runs** which file; `ci.yml` is the
+source of truth.
+
+| Module | CI lane |
+| --- | --- |
+| `test_bluesky_deploy.py` | `bluesky-deploy-e2e` |
+| `test_bluesky_web_deploy.py` | `bluesky-web-deploy-e2e` |
+| `test_va_substrate_equivalence.py` | `va-substrate-equivalence-e2e` |
+| `test_orm_roundtrip.py`, then `test_grid_scan_roundtrip.py`, then `test_bump_roundtrip.py` | `orm-roundtrip-e2e` (all three, sequentially, one deploy per file) |
+| `test_bluesky_queue_e2e.py` | `bluesky-queue-e2e` |
+| `test_tiled_roundtrip.py` | `tiled-roundtrip-e2e` |
+| `test_bluesky_catalog_e2e.py` | `bluesky-catalog-e2e` |
+| `test_bluesky_sandbox_escape_e2e.py` | `bluesky-sandbox-escape-e2e` |
+| `test_plan_stack_agentic.py` | `scan-agentic-e2e` |
+
+Two entries are worth reading twice. `test_grid_scan_roundtrip.py` and
+`test_bump_roundtrip.py` are **adopted into** `orm-roundtrip-e2e` rather than
+given lanes of their own: they run as sequential steps after
+`test_orm_roundtrip.py` — grid-scan so the two stacks never contend for the
+same CA port (5064), and orbit-bump for runner memory rather than port
+contention, since `test_bump_roundtrip.py` pins its whole port block. And
+`bluesky-queue-e2e` drives the queue stack with **no LLM in the loop** — it is
+a plain protocol test, unlike the agentic lane below.
+
+### `test_plan_stack_agentic.py` — the agentic member
+
+The only module in the family that puts an **agent** in the loop. An operator
+asks in plain language for a measurement on a **healthy** stack; the agent must
+discover the tools, stage a draft of the right plan class, queue it, start the
+queue, read the run back, and say what it shows. Nothing is broken, so there is
+no hidden answer: a run that "concludes" a fault is wrong, and a run that never
+took a measurement has nothing to conclude from.
+
+It grades in the two layers described under [Best Practices](#best-practices) —
+a deterministic floor over the tool trace, plus one judge criterion over the
+prose. The floor is a **plan-class predicate**, never a plan name: correctors
+driven against BPM readbacks is the orbit-response class, two or more distinct
+setpoint axes is the grid class, and correctors driven toward per-BPM
+`targets` within a `tolerance` band is the orbit-bump class. A bump draft may
+legitimately carry monitor readbacks alongside its correctors — which is
+precisely the orbit-response shape — so the orbit-response predicate excludes
+any state carrying `targets`. A structurally equivalent plan under a different name
+still passes, and the predicates are pairwise exclusive, so no live test can
+be satisfied by another class's run.
+
+Both halves are dry-verified offline against the same contracts the live tests
+use, so you can iterate without Docker or a live run:
+
+```bash
+# Structural floor — hand-built traces. No Docker, no API key, no agent.
+.venv/bin/pytest tests/e2e/test_plan_stack_agentic.py -k floor
+
+# Judge rubric — hand-written conclusions, one failing control per criterion.
+# Needs the judge provider's credentials (ALS_APG_API_KEY), nothing else.
+.venv/bin/pytest tests/e2e/test_plan_stack_agentic.py -k judge
+```
+
 ## Per-PR LLM cost expectation
 
 The ``e2e-tests`` job is a hard-fail gate — as is every e2e lane: the
@@ -178,6 +260,18 @@ export CBORG_API_KEY="your-key"
 
 # Or for Anthropic
 export ANTHROPIC_API_KEY="your-key"
+```
+
+### Provider × model matrix (opt-in)
+
+`test_llm_providers.py` is skipped by default. It is the one file that makes
+paid API calls on **every** provider whose key is in the environment (all other
+e2e tests pick a single provider by preference order), so it only runs when
+explicitly requested — typically after changing `src/osprey/models/providers/`
+or adding a provider:
+
+```bash
+OSPREY_LLM_MATRIX_ENABLE=1 pytest tests/e2e/test_llm_providers.py -v
 ```
 
 ### Additional Dependencies
@@ -239,7 +333,15 @@ async def test_my_workflow(e2e_project_factory):
 ### Best Practices
 
 1. **Use deterministic assertions** - check files created, content present, no errors
-2. **Don't use LLM judges** - they're slow, expensive, and non-deterministic
+2. **Grade in two layers** - when a test has to judge an agent's *work*, put the
+   load-bearing grading in a deterministic structural floor over the tool trace
+   ("did it actually do the thing?") and give an LLM judge only what a trace
+   cannot see ("did it describe and interpret what it did, without inventing
+   findings?"). Never let a judge carry a claim a floor could pin. Tell the
+   judge what the floor already covered so it does not re-penalize it, and
+   dry-verify both halves offline — the floor against hand-built traces, the
+   judge against one passing conclusion plus one failing control per criterion —
+   before you spend a live run. See `test_plan_stack_agentic.py`.
 3. **Mark appropriately** - use `@pytest.mark.e2e`, `@pytest.mark.slow`, `@pytest.mark.requires_*`
 4. **Clean validation** - verify actual outputs (files, code content) not just LLM responses
 

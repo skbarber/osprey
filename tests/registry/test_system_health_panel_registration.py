@@ -5,9 +5,11 @@ builtin, its ``WebServerDefinition`` constructs with the required fields, and th
 wiring is consistent across every site. Two facts are specific to this panel:
 
 * the panel **id** ``system-health`` (hyphen) differs from the registry **key**
-  ``system_health`` (underscore); ``cli/web_cmd.py`` maps between them;
+  ``system_health`` (underscore); the definition's own ``panel_id`` field is the
+  one place that relation is stated (see
+  ``tests/registry/test_web_panel_namespaces.py``);
 * the id ``system-health`` was chosen to avoid the already-occupied ``health``
-  id (the Bluesky scan-stack tab). The collision guard asserts no ``_inject_*``
+  id (the Bluesky plan-stack tab). The collision guard asserts no ``_inject_*``
   build step registers a ``system-health`` panel, and that the Bluesky ``health``
   entry is left untouched.
 """
@@ -15,9 +17,9 @@ wiring is consistent across every site. Two facts are specific to this panel:
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 from fastapi.testclient import TestClient
 
 from osprey.cli import web_cmd
@@ -25,7 +27,11 @@ from osprey.infrastructure import server_launcher
 from osprey.interfaces.web_terminal import app as web_terminal_app
 from osprey.interfaces.web_terminal.routes import proxy as proxy_module
 from osprey.profiles.web_panels import BUILTIN_PANEL_LABELS, BUILTIN_PANELS
-from osprey.registry.web import FRAMEWORK_WEB_SERVERS, WebServerDefinition
+from osprey.registry.web import (
+    FRAMEWORK_WEB_SERVERS,
+    PANEL_ID_TO_REGISTRY_KEY,
+    WebServerDefinition,
+)
 
 PANEL_ID = "system-health"
 REGISTRY_KEY = "system_health"
@@ -37,6 +43,24 @@ def _fresh_source(obj) -> str:
     path = inspect.getsourcefile(obj) or inspect.getfile(obj)
     with open(path, encoding="utf-8") as fh:
         return fh.read()
+
+
+def _fresh_build_package_source() -> str:
+    """Concatenate every ``build_*.py`` concern module's source.
+
+    The build pipeline is split across sibling modules (``build_cmd`` orchestrates;
+    injectors, environment, lifecycle, persistence, and profile live alongside it).
+    A panel-id guard must cover wherever the injectors *currently* live, so this
+    scans the whole family rather than naming one module — otherwise moving an
+    injector between modules silently voids the guard while everything still
+    imports and passes.
+    """
+    from osprey.cli import build_cmd
+
+    build_dir = Path(inspect.getsourcefile(build_cmd) or inspect.getfile(build_cmd)).parent
+    sources = sorted(build_dir.glob("build_*.py"))
+    assert sources, f"no build_*.py concern modules found under {build_dir}"
+    return "\n".join(p.read_text(encoding="utf-8") for p in sources)
 
 
 # -- builtin registration + definition -----------------------------------------
@@ -79,84 +103,12 @@ def test_proxy_state_map_wires_system_health_to_server_url():
     assert proxy_module._PANEL_STATE_MAP[PANEL_ID] == "system_health_server_url"
 
 
-def test_web_cmd_maps_registry_key_to_panel_id():
-    # Key ≠ id: the enabled-panels gate resolves the hyphenated panel id.
-    assert web_cmd._PANEL_ID_FOR_REGISTRY_KEY[REGISTRY_KEY] == PANEL_ID
-
-
-# -- web-terminal launch helper + gate -----------------------------------------
-
-
-def test_launch_system_health_server_sets_proxy_state_and_invokes_launcher(monkeypatch):
-    import osprey.utils.workspace as workspace
-
-    ensure_calls: list[bool] = []
-    monkeypatch.setattr(workspace, "load_osprey_config", lambda: {"health": {"web": {}}})
-    monkeypatch.setattr(
-        server_launcher, "ensure_system_health_server", lambda: ensure_calls.append(True)
-    )
-    monkeypatch.delenv("OSPREY_HEALTH_PORT", raising=False)
-
-    app = SimpleNamespace(state=SimpleNamespace())
-    web_terminal_app._launch_system_health_server(app)
-
-    # The proxy reads app.state.system_health_server_url; it must be populated.
-    assert getattr(app.state, "system_health_server_url", None)
-    assert ensure_calls == [True]
-
-
-def test_lifespan_gates_system_health_launch_on_enabled_panels():
-    assert hasattr(web_terminal_app, "_launch_system_health_server")
-    module_src = _fresh_source(web_terminal_app)
-    assert '"system-health" in enabled_panels' in module_src
-    assert "_launch_system_health_server(app)" in module_src
-
-
-# -- launch/launcher port agreement (okf regression pattern) -------------------
-
-
-def _launch_side_port(monkeypatch, fake_config, env_value):
-    """Port that _launch_system_health_server stores in app.state (app side)."""
-    import osprey.utils.workspace as workspace
-
-    monkeypatch.setattr(workspace, "load_osprey_config", lambda: fake_config)
-    monkeypatch.setattr(server_launcher, "ensure_system_health_server", lambda: None)
-    if env_value is None:
-        monkeypatch.delenv("OSPREY_HEALTH_PORT", raising=False)
-    else:
-        monkeypatch.setenv("OSPREY_HEALTH_PORT", env_value)
-
-    app = SimpleNamespace(state=SimpleNamespace())
-    web_terminal_app._launch_system_health_server(app)
-    url = getattr(app.state, "system_health_server_url", None)
-    assert url, "launch fn crashed → system_health_server_url is None (silent dead tab)"
-    return int(url.rsplit(":", 1)[1])
-
-
-def _launcher_side_port(monkeypatch, fake_config, env_value):
-    """Port that ServerLauncher's config reader resolves (the port uvicorn binds)."""
-    monkeypatch.setattr(server_launcher, "load_osprey_config", lambda: fake_config)
-    if env_value is None:
-        monkeypatch.delenv("OSPREY_HEALTH_PORT", raising=False)
-    else:
-        monkeypatch.setenv("OSPREY_HEALTH_PORT", env_value)
-    _host, port = server_launcher._make_config_reader(FRAMEWORK_WEB_SERVERS[REGISTRY_KEY])()
-    return port
-
-
-@pytest.mark.parametrize(
-    "env_value",
-    [
-        None,  # no override → port_default 8094 on both sides
-        "9099",  # explicit override → both sides honour it
-        "",  # SET-BUT-EMPTY (compose `VAR=`) → must not crash the launch (regression)
-    ],
-)
-def test_launch_and_launcher_agree_on_port(monkeypatch, env_value):
-    fake = {"health": {"web": {}}}
-    app_port = _launch_side_port(monkeypatch, fake, env_value)
-    bound_port = _launcher_side_port(monkeypatch, fake, env_value)
-    assert app_port == bound_port
+def test_the_definition_carries_the_hyphenated_panel_id():
+    # Key ≠ id: the enabled-panels gate in `osprey web` resolves the panel id
+    # off the definition, so the relation is declared once.
+    assert FRAMEWORK_WEB_SERVERS[REGISTRY_KEY].panel_id == PANEL_ID
+    assert PANEL_ID_TO_REGISTRY_KEY[PANEL_ID] == REGISTRY_KEY
+    assert "_PANEL_ID_FOR_REGISTRY_KEY" not in inspect.getsource(web_cmd)
 
 
 # -- consistency across the wiring sites ---------------------------------------
@@ -164,12 +116,12 @@ def test_launch_and_launcher_agree_on_port(monkeypatch, env_value):
 
 def test_id_and_key_consistency_across_sites():
     # The panel id is used at the builtin/proxy/frontend sites; the registry key
-    # at the definition site; web_cmd is the single id↔key bridge.
+    # at the definition site; the definition's `panel_id` is the single bridge.
     assert PANEL_ID in BUILTIN_PANELS
     assert PANEL_ID in proxy_module._PANEL_STATE_MAP
     assert proxy_module._PANEL_STATE_MAP[PANEL_ID] == f"{REGISTRY_KEY}_server_url"
     assert REGISTRY_KEY in FRAMEWORK_WEB_SERVERS
-    assert web_cmd._PANEL_ID_FOR_REGISTRY_KEY[REGISTRY_KEY] == PANEL_ID
+    assert PANEL_ID_TO_REGISTRY_KEY[PANEL_ID] == REGISTRY_KEY
 
 
 # -- panels config endpoint ----------------------------------------------------
@@ -201,12 +153,13 @@ async def test_system_health_server_config_endpoint_returns_proxy_path():
 
 
 def test_frontend_panel_manager_registers_system_health_tab():
+    """The PANELS array lives in panel-catalog.js; panel-manager.js imports it."""
     import os
 
-    pm_path = os.path.join(
-        os.path.dirname(inspect.getfile(web_terminal_app)), "static", "js", "panel-manager.js"
+    catalog_path = os.path.join(
+        os.path.dirname(inspect.getfile(web_terminal_app)), "static", "js", "panel-catalog.js"
     )
-    with open(pm_path, encoding="utf-8") as fh:
+    with open(catalog_path, encoding="utf-8") as fh:
         js = fh.read()
     assert "id: 'system-health'" in js
     assert "/api/system-health-server" in js
@@ -217,10 +170,10 @@ def test_frontend_panel_manager_registers_system_health_tab():
 
 
 def test_build_chain_reads_builtins_dynamically():
-    from osprey.cli import build_profile
+    from osprey.cli import build_profile_model
     from osprey.cli.templates import manifest
 
-    assert "BUILTIN_PANELS" in _fresh_source(build_profile)
+    assert "BUILTIN_PANELS" in _fresh_source(build_profile_model)
     assert "BUILTIN_PANELS" in _fresh_source(manifest)
 
 
@@ -234,9 +187,7 @@ def test_no_injector_registers_a_system_health_panel_id():
     so an injector adding a ``system-health`` custom panel would silently hijack
     the builtin tab.
     """
-    from osprey.cli import build_cmd
-
-    source = _fresh_source(build_cmd)
+    source = _fresh_build_package_source()
     assert "system-health" not in source  # no injector (or literal) registers it
 
 

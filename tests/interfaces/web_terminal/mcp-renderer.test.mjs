@@ -41,7 +41,7 @@ const MCP_JSON = JSON.stringify({
     bluesky: {
       command: 'python',
       args: ['-m', 'osprey.mcp_server.bluesky'],
-      env: { SCAN_TOKEN: '${SCAN_TOKEN}' },
+      env: { BLUESKY_LAUNCH_TOKEN: '${BLUESKY_LAUNCH_TOKEN}' },
     },
   },
 }, null, 2);
@@ -188,7 +188,7 @@ describe('renderMcpJson', () => {
 
     renderContainer(MCP_JSON);
 
-    expect(fetchMock).toHaveBeenCalledWith('/u/alice/api/mcp-servers');
+    expect(fetchMock).toHaveBeenCalledWith('/u/alice/api/mcp-servers', { cache: 'no-store' });
   });
 
   test('falls back to "tools not available" when the fetch rejects', async () => {

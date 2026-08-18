@@ -50,31 +50,62 @@ class TestLazyGroup:
         cmd = group.get_command(ctx, "nonexistent_command")
         assert cmd is None
 
-    def test_list_commands_returns_expected_commands(self):
-        """Verify list_commands returns all available commands."""
+    def test_list_commands_offers_the_whole_lifecycle(self):
+        """The listing is the surface an operator navigates by.
+
+        A verb missing from it is unreachable from `osprey --help` even when it
+        resolves, so the lifecycle sequence is asserted as a whole rather than
+        sampled — it is the order the help screen teaches.
+        """
         group = LazyGroup(name="test")
         ctx = mock.Mock()
 
         commands = group.list_commands(ctx)
 
-        # Verify expected commands are present
-        expected_commands = [
+        lifecycle = [
+            "init",
             "build",
+            "up",
+            "down",
+            "restart",
+            "status",
+            "logs",
+            "reset",
+            "set",
+            "validate",
+            "chat",
             "config",
-            "deploy",
-            "health",
-            "channel-finder",
-            "claude",
-            "eject",
-            "ariel",
-            "artifacts",
-            "web",
-            "scaffold",
+            "users",
         ]
         assert isinstance(commands, list)
-        assert len(commands) > 0
-        for cmd in expected_commands:
+        for cmd in lifecycle:
             assert cmd in commands
+
+    def test_the_retired_groups_are_gone_from_the_listing(self):
+        """A listing that still offered them would advertise commands that do
+        not resolve — the failure mode the lazy registry makes easy, since a
+        name in the list and a name in the import map are two separate edits."""
+        group = LazyGroup(name="test")
+
+        commands = group.list_commands(mock.Mock())
+
+        for retired in ("deploy", "claude"):
+            assert retired not in commands
+
+    def test_every_listed_command_actually_resolves(self):
+        """The list and the import map have to agree.
+
+        They are two separate literals in the same class, so a verb added to
+        one and forgotten in the other produces a help screen naming a command
+        that cannot be run.
+        """
+        import click
+
+        from osprey.cli.main import cli
+
+        ctx = click.Context(cli)
+        for name in cli.list_commands(ctx):
+            assert cli.get_command(ctx, name) is not None, name
 
     def test_get_command_handles_config_command(self):
         """Test special handling for config command."""
@@ -121,19 +152,23 @@ class TestCliGroup:
         # Should contain version info
         assert "osprey" in result.output.lower() or "version" in result.output.lower()
 
-    @mock.patch("osprey.cli.interactive_menu.launch_tui")
-    def test_cli_without_command_launches_tui(self, mock_launch_tui, runner):
-        """Test CLI without command launches interactive menu."""
-        runner.invoke(cli, [])
+    def test_cli_without_command_prints_help(self, runner):
+        """Bare `osprey` lists what there is to run.
 
-        # Should attempt to launch TUI
-        assert mock_launch_tui.called
+        Every verb is zero-argument, so the help IS the menu rather than an
+        interactive launcher — and printing it must exit cleanly rather than
+        read as a usage error.
+        """
+        result = runner.invoke(cli, [])
+
+        assert result.exit_code == 0
+        assert "Usage: cli" in result.output
+        assert "Commands:" in result.output
 
     @mock.patch("osprey.cli.styles.initialize_theme_from_config")
     def test_cli_initializes_theme(self, mock_init_theme, runner):
         """Test CLI attempts to initialize theme from config."""
-        with mock.patch("osprey.cli.interactive_menu.launch_tui"):
-            runner.invoke(cli, [])
+        runner.invoke(cli, [])
 
         # Should attempt theme initialization (silent failure is OK)
         assert mock_init_theme.called
@@ -160,8 +195,7 @@ class TestMainFunction:
         assert mock_cli.called
 
     @mock.patch("osprey.cli.main.cli")
-    @mock.patch("click.echo")
-    def test_main_handles_keyboard_interrupt(self, mock_echo, mock_cli):
+    def test_main_handles_keyboard_interrupt(self, mock_cli, capsys):
         """Test main handles Ctrl+C gracefully."""
         mock_cli.side_effect = KeyboardInterrupt()
 
@@ -171,12 +205,16 @@ class TestMainFunction:
         # Should exit with 130 (standard for SIGINT)
         assert exc_info.value.code == 130
 
-        # Should print goodbye message
-        assert mock_echo.called
+        # An interruption is a warning: stderr, with the warning mark. Asserted
+        # on what reaches the stream rather than on which function printed it,
+        # so the pin survives the next change of printer.
+        captured = capsys.readouterr()
+        assert "⚠" in captured.err
+        assert "Goodbye" in captured.err
+        assert captured.out == ""
 
     @mock.patch("osprey.cli.main.cli")
-    @mock.patch("click.echo")
-    def test_main_handles_general_exception(self, mock_echo, mock_cli):
+    def test_main_handles_general_exception(self, mock_cli, capsys):
         """Test main handles exceptions gracefully."""
         mock_cli.side_effect = Exception("Test error")
 
@@ -186,10 +224,12 @@ class TestMainFunction:
         # Should exit with 1
         assert exc_info.value.code == 1
 
-        # Should print error message
-        assert mock_echo.called
-        call_args = str(mock_echo.call_args)
-        assert "error" in call_args.lower()
+        # The last-resort failure wears the same mark as every other one, and
+        # lands on stderr so a caller piping stdout still sees it.
+        captured = capsys.readouterr()
+        assert "✗" in captured.err
+        assert "Test error" in captured.err
+        assert captured.out == ""
 
 
 class TestLazyLoading:
@@ -278,10 +318,14 @@ class TestEdgeCases:
         group.get_command(None, "init")
         # May return None or command - documenting behavior
 
-    @mock.patch("osprey.cli.interactive_menu.launch_tui")
-    def test_cli_invoked_subcommand_skips_tui(self, mock_launch_tui, runner):
-        """Test that providing a subcommand skips the TUI."""
-        runner.invoke(cli, ["health", "--help"])
+    def test_a_subcommand_gets_its_own_help_not_the_groups(self, runner):
+        """The group prints its help only when no subcommand was named.
 
-        # TUI should NOT be launched when subcommand is provided
-        assert not mock_launch_tui.called
+        Otherwise `osprey health --help` would answer with the group's listing
+        instead of the verb's own options — the same branch the bare-`osprey`
+        case above exercises, read from the other side.
+        """
+        result = runner.invoke(cli, ["health", "--help"])
+
+        assert result.exit_code == 0
+        assert "Usage: cli health" in result.output

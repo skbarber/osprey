@@ -1,8 +1,9 @@
 """Artifact storage for OSPREY MCP tools.
 
 Manages interactive artifacts (plots, tables, HTML, markdown) produced by
-Claude during analysis sessions.  Artifacts are stored in
-``_agent_data/artifacts/`` and served by the Artifact Server gallery.
+Claude during analysis sessions.  Artifacts are stored under the agent-data
+root (``agent_data.base_dir``) in ``artifacts/``, and served by the Artifact
+Server gallery.
 
 Two entry points create artifacts:
   1. ``save_artifact()`` — injected into ``execute`` namespace
@@ -13,12 +14,14 @@ This module provides the low-level storage layer used by both.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import mimetypes
 import os
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,6 +30,35 @@ from typing import Any
 from osprey.stores.base_store import BaseStore, _sanitize_for_json
 
 logger = logging.getLogger("osprey.stores.artifact_store")
+
+#: Who is performing the current store mutation. The store itself cannot tell
+#: an agent tool call from a gallery click or a retention sweep — the frames a
+#: listener emits from these events are *agent* activity, so non-agent callers
+#: declare themselves via :func:`artifact_mutation_actor` and listeners read
+#: :func:`current_artifact_mutation_actor` at event time. Defaults to "agent"
+#: because every MCP-tool path mutates the store on the agent's behalf.
+_MUTATION_ACTOR: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "artifact_mutation_actor", default="agent"
+)
+
+
+@contextmanager
+def artifact_mutation_actor(actor: str) -> Iterator[None]:
+    """Attribute store mutations in this scope to *actor* ("human", "system").
+
+    Listener callbacks fire synchronously inside the mutation call, so the
+    scope only needs to cover the ``save_*``/``delete_*`` call itself.
+    """
+    token = _MUTATION_ACTOR.set(actor)
+    try:
+        yield
+    finally:
+        _MUTATION_ACTOR.reset(token)
+
+
+def current_artifact_mutation_actor() -> str:
+    """Return the actor of the mutation currently firing listeners."""
+    return _MUTATION_ACTOR.get()
 
 
 def register_artifact_listener(fn: Callable[[ArtifactEntry], None]) -> None:
@@ -75,10 +107,11 @@ class ArtifactEntry:
     """Dispatch run that produced this artifact (``OSPREY_DISPATCH_RUN_ID``),
     empty for artifacts made outside a dispatch run.
 
-    Deliberately separate from ``session_id``: ``OSPREY_SESSION_ID`` also
-    relocates the whole store into ``_agent_data/sessions/<id>/`` (see
-    ``resolve_agent_data_root``), so it cannot be reused to tag a dispatch run
-    without moving its artifacts off the shared root the gallery reads."""
+    Deliberately separate from ``session_id``: a session id is not a run id —
+    ``OSPREY_SESSION_ID`` tags an interactive session's artifacts, while a
+    dispatch run needs its own scope so the worker can report and serve
+    exactly this run's artifacts. The store itself always lives on the shared
+    data root; both fields are index-level tags."""
     origin: str = ""
     """Provenance of the artifact within its run. Empty (the default) for the
     agent's own output. ``"input"`` marks a caller-supplied file ingested into
@@ -94,8 +127,8 @@ class ArtifactEntry:
         """Compact response returned to Claude after artifact creation.
 
         When ``summary`` / ``access_details`` are populated (data artifacts),
-        the response includes them so Claude sees the same compact info that
-        DataContext.to_tool_response() used to provide.
+        the response includes them so Claude sees the shape of the data without
+        a second read.
         """
         resp: dict[str, Any] = {
             "status": "success",
@@ -405,12 +438,12 @@ class ArtifactStore(BaseStore[ArtifactEntry]):
             filepath.write_bytes(content)
 
             # data_file is the agent-facing pointer: a path relative to the
-            # project CWD (one level above the workspace dir), so the agent
-            # can pass it directly to ``open()`` from its working directory.
+            # repo root, which is where agent code's working directory is, so
+            # the agent can pass it directly to ``open()``.
             # Falls back to a bare filename if the workspace layout doesn't
             # support a clean relative path (defensive — should not happen).
             try:
-                agent_path = str(filepath.relative_to(self._workspace.parent))
+                agent_path = str(filepath.relative_to(self.repo_root))
             except ValueError:
                 agent_path = safe_filename
 
@@ -553,26 +586,61 @@ class ArtifactStore(BaseStore[ArtifactEntry]):
         self._notify_delete_listeners(deleted)
         return True
 
-    def delete_all(self) -> list[ArtifactEntry]:
-        """Delete every artifact in one atomic operation.
+    def _delete_where(self, predicate: Callable[[ArtifactEntry], bool]) -> list[ArtifactEntry]:
+        """Delete every entry matching *predicate* in one atomic operation.
 
-        Removes all physical files and clears the index in a single locked
+        Unlinks the matching files and rewrites the index in a single locked
         block, then fires the delete listener once per removed entry outside
-        the lock. Returns the list of deleted entries.
+        the lock. Returns the removed entries.
         """
         with self._with_index_lock():
-            snapshot = list(self._entries)
-            for e in snapshot:
+            doomed = [e for e in self._entries if predicate(e)]
+            for e in doomed:
                 filepath = self._store_dir / e.filename
                 if filepath.exists():
                     filepath.unlink()
-            self._entries.clear()
-            self._save_index()
+            if doomed:
+                survivors = [e for e in self._entries if not predicate(e)]
+                self._entries[:] = survivors
+                self._save_index()
 
-        for entry in snapshot:
+        for entry in doomed:
             self._notify_delete_listeners(entry)
 
-        return snapshot
+        return doomed
+
+    def delete_category(self, category: str) -> list[ArtifactEntry]:
+        """Delete every artifact whose ``category`` equals *category*.
+
+        The scoped destructive path: it honours exactly the partition the read
+        path honours (:meth:`list_entries` ``category_filter``), so clearing
+        one category never touches another. Pass ``""`` to delete only
+        uncategorised entries.
+
+        Deletion is not recoverable — files are unlinked outright.
+
+        Args:
+            category: Category key to delete. ``""`` selects uncategorised
+                entries.
+
+        Returns:
+            The removed entries (empty when nothing matched).
+        """
+        return self._delete_where(lambda e: e.category == category)
+
+    def delete_everything(self) -> list[ArtifactEntry]:
+        """Delete EVERY artifact in the store, across all categories.
+
+        Named for its blast radius. This is the whole-store clear, not a
+        scoped delete: it destroys archiver datasets, run results and data
+        files written by :meth:`save_data` alongside plots, documents and
+        screenshots, and the files are unlinked outright — there is no trash.
+        Callers that mean a single partition must use :meth:`delete_category`.
+
+        Returns:
+            Every removed entry.
+        """
+        return self._delete_where(lambda e: True)
 
     def get_file_path(self, artifact_id: str) -> Path | None:
         entry = self.get_entry(artifact_id)

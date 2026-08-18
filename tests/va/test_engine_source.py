@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from osprey.services.virtual_accelerator.ioc.engine_source import EngineSource
@@ -24,6 +25,7 @@ from osprey.simulation.engine import SimulationEngine
 VAC_RB = "ZZTEST:VAC:PRESSURE:01:RB"
 FAULT_BI = "ZZTEST:STATUS:01:FAULT"
 NOT_IN_MACHINE = "ZZTEST:UNKNOWN:01:LEVEL:RB"
+POSITION_UNMODELED = "ZZTEST:BPM:01:POSITION:X:RB"
 
 TEST_MACHINE = {
     "name": "EngineSourceTestRig",
@@ -84,8 +86,22 @@ def data_dir(tmp_path) -> Path:
 
 
 @pytest.fixture()
-def engine(data_dir) -> SimulationEngine:
-    return SimulationEngine.from_file(data_dir / "machine.json")
+def state_dir(tmp_path) -> Path:
+    """Scenario state directory -- a separate mount from the machine model.
+
+    The container bind-mounts the build-owned data dir (machine.json) and the
+    host's runtime state dir (active_scenarios) independently; the engine and
+    the EngineSource must be pointed at the SAME state dir or they disagree
+    about which scenarios are active.
+    """
+    path = tmp_path / "state"
+    path.mkdir()
+    return path
+
+
+@pytest.fixture()
+def engine(data_dir, state_dir) -> SimulationEngine:
+    return SimulationEngine.from_file(data_dir / "machine.json", state_dir=state_dir)
 
 
 @pytest.fixture()
@@ -94,8 +110,8 @@ def records() -> dict[str, FakeRecord]:
 
 
 @pytest.fixture()
-def source(engine, records, data_dir) -> EngineSource:
-    return EngineSource(engine, CHANNELS, records, data_dir)
+def source(engine, records, data_dir, state_dir) -> EngineSource:
+    return EngineSource(engine, CHANNELS, records, data_dir, state_dir=state_dir)
 
 
 class TestBasicDrive:
@@ -163,8 +179,8 @@ class TestAtomicRenameStillDetected:
     such a swap even when the replacement file's mtime is forced to collide
     with the old one (the edge case content-hash comparison exists for)."""
 
-    def test_inode_swap_with_colliding_mtime_is_still_detected(self, source, records, data_dir):
-        state_path = data_dir / "active_scenarios"
+    def test_inode_swap_with_colliding_mtime_is_still_detected(self, source, records, state_dir):
+        state_path = state_dir / "active_scenarios"
 
         # Establish a baseline signature identical to what set_active_scenarios
         # would have written for the (implicit) nominal set.
@@ -177,7 +193,7 @@ class TestAtomicRenameStillDetected:
         # apply.py/set_active_scenarios uses) to a DIFFERENT scenario, with
         # its mtime forced to collide with the original -- this is the exact
         # scenario mtime-only detection can miss.
-        tmp_path = data_dir / "active_scenarios.tmp"
+        tmp_path = state_dir / "active_scenarios.tmp"
         tmp_path.write_text("leak\n")
         os.utime(tmp_path, ns=(original_mtime_ns, original_mtime_ns))
         os.replace(tmp_path, state_path)
@@ -198,7 +214,9 @@ class TestLegacyFallbackForUnmodeledChannels:
 
     def test_unmodeled_channel_gets_a_plausible_nonzero_value(self, source, records):
         source.poll_once()
-        assert records[NOT_IN_MACHINE].value == pytest.approx(100.0)  # classify_pv's default kind
+        assert records[NOT_IN_MACHINE].value == pytest.approx(
+            100.0
+        )  # classify_channel's default kind
 
     def test_unmodeled_channel_value_is_stable_when_not_noisy(self, source, records):
         source.poll_once()
@@ -230,3 +248,137 @@ class TestLegacyFallbackForUnmodeledChannels:
         src = EngineSource(engine, channels, recs, data_dir)
         src.poll_once()
         assert isinstance(recs[bi_addr].value, bool)
+
+
+class _RecordingRng:
+    """Stand-in for a numpy Generator that records each draw's sigma.
+
+    Lets a test assert on the exact noise sigma the fallback asked for rather
+    than on a sampled value.
+
+    Args:
+        draw: The standard-normal deviate every ``normal()`` call returns.
+    """
+
+    def __init__(self, draw: float = 1.0) -> None:
+        self.sigmas: list[float] = []
+        self._draw = draw
+
+    def normal(self, loc: float, scale: float) -> float:
+        self.sigmas.append(scale)
+        return loc + self._draw * scale
+
+
+class TestKindAwareNoiseFloor:
+    """The legacy fallback applies noise relative to the taxonomy base value,
+    so an unmodeled channel whose kind has a ``0.0`` base is immune to its own
+    ``noise`` flag. Kinds whose base can legitimately be zero carry an absolute
+    sigma floor; every other kind's sigma stays exactly what it is today.
+    """
+
+    NOISE_LEVEL = 0.05
+
+    def _driven(self, engine, data_dir, address: str, *, rng=None):
+        """Build a source driving one noisy unmodeled address of any kind."""
+        channels = [*CHANNELS, _channel(address, record_type=RECORD_TYPE_ANALOG, noise=True)]
+        recs = {addr: FakeRecord() for addr in [VAC_RB, FAULT_BI, NOT_IN_MACHINE, address]}
+        src = EngineSource(engine, channels, recs, data_dir, noise_level=self.NOISE_LEVEL)
+        if rng is not None:
+            src._rng = rng
+        return src, recs
+
+    @pytest.mark.parametrize(
+        ("address", "base_value"),
+        [
+            ("ZZTEST:DCCT:01:BEAM:CURRENT:RB", 500.0),
+            ("ZZTEST:PS:01:CURRENT:RB", 150.0),
+            ("ZZTEST:RF:01:VOLTAGE:RB", 5000.0),
+            ("ZZTEST:RF:01:POWER:RB", 50.0),
+            ("ZZTEST:VAC:02:PRESSURE:RB", 1e-9),
+            ("ZZTEST:CRYO:01:TEMP:RB", 25.0),
+            ("ZZTEST:SR:01:LIFETIME:RB", 10.0),
+            ("ZZTEST:SR:01:ENERGY:RB", 1900.0),
+            ("ZZTEST:UNKNOWN:03:LEVEL:RB", 100.0),
+        ],
+    )
+    def test_non_position_kind_sigma_is_exactly_unchanged(
+        self, engine, data_dir, address, base_value
+    ):
+        """Regression guard: the floor must not perturb any kind with a non-zero base."""
+        rng = _RecordingRng()
+        src, _recs = self._driven(engine, data_dir, address, rng=rng)
+        src.poll_once()
+
+        assert rng.sigmas == [abs(base_value) * self.NOISE_LEVEL]
+
+    def test_non_position_kind_spread_is_statistically_unchanged(self, engine, data_dir):
+        """Formulation-independent companion to the sigma assertion above: the
+        realised spread of a non-zero-base kind still matches ``base * level``."""
+        address = "ZZTEST:UNKNOWN:04:LEVEL:RB"
+        src, recs = self._driven(engine, data_dir, address)
+        src._rng = np.random.default_rng(20260730)
+
+        samples = []
+        for _ in range(300):
+            src.poll_once()
+            samples.append(recs[address].value)
+
+        expected_sigma = 100.0 * self.NOISE_LEVEL  # default kind base
+        assert np.std(samples) == pytest.approx(expected_sigma, rel=0.2)
+        assert np.mean(samples) == pytest.approx(100.0, abs=expected_sigma)
+
+    def test_position_kind_sigma_at_zero_base_is_the_kind_floor(self, engine, data_dir):
+        rng = _RecordingRng()
+        src, _recs = self._driven(engine, data_dir, POSITION_UNMODELED, rng=rng)
+        src.poll_once()
+
+        assert rng.sigmas == [0.005]
+
+    def test_position_kind_at_zero_base_varies_across_polls(self, engine, data_dir):
+        src, recs = self._driven(engine, data_dir, POSITION_UNMODELED)
+
+        values = set()
+        for _ in range(20):
+            src.poll_once()
+            values.add(recs[POSITION_UNMODELED].value)
+
+        assert len(values) > 1, "a 0.0-base position channel must still carry noise"
+
+    def test_zero_noise_level_disables_the_floor_and_is_deterministic(self, engine, data_dir):
+        """``noise_level: 0`` is an explicit request for determinism; the kind
+        floor exists to fix the zero-base degeneracy, not to override that
+        request, so a position channel polled repeatedly at level 0.0 returns
+        the exact same value every time (true determinism, not just small
+        variance)."""
+        channels = [
+            *CHANNELS,
+            _channel(POSITION_UNMODELED, record_type=RECORD_TYPE_ANALOG, noise=True),
+        ]
+        recs = {
+            addr: FakeRecord() for addr in [VAC_RB, FAULT_BI, NOT_IN_MACHINE, POSITION_UNMODELED]
+        }
+        src = EngineSource(engine, channels, recs, data_dir, noise_level=0.0)
+
+        values = set()
+        for _ in range(20):
+            src.poll_once()
+            values.add(recs[POSITION_UNMODELED].value)
+
+        assert values == {0.0}
+
+    def test_non_noisy_position_channel_stays_exactly_zero(self, engine, data_dir):
+        """The floor is a sigma floor, not a value source: a channel whose
+        manifest entry says ``noise: false`` is still perfectly static."""
+        channels = [
+            *CHANNELS,
+            _channel(POSITION_UNMODELED, record_type=RECORD_TYPE_ANALOG, noise=False),
+        ]
+        recs = {
+            addr: FakeRecord() for addr in [VAC_RB, FAULT_BI, NOT_IN_MACHINE, POSITION_UNMODELED]
+        }
+        src = EngineSource(engine, channels, recs, data_dir, noise_level=self.NOISE_LEVEL)
+
+        src.poll_once()
+        src.poll_once()
+
+        assert recs[POSITION_UNMODELED].value == 0.0
