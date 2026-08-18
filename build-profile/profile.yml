@@ -1,0 +1,121 @@
+# HTU Assistant — OSPREY build profile
+#
+# Built from the /osprey-build-interview on 2026-07-23 for the HTU laser
+# system at LBNL, then extended with the full service stack (interview
+# follow-up): telemetry, ARIEL search, event dispatch, web terminals, and
+# the Bluesky scan stack — everything the `control-assistant` preset deploys
+# EXCEPT the virtual-accelerator simulator, which is dropped below.
+#
+# Rebuild with:
+#   osprey build htu-assistant build-profile/profile.yml
+
+extends: control-assistant
+
+name: "HTU Assistant"
+
+# Drop the simulated storage-ring soft-IOC: HTU is a laser on live EPICS,
+# and the sim would squat CA port 5064 on the deploy host.
+virtual_accelerator: null
+
+# Owner decision (2026-07-23, see htu-assistant/BELLA-GEECS-SETUP-DEV.md):
+# real data-taking scans stay in the GEECS engine (GeecsBluesky), so OSPREY's
+# native bluesky stack (bridge + Tiled co-deploy + panels sidecar) is removed
+# entirely. The future integration point is a GEECS-side scan MCP declared
+# under `mcp_servers:` below; until it exists, the assistant composes
+# geecs_schemas.ScanRequest YAMLs (see the drafting-geecs-scans skill).
+bluesky: null
+bluesky_panels: null
+
+# Strip the bluesky-stack artifacts the base preset ships.
+exclude:
+  web_panels: [plan, results, health]
+  skills: [writing-bluesky-plans, operating-bluesky-scans]
+
+# Interim scan capability: the drafting-geecs-scans overlay skill (see
+# overlay: below) composes ScanRequest YAMLs for GEECS-Console.
+
+# Future GEECS-side scan MCP plugs in here (submit ScanRequest / status /
+# stop / move_variable / run_action over the engine's GUI/console contract):
+# mcp_servers:
+#   geecs-scan:
+#     url: http://<geecs-host>:<port>/mcp
+#     permissions:
+#       ask: ["submit_scan", "stop_scan", "move_variable", "run_action"]
+
+# The template renderer currently gates skill files by the data bundle's own
+# manifest, not the profile's skills/exclude selection — so the two bluesky
+# skills land despite the exclude above. Remove them post-build until the
+# framework wires profile artifact selection into allowed_outputs.
+lifecycle:
+  post_build:
+    - name: remove-bluesky-skills
+      run: rm -rf .claude/skills/writing-bluesky-plans .claude/skills/operating-bluesky-scans
+
+# AI service: LBNL's CBorg gateway. The model is CBorg's default; change it
+# here if your CBorg account offers a different one.
+provider: cborg
+model: anthropic/claude-haiku
+
+# --- Config overrides --------------------------------------------------------
+# Dotted keys land at the matching nested path in the rendered config.yml.
+config:
+  system.timezone: "America/Los_Angeles"
+  # Live EPICS instead of the preset's mock backend.
+  control_system.type: epics
+  # Write access was chosen in the interview; pin it so it can't drift.
+  control_system.writes_enabled: true
+  # Single gateway address from the interview (EPICS_CA_ADDR_LIST=192.168.6.14).
+  # Both read and write paths use it on the standard CA port; adjust the
+  # write_access port if HTU runs a separate write gateway.
+  control_system.connector.epics.gateways.read_only.address: "192.168.6.14"
+  control_system.connector.epics.gateways.read_only.port: 5064
+  control_system.connector.epics.gateways.write_access.address: "192.168.6.14"
+  control_system.connector.epics.gateways.write_access.port: 5064
+  # GEECS sets are blocking-until-convergence: put-completion on an :SP is
+  # the physical move finishing, and a legitimate slow stage takes 10-30 s
+  # (gateway set budget: 30 s). The 5 s default fails in-range writes to
+  # slow axes mid-move. Reads are unaffected in practice — readbacks are
+  # served from the gateway's stream cache, so only unserved PVs ever wait
+  # out the full connection timeout.
+  control_system.connector.epics.timeout: 30.0
+  control_system.write_verification.timeout: 30.0
+  # Software limits checking ON, over the generated limits database
+  # (tools/generate_channel_limits.py — one entry per settable :SP, min/max
+  # mirroring the GEECS DB, same extract as the channel database). Only
+  # listed :SP channels are writable; everything else is refused. This
+  # duplicates the gateway's EPICS control limits deliberately — client-side
+  # pre-flight tells the agent the range BEFORE a write, the gateway
+  # enforces at the CA layer, the device remains the final authority.
+  control_system.limits_checking.enabled: true
+  control_system.limits_checking.allow_unlisted_channels: false
+  # Container-name prefix for the web-terminal stack (base preset uses "ca").
+  facility.prefix: htu
+  # The preset pins container execution for Bluesky launch-token arming;
+  # with the bluesky stack removed that rationale is gone, and container
+  # mode would require the deploy stack running (plus CA env inside the
+  # container) just to execute Python. Host-venv execution reaches the
+  # gateway directly.
+  execution.execution_method: local
+  # Bluesky stack removed (owner decision above) — disable its MCP server
+  # and the panel entries the base preset wires via dotted config keys.
+  claude_code.servers.bluesky.enabled: false
+  web.panels.plan.enabled: false
+  web.panels.results.enabled: false
+
+# --- Environment variable wiring --------------------------------------------
+env:
+  required:
+    - CBORG_API_KEY
+  defaults:
+    # For tools that talk EPICS directly rather than through the connector.
+    EPICS_CA_ADDR_LIST: "192.168.6.14"
+
+# --- Overlay files -----------------------------------------------------------
+# PLACEHOLDER signal skeleton from the interview — no signal list existed yet.
+# Replace both files' contents with HTU's real PVs, then rebuild.
+overlay:
+  overlays/rules/geecs-semantics.md: .claude/rules/geecs-semantics.md
+  overlays/data/channel_databases/hierarchical.json: data/channel_databases/hierarchical.json
+  overlays/data/channel_limits.json: data/channel_limits.json
+  overlays/skills/drafting-geecs-scans: .claude/skills/drafting-geecs-scans
+  overlays/skills/targetchamberalign: .claude/skills/targetchamberalign
