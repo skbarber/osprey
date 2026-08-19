@@ -41,6 +41,24 @@ from epics import PV
 pv = PV("SR:MAG:QF:01:CURRENT:SP")
 pv.put(150)  # Bypasses all safety layers
 ```
+
+The same prohibition covers pvAccess (PVA) through the `p4p` library — every
+client flavor, not just the threaded one:
+
+```python
+# DO NOT use these — they bypass safety controls
+from p4p.client.thread import Context      # Bypasses all safety layers
+from p4p.client.asyncio import Context     # Same bypass, async client flavor
+ctxt = Context("pva")
+ctxt.get("SR:CAM:01:IMAGE")                 # Bypasses audit logging
+ctxt.put("SR:MAG:QF:01:CURRENT:SP", 150)    # Bypasses limits + approval
+ctxt.rpc("SR:SVC:ORBIT", request)           # Not approvable — refused at runtime
+```
+
+`ctxt.rpc(...)` is the one to remember: it is refused at runtime and no
+approval can let it through. An rpc call carries an arbitrary payload, so
+limits checking cannot apply to it — there is nothing for the approval
+workflow to check. Use `write_channel` for the write you actually need.
 {% elif cs_type == 'tango' %}
 ```python
 # DO NOT use these — they bypass safety controls
@@ -92,6 +110,24 @@ For scripts that write to the control system, use the `execute` MCP tool directl
 with `execution_mode: "write"` —
 the `execute` tool defaults to readonly mode, which blocks write operations.
 {% if "bluesky" in enabled_servers | default([]) %}
+
+## Measurements Go Through the Queue, Not Through Repeated Writes
+
+A request that needs the machine set to **more than one value** is a plan, and
+plans run through the Bluesky queue. This holds however the request was worded:
+"step a corrector across a few settings and record where the beam sits",
+"sweep this setpoint and read the response back", and "run a scan" are the same
+operation, and none of them is a loop of `channel_write` calls.
+
+Stepping a setpoint by hand instead costs the operator one approval for every
+write rather than one for the whole measurement, produces no run — so nothing
+reaches the queue panel, the data store, or `get_run_data` — and parks the
+setpoint wherever the last accepted write left it if the sequence stops part
+way. Use the `operating-bluesky-plans` skill; it owns this path.
+
+`channel_read` is unrestricted, and a single `channel_write` the operator asked
+for by name is a legitimate operation. It is a *sequence* of writes standing in
+for a plan that is not.
 
 ## Starting a Bluesky Queue
 

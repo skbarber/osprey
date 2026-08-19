@@ -354,6 +354,32 @@ control_system:
                                     # Only used for "readback" verification level
                                     # Can be overridden per-channel in channel_limits.json
 
+  # Channel-read response size
+  # Array channels (waveforms, camera frames) can be far larger than an agent's
+  # context can hold. channel_read returns an array inline only while it fits the
+  # budget below; anything larger is saved as an artifact and reported as a
+  # summary (shape, dtype, element count, numeric stats) plus a handle to the
+  # stored data. Strings and scalars are always inline, whatever their length.
+  #
+  # The default matches the repo's calibrated inline-plot budget
+  # (DEFAULT_MAX_POINTS = 2000 in the Bluesky bridge figure builder): ordinary
+  # waveforms and orbit vectors stay inline, camera frames take the artifact path.
+  read_inline_max_elements: 2000  # Per-value element count (arrays only).
+                                  # One channel_read call also inlines at most 4x
+                                  # this many elements in TOTAL across the channels
+                                  # it was asked for, consumed in request order;
+                                  # channels past that aggregate budget take the
+                                  # artifact path even when individually small, and
+                                  # say so (artifact_reason: aggregate_budget), so
+                                  # re-reading fewer channels inlines them.
+
+  # Per-channel rolling window for those read artifacts: only the newest N
+  # UNPINNED entries per channel are kept, older ones are pruned when a new one
+  # is saved. Pinned entries never count against the window and are never pruned,
+  # so pinning a frame keeps it for good. 0 = keep everything, which lets an
+  # unattended polling loop grow the gallery without bound.
+  channel_read_artifact_retention: 20
+
   # Pattern Detection (Layer 1 - Security)
   # Purpose: Detect ALL control system operations in generated code for approval workflows
   #
@@ -437,8 +463,34 @@ control_system:
           use_name_server: true
 
     # EPICS connector (production mode) — ALS production values.
+    #
+    # PVAccess (PVA) read routing: addresses matching any glob in `pva_channels`
+    # are read through the p4p client — the transport NTNDArray camera frames
+    # arrive on — and every other address stays on Channel Access. Absent or
+    # empty (the default) means pure CA, exactly as before. Addresses stay raw:
+    # no pva:// prefixes anywhere, so channel limits, the :SP writability
+    # contract and audit records keep matching the same strings. PVA is
+    # read-only here — a write to a matching address is refused before any
+    # network operation.
+    #
+    # `pva_gateway` is ONE flat block, not the read_only/write_access pair the
+    # CA `gateways` below uses, precisely because there is no PVA write path.
+    # It is read only when pva_channels is non-empty, and maps to
+    # EPICS_PVA_ADDR_LIST — or to EPICS_PVA_NAME_SERVERS when use_name_server is
+    # true (TCP instead of UDP search: what SSH tunnels need). Whenever the block
+    # is present, EPICS_PVA_AUTO_ADDR_LIST is forced to "NO", mirroring the
+    # EPICS_CA_AUTO_ADDR_LIST containment the CA path applies: a deployment
+    # deliberately pinned to a gateway must not also broadcast-discover servers
+    # on its local subnet.
     epics:
       timeout: 5.0
+      # pva_channels:
+      #   - "*:IMAGE*"
+      #   - "*:ARRAY*"
+      # pva_gateway:
+      #   address: your-pva-gateway.example.com  # Replace with your PVA gateway
+      #   port: 5075
+      #   use_name_server: false  # Set true for SSH tunnels
       gateways:
         read_only:
           address: cagw-alsdmz.als.lbl.gov
@@ -493,9 +545,8 @@ archiver:
     url: https://archiver.als.lbl.gov:8443
     timeout: 60              # Timeout for archiver requests in seconds
 
-  # MongoDB archiver — needs the archiver-mongodb extra:
-  #   pip install 'osprey-framework[archiver-mongodb]'
-  # Every key here except port and timeout is required; the connector raises on
+  # MongoDB archiver. Its client ships with OSPREY, so there is nothing extra to
+  # install. Every key here except port and timeout is required; the connector raises on
   # the first one missing. The password itself is never stored here — it is read
   # at connect time from the environment variable named by password_env, which
   # `osprey up` mints into the project's .env.
@@ -788,19 +839,28 @@ ariel:
   #   port: 8085
   #   auto_launch: true
 
+  # Which module answers a search that names no mode — the web interface's
+  # opening tab, `osprey ariel search` without `--mode`, and the service API.
+  # Naming a module that is not enabled below is refused at startup rather
+  # than quietly answered by a different one. Unset, this resolves to `hybrid`
+  # where that module is enabled and `keyword` everywhere else.
+  default_search_mode: hybrid
+
   # Search modules (leaf-level search functions)
   # provider: references api.providers for credentials (api_key, base_url)
   # Both keyword and semantic are enabled by default.
   # If Ollama/pgvector are unavailable, ARIEL degrades gracefully to keyword-only.
-  # NOTE: entries seeded by `osprey sim apply` are keyword-only. Seeding skips
-  # the enhancement passes AND drops the embedding tables outright, so
+  # NOTE: entries seeded by `osprey sim apply` carry no embeddings. Seeding
+  # skips the enhancement passes AND drops the embedding tables outright, so
   # recovering semantic search takes two steps: `osprey ariel migrate` to
   # recreate the tables, then `osprey ariel enhance` to fill them. (`osprey
   # ariel sync` is not a shortcut here: it migrates, but then polls an
   # ingestion adapter this preset has none of, and fails before it enhances.)
   # Until then a semantic query disables itself at runtime and returns a notice
   # telling you to use keyword search — it does not silently return zero hits,
-  # and it does not run the keyword search for you.
+  # and it does not run the keyword search for you. Hybrid search is NOT
+  # affected: seeding exports the qmd markdown mirror on its way out, so the
+  # sidecar indexes the seeded narrative and `hybrid` answers immediately.
   search_modules:
     keyword:
       enabled: true
@@ -1182,6 +1242,28 @@ web:
   # the `web:` level, NOT under `panels:`:
   # allow_runtime_panels: true                       # let the agent register ad-hoc URL panels at runtime
   # runtime_panel_allowlist: ["grafana.local:3000"]  # restrict registration targets to these host[:port]
+
+  # Channel-name typeahead in the web panels. `osprey build` reads this
+  # project's channel-finder database and writes the channel names it holds
+  # next to the generated config, so a form field asking for a channel can
+  # complete what an operator types. The suggestions come from that snapshot
+  # alone: no control-system traffic, no round trip to the agent, and nothing
+  # to keep in sync at run time. It is on by default because the database is
+  # already built; the snapshot is only written when a `channel_finder:`
+  # section is configured above.
+  #
+  # `max_channels` guards the browser, not the build: every panel load fetches
+  # the whole snapshot, so a database with more channels than this limit is
+  # skipped instead of shipped, the build says which limit it hit, and the
+  # panels simply offer no suggestions — fields still accept any name typed in
+  # full. Raise the limit to cover a larger facility, or set `enabled: false`
+  # to turn the feature off and write no snapshot at all. Both keys fall back
+  # to the values shown here if removed. A build profile overrides them from
+  # its `config:` block in the dotted form, e.g.
+  # `web.channel_suggestions.max_channels: 200000`.
+  channel_suggestions:
+    enabled: true
+    max_channels: 50000
 {%- if panel_presets is defined and panel_presets %}
   # Panel layouts ("Layouts"): named sets of panels a human applies in one click
   # from the web terminal "+" popover. The key is the menu label; the value is

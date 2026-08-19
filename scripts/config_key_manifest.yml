@@ -130,6 +130,20 @@ keys:
       Fallback corpus-sweep period, not the freshness lag — `.qmd-touch` is the
       primary trigger. Default 30 s; a no-op sweep costs ~12.5 s at 135k
       documents, so a large corpus should raise it.
+  services.qmd.models_dir:
+    rendered: false
+    evidence: '_absolute_path\(block\.get\("models_dir"\)'
+    note: >-
+      Hidden key, unset in all five templates. Names a host directory holding
+      the three GGUF models the sidecar image otherwise downloads at build
+      time; setting it skips the downloads and delivers them over a read-only
+      mount instead, which is what makes the sidecar buildable on a network
+      with no route to huggingface.co. Subject-named after what the directory
+      holds, like `path`/`mirror_path`, not after the mount that carries it.
+      `preflight_qmd_models_dir` refuses the deploy when the directory is
+      missing or lacks a model under its exact `hf_<org>_<basename>` cache
+      name — the one operator error that would otherwise surface only as an
+      unhealthy container an hour later.
   # `services.qmd.bind_address` is deliberately absent: the sidecar publishes on
   # the project-wide `deployment.bind_address` like every other service. See
   # deployment/qmd_service.py for why a per-service key would be a hazard.
@@ -151,7 +165,13 @@ keys:
       approval-governed tool (setup_patch) is covered by default_policy.
       See governed_sets.
   approval.tools.channel_write: {evidence: 'channel_write'}
-  approval.tools.channel_read: {evidence: 'channel_read'}
+  approval.tools.channel_read:
+    evidence: 'approval\.tools\.channel_read'
+    note: >-
+      Anchored on the settings-panel schema that serves this key rather than
+      on the bare word. `channel_read` names the MCP tool as well as the
+      policy, so the literal spread across enough modules to trip the
+      vacuity guard -- a match that no longer proved a reader existed.
   approval.tools.archiver_read: {evidence: 'archiver_read'}
   approval.tools.execute: {covered-by: approval.tools}
   approval.tools.setup_patch: {evidence: 'setup_patch'}
@@ -188,6 +208,10 @@ keys:
     evidence: 'get_config_value\("control_system\.write_verification\.default_level", "callback"\)'
   control_system.write_verification.default_tolerance_percent:
     evidence: 'default_tolerance_percent'
+  control_system.read_inline_max_elements:
+    evidence: '"control_system\.read_inline_max_elements"'
+  control_system.channel_read_artifact_retention:
+    evidence: '"control_system\.channel_read_artifact_retention"'
   control_system.connector: {covered-by: control_system}
   control_system.connector.mock: {covered-by: control_system.connector}
   control_system.connector.mock.simulation_file: {evidence: 'simulation_file'}
@@ -394,6 +418,7 @@ keys:
   ariel.ingestion: {covered-by: ariel}
   ariel.ingestion.adapter: {covered-by: ariel.ingestion}
   ariel.ingestion.source_url: {evidence: 'source_url'}
+  ariel.default_search_mode: {evidence: 'default_search_mode'}
   ariel.search_modules: {evidence: 'search_modules'}
   ariel.search_modules.keyword: {covered-by: ariel.search_modules}
   ariel.search_modules.keyword.enabled: {covered-by: ariel.search_modules.keyword}
@@ -513,6 +538,10 @@ keys:
   web.panels.ariel.enabled: {covered-by: web.panels.ariel}
   web.panels.channel-finder: {covered-by: web.panels}
   web.panels.channel-finder.enabled: {covered-by: web.panels.channel-finder}
+  web.channel_suggestions: {evidence: 'web\.get\("channel_suggestions"\)'}
+  web.channel_suggestions.enabled: {evidence: 'section\.get\("enabled", True\)'}
+  web.channel_suggestions.max_channels:
+    evidence: 'section\.get\("max_channels", DEFAULT_MAX_CHANNELS\)'
   cli: {evidence: 'get_config_value\("cli\.theme", "default", config_path\)'}
   cli.theme: {evidence: 'get_config_value\("cli\.theme", "default", config_path\)'}
 
@@ -790,7 +819,7 @@ render_contexts:
     enable_middle_layer: channel_finder.pipelines.middle_layer.database.type
     deploy_services_true: services.openobserve.retention_days
     panels_on: web.panels.channel-finder.enabled
-  expected_union_size: 273
+  expected_union_size: 279
   note_union_size: >-
     Informational, not an assertion — it moves whenever a template gains or
     loses a key. The guard should report a diff against this number, not fail on

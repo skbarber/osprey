@@ -41,6 +41,7 @@ from osprey.deployment.compose_generator import (
 )
 from osprey.deployment.deploy_summary import log_endpoint_summary
 from osprey.deployment.errors import (
+    ArchiverClientMissingError,
     ComposeInterpolationError,
     DevModeUnavailableError,
     NoRenderedBuildError,
@@ -50,6 +51,7 @@ from osprey.deployment.host_ports import (
     format_conflict_report,
     parse_host_port_bindings,
 )
+from osprey.deployment.qmd_service import preflight_qmd_models_dir
 from osprey.deployment.runtime_helper import (
     ComposeProvider,
     UnsupportedComposeProviderError,
@@ -158,6 +160,33 @@ _SERVICE_TOKEN_VARS: dict[str, tuple[str, ...]] = {
     "openobserve": ("ZO_ROOT_USER_PASSWORD",),
     "postgresql": ("ARIEL_DB_PASSWORD",),
     "mongodb": ("MONGO_ROOT_PASSWORD",),
+}
+
+# Non-secret settings written into ``.env`` for a deployed service, as
+# ``service -> ((var, default), ...)``. Keyed by ``deployed_services`` membership
+# exactly like ``_SERVICE_TOKEN_VARS``, and never overwriting a value that is
+# already there — but a DIFFERENT concern, which is why it is a different map.
+#
+# ``_SERVICE_TOKEN_VARS`` declares machine-generated secrets, and every name it
+# reaches is minted through ``_VAR_GENERATORS`` under that module's CSPRNG bar.
+# A constant is not a secret and has no recipe, so registering one there would
+# mean writing a generator that returns a fixed string — a value the bar has no
+# meaning for, sitting in the map an operator reads to learn what osprey
+# considers secret.
+#
+# The reason to write a default down at all is discoverability. Both halves of
+# the OpenObserve login are needed to reach the store, and the email previously
+# existed only as a ``:-`` fallback inline in the compose template and the
+# rendered config.yml. An operator looking for their credentials found a
+# password in ``.env``, no email anywhere, and nothing naming the file that
+# would have told them. Writing the default makes ``.env`` the whole answer,
+# and — because it is the same value the ``:-`` fallback resolves to — records
+# the login rather than changing it.
+_SERVICE_DEFAULT_VARS: dict[str, tuple[tuple[str, str], ...]] = {
+    # Must stay equal to the ``${ZO_ROOT_USER_EMAIL:-…}`` fallback in
+    # ``osprey/templates/services/openobserve/docker-compose.yml.j2``; the mint
+    # tests parse the template and pin the two together.
+    "openobserve": (("ZO_ROOT_USER_EMAIL", "root@example.com"),),
 }
 
 # Vars checked against their _VAR_VALIDATORS constraint when present, but
@@ -594,6 +623,54 @@ def _ensure_service_tokens(
             minted_volume_initialized |= {
                 name for name in generated if name in _VOLUME_INITIALIZED_VARS
             }
+
+    # Write the non-secret service settings (_SERVICE_DEFAULT_VARS) for every
+    # deployed service that declares one. Its OWN block, outside `if
+    # required_vars:` and outside `if generated:`, and that placement is the
+    # whole upgrade path: the mint is idempotent, so a project deployed before
+    # this existed has a `.env` carrying a password and no email, generates
+    # nothing on its next deploy, and would never receive the line if this rode
+    # along with the minted block. Exactly the deployments that need it are the
+    # ones with nothing left to mint.
+    #
+    # Presence is read the same way the mint reads it — process env over `.env`,
+    # non-empty — so an operator's value is never overwritten and a re-run
+    # appends nothing. Reported separately from the token ledger, and the VALUE
+    # is shown: these are account names, not secrets, and an operator who cannot
+    # see what was written is back where they started.
+    defaults: dict[str, str] = {}
+    existing_defaults = parse_dotenv_file(env_path) if env_path.is_file() else {}
+    for svc_name, var_defaults in _SERVICE_DEFAULT_VARS.items():
+        if svc_name not in services:
+            continue
+        for var, default in var_defaults:
+            if _effective_value(var, existing_defaults).strip():
+                continue  # keep the operator's value
+            defaults[var] = default
+
+    if defaults:
+        _append_env_block(
+            env_path,
+            "Service account names (osprey up) — not secrets",
+            defaults,
+        )
+        # Same repair the mint makes, for the same reason: the deploy loaded
+        # this `.env` over the process environment before we got here, so a name
+        # the file spelled EMPTY left an empty copy in `os.environ` that
+        # outranks the `--env-file` line for compose's interpolation. Without
+        # this the container receives the blank while `.env` shows the default —
+        # written down and not delivered. Names absent from the environment stay
+        # absent and reach the containers through `--env-file` as usual.
+        for var, value in defaults.items():
+            if var in os.environ:
+                os.environ[var] = value
+        _report_fact(
+            f"wrote {len(defaults)} service account name(s) → .env",
+            wrote=(
+                ".env",
+                ", ".join(f"{var}={value}" for var, value in defaults.items()),
+            ),
+        )
 
     # Validate the effective value of every required var — whichever of
     # process env, an existing .env, or a value just minted above the caller
@@ -1654,6 +1731,38 @@ def _resolve_pip_spec(dev_mode: bool = False) -> str:
     return f"osprey-framework=={get_release_version()}"
 
 
+#: Env-var spellings for "on" and "off", matching the other framework switches.
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
+
+
+def _resolve_prebuilt_images(config: dict) -> bool:
+    """Whether this host already has the images and must not build them.
+
+    Some deployment hosts cannot build at all — no build tooling, no registry
+    reachable, images side-loaded from a tarball instead. There the dev-mode
+    compose build is not slow but impossible, and the only thing that can run
+    is ``up`` against tags that are already present.
+
+    Resolution order:
+      1. ``OSPREY_PREBUILT_IMAGES`` environment variable (truthy: 1/true/yes/on;
+         falsy: 0/false/no/off)
+      2. Top-level ``prebuilt_images`` key in the deploy config
+      3. Default: false — deploys build as they always have
+
+    Env var wins in both directions, so a host whose config pins the switch can
+    still be made to build for one shell, and vice versa.
+
+    :param config: Loaded deploy config.
+    """
+    env = os.environ.get("OSPREY_PREBUILT_IMAGES", "").strip().lower()
+    if env in _TRUTHY:
+        return True
+    if env in _FALSY:
+        return False
+    return bool(config.get("prebuilt_images", False))
+
+
 def _worker_image_target(config: dict, env: dict) -> str:
     """The image the dispatch worker will actually run.
 
@@ -2684,10 +2793,11 @@ _ARCHIVER_STORE_SERVICE = "mongodb"
 _ARCHIVER_RECORDER_SERVICE = "archiver-recorder"
 _ARCHIVER_RECORDER_DEPLOY_NAME = "archiver_recorder"
 
-# The install target every archiver error names. pymongo is an optional extra,
-# and a deploy that hits the seeder without it must say what to install rather
-# than surfacing a bare ImportError.
-_ARCHIVER_EXTRA = "osprey-framework[archiver-mongodb]"
+# The install target every archiver error names. pymongo is a core dependency,
+# so a deploy that hits the seeder without it is running from an incomplete
+# environment -- which is worth saying plainly rather than surfacing a bare
+# ImportError, or pointing at an extra that no longer exists.
+_ARCHIVER_INSTALL_TARGET = "osprey-framework"
 
 # How long the staged store gets to start answering before the deploy gives up.
 # Generous because the very first start of a fresh volume creates the admin user
@@ -2736,23 +2846,39 @@ def _archiver_store_deployed(config: dict) -> bool:
 def _preflight_archiver_pymongo(config: dict) -> None:
     """Abort a store-deploying run that cannot talk to the store it deploys.
 
-    pymongo is an optional extra, and without it the seeder cannot run — but the
-    only place that becomes visible is minutes later, after the project image has
-    been built and the store container is already up. Checking here, beside the
-    token mint, turns that into an immediate error naming the install.
+    pymongo is a core dependency, but an environment can still be missing it —
+    a partial install, a stale venv — and without it the seeder cannot run. The
+    only place that would otherwise become visible is minutes later, after the
+    project image has been built and the store container is already up. Checking
+    here, beside the token mint, turns that into an immediate error naming the
+    install.
+
+    The reason names ``sys.executable`` rather than only the package, because
+    the environment is the whole confusion: see
+    :class:`~osprey.deployment.errors.ArchiverClientMissingError`.
 
     :param config: Raw deploy config.
-    :raises RuntimeError: if the store is deployed and pymongo is absent.
+    :raises ArchiverClientMissingError: if the store is deployed and pymongo is
+        absent from the interpreter running this process.
     """
     if not _archiver_store_deployed(config):
         return
     try:
         import pymongo  # noqa: F401
     except ImportError as exc:
-        raise RuntimeError(
-            "This project deploys the archiver store (services.mongodb), and seeding "
-            "its history needs pymongo, which is not installed.\n"
-            f"Install it with: pip install '{_ARCHIVER_EXTRA}'"
+        raise ArchiverClientMissingError(
+            reason=(
+                "This project deploys the archiver store (services.mongodb), and "
+                "OSPREY seeds its history from this process — "
+                f"{sys.executable} — not from the project's build/.venv and not "
+                "in the project image. pymongo is not importable there. A "
+                "`dependencies:` entry in the build profile installs it into "
+                "those, not into this interpreter."
+            ),
+            remedy=(
+                "Reinstall osprey where the CLI runs:\n"
+                f"    pip install --upgrade {_ARCHIVER_INSTALL_TARGET}"
+            ),
         ) from exc
 
 
@@ -3671,6 +3797,14 @@ def _start_stack(
     # in each.
     _check_shared_disk_preflight(config)
 
+    # Same shape, for the other configured host path: when services.qmd.models_dir
+    # is set, the sidecar's models come from that directory over a read-only mount
+    # instead of from the image. A missing or mis-named file there does not fail
+    # the deploy — it makes the sidecar try to download the model it cannot find,
+    # on a host that was configured this way because it has no route out. Checked
+    # here, before the build the setting is meant to shorten.
+    preflight_qmd_models_dir(config)
+
     # Verify container runtime is actually running
     is_running, error_msg = verify_runtime_is_running(config)
     if not is_running:
@@ -3911,7 +4045,14 @@ def _start_stack(
     run_captured(rm_cmd, env=run_env, spool_name="compose-rm", repo_root=repo_root, check=False)
     _report_step("cleared stopped containers")
 
-    if dev_mode:
+    if dev_mode and _resolve_prebuilt_images(config):
+        # Nothing to build: the tags are expected to be on the host already, and
+        # the `up --no-build` below runs against them. A tag that is in fact
+        # missing surfaces as compose's own "No such image", which names the
+        # image that has to be loaded — better than anything a preflight here
+        # could say.
+        _report_step("skipped image build (prebuilt images)")
+    elif dev_mode:
         # `osprey up --dev` re-bakes the local osprey checkout into a fresh
         # wheel on every run, but compose reuses the cached image tag (e.g.
         # <project>-dispatch:local) unless it is rebuilt — so a dev deploy must build.

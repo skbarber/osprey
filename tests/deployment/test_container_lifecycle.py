@@ -18,7 +18,11 @@ from pathlib import Path
 import pytest
 
 from osprey.deployment import container_lifecycle
-from osprey.deployment.errors import UnmetPreconditionsError
+from osprey.deployment.errors import (
+    ArchiverClientMissingError,
+    DeploymentPreconditionError,
+    UnmetPreconditionsError,
+)
 from osprey.deployment.web_terminals import postup_hooks, provision
 
 
@@ -59,6 +63,9 @@ def captured_argv(monkeypatch, tmp_path):
     captured: dict = {}
 
     monkeypatch.chdir(tmp_path)
+    # An operator shell that exported the prebuilt-images switch would delete
+    # the dev-mode build from every deploy driven here (see the switch tests).
+    monkeypatch.delenv("OSPREY_PREBUILT_IMAGES", raising=False)
     monkeypatch.setattr(
         container_lifecycle,
         "prepare_compose_files",
@@ -453,6 +460,9 @@ def captured_combined_runs(monkeypatch, tmp_path):
     token_calls: list[dict] = []
 
     monkeypatch.chdir(tmp_path)
+    # Same hygiene as captured_argv: the switch tests set this deliberately, and
+    # an exported one would otherwise remove the build these tests count.
+    monkeypatch.delenv("OSPREY_PREBUILT_IMAGES", raising=False)
     # Registry mode (default) -- pre-write .env.users so
     # ensure_env_production's exists-check passes (see captured_web_runs).
     (tmp_path / ".env.users").write_text("", encoding="utf-8")
@@ -2032,6 +2042,198 @@ class TestResolvePipSpec:
             container_lifecycle._resolve_pip_spec(dev_mode=False)
 
 
+class TestResolvePrebuiltImages:
+    """Some deployment hosts cannot build images at all.
+
+    No build tooling, no reachable registry, images side-loaded from a tarball
+    instead. There a dev deploy's ``compose build`` is not slow but impossible,
+    and the only thing that can run is an ``up`` against tags already present.
+    """
+
+    def test_the_default_is_to_build(self, monkeypatch):
+        monkeypatch.delenv("OSPREY_PREBUILT_IMAGES", raising=False)
+        assert container_lifecycle._resolve_prebuilt_images({}) is False
+
+    @pytest.mark.parametrize("value", sorted(container_lifecycle._TRUTHY))
+    def test_every_on_spelling_is_accepted(self, monkeypatch, value):
+        """Operators reach for whichever word the rest of the framework took.
+
+        A spelling that parsed as "off" would start a build on a host that
+        cannot run one, and the failure would name compose rather than the
+        variable that was misread.
+        """
+        monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", value)
+        assert container_lifecycle._resolve_prebuilt_images({}) is True
+
+    @pytest.mark.parametrize("value", sorted(container_lifecycle._FALSY))
+    def test_every_off_spelling_overrides_a_config_that_says_prebuilt(self, monkeypatch, value):
+        """The env var wins in both directions, not just when it says "on".
+
+        A one-way override would leave a config-pinned host unable to prove its
+        build works again without an edit someone has to remember to revert.
+        """
+        monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", value)
+        assert container_lifecycle._resolve_prebuilt_images({"prebuilt_images": True}) is False
+
+    @pytest.mark.parametrize("value", [" true ", "TRUE", "\tYes\n", "On"])
+    def test_case_and_surrounding_whitespace_do_not_change_the_answer(self, monkeypatch, value):
+        """A value pasted out of a shell script keeps its padding."""
+        monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", value)
+        assert container_lifecycle._resolve_prebuilt_images({}) is True
+
+    def test_the_config_key_turns_the_switch_on(self, monkeypatch):
+        monkeypatch.delenv("OSPREY_PREBUILT_IMAGES", raising=False)
+        assert container_lifecycle._resolve_prebuilt_images({"prebuilt_images": True}) is True
+
+    def test_the_config_key_can_also_spell_out_the_default(self, monkeypatch):
+        monkeypatch.delenv("OSPREY_PREBUILT_IMAGES", raising=False)
+        assert container_lifecycle._resolve_prebuilt_images({"prebuilt_images": False}) is False
+
+    def test_env_on_overrides_a_config_that_says_build(self, monkeypatch):
+        monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "yes")
+        assert container_lifecycle._resolve_prebuilt_images({"prebuilt_images": False}) is True
+
+    @pytest.mark.parametrize("value", ["", "   ", "maybe", "2", "yes please"])
+    def test_an_unreadable_value_defers_to_the_config(self, monkeypatch, value):
+        """An empty or unrecognized export must not silently mean "off".
+
+        Reading it as a decision would let a stray ``OSPREY_PREBUILT_IMAGES=``
+        in an env file quietly re-enable building on a host whose config
+        already said it cannot build.
+        """
+        monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", value)
+        assert container_lifecycle._resolve_prebuilt_images({"prebuilt_images": True}) is True
+        assert container_lifecycle._resolve_prebuilt_images({}) is False
+
+
+# ---------------------------------------------------------------------------
+# The prebuilt-images switch at the two dev-mode build sites
+# ---------------------------------------------------------------------------
+
+
+def _dev_deploy_cmds(monkeypatch, tmp_path, config_extra: dict | None = None) -> list[list[str]]:
+    """Every argv a ``--dev`` deploy runs down the plain (no web) path."""
+    cmds: list[list[str]] = []
+    config = {"deployed_services": ["event_dispatcher"], **(config_extra or {})}
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        container_lifecycle,
+        "prepare_compose_files",
+        lambda *a, **k: (config, ["docker-compose.yml"]),
+    )
+    monkeypatch.setattr(container_lifecycle, "verify_runtime_is_running", lambda config: (True, ""))
+    monkeypatch.setattr(
+        container_lifecycle, "get_runtime_command", lambda config: ["docker", "compose"]
+    )
+    # The project image is built by its own helper, outside the compose build
+    # this switch gates; leaving it live would add argv that says nothing about
+    # which branch ran.
+    monkeypatch.setattr(container_lifecycle, "_build_project_image", lambda *a, **k: None)
+
+    def _fake_run(cmd, env=None, check=False, **kwargs):
+        cmds.append(list(cmd))
+        return _FakeCompletedProcess(returncode=0)
+
+    monkeypatch.setattr(container_lifecycle.subprocess, "run", _fake_run)
+    monkeypatch.setattr(
+        container_lifecycle.subprocess,
+        "Popen",
+        _fake_popen(lambda cmd, env: cmds.append(list(cmd))),
+    )
+
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True, dev_mode=True)
+    return cmds
+
+
+def _compose_builds(cmds: list[list[str]]) -> list[list[str]]:
+    return [cmd for cmd in cmds if cmd[-1] == "build" and _addresses(cmd, "docker-compose.yml")]
+
+
+def test_a_dev_deploy_builds_the_service_images_by_default(monkeypatch, tmp_path):
+    """The baseline the switch has to leave alone."""
+    monkeypatch.delenv("OSPREY_PREBUILT_IMAGES", raising=False)
+
+    cmds = _dev_deploy_cmds(monkeypatch, tmp_path)
+
+    assert len(_compose_builds(cmds)) == 1
+
+
+def test_the_switch_removes_the_services_build_from_a_dev_deploy(monkeypatch, tmp_path):
+    monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "1")
+
+    cmds = _dev_deploy_cmds(monkeypatch, tmp_path)
+
+    assert _compose_builds(cmds) == []
+
+
+def test_the_config_key_removes_it_too(monkeypatch, tmp_path):
+    monkeypatch.delenv("OSPREY_PREBUILT_IMAGES", raising=False)
+
+    cmds = _dev_deploy_cmds(monkeypatch, tmp_path, {"prebuilt_images": True})
+
+    assert _compose_builds(cmds) == []
+
+
+def test_env_off_restores_the_build_a_prebuilt_config_would_have_skipped(monkeypatch, tmp_path):
+    monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "false")
+
+    cmds = _dev_deploy_cmds(monkeypatch, tmp_path, {"prebuilt_images": True})
+
+    assert len(_compose_builds(cmds)) == 1
+
+
+def test_the_up_still_carries_no_build_when_the_build_was_skipped(monkeypatch, tmp_path):
+    """``up --no-build`` is what makes the skip safe on a host that cannot build.
+
+    Without it compose would build on ``up`` instead, moving the failure rather
+    than removing it.
+    """
+    monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "1")
+
+    cmds = _dev_deploy_cmds(monkeypatch, tmp_path)
+
+    up = next(cmd for cmd in cmds if "up" in cmd)
+    assert "--no-build" in up
+    assert "--build" not in up
+
+
+def test_the_web_terminals_path_skips_its_services_build_too(
+    captured_combined_runs, monkeypatch, tmp_path
+):
+    """A web-terminals deploy builds the backend services on its own path.
+
+    That second build site is the one a web-terminals host actually hits, so a
+    switch wired only into the plain path would look correct in tests and still
+    fail the deployment it was written for.
+    """
+    steps: list[str] = []
+    monkeypatch.setattr(provision, "_report_step", steps.append)
+    monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "1")
+
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=False, dev_mode=True)
+
+    cmds = [c["cmd"] for c in captured_combined_runs["calls"]]
+    assert _compose_builds(cmds) == []
+    assert "skipped image build (prebuilt images)" in steps
+    assert "built service images" not in steps
+
+
+def test_the_web_terminals_path_builds_when_the_switch_is_off(
+    captured_combined_runs, monkeypatch, tmp_path
+):
+    steps: list[str] = []
+    monkeypatch.setattr(provision, "_report_step", steps.append)
+    monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "off")
+
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=False, dev_mode=True)
+
+    cmds = [c["cmd"] for c in captured_combined_runs["calls"]]
+    assert len(_compose_builds(cmds)) == 1
+    assert "built service images" in steps
+    assert "skipped image build (prebuilt images)" not in steps
+
+
 # ---------------------------------------------------------------------------
 # Staged archiver bring-up
 # ---------------------------------------------------------------------------
@@ -2325,7 +2527,7 @@ def test_deploy_without_the_store_service_stages_nothing(captured_argv, monkeypa
 
 
 def test_pymongo_preflight_aborts_before_any_container_work(monkeypatch, tmp_path):
-    """Naming the extra in seconds beats an ImportError after a minutes-long
+    """Naming the install in seconds beats an ImportError after a minutes-long
     image build, so the check sits beside the token mint, not at the seeder."""
     import sys
 
@@ -2344,14 +2546,49 @@ def test_pymongo_preflight_aborts_before_any_container_work(monkeypatch, tmp_pat
     monkeypatch.setattr(
         container_lifecycle.subprocess, "run", lambda *a, **k: ran.append("compose")
     )
-    # A None entry in sys.modules is what an absent optional extra looks like to
+    # A None entry in sys.modules is what an incomplete environment looks like to
     # `import pymongo` — the import machinery raises ImportError without touching
     # the installed package.
     monkeypatch.setitem(sys.modules, "pymongo", None)
 
-    with pytest.raises(RuntimeError, match=r"osprey-framework\[archiver-mongodb\]"):
+    with pytest.raises(ArchiverClientMissingError) as exc_info:
         container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True)
     assert ran == []
+    assert "pip install --upgrade osprey-framework" in exc_info.value.remedy
+
+
+def test_pymongo_preflight_refusal_names_the_interpreter(monkeypatch):
+    """The refusal has to say WHICH environment is missing pymongo.
+
+    A `dependencies:` entry in the build profile installs into the project's
+    `build/.venv`, its recorded pyproject.toml and its image — never into the
+    interpreter running the CLI, which is where the seeder runs. An operator who
+    has declared pymongo and still sees this refusal has already tried the
+    obvious lever, so the reason names `sys.executable` and says that entry is
+    not the one, rather than repeating "pymongo is not installed" at them.
+    """
+    import sys
+
+    monkeypatch.setitem(sys.modules, "pymongo", None)
+
+    with pytest.raises(ArchiverClientMissingError) as exc_info:
+        container_lifecycle._preflight_archiver_pymongo(dict(ARCHIVER_CONFIG))
+
+    reason = exc_info.value.reason
+    assert sys.executable in reason
+    assert "build/.venv" in reason
+    assert "dependencies:" in reason
+
+
+def test_pymongo_preflight_refusal_is_a_precondition_not_a_bug():
+    """It must leave `up` through the precondition handler, not the catch-all.
+
+    `deploy_cmd.up_verb` renders `DeploymentPreconditionError` as a refusal with
+    a remedy and renders everything else as "Deployment failed". A bare
+    RuntimeError here would be indistinguishable from a genuine bug — which is
+    exactly what DeploymentPreconditionError's own docstring forbids.
+    """
+    assert issubclass(ArchiverClientMissingError, DeploymentPreconditionError)
 
 
 def test_pymongo_preflight_is_silent_without_the_store_service():

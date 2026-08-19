@@ -13,6 +13,18 @@ Compatibility is documented in release notes, not encoded in the version string.
 
 ### Added
 
+- New `ariel.default_search_mode` setting names the search module that answers
+  when a caller asks for no mode — the web interface's opening tab, `osprey
+  ariel search` without `--mode`, and the service API. The shipped templates
+  set it to `hybrid`. A name that no enabled module matches is refused at
+  startup instead of being answered by a different mode; left unset, it
+  resolves to `hybrid` where that module is enabled and `keyword` elsewhere.
+
+- The `orbit_bump_sweep` plan can now assert bump closure at its monitor BPMs:
+  an optional `leakage_tolerance` band judges every `readbacks` BPM against the
+  reference orbit at each settled step, failing the run (or recording the miss
+  under `best_effort`) when the bump leaks beyond it. Unset, monitors stay
+  recorded-only as before.
 - Web-terminal roster entries can opt out of the login wall with `login:
   false` — the entry is served without authentication while every other
   terminal stays gated, and no password is provisioned for it. Meant for
@@ -30,9 +42,115 @@ Compatibility is documented in release notes, not encoded in the version string.
   init` materializes it from the preset (the control assistant ships its own
   text), so the context every seeded user starts from is visible and editable
   in the deployment repo instead of hidden in the installed package.
+- The EPICS connector now reads pvAccess (PVA) channels alongside Channel
+  Access, routed by a `pva_channels` glob so one deployment can mix both
+  protocols; PVA writes are refused with a typed reason rather than
+  attempted. Oversized reads — camera images and long waveforms, from either
+  protocol — now come back as gallery artifacts (an interactive chart for
+  1-D data, an image preview plus the raw array for 2-D and up) with an
+  inline summary instead of flooding the context or being stringified, which
+  also fixes oversized Channel Access waveform reads. p4p write patterns are
+  now checked by the same pattern-detection, limits, and safety-rule layers
+  as pyepics writes, and PVA RPC calls are refused outright.
+
+- Channel fields in the BLUESKY panel's plan forms offer typeahead
+  suggestions drawn from the project's Channel Finder catalog, snapshotted at
+  build time. On by default when a channel database is configured;
+  `web.channel_suggestions.enabled` and `web.channel_suggestions.max_channels`
+  tune or disable it.
+
+- A host that cannot build images can now skip the dev-mode image build, with
+  `prebuilt_images: true` in `config.yml` or `OSPREY_PREBUILT_IMAGES=1` for one
+  shell. `osprey up --dev` then starts the containers from the image tags
+  already on the host.
+- The qmd search sidecar can take its three model files from a host directory
+  instead of downloading them during the image build. Point
+  `services.qmd.models_dir` at a directory holding the staged files: the build
+  skips the downloads and the directory is mounted read-only into the
+  container, with the same SHA256 check moved to container start. For build
+  hosts with no route to the model host.
+
+- Authored plans can now be retired. `DELETE /plans/session/{name}` on the
+  Bluesky bridge removes a session-tier plan file, which until now stayed in
+  the catalog until the container restarted. The plan leaves `GET /plans`
+  immediately; anything already queued or running is unaffected.
 
 ### Fixed
 
+- Container builds no longer fail when one package download is cut short. apt
+  now fetches one request per connection: with pipelining left at its default,
+  a connection reset partway through a batch could fail the whole image even
+  though retries were configured.
+
+- Seeding a simulated logbook (`osprey sim apply`, and the deploy's own
+  first-bring-up seed) now writes the markdown mirror the qmd sidecar indexes.
+  Seeding skips the enhancement passes, so `hybrid` search previously searched
+  an index nothing had built and returned no hits — which reads as "the logbook
+  has nothing on that" rather than as a missing index.
+- Container builds now hand apt the proxy settings they were given. A facility
+  proxy arrives as `HTTP_PROXY`/`HTTPS_PROXY`, which apt does not read, so on a
+  network with no direct egress every image build stalled in its first package
+  install.
+- The project and dispatch images install Node and npm from the base image's
+  own Debian release instead of a third-party apt repository. That repository's
+  setup step had stopped configuring anything on current base images, leaving
+  them without npm and without a working agent launch path.
+- Model files staged inside the project tree no longer end up in the built
+  wheel, which they had been inflating to several gigabytes.
+- The qmd sidecar now finds its own daemon on hosts where `localhost` resolves
+  to IPv4. It previously probed only the IPv6 loopback, and where that was the
+  wrong one the container crash-looped while the deploy still reported success.
+- Agents now route a measurement that needs more than one setting through the
+  Bluesky queue instead of stepping a setpoint with repeated `channel_write`
+  calls. The `operating-bluesky-plans` skill also triggers on requests phrased
+  as physics ("step a corrector across a few settings and record the beam")
+  rather than only on the words *plan*, *run*, *queue* and *start*, and the
+  control-system safety rule states the routing directly. Hand-stepping cost
+  the operator one approval per write instead of one per measurement and left
+  no run behind.
+- A panel closed by an agent workspace arrange no longer pops back open when a
+  browser's tab-switch report, sent before the arrange, arrives after it. The
+  server drops the stale report instead of re-adding the panel to every
+  client's rail and stealing the active tab.
+- A relative `control_system.limits_checking.database_path` now anchors on the
+  directory of the config actually loaded, so the limits gate finds the render's
+  database regardless of how the process was launched. Previously a Claude Code
+  hook running without `CONFIG_FILE` resolved it against the repo root and the
+  empty-database failsafe denied every write (#636).
+- The limits failsafe now refuses with "limits database unavailable" instead of
+  reporting every channel as "not in limits database", so a load failure is no
+  longer mistaken for a data problem (#636).
+- Resizing a web-terminal pane no longer freezes the other panels until a
+  browser refresh: the adapter's sash shield poisoned dockview's own
+  pointer-events snapshot and is removed — dockview shields iframes during
+  sash drags itself (#638).
+- `osprey up` now refuses as a precondition, rather than failing with a generic
+  "Deployment failed", when a project deploys the archiver store and pymongo is
+  missing. The refusal names the interpreter it is missing from — OSPREY seeds
+  the store from the process running the CLI, not from the project's
+  `build/.venv` — so a `dependencies:` entry in the build profile is visibly
+  the wrong lever.
+- The `osprey` command no longer prints a Python traceback when something goes
+  wrong. Its console script was wired straight to the Click group, past the
+  handler that turns an error into a `✗` line with a cause and a remedy, so
+  every failure no verb caught reached the terminal as a stack trace ending in
+  installed-package paths. Affects every verb.
+- `osprey init --reset` and `osprey init --up` now check for a running
+  container runtime before they create anything. Both need one — `--reset` to
+  read what the previous deployment owns, `--up` to start the new one — but the
+  check ran after the repo had been written, git-initialized and committed, so
+  a stopped Docker left a repo behind that nobody asked for.
+- `osprey init --provider cborg` (and `--model`, `--connector`,
+  `--channel-finder-mode`) now say which spelling works — `--set
+  provider=cborg` — instead of suggesting the unrelated `--override`.
+- Artifacts built from a dev checkout report the right version again. A release
+  tag cut for the workspace sibling (`osprey-connectors-v0.1.0`) matched the
+  build backend's default tag glob, so every wheel, editable install and
+  container built off `main` since 2026-08-15 was stamped `0.1.0.postN` while
+  `osprey --version` said `2026.6.2.postN`. The build now describes against the
+  same `v[0-9]*` tags the runtime always has, the commit hash is pinned to one
+  width instead of varying with clone size, and a test holds the two
+  derivations byte-identical.
 - `osprey init --reset` no longer crashes with a Python traceback when the
   containers it would remove belong to another copy of this repo. `osprey
   reset` has always caught that refusal and rendered it; this path never did,
@@ -80,6 +198,37 @@ Compatibility is documented in release notes, not encoded in the version string.
 
 ### Changed
 
+- A finished `osprey up -d` now ends by saying what to do next: one line naming
+  the landing page, and, when the roster's passwords are still the ones the
+  profile declared, the logins to sign in with. URLs the CLI prints are
+  clickable in terminals that support it.
+- The "This deploy wrote" block is grouped by file instead of repeating the
+  filename on every row, and its long values wrap under their own bullet rather
+  than running off the terminal. It now prints before the closing summary card,
+  so a run ends on where to go rather than on what it wrote.
+- The web terminal no longer opens with a full-screen welcome banner. The
+  OSPREY wordmark now heads the landing page, and the safety guidelines live at
+  the bottom of that page instead of behind a link in a banner nobody sees
+  twice.
+
+- `osprey up` now writes the OpenObserve account name `ZO_ROOT_USER_EMAIL` into
+  `.env` alongside the minted password, so both halves of the telemetry login
+  are in one findable place. Previously only the password was written and the
+  email existed solely as a default inside the templates. The value is
+  unchanged (`root@example.com`), and a value you already set is never
+  overwritten.
+- The minted `ZO_ROOT_USER_PASSWORD` is now 12 characters instead of 48, drawn
+  from an alphabet without the easily-misread `l I 1 O 0` — you read this one
+  off a terminal and type it into a browser login. Existing projects keep the
+  password already in their `.env`.
+
+- `pymongo` is now a core dependency instead of the `archiver-mongodb` extra.
+  The `control-assistant` preset deploys a MongoDB archive, so a plain `pip
+  install osprey-framework` has to be able to run it. The extra is gone —
+  drop it from any install command, since pip only warns about an unknown
+  extra rather than failing. The preset no longer lists `pymongo` under
+  `dependencies:`, which moves its profile hash: rebuilt projects will report
+  staleness once, then match.
 - The browser-facing bluesky sidecar is now the `bluesky-web` service (was
   `bluesky-panels`): it is named for its role — the web half of the bluesky
   stack, beside `bluesky-bridge` — rather than for the one panel it serves.
@@ -254,6 +403,17 @@ Compatibility is documented in release notes, not encoded in the version string.
   `uv.lock` regenerated to match. `openai` is now capped below 3.x: the 3.0
   major is a client rewrite, so adopting it should be a deliberate change
   rather than something a lock refresh picks up on its own.
+
+- Controls no longer slide out from under the pointer when a neighbouring
+  control appears, disappears, or changes its label. Fixed across the web
+  interfaces: the bluesky panel's Plans / Queue / Results switcher (the plan
+  filter now opens to its left), the operator chat's Send button (Stop now
+  opens inboard of it, so Send never lands where Stop was), the ARIEL entry
+  pager (Previous and Next stay put and grey out at the ends instead of
+  vanishing), the channel finder's feedback toolbar (Clear All now opens
+  left of Add/Export instead of shoving them), and the confirm step on the
+  bluesky emergency abort and the lattice dashboard's Baseline button, whose
+  armed labels no longer widen the button and shove the control beside it.
 
 ### Added
 
@@ -1204,6 +1364,34 @@ Compatibility is documented in release notes, not encoded in the version string.
   ~1e-16 residue a rank-deficient matrix leaves behind. The raw per-corrector
   sweeps move below the fit into a collapsed section that shows one corrector
   at a time; when the fit is skipped they stay inline.
+
+### Added
+
+- The web terminal's command palette keeps a Recent section listing the
+  commands you last ran.
+- The command palette can open a panel in a new window or in a new tile — the
+  same two verbs the right-click menu offers. The new-window rows include the
+  panel you are looking at, which is the one most often wanted in its own tab.
+  The new-tile rows are absent in simple mode, whose layout holds one service
+  tile.
+
+### Changed
+
+- Panel actions in the web terminal now live in a right-click menu, on the
+  panel's rail entry and on its tile header alike: focus the panel, open it in
+  a new tile, open it in a new window, remove it from the rail. It replaces the
+  ↗ and ⊞ corner glyphs, which appeared only on hover and only on the rail. The
+  menu also opens from the keyboard — the menu key or Shift+F10 on a focused
+  rail entry.
+
+### Fixed
+
+- The command palette takes typing straight away. The search box was focused
+  before the overlay was made visible, which does nothing, so the first
+  keystrokes after Cmd/Ctrl+K were dropped and you had to click the box first.
+- Palette search answers to the words operators actually reach for: a panel's
+  domain vocabulary ("logbook" finds ARIEL, "pv" finds Channel Finder) and the
+  verbs' synonyms ("window", "popout", "tile", "split").
 
 ## [2026.8.0]
 

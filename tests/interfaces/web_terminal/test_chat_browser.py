@@ -272,15 +272,12 @@ def _live_chat_server(tmp_path, ui_mode: str = "simple"):
 
 
 def _open_chat_page(browser, base_url: str, query: str = "") -> Page:
-    """Open a fresh page, wait for the console, and drop the welcome overlay."""
+    """Open a fresh page and wait for the console."""
     page = browser.new_page()
     page.goto(f"{base_url}{query}", wait_until="domcontentloaded")
     # initChat builds the console on DOMContentLoaded; the input row is the
     # last thing appended, so its presence means the console is mounted.
     expect(page.locator(f"{_OP} .op-input-area textarea")).to_be_visible(timeout=10_000)
-    # The first-visit overlay intercepts pointer events; remove it so the
-    # textarea and header controls are genuinely interactable.
-    page.evaluate("document.getElementById('welcome-overlay')?.remove()")
     return page
 
 
@@ -444,6 +441,56 @@ def test_stop_mid_stream_reenables_and_next_prompt_works(tmp_path, chromium_brow
         _send(page, "quick follow up")
         expect(page.locator(f"{_OP} .op-entry.assistant").last).to_contain_text(
             "all clear", timeout=10_000
+        )
+
+        page.close()
+
+
+# ---------------------------------------------------------------------------
+# 4b. Send holds its position while Stop comes and goes
+# ---------------------------------------------------------------------------
+
+
+def test_send_button_does_not_move_when_stop_appears_and_leaves(tmp_path, chromium_browser):
+    """Send is pinned to the composer's right edge; only Stop moves, inboard of it.
+
+    The textarea takes all the slack (``flex: 1``), so the button cluster is
+    anchored to the row's right edge and a member's arrival shifts everything
+    BEFORE it and nothing after it. Stop is the conditional member, so it has to
+    come FIRST in the cluster or Send slides sideways on every turn.
+
+    The end of a turn is what makes this worth a browser test rather than a
+    child-order assertion: ``setStreaming(false)`` hides Stop and re-enables Send
+    in the same statement block, so the wrong order drops a live Send onto the
+    exact pixels a hand was already moving toward for Stop. Asserted on real
+    geometry, because the invariant is "the operator's target does not move" —
+    a future layout change could honour the child order and still break it.
+    """
+    with _live_chat_server(tmp_path) as (base_url, _app):
+        _PLANS["long task"] = [("text", "starting…"), ("await_interrupt",), ("result",)]
+        page = _open_chat_page(chromium_browser, base_url)
+
+        send_btn = page.locator(f"{_OP} .op-send-btn")
+        stop_btn = page.locator(f"{_OP} .op-stop-btn")
+        expect(send_btn).to_be_visible()
+        idle_x = send_btn.bounding_box()["x"]
+
+        _send(page, "long task")
+        expect(stop_btn).to_be_visible(timeout=10_000)
+        streaming_x = send_btn.bounding_box()["x"]
+
+        stop_btn.click()
+        expect(stop_btn).to_be_hidden(timeout=10_000)
+        _wait_chat_idle(base_url)
+        settled_x = send_btn.bounding_box()["x"]
+
+        assert streaming_x == pytest.approx(idle_x, abs=1.0), (
+            "Send moved when Stop appeared — Stop must be the first child of "
+            ".op-input-controls so it opens inboard of Send"
+        )
+        assert settled_x == pytest.approx(idle_x, abs=1.0), (
+            "Send moved back when Stop went away, landing on the pixels Stop had "
+            "occupied at the moment Send became clickable again"
         )
 
         page.close()

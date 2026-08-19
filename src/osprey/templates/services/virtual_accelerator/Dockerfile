@@ -14,8 +14,9 @@
 #     on dev builds. Its build cache is shared across projects and only
 #     rebuilds when the staged manifest changes. The extra is what carries the
 #     serving stack (`lume-pva-apg[ca,pva]`, PyAT) and the archiver recorder's
-#     client-side deps (a CA client, pymongo) — deliberately, so this file
-#     cannot pin a dependency that pyproject.toml disagrees with. The recorder
+#     CA client — deliberately, so this file cannot pin a dependency that
+#     pyproject.toml disagrees with. The recorder's other client-side dep,
+#     pymongo, is core and arrives with the base install. The recorder
 #     runs THIS image with a different command (compose template only, no
 #     Dockerfile of its own), which is why its deps ride along here.
 #   * wheel layer — when `osprey up --dev` stages a locally-built wheel
@@ -67,10 +68,20 @@ RUN arch="$(dpkg --print-architecture)"; [ "$arch" = "amd64" ] \
 # Debian apt mirrors over HTTPS (plain-HTTP bulk fetches are throttled or
 # broken by middleboxes on some networks; deb.debian.org supports HTTPS), and
 # bounded apt retries with backoff so a transient network blip mid-build does
-# not fail the whole image.
-RUN find /etc/apt \( -name '*.sources' -o -name '*.list' \) \
+# not fail the whole image. Pipelining is disabled alongside those retries
+# because retries alone were seen not to cover every blip: a CI build lost one
+# 4.6 kB .deb to a peer connection reset while 70 other packages fetched fine
+# from the same host, with Acquire::Retries already in effect. Apt's default of
+# up to 10 requests per connection is the part of that failure we can act on —
+# one request per connection is marginally slower and strictly easier to
+# recover. Set for both schemes deliberately: these mirrors are rewritten to
+# HTTPS just above, and apt keeps no https entry in its config tree unless one
+# is written, so relying on a fallback from the http key is how this would
+# quietly become a no-op.
+RUN export http_proxy="${http_proxy:-${HTTP_PROXY:-}}" https_proxy="${https_proxy:-${HTTPS_PROXY:-}}" no_proxy="${no_proxy:-${NO_PROXY:-}}"; \
+    find /etc/apt \( -name '*.sources' -o -name '*.list' \) \
     -exec sed -i 's|http://deb.debian.org|https://deb.debian.org|g' {} + \
- && printf 'Acquire::Retries "5";\n' > /etc/apt/apt.conf.d/80-osprey-retries
+ && printf 'Acquire::Retries "5";\nAcquire::http::Pipeline-Depth "0";\nAcquire::https::Pipeline-Depth "0";\n' > /etc/apt/apt.conf.d/80-osprey-retries
 
 # ── deps layer ───────────────────────────────────────────────────────────────
 # Prime the image with the pinned framework release + `virtual-accelerator`
@@ -99,7 +110,8 @@ RUN find /etc/apt \( -name '*.sources' -o -name '*.list' \) \
 ARG OSPREY_VERSION=""
 ARG OSPREY_DEV=""
 COPY .dockerignore osprey-local-requirements.tx[t] /tmp/deps-ctx/
-RUN [ -n "$OSPREY_VERSION" ] || { echo "ERROR: OSPREY_VERSION build-arg is required" >&2; exit 1; } \
+RUN export http_proxy="${http_proxy:-${HTTP_PROXY:-}}" https_proxy="${https_proxy:-${HTTPS_PROXY:-}}" no_proxy="${no_proxy:-${NO_PROXY:-}}"; \
+    [ -n "$OSPREY_VERSION" ] || { echo "ERROR: OSPREY_VERSION build-arg is required" >&2; exit 1; } \
     && printf 'setuptools<84\n' > /tmp/deps-ctx/pip-constraints.txt \
     && export PIP_CONSTRAINT=/tmp/deps-ctx/pip-constraints.txt \
     && apt-get update \

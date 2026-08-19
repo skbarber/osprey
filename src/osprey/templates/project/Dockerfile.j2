@@ -37,23 +37,41 @@ ARG OSPREY_OFFLINE="0"
 # Debian apt mirrors over HTTPS (plain-HTTP bulk fetches are throttled or
 # broken by middleboxes on some networks; deb.debian.org supports HTTPS), and
 # bounded apt retries with backoff so a transient network blip mid-build does
-# not fail the whole image.
-RUN find /etc/apt \( -name '*.sources' -o -name '*.list' \) \
+# not fail the whole image. Pipelining is disabled alongside those retries
+# because retries alone were seen not to cover every blip: a CI build lost one
+# 4.6 kB .deb to a peer connection reset while 70 other packages fetched fine
+# from the same host, with Acquire::Retries already in effect. Apt's default of
+# up to 10 requests per connection is the part of that failure we can act on —
+# one request per connection is marginally slower and strictly easier to
+# recover. Set for both schemes deliberately: these mirrors are rewritten to
+# HTTPS just above, and apt keeps no https entry in its config tree unless one
+# is written, so relying on a fallback from the http key is how this would
+# quietly become a no-op.
+RUN export http_proxy="${http_proxy:-${HTTP_PROXY:-}}" https_proxy="${https_proxy:-${HTTPS_PROXY:-}}" no_proxy="${no_proxy:-${NO_PROXY:-}}"; \
+    find /etc/apt \( -name '*.sources' -o -name '*.list' \) \
     -exec sed -i 's|http://deb.debian.org|https://deb.debian.org|g' {} + \
- && printf 'Acquire::Retries "5";\n' > /etc/apt/apt.conf.d/80-osprey-retries
+ && printf 'Acquire::Retries "5";\nAcquire::http::Pipeline-Depth "0";\nAcquire::https::Pipeline-Depth "0";\n' > /etc/apt/apt.conf.d/80-osprey-retries
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends curl git procps ca-certificates gnupg \
- && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
- && apt-get install -y --no-install-recommends nodejs \
- && apt-get purge -y gnupg \
- && apt-get autoremove -y \
+# Tools the agent's shell reaches for at runtime (curl, git, procps) and Node
+# for the Claude Code CLI installed below. Node comes from the base image's own
+# Debian release rather than a third-party apt repo, so the image has a single
+# package provenance and needs no network beyond the Debian mirror to build. The
+# CLI's engines floor is node >= 18, which every Debian release the slim bases
+# resolve to satisfies.
+#
+# npm is a runtime dependency, not a build-time convenience: the agent is
+# launched as `npx -y @anthropic-ai/claude-code@<version>` (claude_launcher.py),
+# so npm must remain in the final image.
+RUN export http_proxy="${http_proxy:-${HTTP_PROXY:-}}" https_proxy="${https_proxy:-${HTTPS_PROXY:-}}" no_proxy="${no_proxy:-${NO_PROXY:-}}"; \
+    apt-get update \
+ && apt-get install -y --no-install-recommends curl git procps ca-certificates nodejs npm \
  && rm -rf /var/lib/apt/lists/*
 
 # Claude Code CLI, pinned via CLAUDE_CLI_VERSION (npm global install) so an
 # upstream release cannot silently change agent behavior between image
 # builds — mirrors the dispatch-worker image's pinned install.
-RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}"
+RUN export http_proxy="${http_proxy:-${HTTP_PROXY:-}}" https_proxy="${https_proxy:-${HTTPS_PROXY:-}}" no_proxy="${no_proxy:-${NO_PROXY:-}}"; \
+    npm install -g "@anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}"
 
 # OSPREY + profile dependencies (deps layer). A C toolchain (build-essential +
 # python3-dev) is needed at install time to compile native deps (e.g.
@@ -79,7 +97,8 @@ COPY .dockerignore osprey-local-requirements.tx[t] /tmp/deps-ctx/
 # reaches pip's isolated build environments, where a plain requirement pin
 # would not. Drop the constraint once a fixed setuptools or setuptools_dso
 # release is out.
-RUN export NO_PROXY="$PIP_NO_PROXY" no_proxy="$PIP_NO_PROXY" \
+RUN export http_proxy="${http_proxy:-${HTTP_PROXY:-}}" https_proxy="${https_proxy:-${HTTPS_PROXY:-}}" no_proxy="${no_proxy:-${NO_PROXY:-}}"; \
+    export NO_PROXY="$PIP_NO_PROXY" no_proxy="$PIP_NO_PROXY" \
     && printf 'setuptools<84\n' > /tmp/deps-ctx/pip-constraints.txt \
     && export PIP_CONSTRAINT=/tmp/deps-ctx/pip-constraints.txt \
     && apt-get update \
