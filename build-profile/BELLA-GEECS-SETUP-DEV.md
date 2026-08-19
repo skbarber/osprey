@@ -39,8 +39,8 @@ detail in the contract; the assistant carries these as the
 ## Part 1 — Channel finder: hierarchical, generated from the GEECS DB
 
 The channel finder runs in **hierarchical** mode (the `control-assistant`
-preset default) over the **complete gateway served set** — 113 devices,
-~5,800 channels including `:SP` companions, per-device `connected`, and the
+preset default) over the **complete gateway served set** — 114 devices,
+~6,000 channels including `:SP` companions, per-device `connected`, 140 PVA camera-image channels (listed, marked unreadable via CA — see below), and the
 gateway's own diagnostics. Hierarchical navigation makes the full set
 affordable; no curation subset is needed.
 
@@ -48,18 +48,19 @@ affordable; no curation subset is needed.
 
 The database is generated, in `build-profile/` of the osprey checkout:
 
-- `tools/extract_geecs.py` — drives GeecsCAGateway's own config builder
+- `scripts/extract_geecs.py` — drives GeecsCAGateway's own config builder
   (`GatewayConfig.from_geecs_experiment("Undulator")`), so extracted
   names/units/limits/settability are exactly the gateway's served set
   (every `get='yes'` variable ∪ settables of enabled devices). Run it with
   the GeecsCAGateway venv's Python, on a machine with lab-network access
   and the GEECS INI pair. It writes a snapshot JSON.
-- `tools/generate_hierarchical.py` — renders the snapshot into the OSPREY
+- `scripts/generate_hierarchical.py` — renders the snapshot into the OSPREY
   hierarchical channel database at
-  `overlays/data/channel_databases/hierarchical.json`; the profile's
-  `overlay:` map copies it into the project at build time.
+  `project/data/channel_databases/hierarchical.json`; the `project/`
+  convention directory mirrors it onto the built tree.
 
-To refresh after a GEECS DB change: rerun both tools, rebuild the project.
+To refresh after a GEECS DB change: rerun both scripts, then `osprey build`
+(run anywhere inside this repo; output renders into `build/`).
 
 Tree shape: `experiment → GEECS device type → device → variable [→ SP]`,
 producing `undulator:<device>:<variable>[:SP]`.
@@ -142,6 +143,13 @@ Single setpoint changes outside a scan are ordinary OSPREY channel writes
 
 ## Part 3 — Facility-side prerequisites
 
+- **PVA to the camera fleet** (images): `EPICS_PVA_ADDR_LIST` with the
+  13-server fleet list + `EPICS_PVA_AUTO_ADDR_LIST=NO` in `.env` (roster of
+  record: `HOSTS` in `GeecsPvaGateway/deploy/gen_fleet_status.py`). Camera
+  images are pvAccess NTNDArray PVs (`undulator:<camera>:image`) served by
+  per-server GeecsPvaGateway instances — Phoebus/p4p territory; OSPREY's
+  channel tools are CA-only and cannot read them. `p4p` is installed in the
+  build venv for the eventual sanctioned image path.
 - **Channel Access to the gateway**: the OSPREY host/containers need
   `EPICS_CA_ADDR_LIST=192.168.6.14` (CA on standard port 5064) — the
   profile sets this as an env default and wires both connector gateways
@@ -151,13 +159,21 @@ Single setpoint changes outside a scan are ordinary OSPREY channel writes
   `GeecsBluesky/EVENT_SCHEMA.md` for column meanings). There is no
   OSPREY-side Tiled; this is the only catalog.
 - **GEECS MySQL** on the same host — needed only by the channel-database
-  extraction tooling (`build-profile/tools/`), never at assistant runtime.
+  extraction tooling (`build-profile/scripts/`), never at assistant runtime.
 - The GEECS INI pair (`config.ini` / `Configurations.INI`) is needed only
   on the machine that runs the extraction tooling. Nothing in the built
   assistant reads it; it stays out-of-band on GEECS machines, never
   committed anywhere.
 - An LLM `provider:`/`model:` pair with real credentials — the profile
-  uses **CBorg** (`CBORG_API_KEY` in the project `.env`).
+  uses **CBorg** (`CBORG_API_KEY` in the repo `.env`).
+- **`.env` must also carry**
+  `CONFIG_FILE=<absolute-path-to-this-repo>/build/config.yml` — a
+  workaround for a framework bug (hooks are launched without `CONFIG_FILE`,
+  so the limits hook resolves its database against the repo root instead of
+  the build zone; its empty-database failsafe then denies every write as
+  "channel not in limits database"). Machine-specific absolute path: set it
+  fresh on every new clone/machine. Remove when upstream ships
+  `CONFIG_FILE` in hook environments (tracked: als-apg/osprey#636).
 
 ## Current profile state (cross-reference)
 
@@ -165,7 +181,7 @@ Single setpoint changes outside a scan are ordinary OSPREY channel writes
 `control-assistant` preset **minus** the virtual accelerator and the
 entire bluesky stack; live EPICS via 192.168.6.14 with writes enabled and
 software limits checking **on**, over a generated limits database
-(`tools/generate_channel_limits.py`, same extract as the channel
+(`scripts/generate_channel_limits.py`, same extract as the channel
 database): one entry per settable `:SP` with min/max mirroring the GEECS
 DB; readbacks and unlisted channels are refused. Layered write safety:
 OSPREY software limits (client pre-flight) → gateway EPICS control limits
@@ -184,7 +200,7 @@ channel finder as in Part 1.
   new-client onboarding recipe.
 - `docs/geecs_schemas/schema_reference.md` — every ScanRequest/config
   field, generated from the schemas.
-- `build-profile/tools/` (osprey checkout) — the extraction + generation
+- `build-profile/scripts/` (osprey checkout) — the extraction + generation
   pipeline for the channel database, and the snapshot it last ran from.
 - The old `bella-profiles` prototype is reference-only; its scanner
   wiring predates the gateway and must not be copied.

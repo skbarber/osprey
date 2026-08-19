@@ -23,6 +23,19 @@ for dev in cfg.devices:
     except Exception as exc:  # noqa: BLE001
         devtypes[dev.name] = f"<error: {exc}>"
 
+# Image-typed variables are skipped by the CA config builder (not scalar CA
+# data) but are now served as PVA NTNDArray PVs by GeecsPvaGateway — capture
+# them separately so the channel database can list them.
+from geecs_ca_gateway.config import effective_vartype
+from geecs_ca_gateway.pv_naming import pv_name
+
+image_map: dict[str, list[str]] = {}
+var_map = GeecsDb.get_experiment_device_variables(EXPERIMENT)
+for dev_name, rows in var_map.items():
+    for meta in rows:
+        if effective_vartype(meta.get("variabletype"), meta.get("choices")) == "image":
+            image_map.setdefault(dev_name, []).append(meta["name"])
+
 out = []
 for dev in cfg.devices:
     out.append(
@@ -30,6 +43,10 @@ for dev in cfg.devices:
             "device": dev.name,
             "devicetype": devtypes.get(dev.name),
             "pv_prefix": dev.pv_prefix,
+            "image_variables": [
+                {"geecs_var": v, "pv": pv_name(EXPERIMENT, dev.pv_prefix, v)}
+                for v in sorted(set(image_map.get(dev.name, [])))
+            ],
             "variables": [
                 {
                     "geecs_var": v.geecs_var,

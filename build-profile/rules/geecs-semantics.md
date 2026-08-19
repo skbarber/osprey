@@ -49,6 +49,52 @@ control system speaks gateway PVs (`undulator:u_esp_jetxyz:position_axis_1`).
 Channel-finder descriptions carry the mapping. When reporting, give the
 GEECS name with the PV in parentheses at first mention.
 
+## Camera images are PVA streams — NOT readable via channel tools
+
+Camera image variables (e.g. `undulator:uc_tubein:image`) are served as
+**pvAccess NTNDArray PVs** by per-server image gateways — a different
+protocol from the CA scalars. The channel tools (`channel_read` etc.) speak
+CA only: attempting to read an image PV will time out, and that timeout
+means "wrong protocol," never "camera down."
+
+### Sanctioned image access: read-only p4p in python execution
+
+**Facility exception to the direct-EPICS-library prohibition** (which
+otherwise stands in full; interim until OSPREY gains native PVA support —
+tracked as als-apg/osprey#637): for **image PVs only**, you MAY use `p4p`
+in python execution, **read-only** — a `Context("pva")` with
+`monitor`/`get` and never a `put`. Rationale: the prohibition protects the write path
+(limits, approval, audit); a read-only image monitor has no write path.
+All scalar reads and ALL writes stay on the connector tools / `osprey.runtime`.
+
+The correct idiom is a **held monitor**, because subscriptions are gated on
+client interest — a bare `get` returns a cached or placeholder frame
+(a `(1, 1)` array is the startup placeholder, not data), and the first
+fresh frame lands ~1–2 s after subscribing:
+
+```python
+import time
+from p4p.client.thread import Context
+
+frames = []
+ctx = Context("pva")
+sub = ctx.monitor("undulator:uc_tubein:image", frames.append)
+time.sleep(3)          # hold the gate open past one push interval
+sub.close(); ctx.close()
+img = frames[-1]       # newest frame; verify img.shape != (1, 1)
+```
+
+Then analyze/display normally (`numpy` stats, `save_artifact` for the
+gallery). Rules of the road:
+
+- Close every monitor/context — a leaked subscription keeps the camera
+  gate open for nothing.
+- The stream is **latest-wins, live watching only** — shot-synchronized
+  image data lives in the GEECS file path and scan system, never here.
+  Always label results as a live snapshot, never as shot data.
+- If no frame beyond the placeholder arrives, the camera is idle or off —
+  report that; do not retry in a loop.
+
 ## Enum and string quirks
 
 - Enum channels with numeric labels (e.g. DG645 configs with options

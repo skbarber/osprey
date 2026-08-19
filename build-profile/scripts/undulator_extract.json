@@ -5,6 +5,20 @@
    "device": "UC_ALineEbeam1",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_ALineEbeam1",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_alineebeam1:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_alineebeam1:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_alineebeam1:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -515,6 +529,20 @@
    "device": "UC_ALineEBeam2",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_ALineEBeam2",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_alineebeam2:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_alineebeam2:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_alineebeam2:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -1069,6 +1097,20 @@
    "device": "UC_ALineEBeam3",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_ALineEBeam3",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_alineebeam3:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_alineebeam3:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_alineebeam3:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -1758,6 +1800,20 @@
    "device": "UC_Amp2Depletion_South",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_Amp2Depletion_South",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_amp2depletion_south:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_amp2depletion_south:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_amp2depletion_south:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -2334,6 +2390,20 @@
    "device": "UC_Amp2_IR_input",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_Amp2_IR_input",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_amp2_ir_input:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_amp2_ir_input:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_amp2_ir_input:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -2932,6 +3002,20 @@
    "device": "UC_Amp3Depletion_South",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_Amp3Depletion_South",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_amp3depletion_south:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_amp3depletion_south:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_amp3depletion_south:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -3508,6 +3592,20 @@
    "device": "UC_Amp3_IR_input",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_Amp3_IR_input",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_amp3_ir_input:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_amp3_ir_input:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_amp3_ir_input:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -4084,6 +4182,20 @@
    "device": "UC_Amp4Depletion_South",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_Amp4Depletion_South",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_amp4depletion_south:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_amp4depletion_south:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_amp4depletion_south:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -4660,6 +4772,20 @@
    "device": "UC_Amp4_IR_input",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_Amp4_IR_input",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_amp4_ir_input:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_amp4_ir_input:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_amp4_ir_input:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -5236,6 +5362,20 @@
    "device": "UC_Amp4_IR_output",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_Amp4_IR_output",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_amp4_ir_output:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_amp4_ir_output:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_amp4_ir_output:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -5812,6 +5952,20 @@
    "device": "UC_BCaveIn",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_BCaveIn",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_bcavein:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_bcavein:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_bcavein:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -6322,6 +6476,16 @@
    "device": "UC_BCaveMagSpecCam1",
    "devicetype": "MagSpecCamera",
    "pv_prefix": "UC_BCaveMagSpecCam1",
+   "image_variables": [
+    {
+     "geecs_var": "Image",
+     "pv": "undulator:uc_bcavemagspeccam1:image"
+    },
+    {
+     "geecs_var": "ImageInterp",
+     "pv": "undulator:uc_bcavemagspeccam1:imageinterp"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -6619,6 +6783,16 @@
    "device": "UC_BCaveMagSpecCam2",
    "devicetype": "MagSpecCamera",
    "pv_prefix": "UC_BCaveMagSpecCam2",
+   "image_variables": [
+    {
+     "geecs_var": "Image",
+     "pv": "undulator:uc_bcavemagspeccam2:image"
+    },
+    {
+     "geecs_var": "ImageInterp",
+     "pv": "undulator:uc_bcavemagspeccam2:imageinterp"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -6916,6 +7090,16 @@
    "device": "UC_BCaveMagSpecCam3",
    "devicetype": "MagSpecCamera",
    "pv_prefix": "UC_BCaveMagSpecCam3",
+   "image_variables": [
+    {
+     "geecs_var": "Image",
+     "pv": "undulator:uc_bcavemagspeccam3:image"
+    },
+    {
+     "geecs_var": "ImageInterp",
+     "pv": "undulator:uc_bcavemagspeccam3:imageinterp"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -7213,6 +7397,20 @@
    "device": "UC_ChicaneSlit",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_ChicaneSlit",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_chicaneslit:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_chicaneslit:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_chicaneslit:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -7701,6 +7899,20 @@
    "device": "UC_DiagnosticsPhosphor",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_DiagnosticsPhosphor",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_diagnosticsphosphor:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_diagnosticsphosphor:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_diagnosticsphosphor:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -8277,6 +8489,20 @@
    "device": "UC_DMSurface",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_DMSurface",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_dmsurface:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_dmsurface:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_dmsurface:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -8787,6 +9013,20 @@
    "device": "UC_ExpanderIn1",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_ExpanderIn1",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_expanderin1:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_expanderin1:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_expanderin1:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -9275,6 +9515,20 @@
    "device": "UC_ExpanderIn1_Pulsed",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_ExpanderIn1_Pulsed",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_expanderin1_pulsed:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_expanderin1_pulsed:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_expanderin1_pulsed:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -9851,6 +10105,20 @@
    "device": "UC_FinalSteeringLeak",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_FinalSteeringLeak",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_finalsteeringleak:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_finalsteeringleak:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_finalsteeringleak:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -10339,6 +10607,20 @@
    "device": "UC_GaiaMode",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_GaiaMode",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_gaiamode:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_gaiamode:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_gaiamode:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -10871,6 +11153,20 @@
    "device": "UC_GhostFocus",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_GhostFocus",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_ghostfocus:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_ghostfocus:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_ghostfocus:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -11469,6 +11765,20 @@
    "device": "UC_GhostUpstream",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_GhostUpstream",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_ghostupstream:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_ghostupstream:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_ghostupstream:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -12067,6 +12377,20 @@
    "device": "UC_GratingMode",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_GratingMode",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_gratingmode:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_gratingmode:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_gratingmode:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -12577,6 +12901,20 @@
    "device": "UC_HiResMagCam",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_HiResMagCam",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_hiresmagcam:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_hiresmagcam:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_hiresmagcam:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -13266,6 +13604,20 @@
    "device": "UC_ModeImager",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_ModeImager",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_modeimager:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_modeimager:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_modeimager:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -13831,6 +14183,20 @@
    "device": "UC_OAPin1",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_OAPin1",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_oapin1:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_oapin1:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_oapin1:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -14341,6 +14707,20 @@
    "device": "UC_OAPin2",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_OAPin2",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_oapin2:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_oapin2:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_oapin2:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -14917,6 +15297,20 @@
    "device": "UC_Phosphor1",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_Phosphor1",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_phosphor1:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_phosphor1:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_phosphor1:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "2ndmomW0x",
@@ -15493,6 +15887,20 @@
    "device": "UC_Stretcher",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_Stretcher",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_stretcher:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_stretcher:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_stretcher:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -15981,6 +16389,20 @@
    "device": "UC_Stretcher_MI",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_Stretcher_MI",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_stretcher_mi:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_stretcher_mi:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_stretcher_mi:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -16469,6 +16891,20 @@
    "device": "UC_TargetIn",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_TargetIn",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_targetin:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_targetin:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_targetin:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -16590,6 +17026,28 @@
      "description": ""
     },
     {
+     "geecs_var": "centroidx",
+     "pv": "undulator:uc_targetin:centroidx",
+     "dtype": "float",
+     "settable": false,
+     "egu": "pixel",
+     "lo": null,
+     "hi": null,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "centroidy",
+     "pv": "undulator:uc_targetin:centroidy",
+     "dtype": "float",
+     "settable": false,
+     "egu": "pixel",
+     "lo": null,
+     "hi": null,
+     "choices": [],
+     "description": ""
+    },
+    {
      "geecs_var": "CompressionQuality",
      "pv": "undulator:uc_targetin:compressionquality",
      "dtype": "float",
@@ -16688,6 +17146,17 @@
      "egu": "pixel",
      "lo": 10.0,
      "hi": 3000.0,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "MeanCounts",
+     "pv": "undulator:uc_targetin:meancounts",
+     "dtype": "float",
+     "settable": false,
+     "egu": "counts",
+     "lo": 0.0,
+     "hi": 999999999.0,
      "choices": [],
      "description": ""
     },
@@ -16957,6 +17426,20 @@
    "device": "UC_TC_Output",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_TC_Output",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_tc_output:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_tc_output:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_tc_output:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -17489,6 +17972,20 @@
    "device": "UC_TopView",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_TopView",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_topview:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_topview:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_topview:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -18021,6 +18518,20 @@
    "device": "UC_TubeIn",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_TubeIn",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_tubein:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_tubein:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_tubein:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -18531,6 +19042,20 @@
    "device": "UC_UndulatorImagingSpec",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_UndulatorImagingSpec",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_undulatorimagingspec:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_undulatorimagingspec:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_undulatorimagingspec:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -19033,6 +19558,20 @@
    "device": "UC_UndulatorRad2",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_UndulatorRad2",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_undulatorrad2:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_undulatorrad2:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_undulatorrad2:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -19623,6 +20162,20 @@
    "device": "UC_VisaEBeam1",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_VisaEBeam1",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_visaebeam1:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_visaebeam1:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_visaebeam1:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -20111,6 +20664,20 @@
    "device": "UC_VisaEBeam2",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_VisaEBeam2",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_visaebeam2:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_visaebeam2:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_visaebeam2:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -20599,6 +21166,20 @@
    "device": "UC_VisaEBeam3",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_VisaEBeam3",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_visaebeam3:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_visaebeam3:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_visaebeam3:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -21087,6 +21668,20 @@
    "device": "UC_VisaEBeam4",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_VisaEBeam4",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_visaebeam4:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_visaebeam4:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_visaebeam4:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -21575,6 +22170,20 @@
    "device": "UC_VisaEBeam5",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_VisaEBeam5",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_visaebeam5:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_visaebeam5:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_visaebeam5:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -22063,6 +22672,20 @@
    "device": "UC_VisaEBeam6",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_VisaEBeam6",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_visaebeam6:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_visaebeam6:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_visaebeam6:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -22551,6 +23174,20 @@
    "device": "UC_VisaEBeam7",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_VisaEBeam7",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_visaebeam7:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_visaebeam7:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_visaebeam7:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -23039,6 +23676,20 @@
    "device": "UC_VisaEBeam8",
    "devicetype": "Point Grey Camera",
    "pv_prefix": "UC_VisaEBeam8",
+   "image_variables": [
+    {
+     "geecs_var": "bakground image",
+     "pv": "undulator:uc_visaebeam8:bakground_image"
+    },
+    {
+     "geecs_var": "image",
+     "pv": "undulator:uc_visaebeam8:image"
+    },
+    {
+     "geecs_var": "processed image",
+     "pv": "undulator:uc_visaebeam8:processed_image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "Analysis",
@@ -23527,6 +24178,7 @@
    "device": "U_148Spectrometer",
    "devicetype": "Thorlabs CCS175 Spectrometer",
    "pv_prefix": "U_148Spectrometer",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "exposure",
@@ -23595,6 +24247,7 @@
    "device": "U_148_PLC",
    "devicetype": "Productivity1000PLC",
    "pv_prefix": "U_148_PLC",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "DI.Ch1",
@@ -24344,6 +24997,7 @@
    "device": "U_1HzShiftedBox",
    "devicetype": "DG535",
    "pv_prefix": "U_1HzShiftedBox",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "amplitude.Channel_A",
@@ -25043,6 +25697,7 @@
    "device": "U_ACaveHallProbe",
    "devicetype": "HallProbeLS455",
    "pv_prefix": "U_ACaveHallProbe",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "CalibrationCoefficient0",
@@ -25116,6 +25771,7 @@
    "device": "U_ACaveMagSpecPS",
    "devicetype": "CaenELSFastPS",
    "pv_prefix": "U_ACaveMagSpecPS",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -25173,6 +25829,7 @@
    "device": "U_Aline3Filter",
    "devicetype": "DaqPad_NI6009",
    "pv_prefix": "U_Aline3Filter",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "AnalogOutput.Channel 0",
@@ -25842,6 +26499,7 @@
    "device": "U_Amp4TelStage",
    "devicetype": "ZaberASeries",
    "pv_prefix": "U_Amp4TelStage",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Position.Ch1",
@@ -25871,6 +26529,7 @@
    "device": "U_BCaveHallProbe",
    "devicetype": "HallProbeLS455",
    "pv_prefix": "U_BCaveHallProbe",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "CalibrationCoefficient0",
@@ -25944,6 +26603,7 @@
    "device": "U_BCaveICT",
    "devicetype": "PicoscopeV2",
    "pv_prefix": "U_BCaveICT",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Enable.ChA",
@@ -26212,6 +26872,12 @@
    "device": "U_BCaveMagSpec",
    "devicetype": "MagSpecStitcher",
    "pv_prefix": "U_BCaveMagSpec",
+   "image_variables": [
+    {
+     "geecs_var": "Image",
+     "pv": "undulator:u_bcavemagspec:image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "DeltaAngle",
@@ -26266,6 +26932,7 @@
    "device": "U_BCaveMagSpecPS",
    "devicetype": "TDK-Lambda Z",
    "pv_prefix": "U_BCaveMagSpecPS",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current_Limit.Ch1",
@@ -26309,6 +26976,7 @@
    "device": "U_BlueDiodePicos",
    "devicetype": "Picomotor8742dotNet",
    "pv_prefix": "U_BlueDiodePicos",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Position.Axis 1",
@@ -26415,6 +27083,7 @@
    "device": "U_ChicaneInner",
    "devicetype": "CaenELSFastPS",
    "pv_prefix": "U_ChicaneInner",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -26472,6 +27141,7 @@
    "device": "U_ChicaneMotors",
    "devicetype": "AgilisPiezoStage",
    "pv_prefix": "U_ChicaneMotors",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Ch1Ax1MoveNeg",
@@ -26635,6 +27305,7 @@
    "device": "U_ChicaneOuter",
    "devicetype": "CaenELSFastPS",
    "pv_prefix": "U_ChicaneOuter",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -26692,6 +27363,7 @@
    "device": "U_CompAerotech",
    "devicetype": "AerotechStage",
    "pv_prefix": "U_CompAerotech",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Enable.Axis1",
@@ -26860,9 +27532,566 @@
    ]
   },
   {
+   "device": "U_DG645_BCaveBox1",
+   "devicetype": "DG645",
+   "pv_prefix": "U_DG645_BCaveBox1",
+   "image_variables": [],
+   "variables": [
+    {
+     "geecs_var": "Amplitude.Ch AB",
+     "pv": "undulator:u_dg645_bcavebox1:amplitude_ch_ab",
+     "dtype": "float",
+     "settable": true,
+     "egu": "V",
+     "lo": 0.5,
+     "hi": 5.0,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Amplitude.Ch CD",
+     "pv": "undulator:u_dg645_bcavebox1:amplitude_ch_cd",
+     "dtype": "float",
+     "settable": true,
+     "egu": "V",
+     "lo": 0.5,
+     "hi": 5.0,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Amplitude.Ch EF",
+     "pv": "undulator:u_dg645_bcavebox1:amplitude_ch_ef",
+     "dtype": "float",
+     "settable": true,
+     "egu": "V",
+     "lo": 0.5,
+     "hi": 5.0,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Amplitude.Ch GH",
+     "pv": "undulator:u_dg645_bcavebox1:amplitude_ch_gh",
+     "dtype": "float",
+     "settable": true,
+     "egu": "V",
+     "lo": 0.5,
+     "hi": 5.0,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Amplitude.Ch T0",
+     "pv": "undulator:u_dg645_bcavebox1:amplitude_ch_t0",
+     "dtype": "float",
+     "settable": true,
+     "egu": "V",
+     "lo": 0.5,
+     "hi": 5.0,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Delay.Ch A",
+     "pv": "undulator:u_dg645_bcavebox1:delay_ch_a",
+     "dtype": "float",
+     "settable": true,
+     "egu": "s",
+     "lo": 0.0,
+     "hi": 0.9,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Delay.Ch B",
+     "pv": "undulator:u_dg645_bcavebox1:delay_ch_b",
+     "dtype": "float",
+     "settable": true,
+     "egu": "s",
+     "lo": 0.0,
+     "hi": 0.9,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Delay.Ch C",
+     "pv": "undulator:u_dg645_bcavebox1:delay_ch_c",
+     "dtype": "float",
+     "settable": true,
+     "egu": "s",
+     "lo": 0.0,
+     "hi": 0.9,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Delay.Ch D",
+     "pv": "undulator:u_dg645_bcavebox1:delay_ch_d",
+     "dtype": "float",
+     "settable": true,
+     "egu": "s",
+     "lo": 0.0,
+     "hi": 0.9,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Delay.Ch E",
+     "pv": "undulator:u_dg645_bcavebox1:delay_ch_e",
+     "dtype": "float",
+     "settable": true,
+     "egu": "s",
+     "lo": 0.0,
+     "hi": 0.9,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Delay.Ch F",
+     "pv": "undulator:u_dg645_bcavebox1:delay_ch_f",
+     "dtype": "float",
+     "settable": true,
+     "egu": "s",
+     "lo": 0.0,
+     "hi": 0.9,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Delay.Ch G",
+     "pv": "undulator:u_dg645_bcavebox1:delay_ch_g",
+     "dtype": "float",
+     "settable": true,
+     "egu": "s",
+     "lo": 0.0,
+     "hi": 0.9,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Delay.Ch H",
+     "pv": "undulator:u_dg645_bcavebox1:delay_ch_h",
+     "dtype": "float",
+     "settable": true,
+     "egu": "s",
+     "lo": 0.0,
+     "hi": 0.9,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "fire",
+     "pv": "undulator:u_dg645_bcavebox1:fire",
+     "dtype": "string",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Inhibit",
+     "pv": "undulator:u_dg645_bcavebox1:inhibit",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "off",
+      "Triggers",
+      "AB",
+      "AB and CD",
+      "AB",
+      "CD and EF",
+      "AB",
+      "CD",
+      "EF and GH"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Linked.Ch A",
+     "pv": "undulator:u_dg645_bcavebox1:linked_ch_a",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "T0",
+      "T1",
+      "A",
+      "B",
+      "C",
+      "D",
+      "E",
+      "F",
+      "G",
+      "H"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Linked.Ch B",
+     "pv": "undulator:u_dg645_bcavebox1:linked_ch_b",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "T0",
+      "T1",
+      "A",
+      "B",
+      "C",
+      "D",
+      "E",
+      "F",
+      "G",
+      "H"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Linked.Ch C",
+     "pv": "undulator:u_dg645_bcavebox1:linked_ch_c",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "T0",
+      "T1",
+      "A",
+      "B",
+      "C",
+      "D",
+      "E",
+      "F",
+      "G",
+      "H"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Linked.Ch D",
+     "pv": "undulator:u_dg645_bcavebox1:linked_ch_d",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "T0",
+      "T1",
+      "A",
+      "B",
+      "C",
+      "D",
+      "E",
+      "F",
+      "G",
+      "H"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Linked.Ch E",
+     "pv": "undulator:u_dg645_bcavebox1:linked_ch_e",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "T0",
+      "T1",
+      "A",
+      "B",
+      "C",
+      "D",
+      "E",
+      "F",
+      "G",
+      "H"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Linked.Ch F",
+     "pv": "undulator:u_dg645_bcavebox1:linked_ch_f",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "T0",
+      "T1",
+      "A",
+      "B",
+      "C",
+      "D",
+      "E",
+      "F",
+      "G",
+      "H"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Linked.Ch G",
+     "pv": "undulator:u_dg645_bcavebox1:linked_ch_g",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "T0",
+      "T1",
+      "A",
+      "B",
+      "C",
+      "D",
+      "E",
+      "F",
+      "G",
+      "H"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Linked.Ch H",
+     "pv": "undulator:u_dg645_bcavebox1:linked_ch_h",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "T0",
+      "T1",
+      "A",
+      "B",
+      "C",
+      "D",
+      "E",
+      "F",
+      "G",
+      "H"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Load File",
+     "pv": "undulator:u_dg645_bcavebox1:load_file",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "on",
+      "off"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Load Local",
+     "pv": "undulator:u_dg645_bcavebox1:load_local",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "off",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "LocalSavingPath",
+     "pv": "undulator:u_dg645_bcavebox1:localsavingpath",
+     "dtype": "path",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Polarity.Ch AB",
+     "pv": "undulator:u_dg645_bcavebox1:polarity_ch_ab",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "Positive",
+      "Negative"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Polarity.Ch CD",
+     "pv": "undulator:u_dg645_bcavebox1:polarity_ch_cd",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "Positive",
+      "Negative"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Polarity.Ch EF",
+     "pv": "undulator:u_dg645_bcavebox1:polarity_ch_ef",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "Positive",
+      "Negative"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Polarity.Ch GH",
+     "pv": "undulator:u_dg645_bcavebox1:polarity_ch_gh",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "Positive",
+      "Negative"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Polarity.Ch T0",
+     "pv": "undulator:u_dg645_bcavebox1:polarity_ch_t0",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "Positive",
+      "Negative"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Save Local",
+     "pv": "undulator:u_dg645_bcavebox1:save_local",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "off",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "timeout",
+     "pv": "undulator:u_dg645_bcavebox1:timeout",
+     "dtype": "float",
+     "settable": true,
+     "egu": "s",
+     "lo": 0.0,
+     "hi": 0.1,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Trigger.ExecuteSingleShot",
+     "pv": "undulator:u_dg645_bcavebox1:trigger_executesingleshot",
+     "dtype": "enum",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [
+      "on",
+      "off"
+     ],
+     "description": ""
+    },
+    {
+     "geecs_var": "Trigger.Level",
+     "pv": "undulator:u_dg645_bcavebox1:trigger_level",
+     "dtype": "float",
+     "settable": true,
+     "egu": "V",
+     "lo": 0.5,
+     "hi": 4.0,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Trigger.Rate",
+     "pv": "undulator:u_dg645_bcavebox1:trigger_rate",
+     "dtype": "float",
+     "settable": true,
+     "egu": "Hz",
+     "lo": 0.001,
+     "hi": 1000.0,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Trigger.Source",
+     "pv": "undulator:u_dg645_bcavebox1:trigger_source",
+     "dtype": "string",
+     "settable": true,
+     "egu": "",
+     "lo": null,
+     "hi": null,
+     "choices": [],
+     "description": ""
+    }
+   ]
+  },
+  {
    "device": "U_DG645_ShotControl",
    "devicetype": "DG645",
    "pv_prefix": "U_DG645_ShotControl",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Amplitude.Ch AB",
@@ -27418,6 +28647,7 @@
    "device": "U_EMQTripletBipolar",
    "devicetype": "TDK-Lambda Z Bipolar",
    "pv_prefix": "U_EMQTripletBipolar",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Continuous_trigger.Ch1",
@@ -27777,6 +29007,7 @@
    "device": "U_ESP302_01",
    "devicetype": "ESP302",
    "pv_prefix": "U_ESP302_01",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "automotoroff",
@@ -28110,6 +29341,7 @@
    "device": "U_ESP302_02",
    "devicetype": "ESP302",
    "pv_prefix": "U_ESP302_02",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "automotoroff",
@@ -28465,6 +29697,7 @@
    "device": "U_ESP_JetXYZ",
    "devicetype": "ESP301",
    "pv_prefix": "U_ESP_JetXYZ",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "automotoroff",
@@ -28661,6 +29894,24 @@
    "device": "U_FROG_Grenouille",
    "devicetype": "FROG",
    "pv_prefix": "U_FROG_Grenouille",
+   "image_variables": [
+    {
+     "geecs_var": "SpatialImage",
+     "pv": "undulator:u_frog_grenouille:spatialimage"
+    },
+    {
+     "geecs_var": "frogTrace",
+     "pv": "undulator:u_frog_grenouille:frogtrace"
+    },
+    {
+     "geecs_var": "retrieved FrogTrace",
+     "pv": "undulator:u_frog_grenouille:retrieved_frogtrace"
+    },
+    {
+     "geecs_var": "retrievedFrogTrace",
+     "pv": "undulator:u_frog_grenouille:retrievedfrogtrace"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "analysis",
@@ -28926,6 +30177,7 @@
    "device": "U_GaiaSVEReader",
    "devicetype": "GaiaSVEReader",
    "pv_prefix": "U_GaiaSVEReader",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "InternalShutterA",
@@ -28955,6 +30207,7 @@
    "device": "U_GhostFilters",
    "devicetype": "FilterWheels",
    "pv_prefix": "U_GhostFilters",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "localsavingpath",
@@ -29005,6 +30258,16 @@
    "device": "U_GhostWFS",
    "devicetype": "ThorlabsWFS",
    "pv_prefix": "U_GhostWFS",
+   "image_variables": [
+    {
+     "geecs_var": "Image",
+     "pv": "undulator:u_ghostwfs:image"
+    },
+    {
+     "geecs_var": "SpotfieldImage",
+     "pv": "undulator:u_ghostwfs:spotfieldimage"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "BeamCentroidX",
@@ -29371,6 +30634,7 @@
    "device": "U_HamaSpectro",
    "devicetype": "HamamatsuSpectrometerDAQ",
    "pv_prefix": "U_HamaSpectro",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "BGlevel",
@@ -29508,6 +30772,12 @@
    "device": "U_HasoLift",
    "devicetype": "HASO4_3",
    "pv_prefix": "U_HasoLift",
+   "image_variables": [
+    {
+     "geecs_var": "Image",
+     "pv": "undulator:u_hasolift:image"
+    }
+   ],
    "variables": [
     {
      "geecs_var": "ApplyHoleFill",
@@ -29740,6 +31010,7 @@
    "device": "U_HASO_Filters",
    "devicetype": "FilterWheels",
    "pv_prefix": "U_HASO_Filters",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "localsavingpath",
@@ -29801,6 +31072,7 @@
    "device": "U_Hexapod",
    "devicetype": "HexapodPI",
    "pv_prefix": "U_Hexapod",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "hexinit",
@@ -30125,6 +31397,7 @@
    "device": "U_Highland",
    "devicetype": "Highland T564 DDG",
    "pv_prefix": "U_Highland",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Channel1.ChannelOn",
@@ -30386,6 +31659,7 @@
    "device": "U_HP_Daq",
    "devicetype": "DaqPad_NI6009",
    "pv_prefix": "U_HP_Daq",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "AnalogOutput.Channel 1",
@@ -31083,6 +32357,7 @@
    "device": "U_LowPowerGhostWFSFilter",
    "devicetype": "FilterWheels",
    "pv_prefix": "U_LowPowerGhostWFSFilter",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "localsavingpath",
@@ -31144,6 +32419,7 @@
    "device": "U_MI_CoarseFilters",
    "devicetype": "FilterWheels",
    "pv_prefix": "U_MI_CoarseFilters",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "localsavingpath",
@@ -31205,6 +32481,7 @@
    "device": "U_MI_FineFilters",
    "devicetype": "FilterWheels",
    "pv_prefix": "U_MI_FineFilters",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "localsavingpath",
@@ -31266,6 +32543,7 @@
    "device": "U_ModeImagerESP",
    "devicetype": "ESP301",
    "pv_prefix": "U_ModeImagerESP",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "automotoroff",
@@ -31462,6 +32740,7 @@
    "device": "U_MRC_TimingBox",
    "devicetype": "DG645",
    "pv_prefix": "U_MRC_TimingBox",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Amplitude.Ch AB",
@@ -31581,6 +32860,7 @@
    "device": "U_PIFinalSteering",
    "devicetype": "PI_StageE727",
    "pv_prefix": "U_PIFinalSteering",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Position.Axis1",
@@ -31610,6 +32890,7 @@
    "device": "U_PLC",
    "devicetype": "Productivity1000PLC",
    "pv_prefix": "U_PLC",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "DO.Ch1",
@@ -32093,6 +33374,7 @@
    "device": "U_ProbeCamStage",
    "devicetype": "SMC100",
    "pv_prefix": "U_ProbeCamStage",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Home",
@@ -32147,6 +33429,7 @@
    "device": "U_ProbeFilters",
    "devicetype": "FilterWheels",
    "pv_prefix": "U_ProbeFilters",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "localsavingpath",
@@ -32208,6 +33491,7 @@
    "device": "U_S1H",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_S1H",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -32265,6 +33549,7 @@
    "device": "U_S1V",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_S1V",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -32322,6 +33607,7 @@
    "device": "U_S2H",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_S2H",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -32379,6 +33665,7 @@
    "device": "U_S2V",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_S2V",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -32436,6 +33723,7 @@
    "device": "U_S3H",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_S3H",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -32493,6 +33781,7 @@
    "device": "U_S3V",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_S3V",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -32550,6 +33839,7 @@
    "device": "U_S4H",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_S4H",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -32607,6 +33897,7 @@
    "device": "U_S4V",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_S4V",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -32664,6 +33955,7 @@
    "device": "U_StretchterXMCC",
    "devicetype": "ZaberASeries",
    "pv_prefix": "U_StretchterXMCC",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Home.Ch1",
@@ -32765,6 +34057,7 @@
    "device": "U_TCAlignStages",
    "devicetype": "ZaberASeries",
    "pv_prefix": "U_TCAlignStages",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Position.Ch1",
@@ -32794,6 +34087,7 @@
    "device": "U_TRAServer01",
    "devicetype": "TRAServer_VISA",
    "pv_prefix": "U_TRAServer01",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "backlash.Axis 1",
@@ -33656,6 +34950,7 @@
    "device": "U_TRAServer03",
    "devicetype": "TRAServer_VISA",
    "pv_prefix": "U_TRAServer03",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "backlash.Axis 1",
@@ -34540,6 +35835,7 @@
    "device": "U_UndulatorExitICT",
    "devicetype": "PicoscopeV2",
    "pv_prefix": "U_UndulatorExitICT",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Enable.ChA",
@@ -34749,6 +36045,7 @@
    "device": "U_UndulatorSpecStage",
    "devicetype": "ZaberASeries",
    "pv_prefix": "U_UndulatorSpecStage",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Home.Ch1",
@@ -34828,6 +36125,7 @@
    "device": "U_VacuumGauge",
    "devicetype": "DaqPad_NI6009",
    "pv_prefix": "U_VacuumGauge",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "AI_mean.Channel 0",
@@ -35547,6 +36845,7 @@
    "device": "U_Velmex",
    "devicetype": "VelmexStage",
    "pv_prefix": "U_Velmex",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "MotorSpeed",
@@ -35604,6 +36903,7 @@
    "device": "U_VisaPlungers",
    "devicetype": "DaqPad_NI6009",
    "pv_prefix": "U_VisaPlungers",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "DigitalOutput.Channel 0",
@@ -36276,6 +37576,7 @@
    "device": "U_VS1H",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_VS1H",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -36333,6 +37634,7 @@
    "device": "U_VS1V",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_VS1V",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -36390,6 +37692,7 @@
    "device": "U_VS2H",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_VS2H",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -36447,6 +37750,7 @@
    "device": "U_VS2V",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_VS2V",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -36504,6 +37808,7 @@
    "device": "U_VS3H",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_VS3H",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -36561,6 +37866,7 @@
    "device": "U_VS3V",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_VS3V",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -36618,6 +37924,7 @@
    "device": "U_VS4H",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_VS4H",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -36675,6 +37982,7 @@
    "device": "U_VS4V",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_VS4V",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -36732,6 +38040,7 @@
    "device": "U_VS5H",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_VS5H",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -36789,6 +38098,7 @@
    "device": "U_VS5V",
    "devicetype": "CaenELSEasyDriver",
    "pv_prefix": "U_VS5V",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Current",
@@ -36846,6 +38156,7 @@
    "device": "U_Zaber",
    "devicetype": "ZaberASeries",
    "pv_prefix": "U_Zaber",
+   "image_variables": [],
    "variables": [
     {
      "geecs_var": "Position.Ch1",
@@ -36865,7 +38176,7 @@
      "settable": true,
      "egu": "",
      "lo": 0.0,
-     "hi": 100.0,
+     "hi": 25.0,
      "choices": [],
      "description": ""
     },
@@ -36887,7 +38198,18 @@
      "settable": true,
      "egu": "",
      "lo": 0.0,
-     "hi": 101.6,
+     "hi": 100.0,
+     "choices": [],
+     "description": ""
+    },
+    {
+     "geecs_var": "Position.Ch5",
+     "pv": "undulator:u_zaber:position_ch5",
+     "dtype": "float",
+     "settable": true,
+     "egu": "",
+     "lo": 0.0,
+     "hi": 100.0,
      "choices": [],
      "description": ""
     }

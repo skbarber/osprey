@@ -8618,6 +8618,149 @@
   "min_value": 1e-05,
   "max_value": 50.0
  },
+ "undulator:u_dg645_bcavebox1:amplitude_ch_ab:SP": {
+  "writable": true,
+  "min_value": 0.5,
+  "max_value": 5.0
+ },
+ "undulator:u_dg645_bcavebox1:amplitude_ch_cd:SP": {
+  "writable": true,
+  "min_value": 0.5,
+  "max_value": 5.0
+ },
+ "undulator:u_dg645_bcavebox1:amplitude_ch_ef:SP": {
+  "writable": true,
+  "min_value": 0.5,
+  "max_value": 5.0
+ },
+ "undulator:u_dg645_bcavebox1:amplitude_ch_gh:SP": {
+  "writable": true,
+  "min_value": 0.5,
+  "max_value": 5.0
+ },
+ "undulator:u_dg645_bcavebox1:amplitude_ch_t0:SP": {
+  "writable": true,
+  "min_value": 0.5,
+  "max_value": 5.0
+ },
+ "undulator:u_dg645_bcavebox1:delay_ch_a:SP": {
+  "writable": true,
+  "min_value": 0.0,
+  "max_value": 0.9
+ },
+ "undulator:u_dg645_bcavebox1:delay_ch_b:SP": {
+  "writable": true,
+  "min_value": 0.0,
+  "max_value": 0.9
+ },
+ "undulator:u_dg645_bcavebox1:delay_ch_c:SP": {
+  "writable": true,
+  "min_value": 0.0,
+  "max_value": 0.9
+ },
+ "undulator:u_dg645_bcavebox1:delay_ch_d:SP": {
+  "writable": true,
+  "min_value": 0.0,
+  "max_value": 0.9
+ },
+ "undulator:u_dg645_bcavebox1:delay_ch_e:SP": {
+  "writable": true,
+  "min_value": 0.0,
+  "max_value": 0.9
+ },
+ "undulator:u_dg645_bcavebox1:delay_ch_f:SP": {
+  "writable": true,
+  "min_value": 0.0,
+  "max_value": 0.9
+ },
+ "undulator:u_dg645_bcavebox1:delay_ch_g:SP": {
+  "writable": true,
+  "min_value": 0.0,
+  "max_value": 0.9
+ },
+ "undulator:u_dg645_bcavebox1:delay_ch_h:SP": {
+  "writable": true,
+  "min_value": 0.0,
+  "max_value": 0.9
+ },
+ "undulator:u_dg645_bcavebox1:fire:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:inhibit:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:linked_ch_a:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:linked_ch_b:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:linked_ch_c:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:linked_ch_d:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:linked_ch_e:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:linked_ch_f:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:linked_ch_g:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:linked_ch_h:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:load_file:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:load_local:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:localsavingpath:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:polarity_ch_ab:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:polarity_ch_cd:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:polarity_ch_ef:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:polarity_ch_gh:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:polarity_ch_t0:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:save_local:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:timeout:SP": {
+  "writable": true,
+  "min_value": 0.0,
+  "max_value": 0.1
+ },
+ "undulator:u_dg645_bcavebox1:trigger_executesingleshot:SP": {
+  "writable": true
+ },
+ "undulator:u_dg645_bcavebox1:trigger_level:SP": {
+  "writable": true,
+  "min_value": 0.5,
+  "max_value": 4.0
+ },
+ "undulator:u_dg645_bcavebox1:trigger_rate:SP": {
+  "writable": true,
+  "min_value": 0.001,
+  "max_value": 1000.0
+ },
+ "undulator:u_dg645_bcavebox1:trigger_source:SP": {
+  "writable": true
+ },
  "undulator:u_dg645_shotcontrol:amplitude_ch_ab:SP": {
   "writable": true,
   "min_value": 0.5,
@@ -11189,7 +11332,7 @@
  "undulator:u_zaber:position_ch2:SP": {
   "writable": true,
   "min_value": 0.0,
-  "max_value": 100.0
+  "max_value": 25.0
  },
  "undulator:u_zaber:position_ch3:SP": {
   "writable": true,
@@ -11199,7 +11342,12 @@
  "undulator:u_zaber:position_ch4:SP": {
   "writable": true,
   "min_value": 0.0,
-  "max_value": 101.6
+  "max_value": 100.0
+ },
+ "undulator:u_zaber:position_ch5:SP": {
+  "writable": true,
+  "min_value": 0.0,
+  "max_value": 100.0
  },
  "undulator:cagateway:restart": {
   "writable": true

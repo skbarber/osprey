@@ -33,7 +33,7 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 EXTRACT = HERE / "undulator_extract.json"
-OUT = HERE.parent / "overlays" / "data" / "channel_databases" / "hierarchical.json"
+OUT = HERE.parent / "project" / "data" / "channel_databases" / "hierarchical.json"
 
 # --- PV-name normalization -------------------------------------------------
 # MUST match GeecsCAGateway geecs_ca_gateway/pv_naming.py exactly (the naming
@@ -345,6 +345,25 @@ for dev in sorted(data["devices"], key=lambda d: (d["devicetype"], d["device"]))
                 f"normalized-name collision in {dev['device']}: {v['geecs_var']} -> {v_key}"
             )
         dev_node[v_key] = v_node
+    # Image-typed variables: PVA NTNDArray streams served by GeecsPvaGateway
+    # (per-camera-server), NOT by the CA gateway. Same naming contract, no
+    # :SP. Listed so the finder knows the cameras' image channels exist; the
+    # description must stop the agent from attempting a CA read.
+    for v in dev.get("image_variables", []):
+        v_key = norm(v["geecs_var"])
+        if v_key in dev_node:
+            raise SystemExit(
+                f"image/scalar name collision in {dev['device']}: {v['geecs_var']}"
+            )
+        dev_node[v_key] = {
+            "_description": (
+                f"GEECS name '{v['geecs_var']}'. Live camera-image stream "
+                "(pvAccess NTNDArray, served by GeecsPvaGateway) — NOT readable "
+                "via CA channel tools; view in Phoebus via pva:// or a held p4p "
+                "monitor. Latest-wins live watching only; shot data lives in the "
+                "GEECS file path."
+            ),
+        }
     # Per-device gateway status PV (always served by the CA gateway).
     dev_node["connected"] = {
         "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down).",

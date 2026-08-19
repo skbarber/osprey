@@ -1227,6 +1227,271 @@
    },
    "DG645": {
     "_description": "Stanford Research DG645 digital delay generators \u2014 shot control and trigger timing.",
+    "u_dg645_bcavebox1": {
+     "_description": "U_DG645_BCaveBox1 \u2014 DG645 device 'DG645_BCaveBox1'.",
+     "amplitude_ch_ab": {
+      "_description": "GEECS name 'Amplitude.Ch AB'. Trigger output amplitude, channel AB (V; range 0.5 to 5)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Amplitude.Ch AB \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "amplitude_ch_cd": {
+      "_description": "GEECS name 'Amplitude.Ch CD'. Trigger output amplitude, channel CD (V; range 0.5 to 5)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Amplitude.Ch CD \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "amplitude_ch_ef": {
+      "_description": "GEECS name 'Amplitude.Ch EF'. Trigger output amplitude, channel EF (V; range 0.5 to 5)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Amplitude.Ch EF \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "amplitude_ch_gh": {
+      "_description": "GEECS name 'Amplitude.Ch GH'. Trigger output amplitude, channel GH (V; range 0.5 to 5)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Amplitude.Ch GH \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "amplitude_ch_t0": {
+      "_description": "GEECS name 'Amplitude.Ch T0'. Trigger output amplitude, channel T0 (V; range 0.5 to 5)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Amplitude.Ch T0 \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "delay_ch_a": {
+      "_description": "GEECS name 'Delay.Ch A'. Trigger delay, channel A (s; range 0 to 0.9)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Delay.Ch A \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "delay_ch_b": {
+      "_description": "GEECS name 'Delay.Ch B'. Trigger delay, channel B (s; range 0 to 0.9)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Delay.Ch B \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "delay_ch_c": {
+      "_description": "GEECS name 'Delay.Ch C'. Trigger delay, channel C (s; range 0 to 0.9)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Delay.Ch C \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "delay_ch_d": {
+      "_description": "GEECS name 'Delay.Ch D'. Trigger delay, channel D (s; range 0 to 0.9)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Delay.Ch D \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "delay_ch_e": {
+      "_description": "GEECS name 'Delay.Ch E'. Trigger delay, channel E (s; range 0 to 0.9)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Delay.Ch E \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "delay_ch_f": {
+      "_description": "GEECS name 'Delay.Ch F'. Trigger delay, channel F (s; range 0 to 0.9)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Delay.Ch F \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "delay_ch_g": {
+      "_description": "GEECS name 'Delay.Ch G'. Trigger delay, channel G (s; range 0 to 0.9)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Delay.Ch G \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "delay_ch_h": {
+      "_description": "GEECS name 'Delay.Ch H'. Trigger delay, channel H (s; range 0 to 0.9)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Delay.Ch H \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "fire": {
+      "_description": "Software fire/trigger",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for fire \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "inhibit": {
+      "_description": "GEECS name 'Inhibit'. Trigger inhibit (options: off, Triggers, AB, AB and CD, AB, CD and EF, AB, CD, EF and GH)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Inhibit \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "linked_ch_a": {
+      "_description": "GEECS name 'Linked.Ch A'. Channel A linked-delay setting (options: T0, T1, A, B, C, D, E, F, G, H)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Linked.Ch A \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "linked_ch_b": {
+      "_description": "GEECS name 'Linked.Ch B'. Channel B linked-delay setting (options: T0, T1, A, B, C, D, E, F, G, H)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Linked.Ch B \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "linked_ch_c": {
+      "_description": "GEECS name 'Linked.Ch C'. Channel C linked-delay setting (options: T0, T1, A, B, C, D, E, F, G, H)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Linked.Ch C \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "linked_ch_d": {
+      "_description": "GEECS name 'Linked.Ch D'. Channel D linked-delay setting (options: T0, T1, A, B, C, D, E, F, G, H)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Linked.Ch D \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "linked_ch_e": {
+      "_description": "GEECS name 'Linked.Ch E'. Channel E linked-delay setting (options: T0, T1, A, B, C, D, E, F, G, H)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Linked.Ch E \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "linked_ch_f": {
+      "_description": "GEECS name 'Linked.Ch F'. Channel F linked-delay setting (options: T0, T1, A, B, C, D, E, F, G, H)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Linked.Ch F \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "linked_ch_g": {
+      "_description": "GEECS name 'Linked.Ch G'. Channel G linked-delay setting (options: T0, T1, A, B, C, D, E, F, G, H)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Linked.Ch G \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "linked_ch_h": {
+      "_description": "GEECS name 'Linked.Ch H'. Channel H linked-delay setting (options: T0, T1, A, B, C, D, E, F, G, H)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Linked.Ch H \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "load_file": {
+      "_description": "GEECS name 'Load File'. GEECS variable 'Load File' (options: on, off)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Load File \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "load_local": {
+      "_description": "GEECS name 'Load Local'. GEECS variable 'Load Local' (options: off, 1, 2, 3, 4, 5, 6, 7, 8, 9)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Load Local \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "localsavingpath": {
+      "_description": "GEECS name 'LocalSavingPath'. Local path where the device saves per-shot data",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for LocalSavingPath \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "polarity_ch_ab": {
+      "_description": "GEECS name 'Polarity.Ch AB'. GEECS variable 'Polarity.Ch AB' (options: Positive, Negative)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Polarity.Ch AB \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "polarity_ch_cd": {
+      "_description": "GEECS name 'Polarity.Ch CD'. GEECS variable 'Polarity.Ch CD' (options: Positive, Negative)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Polarity.Ch CD \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "polarity_ch_ef": {
+      "_description": "GEECS name 'Polarity.Ch EF'. GEECS variable 'Polarity.Ch EF' (options: Positive, Negative)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Polarity.Ch EF \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "polarity_ch_gh": {
+      "_description": "GEECS name 'Polarity.Ch GH'. GEECS variable 'Polarity.Ch GH' (options: Positive, Negative)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Polarity.Ch GH \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "polarity_ch_t0": {
+      "_description": "GEECS name 'Polarity.Ch T0'. GEECS variable 'Polarity.Ch T0' (options: Positive, Negative)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Polarity.Ch T0 \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "save_local": {
+      "_description": "GEECS name 'Save Local'. GEECS variable 'Save Local' (options: off, 1, 2, 3, 4, 5, 6, 7, 8, 9)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Save Local \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "timeout": {
+      "_description": "GEECS variable 'timeout' (s; range 0 to 0.1)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for timeout \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "trigger_executesingleshot": {
+      "_description": "GEECS name 'Trigger.ExecuteSingleShot'. GEECS variable 'Trigger.ExecuteSingleShot' (options: on, off)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Trigger.ExecuteSingleShot \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "trigger_level": {
+      "_description": "GEECS name 'Trigger.Level'. GEECS variable 'Trigger.Level' (V; range 0.5 to 4)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Trigger.Level \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "trigger_rate": {
+      "_description": "GEECS name 'Trigger.Rate'. GEECS variable 'Trigger.Rate' (Hz; range 0.001 to 1000)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Trigger.Rate \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "trigger_source": {
+      "_description": "GEECS name 'Trigger.Source'. GEECS variable 'Trigger.Source'",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Trigger.Source \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "connected": {
+      "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
+     }
+    },
     "u_dg645_shotcontrol": {
      "_description": "U_DG645_ShotControl \u2014 Main shot-control delay generator: per-channel trigger delays and amplitudes for machine timing.",
      "amplitude_ch_ab": {
@@ -3734,6 +3999,18 @@
        "_description": "Setpoint (write) PV for triggermode \u2014 CA puts are forwarded to the device."
       }
      },
+     "spatialimage": {
+      "_description": "GEECS name 'SpatialImage'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "frogtrace": {
+      "_description": "GEECS name 'frogTrace'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "retrieved_frogtrace": {
+      "_description": "GEECS name 'retrieved FrogTrace'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "retrievedfrogtrace": {
+      "_description": "GEECS name 'retrievedFrogTrace'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -4091,6 +4368,9 @@
       "SP": {
        "_description": "Setpoint (write) PV for trigger \u2014 CA puts are forwarded to the device."
       }
+     },
+     "image": {
+      "_description": "GEECS name 'Image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -4754,6 +5034,12 @@
        "_description": "Setpoint (write) PV for TriggerDelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "image": {
+      "_description": "GEECS name 'Image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "imageinterp": {
+      "_description": "GEECS name 'ImageInterp'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -4926,6 +5212,12 @@
       "SP": {
        "_description": "Setpoint (write) PV for TriggerDelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "image": {
+      "_description": "GEECS name 'Image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "imageinterp": {
+      "_description": "GEECS name 'ImageInterp'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -5100,6 +5392,12 @@
        "_description": "Setpoint (write) PV for TriggerDelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "image": {
+      "_description": "GEECS name 'Image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "imageinterp": {
+      "_description": "GEECS name 'ImageInterp'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -5128,6 +5426,9 @@
      },
      "timestamp": {
       "_description": "Device timestamp of the last update"
+     },
+     "image": {
+      "_description": "GEECS name 'Image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -5761,6 +6062,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -6112,6 +6422,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -6410,6 +6729,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -6727,6 +7055,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -7051,6 +7388,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -7367,6 +7713,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -7685,6 +8040,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -8001,6 +8365,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -8319,6 +8692,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -8636,6 +9018,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -8935,6 +9326,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -9227,6 +9627,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -9526,6 +9935,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -9844,6 +10262,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -10136,6 +10563,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -10454,6 +10890,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -10746,6 +11191,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -11051,6 +11505,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -11375,6 +11838,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -11698,6 +12170,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -11996,6 +12477,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -12348,6 +12838,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -12662,6 +13161,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -12960,6 +13468,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -13278,6 +13795,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -13595,6 +14121,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -13888,6 +14423,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -14180,6 +14724,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -14486,6 +15039,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -14562,6 +15124,12 @@
        "_description": "Setpoint (write) PV for BackgroundPath \u2014 CA puts are forwarded to the device."
       }
      },
+     "centroidx": {
+      "_description": "GEECS variable 'centroidx' (pixel)"
+     },
+     "centroidy": {
+      "_description": "GEECS variable 'centroidy' (pixel)"
+     },
      "compressionquality": {
       "_description": "GEECS name 'CompressionQuality'. Saved-image compression quality (range 0 to 1000)",
       "_is_leaf": true,
@@ -14624,6 +15192,9 @@
       "SP": {
        "_description": "Setpoint (write) PV for MaxGUIPixel \u2014 CA puts are forwarded to the device."
       }
+     },
+     "meancounts": {
+      "_description": "GEECS name 'MeanCounts'. GEECS variable 'MeanCounts' (counts; range 0 to 1e+09)"
      },
      "roi_height": {
       "_description": "GEECS name 'ROI.Height'. GEECS variable 'ROI.Height' (pixel; range 10 to 2000)",
@@ -14778,6 +15349,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -15084,6 +15664,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -15382,6 +15971,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -15682,6 +16280,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -16007,6 +16614,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -16299,6 +16915,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -16593,6 +17218,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -16885,6 +17519,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -17179,6 +17822,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -17471,6 +18123,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -17765,6 +18426,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -18058,6 +18728,15 @@
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
      },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -18350,6 +19029,15 @@
       "SP": {
        "_description": "Setpoint (write) PV for triggerdelay \u2014 CA puts are forwarded to the device."
       }
+     },
+     "bakground_image": {
+      "_description": "GEECS name 'bakground image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "image": {
+      "_description": "GEECS name 'image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "processed_image": {
+      "_description": "GEECS name 'processed image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
      },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
@@ -20335,6 +21023,12 @@
        "_description": "Setpoint (write) PV for ZernikeOrder \u2014 CA puts are forwarded to the device."
       }
      },
+     "image": {
+      "_description": "GEECS name 'Image'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
+     "spotfieldimage": {
+      "_description": "GEECS name 'SpotfieldImage'. Live camera-image stream (pvAccess NTNDArray, served by GeecsPvaGateway) \u2014 NOT readable via CA channel tools; view in Phoebus via pva:// or a held p4p monitor. Latest-wins live watching only; shot data lives in the GEECS file path."
+     },
      "connected": {
       "_description": "Gateway TCP-subscription status for this device (enum: Disconnected/Connected; MAJOR alarm while down)."
      }
@@ -20539,7 +21233,7 @@
       }
      },
      "position_ch2": {
-      "_description": "GEECS name 'Position.Ch2'. GEECS variable 'Position.Ch2' (range 0 to 100)",
+      "_description": "GEECS name 'Position.Ch2'. GEECS variable 'Position.Ch2' (range 0 to 25)",
       "_is_leaf": true,
       "SP": {
        "_description": "Setpoint (write) PV for Position.Ch2 \u2014 CA puts are forwarded to the device."
@@ -20553,10 +21247,17 @@
       }
      },
      "position_ch4": {
-      "_description": "GEECS name 'Position.Ch4'. GEECS variable 'Position.Ch4' (range 0 to 101.6)",
+      "_description": "GEECS name 'Position.Ch4'. GEECS variable 'Position.Ch4' (range 0 to 100)",
       "_is_leaf": true,
       "SP": {
        "_description": "Setpoint (write) PV for Position.Ch4 \u2014 CA puts are forwarded to the device."
+      }
+     },
+     "position_ch5": {
+      "_description": "GEECS name 'Position.Ch5'. GEECS variable 'Position.Ch5' (range 0 to 100)",
+      "_is_leaf": true,
+      "SP": {
+       "_description": "Setpoint (write) PV for Position.Ch5 \u2014 CA puts are forwarded to the device."
       }
      },
      "connected": {

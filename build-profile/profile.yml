@@ -24,12 +24,12 @@ virtual_accelerator: null
 # under `mcp_servers:` below; until it exists, the assistant composes
 # geecs_schemas.ScanRequest YAMLs (see the drafting-geecs-scans skill).
 bluesky: null
-bluesky_panels: null
+bluesky_web: null
 
 # Strip the bluesky-stack artifacts the base preset ships.
 exclude:
   web_panels: [plan, results, health]
-  skills: [writing-bluesky-plans, operating-bluesky-scans]
+  skills: [operating-bluesky-plans, writing-bluesky-plans, operating-bluesky-scans]
 
 # Interim scan capability: the drafting-geecs-scans overlay skill (see
 # overlay: below) composes ScanRequest YAMLs for GEECS-Console.
@@ -42,19 +42,11 @@ exclude:
 #     permissions:
 #       ask: ["submit_scan", "stop_scan", "move_variable", "run_action"]
 
-# The template renderer currently gates skill files by the data bundle's own
-# manifest, not the profile's skills/exclude selection — so the two bluesky
-# skills land despite the exclude above. Remove them post-build until the
-# framework wires profile artifact selection into allowed_outputs.
-lifecycle:
-  post_build:
-    - name: remove-bluesky-skills
-      run: rm -rf .claude/skills/writing-bluesky-plans .claude/skills/operating-bluesky-scans
 
-# AI service: LBNL's CBorg gateway. The model is CBorg's default; change it
-# here if your CBorg account offers a different one.
+# AI service: LBNL's CBorg gateway, at the fast/cheap tier (resolves to
+# CBorg's current haiku-class model; "sonnet"/"opus" are the larger tiers).
 provider: cborg
-model: anthropic/claude-haiku
+model: haiku
 
 # --- Config overrides --------------------------------------------------------
 # Dotted keys land at the matching nested path in the rendered config.yml.
@@ -102,6 +94,12 @@ config:
   web.panels.plan.enabled: false
   web.panels.results.enabled: false
 
+# p4p: PVA client library for the GeecsPvaGateway camera-image PVs
+# (NTNDArray). OSPREY's connector is CA-only today, so this is for the
+# eventual image-consumption path; harmless until then.
+dependencies:
+  - p4p
+
 # --- Environment variable wiring --------------------------------------------
 env:
   required:
@@ -110,12 +108,9 @@ env:
     # For tools that talk EPICS directly rather than through the connector.
     EPICS_CA_ADDR_LIST: "192.168.6.14"
 
-# --- Overlay files -----------------------------------------------------------
-# PLACEHOLDER signal skeleton from the interview — no signal list existed yet.
-# Replace both files' contents with HTU's real PVs, then rebuild.
-overlay:
-  overlays/rules/geecs-semantics.md: .claude/rules/geecs-semantics.md
-  overlays/data/channel_databases/hierarchical.json: data/channel_databases/hierarchical.json
-  overlays/data/channel_limits.json: data/channel_limits.json
-  overlays/skills/drafting-geecs-scans: .claude/skills/drafting-geecs-scans
-  overlays/skills/targetchamberalign: .claude/skills/targetchamberalign
+# --- Facility artifacts ------------------------------------------------------
+# Carried by convention directories at this repo's root (no profile key
+# needed): rules/geecs-semantics.md, skills/drafting-geecs-scans,
+# skills/targetchamberalign, and project/data/* (generated channel database
+# + limits, mirrored verbatim onto the built project's data tree; regenerate
+# with scripts/generate_hierarchical.py and scripts/generate_channel_limits.py).

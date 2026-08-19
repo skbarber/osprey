@@ -23,7 +23,7 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 EXTRACT = HERE / "undulator_extract.json"
-OUT = HERE.parent / "overlays" / "data" / "channel_limits.json"
+OUT = HERE.parent / "project" / "data" / "channel_limits.json"
 
 data = json.loads(EXTRACT.read_text())
 
