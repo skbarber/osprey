@@ -6,8 +6,8 @@
 # the Bluesky scan stack — everything the `control-assistant` preset deploys
 # EXCEPT the virtual-accelerator simulator, which is dropped below.
 #
-# Rebuild with:
-#   osprey build htu-assistant build-profile/profile.yml
+# Rebuild with (from anywhere inside this deployment repo):
+#   osprey build
 
 extends: control-assistant
 
@@ -20,9 +20,9 @@ virtual_accelerator: null
 # Owner decision (2026-07-23, see htu-assistant/BELLA-GEECS-SETUP-DEV.md):
 # real data-taking scans stay in the GEECS engine (GeecsBluesky), so OSPREY's
 # native bluesky stack (bridge + Tiled co-deploy + panels sidecar) is removed
-# entirely. The future integration point is a GEECS-side scan MCP declared
-# under `mcp_servers:` below; until it exists, the assistant composes
-# geecs_schemas.ScanRequest YAMLs (see the drafting-geecs-scans skill).
+# entirely. The integration point is the GEECS-side MCP server declared
+# under `mcp_servers:` below (GEECS-MCP, in GEECS-Plugins); the
+# drafting-geecs-scans skill composes the ScanRequest dicts it submits.
 bluesky: null
 bluesky_web: null
 
@@ -31,16 +31,37 @@ exclude:
   web_panels: [plan, results, health]
   skills: [operating-bluesky-plans, writing-bluesky-plans, operating-bluesky-scans]
 
-# Interim scan capability: the drafting-geecs-scans overlay skill (see
-# overlay: below) composes ScanRequest YAMLs for GEECS-Console.
-
-# Future GEECS-side scan MCP plugs in here (submit ScanRequest / status /
-# stop / move_variable / run_action over the engine's GUI/console contract):
-# mcp_servers:
-#   geecs-scan:
-#     url: http://<geecs-host>:<port>/mcp
-#     permissions:
-#       ask: ["submit_scan", "stop_scan", "move_variable", "run_action"]
+# GEECS MCP server (GEECS-MCP 0.5.0, on GEECS-Plugins master): scans +
+# analysis domains — manager/queue status, history, Tiled results, config
+# catalogs, ScanRequest validation, analysis task statuses + rendered
+# figures (reads); ask-gated submit/stop/clear plus the v2 control verbs
+# (run_action, move_scan_variable, pause_scan, resume_scan).
+# Production wiring: the central HTTP service on the qserver box
+# (GEECS-MCP/deploy/DEPLOYMENT.md) — no GEECS install on this machine.
+# The old per-machine stdio dev wiring was
+# command: <venv>/bin/python, args: ["-m", "geecs_mcp"].
+mcp_servers:
+  geecs:
+    url: http://192.168.6.14:8100/mcp
+    transport: http
+    permissions:
+      # READ_TOOLS in geecs_mcp/tool_names.py — keep in sync.
+      allow: [scan_status, scan_history, get_scan_result,
+              list_scan_configs, validate_scan_request, scan_progress,
+              get_scan_analysis, get_scan_figure, describe_action]
+      # QUEUE_TOOLS + STOP_TOOLS — keep in sync.
+      ask: [submit_scan, stop_scan, clear_queue,
+            run_action, move_scan_variable, pause_scan, resume_scan]
+    # NOTE (verified 2026-08-22): this profile-level mcp_servers block does
+    # NOT support osprey hook presets — a hooks: key here is silently
+    # ignored (upstream gap, to be filed). Human gating on the ask verbs
+    # is Claude Code's native permission prompt. The interactive
+    # writes kill switch does not cover custom-server tools either (the
+    # framework's deny augmentation walks FRAMEWORK_SERVERS only); the
+    # write_tools entries under config: below cover the HEADLESS path —
+    # every Q-class write verb is listed there, and the halt family
+    # (stop_scan, pause_scan) is deliberately NOT (a halt is never
+    # blocked on any path).
 
 
 # AI service: LBNL's CBorg gateway, at the fast/cheap tier (resolves to
@@ -93,10 +114,47 @@ config:
   claude_code.servers.bluesky.enabled: false
   web.panels.plan.enabled: false
   web.panels.results.enabled: false
+  # GEECS MCP write classification: exact tool names merged into
+  # hook_config.json's write_tools, which the HEADLESS agent runner
+  # (osprey query, bypassPermissions) reads to block write verbs — this is
+  # the load-bearing effect today. submit/clear are listed; stop_scan is
+  # exempt BY OMISSION so a halt is never blocked (the native bluesky
+  # queue_stop/stop_run doctrine). Interactive sessions gate the write
+  # verbs via the permissions ask list above instead.
+  control_system.write_tools:
+    - mcp__geecs__submit_scan
+    - mcp__geecs__clear_queue
+    - mcp__geecs__run_action
+    - mcp__geecs__move_scan_variable
+    - mcp__geecs__resume_scan
+    # stop_scan and pause_scan are deliberately absent: the halt family
+    # is exempt by omission so a halt is never blocked (GEECS-MCP
+    # deploy/DEPLOYMENT.md, verified osprey semantics 2026-08-22).
+  # Camera-image PVs (NTNDArray, served by the GeecsPvaGateway fleet) read
+  # over pvAccess; everything else stays on CA. These nine suffix globs match
+  # exactly the 140 image channels in hierarchical.json and zero of its 3,144
+  # CA channels (verified 2026-08-19 against the generated database — re-check
+  # after any regeneration). PVA is read-only in the connector: a write to a
+  # matching address is refused before any network operation.
+  #
+  # pva_gateway is deliberately NOT set: it would pin EPICS_PVA_ADDR_LIST to a
+  # single address, but the images come from a 13-server per-camera fleet —
+  # that address list lives in .env (EPICS_PVA_ADDR_LIST), which the connector
+  # leaves untouched when pva_gateway is absent.
+  control_system.connector.epics.pva_channels:
+    - "*:image"
+    - "*:imageinterp"
+    - "*:spatialimage"
+    - "*:spotfieldimage"
+    - "*:bakground_image"
+    - "*:frogtrace"
+    - "*:retrieved_frogtrace"
+    - "*:retrievedfrogtrace"
+    - "*:processed_image"
 
 # p4p: PVA client library for the GeecsPvaGateway camera-image PVs
-# (NTNDArray). OSPREY's connector is CA-only today, so this is for the
-# eventual image-consumption path; harmless until then.
+# (NTNDArray). The connector imports it when pva_channels (above) is
+# non-empty; pinned here so the deployment venv always carries it.
 dependencies:
   - p4p
 

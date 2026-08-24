@@ -49,51 +49,33 @@ control system speaks gateway PVs (`undulator:u_esp_jetxyz:position_axis_1`).
 Channel-finder descriptions carry the mapping. When reporting, give the
 GEECS name with the PV in parentheses at first mention.
 
-## Camera images are PVA streams — NOT readable via channel tools
+## Camera images are PVA streams — read them with the channel tools
 
 Camera image variables (e.g. `undulator:uc_tubein:image`) are served as
 **pvAccess NTNDArray PVs** by per-server image gateways — a different
-protocol from the CA scalars. The channel tools (`channel_read` etc.) speak
-CA only: attempting to read an image PV will time out, and that timeout
-means "wrong protocol," never "camera down."
+protocol from the CA scalars. The connector routes these addresses over
+PVA automatically (`pva_channels` in the deployment config), so
+`channel_read` works on them like any other channel and renders the frame
+as an image artifact. PVA is **read-only**: a write to an image address is
+refused before any network operation. The direct-EPICS-library prohibition
+(`p4p`, `pyepics`, …) applies in full — there is no image exception; all
+reads and writes go through the connector tools / `osprey.runtime`.
 
-### Sanctioned image access: read-only p4p in python execution
+Reading them correctly:
 
-**Facility exception to the direct-EPICS-library prohibition** (which
-otherwise stands in full; interim until OSPREY gains native PVA support —
-tracked as als-apg/osprey#637): for **image PVs only**, you MAY use `p4p`
-in python execution, **read-only** — a `Context("pva")` with
-`monitor`/`get` and never a `put`. Rationale: the prohibition protects the write path
-(limits, approval, audit); a read-only image monitor has no write path.
-All scalar reads and ALL writes stay on the connector tools / `osprey.runtime`.
-
-The correct idiom is a **held monitor**, because subscriptions are gated on
-client interest — a bare `get` returns a cached or placeholder frame
-(a `(1, 1)` array is the startup placeholder, not data), and the first
-fresh frame lands ~1–2 s after subscribing:
-
-```python
-import time
-from p4p.client.thread import Context
-
-frames = []
-ctx = Context("pva")
-sub = ctx.monitor("undulator:uc_tubein:image", frames.append)
-time.sleep(3)          # hold the gate open past one push interval
-sub.close(); ctx.close()
-img = frames[-1]       # newest frame; verify img.shape != (1, 1)
-```
-
-Then analyze/display normally (`numpy` stats, `save_artifact` for the
-gallery). Rules of the road:
-
-- Close every monitor/context — a leaked subscription keeps the camera
-  gate open for nothing.
+- Frames are served **subscription-gated on client interest**: a one-shot
+  read returns the gateway's last cached frame, and a **`(1, 1)` array is
+  the startup placeholder, not data** — it means the camera has not
+  streamed since gateway start (idle or off). Report that; do not retry in
+  a loop. If a fresh frame is needed, re-read after a couple of seconds —
+  the first push lands ~1–2 s after a subscription opens the gate.
+  (Connector read path verified live 2026-08-19: `channel_read` on an
+  image PV returned a real frame rendered as a channel-values artifact.
+  Gate behavior verified 2026-07 against the gateway with a raw p4p
+  client.)
 - The stream is **latest-wins, live watching only** — shot-synchronized
   image data lives in the GEECS file path and scan system, never here.
   Always label results as a live snapshot, never as shot data.
-- If no frame beyond the placeholder arrives, the camera is idle or off —
-  report that; do not retry in a loop.
 
 ## Enum and string quirks
 
@@ -104,3 +86,14 @@ gallery). Rules of the road:
 - Path-typed and long-string channels are served as char arrays; if a read
   returns an integer array where text is expected, it needs string
   conversion — report it as a text value, not numbers.
+
+## Scans and the scan queue
+
+- Questions about scans, the scan queue, presets, scan history, or scan
+  results are answered by the `geecs` MCP tools (`scan_status`,
+  `list_scan_configs`, `get_scan_result`, ...) — not by channel search.
+  Channel tools are for live device values; the geecs tools are for the
+  data-acquisition system.
+- Scan submission goes through `submit_scan` (approval-gated) per the
+  drafting-geecs-scans skill. The GEECS engine executes; GEECS-Console is
+  a peer client of the same queue, not a required step.

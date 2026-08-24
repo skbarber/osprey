@@ -1,38 +1,53 @@
 ---
 name: drafting-geecs-scans
-description: Compose a validated geecs_schemas ScanRequest YAML for the operator to run in GEECS-Console. Use when asked to set up, prepare, or draft a scan (jet scan, magnet sweep, noscan data collection, optimization). This drafts scans — it does NOT execute them; real data-taking scans run only in the GEECS engine.
+description: Compose, validate, and submit a geecs_schemas ScanRequest through the geecs MCP server. Use when asked to set up, draft, run, or submit a scan (jet scan, magnet sweep, noscan data collection, optimization), or to check on a running scan. Execution happens in the GEECS engine via its queueserver — this skill drafts the request and submits it through the approval-gated geecs tools.
 ---
 
-# Drafting GEECS Scans (composition, not execution)
+# GEECS Scans (draft → validate → submit)
 
 Real BELLA/HTU data-taking scans run in the **GEECS engine** (scan numbers,
-s-files, event schema, DG645 shot control) — not in OSPREY. Until the
-GEECS-side scan MCP exists, your scan capability is **drafting a
-`ScanRequest` YAML** that the operator reviews and runs in GEECS-Console.
-Never present a draft as a started or completed scan.
+s-files, event schema, DG645 shot control), reached through its
+bluesky-queueserver. The `geecs` MCP tools are the submission path:
+`validate_scan_request` (read, free), `submit_scan` (approval-gated),
+`scan_progress` / `scan_status` (read), `stop_scan` (approval-gated),
+`get_scan_result` / `get_scan_analysis` (read). GEECS-Console is a peer
+client of the same queue — never tell the operator that pasting into the
+console is required; submitting here is a first-class path.
 
 ## Workflow
 
 1. **Gather intent**: what to sweep (or noscan/optimize), range and step,
    shots per step, which diagnostics must be saved, trigger handling.
-2. **Resolve names — never invent them.** Axis `variable` names come from the
-   experiment's scan-variables catalog (single devices and composite/pseudo
-   variables like `ALine_e_beam_angle_offset_x`); `save_sets` entries name
-   files in the experiment's `save_devices/` catalog (e.g. `Amp4Out`,
-   `BCaveMagSpec`); `trigger_profile` names a shot-control configuration.
-   If you don't know the exact catalog name, ask the operator or consult
-   facility knowledge — an unresolved name goes in the draft as an explicit
-   `# TODO(operator): confirm name` comment, never a guess.
-3. **Compose the YAML** against the schema below.
+2. **Resolve names — never invent them.** Use `list_scan_configs` for every
+   catalog: `scan_variables` (single devices and composite/pseudo variables
+   like `ALine_e_beam_angle_offset_x`), `save_sets` (e.g. `Amp4Out`,
+   `BCaveMagSpec`), `trigger_profiles`, `actions`, `presets`. A name not in
+   its catalog does not go in the request — ask the operator instead of
+   guessing.
+3. **Compose the request** against the schema below.
 4. **Sanity-check units and ranges** against live readbacks (read the
    channel's current value first; a jet scan from 4.0 to 6.0 mm should
    bracket the current position, not sit 40 mm away).
-5. **Hand off**: save the YAML as an artifact, show it, and tell the
-   operator to run it in GEECS-Console. Per-experiment presets live at
-   `scanner_configs/experiments/<Exp>/presets/` in GEECS-Plugins-Configs —
-   a good place for drafts the operator wants to keep.
+5. **Validate**: run `validate_scan_request` on the composed request. Fix
+   what it refuses; surface its warnings to the operator verbatim.
+6. **Submit** with `submit_scan` — the approval prompt is the operator's
+   review, so present the request's key facts (mode, axes, shots, save
+   sets, trigger profile) in the message that accompanies it. If the tool
+   returns `needs_acknowledgement` warnings, relay them to the operator and
+   resubmit only with their explicit go-ahead, passing the acknowledged
+   names. If it refuses because the queue is not empty, report the pending
+   items — never clear the queue on your own initiative (`clear_queue` is
+   its own approval-gated, operator-requested action).
+7. **Track and report**: `scan_progress` while it runs, `get_scan_result`
+   when it finishes. Report the scan number and outcome; on failure,
+   remember the failed item returns to the *front* of the queue and say so.
 
-## ScanRequest schema (geecs-schemas 0.9.x, schema_version 1)
+An operator may also just want the YAML (to keep as a preset or run from
+the console) — saving the draft as an artifact and stopping there is fine
+when asked. Per-experiment presets live at
+`scanner_configs/experiments/<Exp>/presets/` in GEECS-Plugins-Configs.
+
+## ScanRequest schema (geecs-schemas 0.11.x, schema_version 1)
 
 Top-level fields (`mode` is required; everything else has defaults):
 
@@ -53,6 +68,7 @@ Top-level fields (`mode` is required; everything else has defaults):
 - `actions`: `{setup: [], per_step: [], closeout: []}` — named action plans
 - `description`: free text for scan metadata and the experiment log
 - `background`: true marks data as background/calibration
+- `submission`: leave unset — the MCP server stamps provenance itself
 - `optimization`: only with `mode: optimize` — `{variables: {name: [lo, hi]},
   objectives: {name: MINIMIZE|MAXIMIZE}, evaluator: {module, class_name,
   kwargs}, generator: {name, options}, max_iterations,
@@ -83,8 +99,11 @@ and that document disagree, that document wins.
 
 ## Hard rules
 
-- Drafting only: never claim a scan ran, and never try to execute one via
-  Python, the control system, or any other tool path.
+- The geecs MCP tools are the ONLY execution path: never run a scan via
+  Python, the control system, or any other tool. Never claim a scan ran
+  without a `submit_scan` success and a scan number to show for it.
+- One scan in flight: never stack queue items, and never call
+  `clear_queue` except at the operator's explicit request.
 - Live moves outside a scan (single setpoint changes) are ordinary
   channel writes with their own approval flow — not this skill.
 - `acquisition` values are GEECS-engine vocabulary (`strict`/`free_run`),
