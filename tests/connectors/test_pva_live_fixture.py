@@ -45,6 +45,7 @@ from p4p.nt import NTEnum, NTNDArray, NTScalar  # noqa: E402
 from p4p.server import Server  # noqa: E402
 from p4p.server.thread import SharedPV  # noqa: E402
 
+from osprey.connectors.control_system.base import WriteOutcome  # noqa: E402
 from osprey.connectors.control_system.epics_connector import EPICSConnector  # noqa: E402
 from tests.mcp_server.conftest import extract_response_dict, get_tool_fn  # noqa: E402
 
@@ -253,11 +254,14 @@ class TestLiveReads:
         assert reading.metadata.units == SCALAR_UNITS
         assert reading.metadata.precision == SCALAR_PRECISION
 
-    async def test_ntenum_reads_as_the_choice_string(self, connector):
-        """An operator reading a state channel gets "Open", not 1."""
+    async def test_ntenum_reads_as_the_index_with_its_label(self, connector):
+        """An operator reading a state channel gets 1 *and* "Open"."""
         reading = await connector.read_channel(ENUM)
 
-        assert reading.value == ENUM_CHOICES[ENUM_INDEX]
+        assert reading.value == ENUM_INDEX
+        assert not isinstance(reading.value, str)
+        assert reading.metadata.enum_label == ENUM_CHOICES[ENUM_INDEX]
+        assert reading.metadata.enum_labels == ENUM_CHOICES
         raw = reading.metadata.raw_metadata
         assert raw["nt_id"] == "epics:nt/NTEnum:1.0"
         assert raw["enum_index"] == ENUM_INDEX
@@ -378,8 +382,7 @@ class TestWriteRefusal:
     async def test_write_is_refused_before_the_network(self, connector, value):
         result = await connector.write_channel(SCALAR, value)
 
-        assert result.success is False
-        assert result.blocked is True
+        assert result.outcome is WriteOutcome.REFUSED
         assert result.refusal_reason == "VALIDATION_ERROR"
         assert "PVAccess writes are not supported" in result.error_message
         assert "No write was attempted." in result.error_message
@@ -460,7 +463,11 @@ class TestThroughTheToolBody:
         assert data["status"] == "success"
         readings = data["summary"]["readings"]
         assert readings[SCALAR]["value"] == pytest.approx(SCALAR_VALUE)
-        assert readings[ENUM]["value"] == ENUM_CHOICES[ENUM_INDEX]
+        assert readings[ENUM]["value"] == ENUM_INDEX
+        assert readings[ENUM]["enum_label"] == ENUM_CHOICES[ENUM_INDEX]
+        assert readings[ENUM]["enum_labels"] == ENUM_CHOICES
+        # The scalar is not an enum, so it grows neither key.
+        assert "enum_label" not in readings[SCALAR]
         assert CA_UNREACHABLE not in readings
 
         failures = data["summary"]["channels_failed"]

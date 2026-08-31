@@ -21,6 +21,7 @@ facility writes itself.
    - Adding a container the facility owns, with its own image-build job
    - Emitting the CI pipeline and the health check with ``osprey scaffold ci``
    - Rendering the build and bringing the stack up
+   - Making the deployment come back by itself after a reboot
 
    **Prerequisites:** A working OSPREY installation, ``git``, and Docker or
    Podman running locally.
@@ -69,11 +70,12 @@ Three services run:
      - Telemetry store for the agent's logs and metrics.
    * - ``virtual_accelerator``
      - packaged
-     - A PyAT soft-IOC serving EPICS Channel Access on port 5064, standing in
-       for the real machine.
+     - A containerized simulator with LUME-backed physics
+       (:doc:`/architecture/virtual-accelerator`), serving EPICS Channel Access
+       on port 5064 and standing in for the real machine.
    * - ``facility-mcp``
      - this profile
-     - The facility's own MCP server on port 8200, built from a Dockerfile that
+     - The facility's own MCP server on port 10900, built from a Dockerfile that
        lives in the profile.
 
 The first two are packaged with OSPREY and come from their own upstreams. The
@@ -110,7 +112,8 @@ stack than Demo Facility runs, so the first edit is subtraction. Delete:
 * the top-level ``bluesky:``, ``bluesky_web:`` and ``dispatch:`` blocks. Each
   of these is a trigger: leaving one in place adds its service to the
   deployment, whatever else you write below.
-* from ``skills:`` — ``writing-bluesky-plans`` and ``operating-bluesky-plans``.
+* from ``skills:`` — ``writing-bluesky-plans``, ``operating-bluesky-plans``
+  and ``bluesky-plans``.
 * from ``agents:`` — ``logbook-search`` and ``logbook-deep-research``. Both
   query a logbook database at runtime, and this facility does not deploy one.
 * for the same reason, the ``ariel`` entries under ``modules.web_terminals``
@@ -123,8 +126,8 @@ stack than Demo Facility runs, so the first edit is subtraction. Delete:
   ``web.panels.events.*`` and ``web.panels.bluesky.*`` override. The panels they
   configure no longer exist.
 
-Keep the ``virtual_accelerator:`` block. It is the trigger for the soft-IOC this
-facility drives.
+Keep the ``virtual_accelerator:`` block. It is the trigger for the Virtual
+Accelerator this facility drives.
 
 
 Step 3 — Name the facility and pin its services
@@ -145,7 +148,7 @@ are already present with a different value; some ship commented out.
        - openobserve
 
 ``control_system.type: virtual_accelerator`` points the agent at the deployed
-soft-IOC, so correctors move and BPMs read through exactly the approval and
+simulator, so correctors move and BPMs read through exactly the approval and
 limit layers a live machine would use. The preset ships ``mock``, which touches
 nothing.
 
@@ -165,7 +168,7 @@ that ``osprey init`` seeded into this repository's ``.env``
 (``alice``/``alice``, ``bob``/``bob``) and ``allow_insecure_http: true``
 keeping the login flow on plain HTTP. That is a demo posture. For a facility
 host, set real passwords in ``.env`` (or rotate with ``osprey users passwd``)
-and serve TLS — :doc:`multi-user` walks through both, and through single
+and serve TLS — :doc:`web-terminal/multi-user/login` walks through both, and through single
 sign-on if your site runs one.
 
 Then confirm the persona catalog, further down the same ``config:`` block
@@ -208,18 +211,21 @@ line and the commented ``mcp_servers:`` example with:
      facility-mcp:
        template: services/facility-mcp
        config:
-         port: 8200
+         port: 10900
 
    mcp_servers:
      facility:
-       port: 8200
+       port: 10900
        transport: http
        permissions:
          allow: [machine_status]
 
 ``template:`` is profile-relative, so the next thing to do is write that
 directory. The port appears twice because it is the same fact told to two
-parties: the container publishes it, and the agent dials it.
+parties: the container publishes it, and the agent dials it. ``10900`` is the
+first port of the facility band, the hundred ports the framework publishes
+nothing in so that a facility's own services can claim them without ever
+colliding — see :ref:`reference-ports-facility`.
 
 Now create ``services/facility-mcp/`` with four files.
 
@@ -247,7 +253,7 @@ be installed alongside it.
 
    STATUS_FILE = Path(os.environ.get("FACILITY_STATUS_FILE", "/data/machine-status.json"))
 
-   mcp = FastMCP("demo-facility", host="0.0.0.0", port=int(os.environ.get("PORT", "8200")))
+   mcp = FastMCP("demo-facility", host="0.0.0.0", port=int(os.environ.get("PORT", "10900")))
 
 
    @mcp.tool()
@@ -284,7 +290,7 @@ job in the pipeline:
    # Unbuffered so container logs appear as the server writes them rather than
    # when the process exits.
    ENV PYTHONUNBUFFERED=1
-   EXPOSE 8200
+   EXPOSE 10900
 
    CMD ["python", "server.py"]
 
@@ -307,17 +313,23 @@ compose template per service directory, rendered by the build.
        container_name: {{ osprey_labels.project_name }}-facility-mcp
        labels:
          osprey.project.name: "{{ osprey_labels.project_name }}"
+         # Which deployment repo this container belongs to. A facility service
+         # carries it for the same reason every packaged one does: the preflight
+         # reads it to tell "a port of ours, already up" from "somebody else's
+         # process on our port", and an unlabelled container can only be guessed
+         # at from the compose project name.
+         com.osprey.repo-id: "{{ osprey_labels.repo_id }}"
          osprey.project.root: "{{ osprey_labels.project_root }}"
          # Content hashes of the env chain and the rendered config this service
          # reads. They are what makes an edit to either file restart this
-         # container; see the service-template section of deploy-project.
+         # container; see the deploy-project compose-templates page.
          osprey.env.digest: "${OSPREY_ENV_DIGEST:-}"
          osprey.config.digest: "${OSPREY_CONFIG_DIGEST:-}"
        restart: unless-stopped
        ports:
-         - "{{ deployment.bind_address | default('127.0.0.1') }}:{{ (services['facility-mcp'] | default({})).port | default(8200) }}:8200/tcp"
+         - "{{ deployment.bind_address | default('127.0.0.1') }}:{{ (services['facility-mcp'] | default({})).port | default(10900) }}:10900/tcp"
        environment:
-         PORT: "8200"
+         PORT: "10900"
          FACILITY_STATUS_FILE: /data/machine-status.json
          TZ: {{ system.timezone }}
        volumes:
@@ -325,7 +337,7 @@ compose template per service directory, rendered by the build.
        networks:
          - osprey-network
        healthcheck:
-         test: ["CMD-SHELL", "python -c \"import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(0 if s.connect_ex(('localhost', 8200)) == 0 else 1)\""]
+         test: ["CMD-SHELL", "python -c \"import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(0 if s.connect_ex(('localhost', 10900)) == 0 else 1)\""]
          interval: 10s
          timeout: 5s
          retries: 5
@@ -340,8 +352,11 @@ compose template per service directory, rendered by the build.
 The image reference follows the framework convention — environment variable,
 then config key, then a local tag. A laptop deploy builds the image from the
 sources beside the template; the deploy host selects the pipeline's pushed image
-by setting ``OSPREY_FACILITY_MCP_IMAGE``. :doc:`deploy-project` covers the
-template variables in full.
+by setting ``OSPREY_FACILITY_MCP_IMAGE``. The last layer is this template's own
+literal, so the stack-wide registry and tag axes do not reach it: to have a
+facility-owned image follow them, write the default with the same shape they
+produce. :doc:`deploy-project/index` covers the template variables, the image chain,
+and those axes in full.
 
 
 Step 5 — Fill in the deployment coordinates
@@ -497,7 +512,7 @@ Step 9 — Deploy and check
    Running OSPREY from a **source checkout** rather than a released install?
    Add ``--dev`` — ``osprey up`` otherwise refuses, because a container built
    from PyPI would run different code than your checkout, and ``--dev`` builds
-   the image from the checkout instead; see :doc:`deploy-project` for that
+   the image from the checkout instead; see :doc:`deploy-project/index` for that
    workflow.
 
 The first run is slow: the virtual accelerator and the facility's own image are
@@ -572,6 +587,8 @@ anywhere inside the repository:
 .. code-block:: bash
 
    osprey set connector=epics          # or edit profile.yml by hand
+   osprey set config.archiver.type=epics_archiver
+   osprey set va_archiver=null         # the recorded archive goes with the stand-in
    osprey build
    osprey up -d
 
@@ -605,22 +622,188 @@ When the answer is not obvious from those, run them inside an OSPREY agent
 session in the repository: the agent reads the same output you do, and it has
 the deployment's configuration and rendered files at hand.
 
+
+Starting it again after a reboot
+================================
+
+Nothing so far survives the host restarting: the containers come back only when
+somebody runs ``osprey up -d`` again. ``osprey scaffold systemd`` writes a
+systemd user unit that does it for you.
+
+.. code-block:: bash
+
+   osprey scaffold systemd
+
+It writes ``osprey.service`` at the repository root — and, beside it,
+``scripts/osprey-boot-hook.sh``, covered below — and prints the commands that
+install the unit on this machine:
+
+.. code-block:: bash
+
+   cp /path/to/repo/osprey.service ~/.config/systemd/user/
+   systemctl --user daemon-reload
+   systemctl --user enable --now osprey.service
+
+Run the scaffold verb **on the machine that will run the deployment**. Both the
+repository directory and the ``osprey`` program are written into the unit as
+full paths, because systemd starts a unit with no working directory and a short
+``PATH`` — a unit generated on your laptop would name paths the host does not
+have. Run it again after the repository moves or OSPREY is reinstalled
+somewhere else. Re-running is otherwise safe: a unit whose content already
+matches is left untouched, stamp included, so an OSPREY upgrade alone produces
+no diff, and a file the scaffolder did not write is reported and left alone
+unless you pass ``--force``.
+
+If no ``osprey`` program can be found to name, the command refuses rather than
+writing a unit that points at nothing. Check that ``command -v osprey`` answers
+in the same shell — if OSPREY lives in a virtual environment, activate it and
+re-run.
+
+One more step, and it is the one people miss:
+
+.. code-block:: bash
+
+   loginctl enable-linger $USER
+
+A user unit runs inside that account's own ``systemd --user`` instance, which
+logind starts at login and tears down when the account's last session ends.
+Without linger there is no user instance at boot, so the unit never runs, and it
+stops again the moment you log out. ``osprey up`` already enables linger by
+itself for a rootless-podman deployment running web terminals — rootless podman
+puts the containers themselves under that same user instance, so they need it
+too — but every other deployment needs the command run once by hand. On Docker
+hosts the containers run under the Docker daemon and are unaffected by linger;
+the unit that starts them is still a user unit, so it still needs it.
+
+Check it the way you would check any unit:
+
+.. code-block:: bash
+
+   systemctl --user status osprey.service
+   journalctl --user -u osprey.service -b
+
+When the home directory is on a network mount
+---------------------------------------------
+
+Linger is not enough when ``$HOME`` is on NFS or autofs, and the scaffold verb
+says so: it reads the home directory's filesystem type with ``findmnt`` and
+prints a warning beside the install commands. The lingering user manager starts
+at boot before that mount is there. It resolves its unit search path once,
+finds nothing, and does not look again — so after every host reboot the unit
+reads as ``not-found``, and ``podman.socket`` with it, until somebody runs
+``systemctl --user daemon-reload`` by hand. It looks like a broken unit and it
+is a mount-ordering problem.
+
+When systemd manages the mount itself — an fstab entry, or a ``.mount`` or
+``.automount`` unit — ordering the user manager after it is a drop-in on
+``user@<uid>.service``, which OSPREY cannot install for you because it needs
+root:
+
+.. code-block:: ini
+
+   # /etc/systemd/system/user@<uid>.service.d/network-home.conf
+   [Unit]
+   RequiresMountsFor=/home/<account>
+   After=remote-fs.target autofs.service
+
+Followed by ``sudo systemctl daemon-reload``. The command prints that file with
+your own uid and home directory already filled in, ready to hand to whoever
+administers the host. On a local home — or on a host with no ``findmnt``, where
+there is no way to tell — it prints nothing extra.
+
+That drop-in does nothing for a home served by the autofs daemon
+(``automount(8)``): there is no systemd mount unit for ``RequiresMountsFor`` to
+order against, so the manager starts exactly as before. ``findmnt`` reports
+``autofs`` for a systemd automount as well, so the command cannot tell the two
+apart — check ``systemctl list-units -t mount,automount`` for your home to know
+which you have. For a daemon-managed home, and for any host where nobody with
+root is available, the same run has already written the other route:
+``scripts/osprey-boot-hook.sh``, beside the unit. It waits for the home, the
+deployment and the user manager to appear, then reloads the unit files and
+starts the unit — the script an affected site otherwise ends up writing by
+hand. Wire it into the account's own crontab with the lines the command
+prints, all of them, pasted whole:
+
+.. code-block:: bash
+
+   crontab -e
+   SHELL=/bin/sh
+   HOME=/
+   @reboot d=/tmp/osprey-boot-hook.$(id -u); mkdir -m 700 "$d" 2>/dev/null; if [ -d "$d" ] && [ ! -L "$d" ] && [ -O "$d" ]; then log=/tmp/osprey-boot-hook.$(id -u)/boot.log; else log=/dev/null; fi; echo "$(date) osprey-boot-hook: cron fired" >> "$log"; n=0; until [ -x /path/to/repo/scripts/osprey-boot-hook.sh ] || [ $n -ge 120 ]; do sleep 5; n=$((n+1)); done; if [ -x /path/to/repo/scripts/osprey-boot-hook.sh ]; then exec /path/to/repo/scripts/osprey-boot-hook.sh; fi; echo "$(date) osprey-boot-hook: gave up, /path/to/repo/scripts/osprey-boot-hook.sh never appeared" | tee -a "$log"
+
+The job is deliberately not a bare ``@reboot`` with the script's path, because
+two things happen before a cron job's command runs and each one kills the job
+silently on this kind of host. cron changes into the crontab's ``HOME`` first
+and dies, with no mail, when that directory is not there yet — ``HOME=/``
+gives it one that is, ``SHELL=/bin/sh`` names the shell the job is written
+for whatever an existing crontab set above, and the script restores the real
+home as its first act. Then ``sh`` has to read the script, which sits on the same late mount; so the
+job, which lives in the crontab on the local disk, notes that cron fired it in
+``/tmp/osprey-boot-hook.<uid>/boot.log`` and waits for the script to become
+readable before running it. That log is the first place to look after a boot
+that did not come back: it splits "cron never fired" from "still waiting for
+the home" from "the hook ran and said why". Put the lines last in the
+crontab: every job below them runs from ``/`` and sees ``HOME=/`` in its
+environment, so a job body that expands ``$HOME`` breaks silently unless it
+starts with its own ``export HOME=<the real home>``.
+
+Where the drop-in applies, the hook repairs each boot after the fact rather
+than ordering the manager correctly in the first place, so there it is a
+fallback, not a replacement.
+
+``osprey health`` reports this condition too: the ``systemd_unit`` category
+is ``error`` when the unit is installed but the user manager reports it
+``not-found``, ``warning`` when it was scaffolded but never installed, and
+a skip on any host without a scaffolded unit or a user manager.
+
+Why the unit runs ``osprey`` and not compose
+--------------------------------------------
+
+The unit's ``ExecStart`` is ``osprey up -d`` and its ``ExecStop`` is ``osprey
+down`` — not a compose command against the rendered files in ``build/``. That is
+deliberate. A compose invocation started by systemd would have to reproduce, by
+hand and correctly, everything ``osprey up`` assembles around compose:
+
+- ``COMPOSE_PROJECT_NAME``, pinned to the project name in the configuration
+  rather than left to compose's own fallback of the current directory's name.
+  It decides which containers, networks and volumes the command addresses; get
+  it wrong at boot and the host quietly grows a second copy of the stack beside
+  the one your volumes belong to.
+- ``OSPREY_ENV_DIGEST``, a hash of the ``.env`` chain that the rendered files
+  carry as a container label. It is what makes an edit to ``.env`` reach a
+  running container. A compose run that left it unset would look like a changed
+  document on every boot and recreate the whole stack for no reason.
+- The ``.env`` chain itself — ``.env.shared`` then ``.env`` — collapsed in the
+  right order, and the repository pinned as compose's project directory so it
+  resolves those files at all.
+- The container runtime, which ``osprey up`` detects (or reads from the
+  configuration) and then probes for the compose provider behind it; the
+  supported providers do not take the same command line.
+- Everything that is not compose: the host-port check that refuses before it
+  touches a container, the drift check that refuses when ``build/`` no longer
+  matches ``profile.yml``, minting any missing service credentials into
+  ``.env``, the second compose invocation a multi-user deployment needs for its
+  web tier, and ``scripts/verify.sh`` afterwards.
+
+Wrapping the verb keeps all of that in one place: the unit is two commands, and
+a boot does exactly what you do by hand.
+
 .. seealso::
 
    :doc:`build-profiles`
        What lives in a profile, the convention directories, and taking ownership
        of a framework artifact.
 
-   :doc:`deploy-project`
+   :doc:`deploy-project/index`
        The container-deployment reference: service configuration, compose template
        variables, image overrides, and the ``--dev`` workflow.
 
-   :doc:`multi-user`
+   :doc:`web-terminal/multi-user/index`
        The web tier this facility deploys — the landing page and one
        containerized terminal per operator.
 
-   :doc:`use-virtual-accelerator`
-       The PyAT soft-IOC, and driving it from the agent.
+   :doc:`control-systems/use-virtual-accelerator`
+       Running the simulator, and driving it from the agent.
 
-   :doc:`../cli-reference/index`
+   :doc:`/reference/cli`
        Every ``osprey`` command and flag.

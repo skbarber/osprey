@@ -16,9 +16,9 @@ itself against the bridge; this proves the hop in front of it.
 Reuses ``tests/e2e/_orm_stack.py`` (the single source for FR11's VA-backed
 turn-key deploy config): ``init_args``/``find_osprey_console_script`` materialize
 the real deployment repo and ``select_correctors``/``select_bpms``/
-``write_substrate_env`` wire the substrate device env from the render's own
-``build/data/channel_limits.json`` -- the limits database the deployed
-containers read, never a hardcoded preset channel.
+``write_devices_file`` author the worker's plan devices from the repo's own
+``data/channel_limits.json`` -- the limits database the build copies into the
+build zone for the deployed containers, never a hardcoded preset channel.
 ``override_yaml()`` still pins ``control_system.type: virtual_accelerator``
 explicitly even though the preset now defaults to it (a connector-mediated
 plan only runs against a setpoint-tracking control system; the shipped
@@ -97,7 +97,7 @@ from tests.e2e._volumes import remove_project_volumes
 BRIDGE_PORT = 18106
 BRIDGE_URL = f"http://localhost:{BRIDGE_PORT}"
 
-# The bluesky-web sidecar's default host port (8095) is shared with the
+# The bluesky-web sidecar's slot in the deployment's port block is shared with the
 # tutorial's own default -- pin a distinct one so this e2e never collides
 # with a locally-running tutorial deploy on the same host.
 BLUESKY_WEB_PORT = 18095
@@ -164,14 +164,14 @@ def _run(cmd: list[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess
 
 
 def _channel_limits(repo: Path) -> dict[str, Any]:
-    """The limits database the deployed containers actually read.
+    """The deployment repo's own limits database.
 
-    ``control_system.limits_checking.database_path`` resolves against
-    ``CONFIG_FILE``'s directory, and the render points that at
-    ``<repo>/build/config.yml`` -- so the render's copy, not the operator-owned
-    source under ``<repo>/data/``, is the file whose channels the containers see.
+    ``osprey build`` copies ``<repo>/data`` into the build zone verbatim, so
+    this file and the ``build/data/`` copy the containers read are the same
+    bytes and name the same channels -- but only this one exists before the
+    build, which is when the plan devices have to be chosen and authored.
     """
-    return json.loads((repo / "build" / "data" / "channel_limits.json").read_text(encoding="utf-8"))
+    return json.loads((repo / "data" / "channel_limits.json").read_text(encoding="utf-8"))
 
 
 def _bounds(limits: dict[str, Any], address: str) -> tuple[float, float]:
@@ -190,6 +190,33 @@ def _minted_token(repo: Path) -> str:
     return token
 
 
+def _minted_sidecar_secret(repo: Path) -> str:
+    """The sidecar's operator secret, read from the same .env `osprey up` wrote.
+
+    The sidecar is gated by WebAuthMiddleware like every interface app, so this
+    suite authenticates the way any non-browser operator client does: the
+    minted ``OSPREY_TERMINAL_SECRET`` sent as the operator-secret header.
+    """
+    from osprey.utils.dotenv import parse_dotenv_file
+
+    env_path = repo / ".env"
+    assert env_path.is_file(), f"no .env written at {env_path} — secret was not minted"
+    env = parse_dotenv_file(env_path)
+    secret = env.get("OSPREY_TERMINAL_SECRET")
+    assert secret, "OSPREY_TERMINAL_SECRET missing/empty in the deployment repo's .env"
+    return secret
+
+
+#: Set by the ``deployed_stack`` fixture once the stack's .env exists; the
+#: sidecar helpers below attach it to every request. Module state rather than a
+#: fixture return so the plain helper functions need no threading-through.
+_sidecar_secret: str | None = None
+
+
+def _auth_headers() -> dict[str, str]:
+    return {"X-Osprey-Terminal-Secret": _sidecar_secret} if _sidecar_secret else {}
+
+
 def _wait_for_health(url: str, timeout: float) -> None:
     deadline = time.monotonic() + timeout
     last_err = "(no response yet)"
@@ -206,14 +233,20 @@ def _wait_for_health(url: str, timeout: float) -> None:
 
 
 def _request(
-    base: str, path: str, method: str, body: dict[str, Any] | None = None
+    base: str,
+    path: str,
+    method: str,
+    body: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> tuple[int, Any]:
     data = json.dumps(body).encode("utf-8") if body is not None else None
+    all_headers = {"Content-Type": "application/json"} if data is not None else {}
+    all_headers.update(headers or {})
     req = urllib.request.Request(  # noqa: S310
         f"{base}{path}",
         data=data,
         method=method,
-        headers={"Content-Type": "application/json"} if data is not None else {},
+        headers=all_headers,
     )
     try:
         with urllib.request.urlopen(req, timeout=15.0) as resp:  # noqa: S310
@@ -231,11 +264,11 @@ def _request(
 
 
 def _sidecar_get(path: str) -> tuple[int, Any]:
-    return _request(BLUESKY_WEB_URL, path, "GET")
+    return _request(BLUESKY_WEB_URL, path, "GET", headers=_auth_headers())
 
 
 def _sidecar_post(path: str, body: dict[str, Any]) -> tuple[int, Any]:
-    return _request(BLUESKY_WEB_URL, path, "POST", body)
+    return _request(BLUESKY_WEB_URL, path, "POST", body, headers=_auth_headers())
 
 
 def _bridge_get(path: str) -> tuple[int, Any]:
@@ -258,7 +291,9 @@ def _bridge_post(path: str, body: dict[str, Any], token: str | None = None) -> t
 
 
 def _get_html(path: str) -> tuple[int, str]:
-    req = urllib.request.Request(f"{BLUESKY_WEB_URL}{path}", method="GET")  # noqa: S310
+    req = urllib.request.Request(  # noqa: S310
+        f"{BLUESKY_WEB_URL}{path}", method="GET", headers=_auth_headers()
+    )
     try:
         with urllib.request.urlopen(req, timeout=10.0) as resp:  # noqa: S310
             return resp.status, resp.read().decode("utf-8", errors="replace")
@@ -429,6 +464,10 @@ def deployed_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Deploye
         output_dir=base,
         bridge_port=BRIDGE_PORT,
         va_port=VA_CA_PORT,
+        # This module's own thousand-port block (see test_dispatch_deploy.py's
+        # 20700 note): everything not pinned explicitly follows it instead of
+        # landing on a real deployment's default 10000 block.
+        port_base=21700,
     )
     args += ["--set", f"bluesky_web.port={BLUESKY_WEB_PORT}"]
 
@@ -441,6 +480,18 @@ def deployed_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Deploye
             f"--- stdout ---\n{init.stdout}\n--- stderr ---\n{init.stderr}"
         )
 
+    # STRICTLY between the two verbs: the build copies <repo>/data into the
+    # build zone and stages the device file it finds there for the queueserver
+    # worker, so a set written after the build would never reach a container
+    # (and one written before `init` would break init's own copy of the preset's
+    # data/). launch_token left unset: `osprey up` mints BLUESKY_LAUNCH_TOKEN
+    # for every deployed service that declares it, so there is nothing to supply
+    # ourselves here.
+    limits = _channel_limits(repo)
+    correctors = _orm_stack.select_correctors(limits, count=1)
+    bpms = _orm_stack.select_bpms(limits, count=2)
+    _orm_stack.write_devices_file(repo, correctors=correctors, bpms=bpms)
+
     build = _run(
         [str(osprey_bin), "build", "--repo", str(repo), "--skip-deps", "--skip-lifecycle", "--dev"],
         cwd=base,
@@ -452,15 +503,9 @@ def deployed_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Deploye
             f"--- stdout ---\n{build.stdout}\n--- stderr ---\n{build.stderr}"
         )
 
-    limits = _channel_limits(repo)
-    correctors = _orm_stack.select_correctors(limits, count=1)
-    bpms = _orm_stack.select_bpms(limits, count=2)
-    # launch_token left unset: `osprey up` mints BLUESKY_LAUNCH_TOKEN for every
-    # deployed service that declares it, so there is nothing to supply
-    # ourselves here. This call also creates the repo root's `.env` — the
-    # deployment's whole secret store, and the file `osprey up` refuses to
-    # start without.
-    _orm_stack.write_substrate_env(repo, correctors=correctors, bpms=bpms)
+    # The repo root's `.env` — the deployment's whole secret store, and the file
+    # `osprey up` refuses to start without.
+    _orm_stack.seed_repo_env(repo)
 
     # Force fresh --dev builds so the deployed containers run CURRENT source
     # (osprey up does not pass --build to compose, so it would otherwise
@@ -482,6 +527,12 @@ def deployed_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Deploye
                 f"osprey up -d --dev failed (rc={up.returncode}):\n"
                 f"--- stdout ---\n{up.stdout}\n--- stderr ---\n{up.stderr}"
             )
+        # `osprey up` minted the sidecar's operator secret into the repo .env;
+        # arm the sidecar helpers with it before anything talks to the gate
+        # (the /health waits below are on the gate's exempt path).
+        global _sidecar_secret
+        _sidecar_secret = _minted_sidecar_secret(repo)
+
         _wait_for_health(f"{BRIDGE_URL}/health", HEALTH_TIMEOUT_SEC)
         _wait_for_health(f"{BLUESKY_WEB_URL}/health", HEALTH_TIMEOUT_SEC)
         # HTTP readiness is not enqueue readiness -- the worker namespace an
@@ -539,6 +590,18 @@ def test_panels_served_200(deployed_stack: DeployedStack) -> None:
     assert "<html" in body.lower(), f"GET /bluesky/ did not return HTML: {body[:200]!r}"
 
 
+@pytest.mark.flaky(reruns=1, only_rerun=["AssertionError"])
+def test_sidecar_refuses_unauthenticated_requests(deployed_stack: DeployedStack) -> None:
+    """The deployed sidecar's gate refuses a request carrying no credential.
+
+    Every other test here authenticates with the minted operator secret; this
+    one pins the other half of the contract — that the deployed container
+    actually enforces the gate, rather than serving whoever reaches the port.
+    """
+    status, body = _request(BLUESKY_WEB_URL, "/plans", "GET")
+    assert status == 401, f"expected 401 for an unauthenticated GET /plans, got {status}: {body!r}"
+
+
 # ---------------------------------------------------------------------------
 # 3. HEADLINE: a run driven entirely through the sidecar's relays
 # ---------------------------------------------------------------------------
@@ -565,7 +628,12 @@ def test_plan_via_sidecar_queue_completes(deployed_stack: DeployedStack) -> None
     # is a no-op that does NOT bump the revision, so a rerun (or a sibling test
     # staging the same plan) would pin an already-consumed revision and the
     # enqueue below would 409 draft_revision_already_launched.
-    _request(BLUESKY_WEB_URL, "/draft?client_id=panels-deploy-e2e", "DELETE")
+    _request(
+        BLUESKY_WEB_URL,
+        "/draft?client_id=panels-deploy-e2e",
+        "DELETE",
+        headers=_auth_headers(),
+    )
     status, patched = _request(
         BLUESKY_WEB_URL,
         "/draft",
@@ -575,6 +643,7 @@ def test_plan_via_sidecar_queue_completes(deployed_stack: DeployedStack) -> None
             "plan_args_patch": deployed_stack.plan_args,
             "client_id": "panels-deploy-e2e",
         },
+        headers=_auth_headers(),
     )
     assert status == 200, f"PATCH /draft (via sidecar) failed: {status} {patched}"
     _assert_no_token("draft response", patched)
@@ -696,7 +765,7 @@ def test_sidecar_runs_surface_is_read_only(deployed_stack: DeployedStack) -> Non
     # No /runs/{id}/stop at all -- the path template isn't registered on the
     # sidecar for any method, so it 404s regardless of verb. (The halt lives on
     # the queue surface: POST /queue/stop and POST /queue/abort.)
-    status, body = _request(BLUESKY_WEB_URL, "/runs/not-a-real-run-id/stop", "GET")
+    status, body = _sidecar_get("/runs/not-a-real-run-id/stop")
     assert status == 404, f"expected no GET /runs/{{id}}/stop route, got {status}: {body}"
     status, body = _sidecar_post("/runs/not-a-real-run-id/stop", {})
     assert status == 404, f"expected no POST /runs/{{id}}/stop route, got {status}: {body}"

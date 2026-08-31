@@ -42,18 +42,34 @@ PINNED_PRESET_DEPENDENCIES: dict[str, list[str]] = {
     # Emptied when pymongo became a core OSPREY dependency. Before that this
     # read ``[pymongo>=4.0]`` — see the module docstring.
     "control-assistant": [],
+    # The admin tier, added with the tier floor. Empty like its siblings: the
+    # only thing it adds over `control-assistant-readwrite` is the `setup-mode`
+    # skill and the config keys that lift the floor, and a skill OSPREY ships
+    # needs no package a plain `pip install osprey-framework` does not already
+    # bring — the workspace MCP server it drives is framework-side.
+    "control-assistant-admin": [],
     "control-assistant-ariel": [],
     "control-assistant-readonly": [],
     "control-assistant-readwrite": [],
+    # The simulator-write rung, added with per-target write posture. Empty like
+    # its siblings: it differs from `control-assistant-readwrite` only in which
+    # connector types its `config:` block arms, and a posture key needs no
+    # package at all — the resolver that reads it ships in the framework.
+    "control-assistant-va-readwrite": [],
     "hello-world": [],
 }
 
-#: Packages a deploy imports in the CLI's own process, which therefore cannot be
-#: supplied by any profile. Each must be a core dependency of the framework.
+#: Packages a build or deploy imports in the CLI's own process, which therefore
+#: cannot be supplied by any profile. Each must be a core dependency of the
+#: framework.
 HOST_SIDE_PACKAGES = {
     # container_lifecycle._preflight_archiver_pymongo and, behind it,
     # _stage_archiver_store -> simulation.apply.archiver_collection.
     "pymongo",
+    # deployment.channel_snapshot.compute_channel_snapshot parses the graph
+    # corpus in the CLI's own process — on `osprey build` and on the
+    # deploy-time compose re-render.
+    "rdflib",
 }
 
 
@@ -89,7 +105,7 @@ def test_every_bundled_preset_declares_the_dependencies_it_is_pinned_to():
 
 
 def test_host_side_packages_are_core_dependencies():
-    """A package the CLI imports during a deploy cannot live behind an extra.
+    """A package the CLI imports during a build or a deploy cannot live behind an extra.
 
     This is the check that would have caught the original mistake at the commit
     that made it, rather than at a deploy months later: pymongo was reachable

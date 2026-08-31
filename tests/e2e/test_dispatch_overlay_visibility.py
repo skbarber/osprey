@@ -62,9 +62,17 @@ import pytest
 import yaml
 
 from osprey.deployment.compose_generator import resolve_project_name
+from osprey.port_layout import default_port
 from tests.e2e._volumes import remove_project_volumes
 
-DISPATCHER_URL = "http://localhost:8020"
+#: This deploy's own thousand-port block — same convention as
+#: test_dispatch_deploy.py (20700) and test_web_bind.py (21000): a real
+#: control-assistant stack owns the default 10000 block on a dev host, so a
+#: test deploy that landed there would crash-loop the live stack's terminals
+#: against its own dispatcher and panels.
+PORT_BASE = 21100
+
+DISPATCHER_URL = f"http://localhost:{default_port('dispatcher', base=PORT_BASE)}"
 TOKEN = "dev-token"  # matches the .env tokens written below
 
 # Container image build (Node + Claude CLI install) is slow on a cold cache.
@@ -141,7 +149,7 @@ description: >
   Facility-specific end-to-end visibility check. When invoked, read the render's
   channel-limits data file and save a report proving the overlay skill and the
   data bundle are both reachable in the running worker container.
-allowed-tools: Read, mcp__osprey_workspace__artifact_save
+allowed-tools: Read, mcp__osprey_workspace__artifact_register
 ---
 
 # Facility Marker
@@ -151,7 +159,8 @@ When this skill is invoked, do exactly the following, in order:
 1. Read the file `build/data/channel_limits.json` from the working directory.
 2. Note the value of its top-level `_sentinel` field.
 3. Save a short markdown report using the workspace artifact tool
-   (`mcp__osprey_workspace__artifact_save`) with `content` (inline markdown).
+   (`mcp__osprey_workspace__artifact_register`) with `content` (inline markdown)
+   and `content_type` set to `markdown`.
    The report body MUST contain, each on its own line and verbatim:
    - the literal token `{OVERLAY_MARKER}`
    - the `_sentinel` value you read from the data file
@@ -190,13 +199,13 @@ _OVERLAY_TRIGGER_ENTRY = {
             "Invoke the facility-marker skill now using the Skill tool, and follow "
             "its steps exactly: read the file build/data/channel_limits.json from "
             "the working directory, then save a markdown report via the workspace "
-            "artifact_save tool. Do not skip any step."
+            "artifact_register tool. Do not skip any step."
         ),
         "surface_prompt": _SURFACE_PROMPT,
         "allowed_tools": [
             "Skill",
             "Read",
-            "mcp__osprey_workspace__artifact_save",
+            "mcp__osprey_workspace__artifact_register",
         ],
     },
 }
@@ -254,7 +263,7 @@ def _mutate_source(repo: Path) -> None:
     data_path.write_text(json.dumps(_DATA_FIXTURE, indent=2), encoding="utf-8")
 
     # Append the custom trigger to the source triggers file, preserving its
-    # dispatcher block (which carries the dispatch-worker-1:9190 routing).
+    # dispatcher block (which carries the dispatch-worker-1 routing).
     triggers_path = repo / "triggers.yml"
     doc = yaml.safe_load(triggers_path.read_text(encoding="utf-8")) or {}
     doc.setdefault("triggers", []).append(_OVERLAY_TRIGGER_ENTRY)
@@ -304,6 +313,8 @@ def deployed_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
             "provider=als-apg",
             "--set",
             "model=haiku",
+            "--set",
+            f"port_base={PORT_BASE}",
         ],
         cwd=base,
         timeout=300,

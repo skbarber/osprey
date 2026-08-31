@@ -22,6 +22,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from osprey.registry.web import framework_web_port_default
+
 _MODULE = "osprey.interfaces.artifacts.logbook"
 
 
@@ -257,10 +259,10 @@ class TestLogbookSubmit:
         """Without ARIEL_WEB_URL, the submit URL must be a web-terminal-relative
         proxy path — not an absolute container-internal address.
 
-        Regression: a default of ``http://127.0.0.1:8085`` is unreachable
-        from the user's browser. The panel embeds via /panel/ariel
-        and resolves the URL with ``new URL(url, origin)``, so it must be
-        origin-relative to load through the proxy.
+        Regression: an absolute loopback address — ARIEL's own layout port
+        included — is unreachable from the user's browser. The panel embeds via
+        /panel/ariel and resolves the URL with ``new URL(url, origin)``, so it
+        must be origin-relative to load through the proxy.
         """
         monkeypatch.delenv("ARIEL_WEB_URL", raising=False)
         with patch(f"{_MODULE}.resolve_shared_data_root", return_value=tmp_path):
@@ -271,7 +273,7 @@ class TestLogbookSubmit:
 
         url = resp.json()["url"]
         assert not url.startswith("http://127.0.0.1")
-        assert "8085" not in url
+        assert str(framework_web_port_default("ariel")) not in url
         assert url.startswith("/panel/ariel")
 
     @pytest.mark.unit
@@ -781,8 +783,14 @@ class TestUserPromptContent:
         assert "ASSISTANT: The beam current is 500 mA." in user_msg
 
     @pytest.mark.unit
-    def test_prompt_includes_tool_arguments_and_results(self, app_client):
-        """Audit trail entries include tool arguments and result summaries."""
+    def test_prompt_excludes_tool_arguments(self, app_client):
+        """Audit trail entries carry tool names and results but NOT arguments.
+
+        Arguments are the part of a session most likely to hold values the
+        operator did not mean to publish (the feedback composer states and
+        enforces the same policy), and the composition prompt leaves the
+        deployment for an external LLM provider.
+        """
         store = app_client.app.state.artifact_store
         entry = _make_artifact(store)
 
@@ -817,8 +825,9 @@ class TestUserPromptContent:
         user_msg = self._get_user_prompt(mock_llm)
         assert "## Recent session activity" in user_msg
         assert "channel_read" in user_msg
-        assert "SR:CURRENT" in user_msg
         assert "500.0" in user_msg
+        assert "SR:CURRENT" not in user_msg
+        assert "args=" not in user_msg
 
     @pytest.mark.unit
     def test_prompt_chat_history_excluded_when_session_log_disabled(self, app_client):

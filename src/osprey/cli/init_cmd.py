@@ -45,8 +45,13 @@ from osprey.utils.logger import get_logger
 from osprey.utils.workspace import STATE_ZONE_DIRS
 
 from . import output
-from .profile_conventions import BUILD_OUTPUT_DIR, STATE_DIR
+from .profile_conventions import BUILD_OUTPUT_DIR, STATE_DIR, convention_for
 from .repo_resolver import HELD_SOURCE_ZONE_DIRNAME
+from .variant_selection import (
+    VARIANT_DIRNAME,
+    VARIANT_SETTING_FILENAME,
+    VARIANT_SETTING_KEY,
+)
 
 if TYPE_CHECKING:
     # Annotation only — both modules are imported lazily inside the command
@@ -54,6 +59,7 @@ if TYPE_CHECKING:
     # lazy-import budget test in tests/cli/test_main.py pins this).
     from osprey.deployment.reset import ForeignCheckoutError
 
+    from .build_profile_schema import McpServerDef
     from .deploy_scaffold import ScaffoldedFile
     from .profile_cmd import _MaterializedProfile
 
@@ -88,8 +94,10 @@ def _repo_gitignore() -> str:
     Every zone entry is ANCHORED with a leading slash, which is the whole
     subtlety of the file: an unanchored ``build/`` or ``.env*`` also matches a
     same-named path anywhere deeper in the tree, including files moved there
-    later, and it does it silently. The editor noise at the end is the one
-    deliberate exception, being a name pattern rather than a path.
+    later, and it does it silently. The noise at the end is the deliberate
+    exception, being a set of name patterns rather than paths: editor droppings
+    and Python bytecode are junk wherever they land, and a seeded server package
+    run in place lands them well below the root.
     """
     return f"""\
 # This repo is the deployment: the source zone is tracked, and the
@@ -119,6 +127,11 @@ def _repo_gitignore() -> str:
 # unanchored `{BUILD_OUTPUT_DIR}/` or `.env*` would also swallow a same-named path anywhere
 # deeper in the tree — including files moved there later — and it would do it
 # silently.
+#
+# The same pattern covers `{VARIANT_SETTING_FILENAME}`, which is not a secret but is
+# host-local for the same reason: it holds `{VARIANT_SETTING_KEY}=<name>`, naming
+# which `{VARIANT_DIRNAME}/<name>.yml` overlay THIS host builds. Committing it would
+# hand this host's choice to every other one.
 /.env*
 !/.env.example
 !/{ENV_SHARED_FILENAME}
@@ -128,14 +141,17 @@ def _repo_gitignore() -> str:
 # `osprey reset` — anchored for the same reason the zones above are.
 /{MERGED_COMPOSE_FILENAME}
 
-# OS / editor noise. Deliberately unanchored: these are junk at any depth.
+# OS / editor noise, and the bytecode Python leaves beside any server package
+# run in place. Deliberately unanchored: these are junk at any depth.
 .DS_Store
 *.swp
 *.swo
+__pycache__/
+*.py[co]
 """
 
 
-def _repo_env_shared(name: str) -> str:
+def _repo_env_shared(name: str, seeded: tuple[str, ...] = ()) -> str:
     """The committed half of the deployment's environment, as a commented starter.
 
     Every line is commented out, because a deployment needs no shared defaults
@@ -165,6 +181,10 @@ def _repo_env_shared(name: str) -> str:
 # A key set in both files takes its value from `.env`. There is nothing more to
 # it than that: same syntax, same variables, lower precedence.
 #
+# One exception, and only if profile.yml asks for it: a variable listed under
+# `env.pinned` is this file's to decide. `osprey up` refuses to start when
+# `.env` or a shell export sets one.
+#
 # Never put a secret here — this file is committed. An API key, a token or a
 # password goes in `.env`, which git ignores and which never leaves the host.
 # Neither file ever enters a container image; both are read at run time.
@@ -173,10 +193,16 @@ def _repo_env_shared(name: str) -> str:
 # NO_PROXY=localhost,127.0.0.1
 # HTTP_PROXY=http://proxy.example.com:8080
 # HTTPS_PROXY=http://proxy.example.com:8080
+
+# Site CA bundle — uncomment if a proxy re-signs TLS with a site CA.
+# On RHEL-family hosts the system bundle lives here:
+# SSL_CERT_FILE=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+# REQUESTS_CA_BUNDLE=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+# NODE_EXTRA_CA_CERTS=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
 """
 
 
-def _repo_readme(name: str) -> str:
+def _repo_readme(name: str, seeded: tuple[str, ...] = ()) -> str:
     """The README an operator meets this layout through.
 
     Its subject is the repo, not the profile: which zone survives what, and the
@@ -198,7 +224,7 @@ the folder name is the assistant's name.
 | Generated files | `{BUILD_OUTPUT_DIR}/` | no | no, safe to delete |
 | The agent's memory and audit log | `{STATE_DIR}/agent_data/`, `{STATE_DIR}/audit/` | no | yes |
 
-In full, the first row is: {_source_zone_prose()}.
+In full, the first row is: {_source_zone_prose(seeded)}.
 
 `{BUILD_OUTPUT_DIR}/` is generated from your settings every time you run `osprey build`.
 Deleting it is always safe: no settings, no keys and no agent memory live there.
@@ -220,6 +246,10 @@ edited by hand.
 setting appears in both, the one in `.env` wins. That is how a single host
 changes a shared default without affecting anyone else. None of these files go
 into a container image — they are all read when the deployment starts.
+
+If `profile.yml` lists a variable under `env.pinned`, that one is the exception:
+`{ENV_SHARED_FILENAME}` decides it, and `osprey up` refuses to start when `.env`
+or a shell export disagrees.
 
 `{MERGED_COMPOSE_FILENAME}` at the root is generated the same way, so a deploy
 can hand the container runtime one file instead of several. It is kept out of
@@ -282,10 +312,67 @@ is a copy of those two, and a restore is:
 ```bash
 git clone <this repo> && tar xf state.tar.gz && osprey build && osprey up -d
 ```
+
+## Common questions
+
+### Adding an MCP server of your own
+
+Put the server's Python package at `mcp_servers/<name>/`. `osprey build` copies
+it to `{BUILD_OUTPUT_DIR}/_mcp_servers/<name>/`, and an entry under `mcp_servers:`
+in `profile.yml` says how to start it:
+
+```yaml
+mcp_servers:
+  my_server:
+    command: "{{current_python_env}}"
+    args: [-m, my_server]
+    env:
+      PYTHONPATH: "{{project_root}}/{BUILD_OUTPUT_DIR}/_mcp_servers"
+```
+
+The hello-world preset ships `example_server` as a worked copy to read. Which
+buckets the artifact gallery sorts into is a separate, top-level key, one entry
+per bucket:
+
+```yaml
+artifact_server:
+  categories:
+    beam_studies: {{label: Beam studies, color: "#4C6EF5"}}
+```
+
+### Adding a panel of your own
+
+A panel is two halves, and one without the other is a tab that opens nothing.
+The id goes in the `web_panels:` list, and its address goes under `config:`, as
+the comment above `web_panels:` in `profile.yml` shows:
+
+```yaml
+web_panels:
+  - elog
+
+config:
+  web.panels.elog.url: http://elog.example.org
+  web.panels.elog.label: Elog
+  web.panels.elog.path: /elog
+```
+
+### Mounting an extra directory into a web terminal
+
+Deployments that give people their own web terminals mount per persona, under
+`config:`. Each entry is a container volume string of two or three non-empty
+parts, `source:target` or `source:target:mode`:
+
+```yaml
+config:
+  modules.web_terminals.personas.operator.extra_mounts:
+    - /opt/facility/data:/data:ro
+```
+
+Every key named here is written up in full at https://als-apg.github.io/osprey/.
 """
 
 
-def _ci_extra_text(name: str) -> str:
+def _ci_extra_text(name: str, seeded: tuple[str, ...] = ()) -> str:
     """The starter ``ci-extra.yml`` — an include point with nothing in it yet.
 
     Written by this command and by nothing else, ever: the pipeline beside it
@@ -331,7 +418,7 @@ _IN_PLACE_NOT_EMPTY = (
 _NOT_A_DIRECTORY = "Not a directory: {target}. `osprey init` creates a deployment repo there."
 
 # ---------------------------------------------------------------------------
-# Every file `init` writes belongs to exactly one of three categories
+# Every path `init` writes belongs to exactly one of four categories
 # ---------------------------------------------------------------------------
 #
 # The categories are what make "--force is safe" checkable rather than asserted.
@@ -353,27 +440,37 @@ _NOT_A_DIRECTORY = "Not a directory: {target}. `osprey init` creates a deploymen
 #                 scaffolding engine under its marker contract and never
 #                 forced from here (see `_emit_ci`); regenerating an unmarked
 #                 one is `osprey scaffold ci`'s job, with its own `--force`.
+#   4. SEEDED     :data:`WRITE_ONCE_DIRS` below — directories copied out of the
+#                 app bundle on a repo's FIRST-EVER materialization. Never
+#                 replaced and never resurrected: `--force`/`--reset` neither
+#                 touch them nor seed them again, so one the facility deleted
+#                 stays deleted rather than reappearing under a later re-init.
 #
 # Nothing else in the repo is written by this command at all, so everything
 # else — `.env`, `var/`, `build/`, `.git` — survives by construction rather
 # than by a promise anybody has to maintain.
 
 
-def _repo_gitignore_for(_name: str) -> str:
+def _repo_gitignore_for(name: str, seeded: tuple[str, ...] = ()) -> str:
     """:func:`_repo_gitignore`, with the uniform signature the table needs.
 
     The zone paths are the layout's, not the deployment's, so this is the one
-    write-once file whose text does not vary with the name.
+    write-once file whose text varies with neither the name nor what was seeded
+    — the bytecode patterns already cover a seeded server package wherever it
+    put its ``__pycache__``.
     """
     return _repo_gitignore()
 
 
 #: Files ``init`` authors and never rewrites, each with the builder producing
 #: its text. This mapping DRIVES the writing — ``init`` loops over it rather
-#: than naming the three files again — so a file that is written is a file that
+#: than naming the four files again — so a file that is written is a file that
 #: is listed, and the ``--force`` promise below cannot describe a set the code
-#: does not implement.
-WRITE_ONCE_FILES: Mapping[str, Callable[[str], str]] = {
+#: does not implement. Every builder takes the same pair — the deployment's
+#: name, and the directories :data:`WRITE_ONCE_DIRS` actually seeded into this
+#: repo — so that a builder may start describing a seeded directory without the
+#: loop that calls it having to learn which builders care.
+WRITE_ONCE_FILES: Mapping[str, Callable[[str, tuple[str, ...]], str]] = {
     ".gitignore": _repo_gitignore_for,
     ENV_SHARED_FILENAME: _repo_env_shared,
     "README.md": _repo_readme,
@@ -386,13 +483,31 @@ WRITE_ONCE_FILES: Mapping[str, Callable[[str], str]] = {
 #: ``CI_OUTPUT_NAMES`` and :data:`REPO_VERIFY_PATH` so the two cannot drift.
 CI_EMITTED_PATHS: tuple[str, ...] = (".gitlab-ci.yml", "/".join(REPO_VERIFY_PATH))
 
+#: The profile-root directory one Python MCP server's package lives in — the
+#: source name of the convention row that carries those packages into a build.
+#: Named here, above the first table that needs it, because the directory the
+#: seeding writes and the directory the pairing check reads are the same one:
+#: spelling it twice is how a rename leaves the check looking for a name
+#: nothing writes any more.
+MCP_SERVER_SOURCE_DIR: str = "mcp_servers"
 
-def _source_zone_prose() -> str:
+#: Directories seeded out of the app bundle the first time a repo is
+#: materialized, mapping the name each takes at the repo root to the
+#: bundle-relative path it is copied from. Once seeded they are the facility's:
+#: nothing rewrites them, and nothing puts one back that the facility removed.
+#: Like the tables above this one DRIVES its consumers — the seeding, the
+#: ``--force`` promise, the README's zone row and the tests all iterate it — so
+#: a second seeded directory joins every one of them by being listed here.
+WRITE_ONCE_DIRS: Mapping[str, str] = {MCP_SERVER_SOURCE_DIR: "mcp_servers"}
+
+
+def _source_zone_prose(seeded: tuple[str, ...] = ()) -> str:
     """The SOURCE row of the README's zone table, derived from the categories above.
 
     The source zone is exactly what a materialization owns
     (:data:`~.profile_cmd.MATERIALIZED_SOURCE_ENTRIES`), plus the repo shell
-    ``init`` authors once (:data:`WRITE_ONCE_FILES`), plus the CI pair the
+    ``init`` authors once (:data:`WRITE_ONCE_FILES`), plus whatever
+    :data:`WRITE_ONCE_DIRS` seeded into THIS repo, plus the CI pair the
     scaffolding engine emits (:data:`CI_EMITTED_PATHS`) — the same
     derive-from-the-tables rule :data:`PRESERVED_BY_FORCE` follows, for the same
     reason. Naming the zone by hand is how this table came to advertise
@@ -404,6 +519,11 @@ def _source_zone_prose() -> str:
     a trailing slash — ``.env.example`` has one, so the split holds for every
     entry in that table. Write-once and CI entries are files by construction.
 
+    ``seeded`` is what this repo actually received, not the seeding table: an
+    app template that ships no server package seeds nothing, and its README must
+    not name a directory the operator will not find. The names arrive already
+    filtered, so the row grows only where the directory does.
+
     Imported inside the body rather than at module scope: ``profile_cmd`` pulls
     the build-profile chain in with it, which ``osprey --help`` must stay off
     (TR-2), and this is only ever called while a repo is being written.
@@ -413,6 +533,7 @@ def _source_zone_prose() -> str:
     entries = [
         f"{name}/" if not Path(name).suffix else name for name in MATERIALIZED_SOURCE_ENTRIES
     ]
+    entries.extend(f"{name}/" for name in seeded)
     entries.extend(WRITE_ONCE_FILES)
     entries.extend(CI_EMITTED_PATHS)
     return ", ".join(f"`{name}`" for name in entries)
@@ -422,13 +543,16 @@ def _source_zone_prose() -> str:
 _UNTOUCHED_BY_INIT: tuple[str, ...] = (".env", ".git", f"{STATE_DIR}/", f"{BUILD_OUTPUT_DIR}/")
 
 #: Everything a re-materialization leaves intact — DERIVED from the categories
-#: above rather than declared beside them. A new write-once file appears here
-#: the moment it is added to the table that writes it, which is the property a
-#: hand-maintained list cannot offer.
+#: above rather than declared beside them. A new write-once file — or a new
+#: seeded directory — appears here the moment it is added to the table that
+#: writes it, which is the property a hand-maintained list cannot offer. The
+#: seeded directories carry a trailing slash, both because that is what they
+#: are and because the survival tests read the slash as "put a file inside it".
 PRESERVED_BY_FORCE: tuple[str, ...] = (
     *_UNTOUCHED_BY_INIT,
     *WRITE_ONCE_FILES,
     *CI_EMITTED_PATHS,
+    *(f"{name}/" for name in WRITE_ONCE_DIRS),
 )
 
 _PRESERVED_PROSE = ", ".join(PRESERVED_BY_FORCE)
@@ -670,24 +794,33 @@ def _reinstate_held_source_zone(target: Path) -> None:
     version simply has no place for. So the holding directory is removed only
     when the restore emptied it, and otherwise stays, named, for its owner to
     decide about. It is git-ignored, so leaving it costs nothing.
-    """
-    import shutil
 
+    Clearing what stands in a held entry's way is
+    :func:`~.build_cmd._clear_leftover`'s job, for the same reason the swap
+    hands it the same job: every removal here is followed by a rename onto the
+    name that was removed, so a half-written output nobody can delete — a
+    container's root-owned files, an NFS sillyrename — must be moved out of the
+    way instead of silently left to fail that rename. Failing to put a source
+    zone back is the one outcome this function must never reach quietly.
+    """
+    from osprey.utils.workspace import STATE_DIR_NAME
+
+    from .build_cmd import _clear_leftover
     from .profile_cmd import MATERIALIZED_SOURCE_ENTRIES
 
     stash = target / HELD_SOURCE_ZONE_DIRNAME
     if not stash.is_dir():
         return
 
+    # The STATE zone, for the same reasons the swap parks there: git-ignored,
+    # same filesystem, and not part of what a re-materialization replaces.
+    aside_root = target / STATE_DIR_NAME
     for name in MATERIALIZED_SOURCE_ENTRIES:
         held = stash / name
         if not held.exists():
             continue
         destination = target / name
-        if destination.is_dir():
-            shutil.rmtree(destination, ignore_errors=True)
-        else:
-            destination.unlink(missing_ok=True)
+        _clear_leftover(destination, aside_root=aside_root)
         held.rename(destination)
 
     unrecognized = sorted(entry.name for entry in stash.iterdir())
@@ -699,7 +832,11 @@ def _reinstate_held_source_zone(target: Path) -> None:
             "directory yourself.",
         )
         return
-    shutil.rmtree(stash, ignore_errors=True)
+    # Not best-effort either: while this directory stands, every verb finds the
+    # repo through it and refuses (:func:`~.repo_resolver.find_repo_root`), so a
+    # stash that survives its own emptying leaves the repo exactly as unusable
+    # as the crash did.
+    _clear_leftover(stash, aside_root=aside_root)
 
 
 @contextmanager
@@ -1037,7 +1174,7 @@ def _point_at_set(ctx: click.Context, param: click.Parameter, value: str | None)
 #: prevent. The copy is held to the original by
 #: ``test_the_refused_flags_are_the_documented_shorthands``, so a shorthand
 #: added there and not here fails a test rather than going quietly uncaught.
-_SHORTHAND_FLAG_KEYS = ("provider", "model", "channel_finder_mode", "connector")
+_SHORTHAND_FLAG_KEYS = ("provider", "model", "channel_finder_mode", "connector", "port_base")
 
 
 def _reject_shorthand_flags(command: Callable) -> Callable:
@@ -1078,7 +1215,9 @@ def _reject_shorthand_flags(command: Callable) -> Callable:
     help="Inline scalar/list override baked into the emitted profile (repeatable). "
     "RHS parsed as YAML. Top-level shorthands: provider, model, "
     "channel_finder_mode, connector (the control system to talk to — mock, "
-    "epics, virtual_accelerator, doocs).",
+    "epics, virtual_accelerator, doocs; a deployment being pointed at its "
+    "stand-in may also set live_standin), port_base (move the whole "
+    "deployment off the default 10000 port block, e.g. --set port_base=42000).",
 )
 @click.option(
     "--list-presets",
@@ -1180,6 +1319,12 @@ def init(
     # mid-replacement is a whole repo again, so the refusals below judge the
     # deployment the operator has rather than the wreck of one.
     _reinstate_held_source_zone(target)
+    # Write-once is a promise about the REPO, not about one materialization, so
+    # the question has to be asked here — before `_replacing_source_zone` moves
+    # profile.yml aside. Inside the materializer a `--force` or `--reset` run
+    # always looks like a first init, and would re-seed a directory the operator
+    # deliberately deleted.
+    first_ever = not (target / "profile.yml").is_file()
     # `--reset` implies `--force`'s file half. Its promise is "start over on
     # this name", and a source zone left standing from the last deployment is
     # not a start over — an edited profile.yml or a file an older preset wrote
@@ -1208,6 +1353,7 @@ def init(
                         overrides,
                         set_pairs,
                         profile_name=_directory_derived_name(target.name),
+                        seed_dirs=WRITE_ONCE_DIRS if first_ever else None,
                     )
             except BuildProfileError as e:
                 # Reaching here means a packaging problem, not a user mistake —
@@ -1223,11 +1369,11 @@ def init(
             phase.step(f"settings and data from preset {preset}")
 
             name = materialized.profile_name
-            # Driven off the table rather than three calls written out: the set of
+            # Driven off the table rather than four calls written out: the set of
             # files this command authors and the set the --force promise names are
             # then the same object, not two lists that agree today.
             for filename, build_text in WRITE_ONCE_FILES.items():
-                _write_if_absent(target / filename, build_text(name))
+                _write_if_absent(target / filename, build_text(name, materialized.seeded))
             for relative in _STATE_DIRS:
                 (target / relative).mkdir(parents=True, exist_ok=True)
 
@@ -1243,6 +1389,17 @@ def init(
             git_note = _bootstrap_git(target, no_git=no_git)
 
         _report(target, materialized, deploy_files, git_note)
+
+        # After the report, and about the repo that was already here rather
+        # than the one just written: a `--force` run restores the block that
+        # names the server, and never the package it starts.
+        for entry, module in _missing_server_packages(materialized.resolved.mcp_servers, target):
+            output.warn(
+                f"profile.yml declares {entry} but "
+                f"{MCP_SERVER_SOURCE_DIR}/{module}/ is missing; "
+                "delete the block too, or copy the package back.",
+                "Every session otherwise waits 20 s for a server that cannot start.",
+            )
 
         # After the repo exists and before anything is built or started. The
         # repo root is what `reset_deployment` reads to resolve the project
@@ -1433,6 +1590,57 @@ def _emit_ci(target: Path, *, declared: bool) -> list[ScaffoldedFile]:
     return scaffold_deploy_files(target, force=False)
 
 
+def _missing_server_packages(
+    resolved_mcp_servers: Mapping[str, McpServerDef],
+    target: Path,
+) -> list[tuple[str, str]]:
+    """The servers this profile declares whose package is not in the repo.
+
+    The entry and the package it starts are two halves of one thing, and only
+    one half is write-once: a repo whose ``mcp_servers/<module>/`` was deleted
+    still gets its ``profile.yml`` written again by ``--force``, live block and
+    all. Nothing puts the package back, and the sessions that follow each wait
+    out the client's start-up timeout on a command that cannot import anything.
+
+    Only the pairing this repo owns is judged. A server reached over the
+    network has no package here, and one started from a program already on the
+    host has one this command cannot see, so both read as fine. What is left is
+    the shape the build supports: ``-m <module>`` run against the copy of this
+    directory the build puts under the output zone, which is what makes the
+    module name in the arguments a directory name in the repo.
+
+    Args:
+        resolved_mcp_servers: The ``mcp_servers`` block of the resolved profile.
+        target: The repo root the packages sit in.
+
+    Returns:
+        One ``(entry name, module)`` pair per unpaired entry, in profile order.
+    """
+    convention = convention_for(MCP_SERVER_SOURCE_DIR)
+    if convention is None:  # pragma: no cover - the row is part of the table
+        return []
+    # What the build copies the packages into, and so what an entry's
+    # PYTHONPATH says when the package it wants is one of this repo's.
+    build_zone = f"/{BUILD_OUTPUT_DIR}/{convention.destination}"
+
+    unpaired: list[tuple[str, str]] = []
+    for name, server in resolved_mcp_servers.items():
+        if server.url:
+            continue
+        if build_zone not in server.env.get("PYTHONPATH", ""):
+            continue
+        args = list(server.args)
+        if "-m" not in args:
+            continue
+        position = args.index("-m") + 1
+        if position == len(args):
+            continue
+        module = args[position]
+        if not (target / MCP_SERVER_SOURCE_DIR / module).is_dir():
+            unpaired.append((name, module))
+    return unpaired
+
+
 def _report(
     target: Path,
     materialized: _MaterializedProfile,
@@ -1454,6 +1662,7 @@ def _report(
     pin.
     """
     from .phase_reporter import current_reporter
+    from .profile_card import print_profile_card
     from .profile_cmd import _skipped_keys_note
 
     echo = current_reporter().echo
@@ -1471,6 +1680,12 @@ def _report(
 
     for line in _ci_report(deploy_files, target):
         echo(line)
+
+    # Last, so the report keeps its shape: files first, then what the profile
+    # those files describe consists of. It stays on screen through everything a
+    # chained `--up` does, which is the point — the composition is what someone
+    # reads while the containers pull.
+    print_profile_card(materialized.resolved, materialized.persona_deltas)
 
 
 def _entry_list(target: Path, materialized: _MaterializedProfile) -> list[str]:

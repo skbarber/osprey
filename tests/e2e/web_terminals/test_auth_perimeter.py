@@ -128,8 +128,9 @@ USERS = ("alice", "bob")
 #: The preset the repo is materialized from — the smallest one that builds.
 PRESET = "hello-world"
 
-# Ports well clear of every other stack a developer may have up (the tutorial
-# stacks hold 5064/5080/5432, and the lifecycle fixtures the 9000s/19081).
+# Ports well clear of every other stack a developer may have up: the block a
+# default-base deployment claims (10000-10999), the CA port 5064, and the
+# registry pin 19081.
 NGINX_PORT = 19180
 AUTH_PORT = 19170
 BASE_PORTS = {
@@ -145,10 +146,10 @@ BASE_PORTS = {
 UPSTREAM_MARKER = "osprey-e2e-auth-perimeter upstream"
 
 AUTH_IMAGE_TAG = f"{PREFIX}-assistant-auth:local"
-# `<catalog project>-<persona>:local`, exactly as resolve_personas derives a
+# `<catalog project>:local`, exactly as resolve_personas derives a
 # local-mode persona tag. Teardown-only, but spelled the way the render spells
 # it so an `rmi` here removes the tag this deploy actually built.
-PERSONA_IMAGE_TAG = f"{PERSONA_PROJECT}-{PERSONA}:local"
+PERSONA_IMAGE_TAG = f"{PERSONA_PROJECT}:local"
 
 NGINX_C = f"{PREFIX}-nginx"
 AUTH_C = f"{PREFIX}-auth"
@@ -331,6 +332,14 @@ def _override_text() -> str:
     ``deployed_services: []`` drops everything the preset would otherwise
     deploy: this lane deploys the web tier and nothing else, and a backend
     service would only add containers and bound ports to a proof about nginx.
+
+    Telemetry goes off with them, and for the same reason. The preset ships it
+    enabled against ``backend: openobserve`` with no explicit ``endpoint``, which
+    derives the store's address from THIS deploy — so dropping the store while
+    leaving the block on describes an exporter aimed at a port this lane binds
+    nothing to. It is also refused before it gets there: the ingest token is
+    minted by the store, and preflight will not generate ``.env.users`` for a
+    telemetry block naming a credential no deploy on this config can issue.
     """
     return yaml.safe_dump(
         {
@@ -341,6 +350,7 @@ def _override_text() -> str:
                 "facility.timezone": "UTC",
                 "deploy.fqdn": "127.0.0.1",
                 "deployed_services": [],
+                "claude_code.telemetry.enabled": False,
                 "modules.web_terminals": {
                     "enabled": True,
                     "image_source": "local",

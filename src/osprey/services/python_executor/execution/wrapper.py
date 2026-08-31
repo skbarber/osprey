@@ -5,11 +5,195 @@ Wraps agent-generated Python code for execution in a host subprocess.
 """
 
 import textwrap
+from collections.abc import Iterable
 from pathlib import Path
 
+from osprey.services.python_executor.execution.fs_guard import (
+    DEFAULT_DENYLIST_PREFIX,
+    EXECUTOR_PATCH_TARGETS,
+    render_fs_guard,
+)
+from osprey.services.python_executor.execution.net_guard import render_net_guard
 from osprey.utils.logger import get_logger
 
 logger = get_logger("execution_wrapper")
+
+
+#: Message raised by every refused write in a readonly run. Tests match on
+#: it, so keep it stable. The MCP tool layer also matches on it to recognise a
+#: runtime refusal in the subprocess's stderr, so that a write blocked *during*
+#: execution reaches the operator alert and the audit log the same way one
+#: blocked before execution does.
+READONLY_REFUSAL = (
+    "readonly execution mode: control-system writes are refused — "
+    "resubmit with execution_mode='readwrite' (human approval required) "
+    "if the write is intended"
+)
+
+#: The substring every readonly refusal message carries, whichever layer
+#: raised it. The wrapper guard raises :data:`READONLY_REFUSAL`; the connector
+#: reference monitor raises its own, channel-named message
+#: (``osprey_connectors.control_system.base._writes_disabled_result``). Both
+#: reach the tool layer only as a traceback on the subprocess's stderr, so the
+#: tool matches on what they share rather than on either full message — which
+#: is what lets a write refused through the *approved* ``write_channel`` path
+#: be alerted and audited exactly like one refused by the guard.
+#:
+#: A test pins the connector's message against this constant, so rewording
+#: either side without the other fails rather than silently stopping the alert.
+READONLY_REFUSAL_MARKER = "readonly execution mode"
+
+#: Refusal prefix the filesystem guard carries in a readonly run. It embeds
+#: :data:`READONLY_REFUSAL_MARKER` so that a write refused into the render zone
+#: or the profile sources reaches the operator alert and the audit ledger by the
+#: same path a refused control-system write does — ``report_runtime_refusal``
+#: scans the subprocess's stderr for that marker and nothing else.
+READONLY_FS_REFUSAL_PREFIX = f"Refused ({READONLY_REFUSAL_MARKER}):"
+
+#: The same refusal in a readwrite run. It names the protected path and says
+#: nothing about the mode: the run *is* readwrite, and telling the agent to
+#: "resubmit with execution_mode='readwrite'" would be advice it has already
+#: taken. Deliberately NOT carrying the readonly marker — see
+#: :meth:`ExecutionWrapper._get_filesystem_guard` for what that costs and why it
+#: is still the right trade.
+READWRITE_FS_REFUSAL_PREFIX = DEFAULT_DENYLIST_PREFIX
+
+
+#: Every entry point a readonly run refuses, as ``(dotted target, attributes)``.
+#: This table is the canonical machine-readable answer to "what counts as a
+#: control-system write from Python" — the docs list is written from it, and a
+#: library added here needs no other change to be enforced.
+#:
+#: The dotted target is resolved by importing its longest importable prefix and
+#: then walking attributes, so a module (``epics``), a module attribute
+#: (``epics.ca``) and a class (``p4p.client.thread.Context``) are all spelled
+#: the same way. Attributes that do not exist on the resolved object are
+#: skipped, which is what makes listing several client flavours free: an
+#: uninstalled or older library simply contributes nothing.
+#:
+#: Patching the object in ``sys.modules`` — rather than inspecting the source —
+#: is what makes this immune to spelling. ``importlib.import_module("epics")``,
+#: ``from epics import caput as _w`` and ``getattr(epics, "ca" + "put")`` all
+#: end up holding the refusing function, because they all resolve through the
+#: one module object this mutates.
+_READONLY_WRITE_TARGETS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # --- EPICS Channel Access (pyepics) ---
+    ("epics", ("caput", "caput_many")),
+    ("epics.PV", ("put",)),
+    ("epics.ca", ("put", "put_complete")),
+    # --- PVAccess (p4p): one client Context per concurrency flavour, plus the
+    # server-side SharedPV, which puts values on the wire when it is opened or
+    # posted to.
+    ("p4p.client.thread.Context", ("put", "rpc")),
+    ("p4p.client.asyncio.Context", ("put", "rpc")),
+    ("p4p.client.cothread.Context", ("put", "rpc")),
+    ("p4p.server.raw.SharedPV", ("post", "open")),
+    ("p4p.server.thread.SharedPV", ("post", "open")),
+    ("p4p.server.asyncio.SharedPV", ("post", "open")),
+    # --- Channel Access (caproto) ---
+    ("caproto.sync.client", ("write", "write_read")),
+    ("caproto.threading.client.PV", ("write", "write_all")),
+    ("caproto.threading.client.Batch", ("write",)),
+    ("caproto.asyncio.client.PV", ("write",)),
+    # --- PVAccess (pvaPy). Its ``Channel`` carries one typed setter per scalar
+    # and array type, so the ``put`` prefix is swept dynamically below rather
+    # than enumerated here; ``put`` itself is listed so the table still names
+    # the library.
+    ("pvaccess.Channel", ("put", "putGet")),
+    # --- Tango. ``command_inout`` is included because a Tango command is an
+    # action on the device, not a read — refusing it is the readonly reading.
+    # ``PyTango`` is the legacy alias for the same package; when both import,
+    # they resolve to the same class object and the second patch is a no-op.
+    (
+        "tango.DeviceProxy",
+        (
+            "write_attribute",
+            "write_attributes",
+            "write_attribute_asynch",
+            "write_attributes_asynch",
+            "write_read_attribute",
+            "write_read_attributes",
+            "write_pipe",
+            "put_property",
+            "command_inout",
+            "command_inout_asynch",
+        ),
+    ),
+    ("tango.AttributeProxy", ("write", "write_asynch", "write_read")),
+    (
+        "PyTango.DeviceProxy",
+        (
+            "write_attribute",
+            "write_attributes",
+            "write_read_attribute",
+            "command_inout",
+        ),
+    ),
+    # --- Routes out of Python. A readonly run has no legitimate use for these:
+    # ``import subprocess`` is already refused in every mode by the static
+    # import check, so anything reaching the process-spawning surface at
+    # runtime got there by an evasion. ``os.fork`` is deliberately absent —
+    # forking alone cannot run a new program, and refusing it would break
+    # ordinary multiprocessing for no security gain, since the exec half of
+    # every fork+exec is refused here.
+    (
+        "subprocess",
+        (
+            "run",
+            "Popen",
+            "call",
+            "check_call",
+            "check_output",
+            "getoutput",
+            "getstatusoutput",
+        ),
+    ),
+    ("_posixsubprocess", ("fork_exec",)),
+    # ``os`` re-exports these from ``posix``; patching only ``os`` would leave
+    # ``import posix; posix.system(...)`` open, so both modules are swept.
+    (
+        "os",
+        (
+            "system",
+            "popen",
+            "execl",
+            "execle",
+            "execlp",
+            "execlpe",
+            "execv",
+            "execve",
+            "execvp",
+            "execvpe",
+            "spawnl",
+            "spawnle",
+            "spawnlp",
+            "spawnlpe",
+            "spawnv",
+            "spawnve",
+            "spawnvp",
+            "spawnvpe",
+            "posix_spawn",
+            "posix_spawnp",
+        ),
+    ),
+    (
+        "posix",
+        (
+            "system",
+            "popen",
+            "execv",
+            "execve",
+            "posix_spawn",
+            "posix_spawnp",
+        ),
+    ),
+    # --- Loading a shared library sidesteps every Python-level guard above:
+    # ``ctypes.CDLL("libca")`` reaches Channel Access without importing a
+    # single client package. ``LibraryLoader.__getattr__`` is patched too,
+    # because ``ctypes.cdll.libca`` never goes through ``CDLL`` by that name.
+    ("ctypes", ("CDLL", "PyDLL", "WinDLL", "OleDLL")),
+    ("ctypes.LibraryLoader", ("LoadLibrary", "__getattr__")),
+)
 
 
 class ExecutionWrapper:
@@ -24,14 +208,63 @@ class ExecutionWrapper:
     - Error handling
     """
 
-    def __init__(self, limits_validator=None):
+    def __init__(
+        self,
+        limits_validator=None,
+        execution_mode: str = "readonly",
+        protected_roots: Iterable[str | Path] = (),
+        permitted_roots: Iterable[str | Path] = (),
+        perimeter_denied_ports: Iterable[int] = (),
+    ):
         """
         Initialize the wrapper.
 
         Args:
             limits_validator: Optional LimitsValidator instance for channel checking
+            execution_mode: The mode the script was submitted under. A
+                ``"readonly"`` run gets the readonly guard (every direct
+                control-system write entry point refuses at runtime); the
+                default is readonly so a wrapper built without a mode fails
+                closed. It does **not** decide whether the filesystem guard is
+                installed — that one is unconditional — only how its refusals
+                are worded.
+            protected_roots: Absolute, already-resolved paths executed code may
+                not write into, in either mode: the render zone and the profile
+                source set. This is the self-change boundary, not a
+                control-system write gate, which is why the mode does not enter
+                into it. Resolved by the parent
+                (:func:`osprey.mcp_server.python_executor.executor.resolve_protected_roots`)
+                and baked into the emitted guard as literals — a child that
+                re-derived them could be pointed at different ones by the very
+                code the guard exists to contain. Empty leaves the guard
+                installed and refusing nothing, which is what a caller that
+                knows no project layout (a unit test, a bare ``ExecutionWrapper()``)
+                should get.
+            permitted_roots: Absolute, already-resolved paths carved back out of
+                the protected set — the agent's own data zone. The execution
+                folder is added to this in :meth:`_get_filesystem_guard`, since
+                that is the one root the wrapper knows and the parent does not
+                until the folder exists.
+            perimeter_denied_ports: Host ports on this machine that executed code
+                may not connect to — the web ports of a deployment whose
+                perimeter authenticates on the caller's behalf, where a request
+                made from inside a terminal container would arrive already
+                credentialed as whoever owns the port. Resolved by the parent
+                (:func:`osprey.mcp_server.python_executor.executor._perimeter_denied_ports`,
+                which reads the deployment's stamp) and passed as literals for
+                the same reason ``protected_roots`` is: a child that re-derived
+                the set could equally derive an empty one. Empty — the default,
+                and what every non-open posture yields — means no ports are
+                denied and no network guard is emitted at all
+                (:meth:`_get_net_guard`); a non-empty set puts the guard in
+                front of user code in **every** execution mode, because the
+                perimeter is orthogonal to the write posture.
         """
         self.limits_validator = limits_validator
+        self.execution_mode = execution_mode
+        self.protected_roots = tuple(str(root) for root in protected_roots)
+        self.permitted_roots = tuple(str(root) for root in permitted_roots)
+        self.perimeter_denied_ports = tuple(perimeter_denied_ports)
 
     def create_wrapper(self, user_code: str, execution_folder: Path | None = None) -> str:
         """
@@ -49,6 +282,9 @@ class ExecutionWrapper:
         imports = self._get_imports()
         environment_setup = self._get_environment_setup(execution_folder)
         limits_checking = self._get_limits_checking_monkeypatch()
+        readonly_guard = self._get_readonly_guard()
+        filesystem_guard = self._get_filesystem_guard(execution_folder)
+        net_guard = self._get_net_guard()
         metadata_init = self._get_metadata_init()
         save_artifact_injection = self._get_save_artifact_injection()
         output_capture_start = self._get_output_capture_start()
@@ -61,6 +297,9 @@ class ExecutionWrapper:
                 imports,
                 environment_setup,
                 limits_checking,
+                readonly_guard,
+                filesystem_guard,
+                net_guard,
                 metadata_init,
                 save_artifact_injection,
                 output_capture_start,
@@ -379,6 +618,231 @@ if not _execution_dir.exists():
         """
         ).strip()
 
+    def _get_readonly_guard(self) -> str:
+        """Generate the readonly-run guard; empty for a readwrite run.
+
+        The pre-execution regex sees only the standard spellings of a write.
+        ``from epics import caput as _w`` evades it, so a readonly run is
+        enforced here, at runtime: every entry point in
+        :data:`_READONLY_WRITE_TARGETS` is replaced with a function that
+        refuses. The guard is emitted *before* user code and *after* the limits
+        monkeypatch, so an alias bound in the user code late-binds to the
+        refusing function, and the refusal — not a limits check — is the first
+        thing a write hits. It is deliberately independent of the limits
+        validator: a deployment with limits checking off is exactly the one
+        with nothing else standing behind the regex.
+
+        The table covers three kinds of route: the control-system client
+        libraries themselves, the process-spawning surface that could shell out
+        to ``caput``, and ``ctypes``, which reaches Channel Access without
+        importing any client package at all. It is emitted into the script
+        rather than applied here because the objects to patch only exist in the
+        subprocess.
+
+        The connector side of the same contract lives in
+        ``osprey_connectors.control_system.base`` (refuses ``write_channel``
+        when ``OSPREY_EXECUTION_MODE`` says readonly) and in the EPICS
+        connector's gateway selection (stays on the read_only gateway).
+        """
+        if self.execution_mode != "readonly":
+            return ""
+
+        guard = f"""
+            # Readonly run: refuse every control-system write entry point, and
+            # every route out of Python that could reach one. Installed before
+            # user code, so an alias bound later resolves here.
+            import importlib as _osprey_importlib
+
+            # CPython resolves ``platform.uname().processor`` lazily, by
+            # shelling out to ``uname -p`` on first read — and h5py reads it
+            # while ``import at`` initialises its type layer, so the subprocess
+            # refusal below would kill the import of a pure-simulation library.
+            # Resolve it once now, while spawning is still allowed; the cached
+            # value answers every later lookup without touching subprocess.
+            import platform as _osprey_platform
+
+            _osprey_platform.processor()
+            del _osprey_platform
+
+            _osprey_targets = {_READONLY_WRITE_TARGETS!r}
+
+
+            def _osprey_readonly_refuse(*_args, **_kwargs):
+                raise RuntimeError("@@REFUSAL@@")
+
+
+            def _osprey_resolve(dotted):
+                \"\"\"Import the longest importable prefix of *dotted*, then walk attributes.
+
+                One spelling for modules, module attributes and classes alike.
+                Returns None when the target is not present, which is the
+                ordinary case for most of the table — an uninstalled library,
+                or an optional flavour of an installed one. That case has to
+                stay SILENT: it is true on every ordinary deployment, and a
+                warning per absent target would print on every readonly run.
+                \"\"\"
+                parts = dotted.split(".")
+                for _cut in range(len(parts), 0, -1):
+                    try:
+                        obj = _osprey_importlib.import_module(".".join(parts[:_cut]))
+                    except ImportError:
+                        continue
+                    for _attr in parts[_cut:]:
+                        try:
+                            obj = getattr(obj, _attr)
+                        except AttributeError:
+                            # An importable parent without the child: the
+                            # target does not exist here either.
+                            return None
+                    return obj
+                return None
+
+
+            for _osprey_dotted, _osprey_attrs in _osprey_targets:
+                try:
+                    _osprey_obj = _osprey_resolve(_osprey_dotted)
+                    if _osprey_obj is None:
+                        continue
+                    for _osprey_attr in _osprey_attrs:
+                        if hasattr(_osprey_obj, _osprey_attr):
+                            setattr(_osprey_obj, _osprey_attr, _osprey_readonly_refuse)
+                    # pvaPy spells one typed setter per scalar and array type
+                    # (putDouble, putScalarArray, ...). Enumerating them would
+                    # go stale against the binding; the prefix will not.
+                    if _osprey_dotted == "pvaccess.Channel":
+                        for _osprey_attr in dir(_osprey_obj):
+                            if _osprey_attr.startswith("put"):
+                                setattr(_osprey_obj, _osprey_attr, _osprey_readonly_refuse)
+                except Exception as _osprey_guard_error:
+                    # A target that cannot be patched must not stop the ones
+                    # after it, and the operator needs to know which one.
+                    print(
+                        f"⚠️  readonly guard ({{_osprey_dotted}}) failed: {{_osprey_guard_error}}"
+                    )
+
+            del _osprey_importlib, _osprey_targets, _osprey_resolve
+        """
+        return textwrap.dedent(guard).strip().replace("@@REFUSAL@@", READONLY_REFUSAL)
+
+    def _get_filesystem_guard(self, execution_folder: Path | None) -> str:
+        """Generate the runtime filesystem guard. Emitted in EVERY mode.
+
+        This is a different boundary from the readonly guard above, and the two
+        are deliberately not folded together. The readonly guard answers "may
+        this run touch the control system"; this one answers "may this run
+        rewrite the thing that builds it". A readwrite run has human approval to
+        move a magnet — it has no approval to overwrite ``profile.yml`` or the
+        render zone, and there is no mode in which it does. So the guard is
+        installed unconditionally and the mode selects only the wording:
+
+        * readonly → :data:`READONLY_FS_REFUSAL_PREFIX`, which carries
+          :data:`READONLY_REFUSAL_MARKER`. That marker is what
+          ``report_runtime_refusal`` scans the subprocess's stderr for, so a
+          refused write into the render zone is alerted and written to the
+          audit ledger exactly like a refused control-system write.
+        * readwrite → :data:`READWRITE_FS_REFUSAL_PREFIX`, which names the
+          protected path and makes no claim about the mode.
+
+        **Readwrite refusals are not audited**, and that is a decision rather
+        than an oversight. The audit path is reached only by the readonly
+        marker, and the marker is a factual claim about the run: carrying it in
+        a readwrite run would put "readonly execution mode" in front of an
+        operator whose run was approved for writes, and would record the
+        refusal under a layer that names the wrong gate ("BLOCKED a
+        control-system write in readwrite mode"). The refusal itself still
+        holds and still reaches the agent and the operator as the traceback in
+        the run's stderr. Auditing a protected-path refusal in its own right
+        wants its own layer and its own marker on both ends — the ledger's
+        writer and the tool that matches it — which is a change to files this
+        does not own.
+
+        The roots are resolved in the parent and interpolated as literals; the
+        child never re-derives them. ``permitted_roots`` is checked before
+        ``protected_roots`` by the renderer, which is what lets the execution
+        folder and the agent-data zone keep taking writes while sitting under a
+        project root whose render zone is refused.
+
+        **This is defense in depth, not a security boundary.** The guard is
+        emitted *into* the child and installs itself in the same module
+        namespace as the user code, restore handle and all, so code that knows
+        it is there disarms it in two lines::
+
+            _restore_patched_targets()
+            open('bui' + 'ld/x', 'w')     # unguarded
+
+        Nothing rendered into the child can be hidden from the child, so that
+        is a property of the approach rather than a bug in it, and a
+        characterization test pins it
+        (``tests/services/python_executor/test_fs_guard.py::TestTamperLimit``)
+        so the limit stays stated rather than assumed. What this guard closes
+        is the gap the static pre-execution walker cannot see — the
+        concatenated or computed path, and the ordinary accident of writing one
+        directory too high. What contains code that is deliberately attacking
+        the boundary is the OS: the container's privilege split, where the
+        render zone and the profile sources belong to a different user than the
+        one executing agent code.
+
+        Args:
+            execution_folder: The run's own output directory, permitted so the
+                wrapper's ``save_artifact`` and figure writes keep working. It
+                is resolved here — it is the one root this method derives
+                rather than receives.
+
+        Returns:
+            The guard source, ready to splice in ahead of the user code.
+        """
+        permitted = list(self.permitted_roots)
+        if execution_folder is not None:
+            permitted.append(str(Path(execution_folder).resolve()))
+
+        prefix = (
+            READONLY_FS_REFUSAL_PREFIX
+            if self.execution_mode == "readonly"
+            else READWRITE_FS_REFUSAL_PREFIX
+        )
+
+        return render_fs_guard(
+            default_deny=False,
+            permitted_roots=permitted,
+            protected_roots=self.protected_roots,
+            read_roots=(),
+            patch_targets=EXECUTOR_PATCH_TARGETS,
+            refusal_prefix=prefix,
+        ).strip()
+
+    def _get_net_guard(self) -> str:
+        """Generate the perimeter network guard; empty when no ports are denied.
+
+        Emitted in **every** execution mode, exactly like the filesystem guard
+        and deliberately unlike the readonly guard: the mode answers "may this
+        run touch the control system", while the perimeter answers "may this
+        run talk to the deployment's own web edge" — a readwrite run has human
+        approval to move a magnet, not to originate requests that nginx would
+        credential on the caller's behalf. What gates emission is solely
+        whether the parent handed this wrapper a non-empty deny-list, which
+        only an open-perimeter deployment does.
+
+        Splice position (kept deterministic by :meth:`create_wrapper`'s
+        assembly list): directly **after** the filesystem guard and before the
+        wrapper's own metadata/artifact machinery, so both guards form one
+        contiguous block installed ahead of any code that could open a
+        connection. Order between the two guards carries no dependency — they
+        patch disjoint entry points — but a fixed position keeps the emitted
+        script diffable. The readonly ``_READONLY_WRITE_TARGETS`` spawn/ctypes
+        table is untouched by this guard: multiprocessing and h5py-style
+        compute keep working in every mode, which the net-guard test suite
+        pins with a real ``Pool``.
+
+        Returns:
+            The guard source ready to splice, or ``""`` when
+            ``perimeter_denied_ports`` is empty — the renderer refuses an
+            empty set rather than emitting an inert guard, so skipping here is
+            the one honest spelling of "no perimeter is open".
+        """
+        if not self.perimeter_denied_ports:
+            return ""
+        return render_net_guard(denied_ports=self.perimeter_denied_ports).strip()
+
     def _get_metadata_init(self) -> str:
         """Initialize execution metadata tracking."""
         return textwrap.dedent(
@@ -402,178 +866,16 @@ if not _execution_dir.exists():
         ).strip()
 
     def _get_save_artifact_injection(self) -> str:
-        """Generate a save_artifact() function for use inside the subprocess.
+        """The ``save_artifact()`` the subprocess exposes to user code.
 
-        The function serializes objects to files in an ``artifacts/`` subdirectory
-        and writes a ``artifacts/manifest.json`` listing all saved artifacts.
-        The executor collects these post-execution, mirroring the figure collection
-        pattern.
+        Shared with the visualization sandbox via
+        :data:`osprey.stores.artifact_manifest.SAVE_ARTIFACT_SOURCE`; the
+        executor collects what it wrote post-execution, mirroring the figure
+        collection pattern.
         """
-        return textwrap.dedent(
-            """
-            # Inject save_artifact() for subprocess execution
-            def save_artifact(obj, title="Untitled", description="", artifact_type=None, category=""):
-                \"\"\"Save an object as a gallery artifact.
+        from osprey.stores.artifact_manifest import SAVE_ARTIFACT_SOURCE
 
-                Supported types:
-                  - plotly Figure -> interactive HTML
-                  - matplotlib Figure -> PNG image
-                  - pandas DataFrame -> HTML table
-                  - str -> markdown or HTML (auto-detected)
-                  - dict / list -> JSON
-                  - bytes -> binary file
-                  - numpy ndarray -> .npy file
-
-                Args:
-                    obj: The object to save.
-                    title: Human-readable title shown in the gallery.
-                    description: Optional longer description.
-                    artifact_type: Override the auto-detected type.
-                    category: Optional category key for gallery grouping.
-                \"\"\"
-                import json as _json
-                import uuid as _uuid
-                from pathlib import Path as _Path
-
-                # Use _execution_dir if set, else cwd
-                _art_base = globals().get('_execution_dir', _Path.cwd())
-                artifacts_dir = _art_base / "artifacts"
-                artifacts_dir.mkdir(exist_ok=True)
-
-                art_id = _uuid.uuid4().hex[:12]
-
-                # Slugify title for filename
-                _slug = title.lower().strip()
-                _slug = "".join(c if c.isalnum() or c in (" ", "-", "_") else "" for c in _slug)
-                _slug = _slug.replace(" ", "_")[:60] or "artifact"
-
-                # Smart type detection and serialization
-                content = None
-                detected_type = None
-                filename = None
-                mime_type = None
-
-                # Plotly Figure
-                try:
-                    import plotly.graph_objects as _go
-                    if isinstance(obj, _go.Figure):
-                        content = obj.to_html(include_plotlyjs=False, full_html=True).encode()
-                        detected_type = "plot_html"
-                        filename = f"{art_id}_{_slug}.html"
-                        mime_type = "text/html"
-                except ImportError:
-                    pass
-
-                # Matplotlib Figure
-                if content is None:
-                    try:
-                        import matplotlib.figure as _mfig
-                        if isinstance(obj, _mfig.Figure):
-                            import io as _io
-                            _buf = _io.BytesIO()
-                            obj.savefig(_buf, format="png", dpi=150, bbox_inches="tight")
-                            _buf.seek(0)
-                            content = _buf.read()
-                            detected_type = "plot_png"
-                            filename = f"{art_id}_{_slug}.png"
-                            mime_type = "image/png"
-                    except ImportError:
-                        pass
-
-                # Pandas DataFrame
-                if content is None:
-                    try:
-                        import pandas as _pd
-                        if isinstance(obj, _pd.DataFrame):
-                            content = obj.to_html(classes="artifact-table", border=0).encode()
-                            detected_type = "table_html"
-                            filename = f"{art_id}_{_slug}.html"
-                            mime_type = "text/html"
-                    except ImportError:
-                        pass
-
-                # str
-                if content is None and isinstance(obj, str):
-                    if obj.lstrip().startswith(("<", "<!")) and "</" in obj:
-                        content = obj.encode()
-                        detected_type = "html"
-                        filename = f"{art_id}_{_slug}.html"
-                        mime_type = "text/html"
-                    else:
-                        content = obj.encode()
-                        detected_type = "markdown"
-                        filename = f"{art_id}_{_slug}.md"
-                        mime_type = "text/markdown"
-
-                # dict / list
-                if content is None and isinstance(obj, (dict, list)):
-                    content = _json.dumps(obj, indent=2, default=str).encode()
-                    detected_type = "json"
-                    filename = f"{art_id}_{_slug}.json"
-                    mime_type = "application/json"
-
-                # bytes
-                if content is None and isinstance(obj, bytes):
-                    content = obj
-                    detected_type = "binary"
-                    filename = f"{art_id}_{_slug}.bin"
-                    mime_type = "application/octet-stream"
-
-                # numpy ndarray -- last of the type branches so every type
-                # already handled above keeps its exact sniffing order. Object
-                # dtypes are left out: np.save cannot write them without
-                # pickle, so they keep falling through to the repr() fallback.
-                if content is None:
-                    try:
-                        import numpy as _np
-                        if isinstance(obj, _np.ndarray) and not obj.dtype.hasobject:
-                            import io as _nio
-                            _nbuf = _nio.BytesIO()
-                            _np.save(_nbuf, obj, allow_pickle=False)
-                            content = _nbuf.getvalue()
-                            detected_type = "file"
-                            filename = f"{art_id}_{_slug}.npy"
-                            mime_type = "application/octet-stream"
-                    except ImportError:
-                        pass
-
-                # Fallback: repr as text
-                if content is None:
-                    content = repr(obj).encode()
-                    detected_type = "text"
-                    filename = f"{art_id}_{_slug}.txt"
-                    mime_type = "text/plain"
-
-                final_type = artifact_type or detected_type
-
-                # Write artifact file
-                artifact_path = artifacts_dir / filename
-                artifact_path.write_bytes(content)
-
-                # Update manifest
-                manifest_path = artifacts_dir / "manifest.json"
-                if manifest_path.exists():
-                    manifest = _json.loads(manifest_path.read_text())
-                else:
-                    manifest = []
-
-                entry = {
-                    "id": art_id,
-                    "filename": filename,
-                    "title": title,
-                    "description": description,
-                    "artifact_type": final_type,
-                    "mime_type": mime_type,
-                    "size_bytes": len(content),
-                }
-                if category:
-                    entry["category"] = category
-                manifest.append(entry)
-                manifest_path.write_text(_json.dumps(manifest, indent=2))
-
-                print(f"Artifact saved: {title} ({final_type}, {len(content)} bytes)")
-        """
-        ).strip()
+        return SAVE_ARTIFACT_SOURCE.strip()
 
     def _get_output_capture_start(self) -> str:
         """Start output capture for both environments."""
@@ -748,14 +1050,46 @@ if not _execution_dir.exists():
         """
         ).strip()
 
+        # The filesystem guard comes off at the END of the finally block, so it
+        # covers the user code and the output-capture teardown and nothing
+        # after: the persistence section below runs at module level on unpatched
+        # entry points, which is what keeps a misjudged protected root from
+        # costing the operator the execution record. Everything the guard *does*
+        # cover writes into the execution folder, which is permitted anyway.
+        guard_restore_section = textwrap.dedent(
+            """
+            # Filesystem guard: put every patched entry point back.
+            _restore_patched_targets()
+
+            # Network guard, same point for the same reason — looked up via
+            # globals() because it is only emitted when the deployment's
+            # perimeter denies ports, and this cleanup tail is shared by every
+            # wrapper. The persistence section below touches only the local
+            # filesystem, so nothing here depends on the restore; it exists so
+            # both guards come off together at a single documented point.
+            _osprey_net_restore = globals().get('_restore_net_patched_targets')
+            if _osprey_net_restore is not None:
+                _osprey_net_restore()
+        """
+        ).strip()
+
         # Combine all parts properly (4-space indent to sit inside the finally block)
         indented_host_section = "\n".join(
             "    " + line if line.strip() else line for line in host_output_section.split("\n")
+        )
+        indented_guard_restore = "\n".join(
+            "    " + line if line.strip() else line for line in guard_restore_section.split("\n")
         )
         indented_error_handling = "\n".join(
             "    " + line if line.strip() else line for line in metadata_error_handling.split("\n")
         )
 
         return "\n".join(
-            [base_cleanup, indented_host_section, file_persistence_section, indented_error_handling]
+            [
+                base_cleanup,
+                indented_host_section,
+                indented_guard_restore,
+                file_persistence_section,
+                indented_error_handling,
+            ]
         )

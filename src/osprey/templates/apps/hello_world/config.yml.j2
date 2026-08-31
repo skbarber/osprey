@@ -152,6 +152,15 @@ control_system:
   # write_tools:
   #   - "mcp__my_server__dangerous_write"
 
+  # Operator-facing names for the control targets, shown on the web terminal's
+  # control-target chip. Defaults come from what each target is — real machine
+  # "Real machine" ("Demo" on a simulated connector), stand-in "Rehearsal",
+  # virtual accelerator "Simulator". Uncomment to rename any of them.
+  # target_display_names:
+  #   live: "Real machine"
+  #   standin: "Rehearsal"
+  #   va: "Simulator"
+
   # Channel limits — the SECOND guard. Every write is checked against
   # data/channel_limits.json (relative to this file's directory) —
   # per-channel min/max values and writable flags. That file is a build
@@ -185,6 +194,10 @@ control_system:
 # plus an `epics_archiver.url` — the control-assistant preset shows it).
 archiver:
   type: mock_archiver
+  # When a read names no bin size, the bin is chosen from the time span so a
+  # continuously archived channel returns about this many points (1 s bins up
+  # to ~2.8 h, ~53 min bins for a year). The agent is told which bin was used.
+  auto_bin_points: 10000
 
 # ============================================================
 # HUMAN-IN-THE-LOOP APPROVAL
@@ -276,11 +289,11 @@ agent_data:
 # it — and when it does, the tab is reported unavailable rather than serving a
 # dead iframe. Port resolution is the one shared function every launcher and
 # URL builder uses: OSPREY_ARTIFACT_SERVER_PORT wins (multi-user deployments
-# export it per user), then `port` here, then the built-in 8086. `host` has no
-# env override.
+# export it per user), then `port` here, then this deployment's layout slot
+# ({{ osprey_ports.artifact }}). `host` has no env override.
 artifact_server:
   host: "127.0.0.1"
-  port: 8086
+  port: {{ osprey_ports.artifact }}
   auto_launch: true
 
 # ============================================================
@@ -319,7 +332,7 @@ services:
   # container runtime (Docker/podman) running.
   openobserve:
     path: ./services/openobserve
-    port: 5080          # Host port for the OpenObserve UI + OTLP ingest
+    port: {{ osprey_ports.openobserve }}         # Host port for the OpenObserve UI + OTLP ingest
     retention_days: 14  # Growth bound: drop data older than N days (min 3). A
                         # named volume has no size cap, so age is the size knob.
 
@@ -357,7 +370,7 @@ claude_code:
   # ── Telemetry / Observability (on by default, local + loopback-bound) ──
   # The agent emits OTLP logs + metrics to the co-deployed OpenObserve store
   # (declared in `services:` and listed in `deployed_services:` above; UI at
-  # http://localhost:5080). On by default: the underlying harness already records
+  # http://localhost:{{ osprey_ports.openobserve }}). On by default: the underlying harness already records
   # every prompt, response, and API body to disk, so this adds no new exposure —
   # it just makes that data queryable in a local store you own. To turn it off,
   # set `enabled: false`. Tracing and OTEL_LOG_TOOL_CONTENT are intentionally
@@ -367,14 +380,18 @@ claude_code:
     backend: openobserve                 # openobserve | generic
     protocol: http/protobuf              # http/protobuf | grpc — grpc requires an explicit `endpoint:` below; it is refused against the auto-derived openobserve endpoint (HTTP only)
     # backend: openobserve auto-derives the endpoint per network context, so
-    # `endpoint` is intentionally OMITTED. OpenObserve auth reads the root
-    # credentials from the project .env — the SAME values the openobserve service
-    # reads — so container and agent auth stay in sync. `osprey up` mints a
-    # strong ZO_ROOT_USER_PASSWORD into .env; the ${VAR:-default} fallbacks keep
-    # the agent launchable before the first deploy.
+    # `endpoint` is intentionally OMITTED. OpenObserve auth uses the store's
+    # dedicated INGEST account, not its root credentials: `osprey up` creates a
+    # service account named ZO_INGEST_USER_EMAIL and writes the token the store
+    # issues for it to the project .env as ZO_INGEST_SA_TOKEN. The store itself
+    # still initializes from ZO_ROOT_USER_* — that stays in the compose file,
+    # and the root password never reaches the agent's config.
+    # The token reference carries NO ${VAR:-default} on purpose: a literal
+    # default would be a published credential, and there is nothing to fall
+    # back to before the first deploy provisions the account.
     openobserve:
-      user: ${ZO_ROOT_USER_EMAIL:-root@example.com}
-      password: ${ZO_ROOT_USER_PASSWORD:-Complexpass#123}
+      user: ${ZO_INGEST_USER_EMAIL:-ingest@example.com}
+      password: ${ZO_INGEST_SA_TOKEN}
       org: default
     # Content gates — all default ON. The store is local and loopback-bound, so
     # full capture is the default posture; set any to false to suppress that

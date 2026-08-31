@@ -69,6 +69,11 @@ SCAN_AGENTIC_TEST_FILE = "tests/e2e/test_plan_stack_agentic.py"
 SCAN_AGENTIC_SKIP_GATE_STEP = "Fail the lane on any skipped test"
 ARCHIVER_JOB = "archiver-world-e2e"
 ARCHIVER_TEST_FILE = "tests/e2e/test_archiver_world_e2e.py"
+TARGET_SWITCH_JOB = "target-switch-e2e"
+#: The agent-driven half of the same feature. A separate lane rather than a
+#: second step in the one above because it needs the LLM secret and the CLI,
+#: and lane-level `if:` gating is the only granularity GitHub offers.
+TARGET_SWITCH_AGENTIC_JOB = "target-switch-agentic-e2e"
 TWO_SHAPE_JOB = "two-shape-boot-e2e"
 TWO_SHAPE_TEST_FILE = "tests/e2e/test_two_shape_boot.py"
 TWO_SHAPE_BOOT_STEP = "Run two-shape boot E2E (podman)"
@@ -120,6 +125,15 @@ EXPECTED_MIN_ALS_APG_PROBES = 8
 
 CONFTEST = Path(__file__).resolve().parents[1] / "conftest.py"
 PARALLEL_FLAGS = ("-n 4", "--dist loadgroup")
+
+#: The per-test hang-breaker on the unit lane. Both halves are load-bearing and
+#: pinned as literal substrings: the value has to clear a cold container image
+#: pull (the ``xdist_group("docker")`` files legitimately sit in one for
+#: minutes) while still ending a hang far inside the step cap, and the method
+#: has to be ``signal`` — ``thread`` ends a timed-out test with ``os._exit`` of
+#: the xdist worker, which is the "node down: Not properly terminated" wedge
+#: tests/ci_diagnostics.py documents.
+PER_TEST_TIMEOUT_FLAGS = ("--timeout=600", "--timeout-method=signal")
 SCHEDULER_HOOK = "pytest_xdist_make_scheduler"
 SCHEDULER_CLASS = "FileOrGroupScheduling"
 
@@ -721,6 +735,121 @@ def test_unit_test_job_runs_xdist_parallel__mutation_drops_dist_mode() -> None:
     step = _find_named_step(mutated, UNIT_TEST_JOB, "Run unit tests")
     step["run"] = step["run"].replace(" --dist loadgroup", "")
     assert _missing_parallel_flags(_unit_test_pytest_line(mutated)) == ["--dist loadgroup"]
+
+
+# ---------------------------------------------------------------------------
+# Coverage is measured on a cell where PEP 669 tracing is actually available
+# ---------------------------------------------------------------------------
+
+
+#: Below this, ``coverage.py`` cannot use ``sys.monitoring`` and silently falls
+#: back to the C trace function. See ``coverage/core.py``: ``pep669`` is a bare
+#: ``hasattr(sys, "monitoring")`` check, so the fallback is a warning, not an
+#: error, and the lane just pays ~2x for identical numbers.
+SYSMON_MIN_PYTHON = (3, 12)
+
+#: The env var that opts into PEP 669 tracing. Not self-enabling until 3.14
+#: (``coverage/env.py``: ``SYSMON_DEFAULT``), so on 3.12/3.13 it must be set
+#: explicitly or the slow core is chosen by default.
+SYSMON_ENV = ("COVERAGE_CORE", "sysmon")
+
+CODECOV_STEP = "Upload coverage reports to Codecov"
+
+
+def _coverage_cell_version(wf: dict[str, Any]) -> str:
+    """The Python version whose ubuntu cell builds a non-empty ``COV_ARGS``."""
+    run_text = _find_named_step(wf, UNIT_TEST_JOB, "Run unit tests")["run"]
+    found = re.findall(
+        r'\[\s+"\$\{\{\s*matrix\.python-version\s*\}\}"\s*=\s*"(\d+\.\d+)"', run_text
+    )
+    assert len(found) == 1, f"expected one coverage-cell guard in the run block; got {found}"
+    return found[0]
+
+
+def _codecov_upload_version(wf: dict[str, Any]) -> str:
+    """The Python version the Codecov upload step is gated on."""
+    condition = _find_named_step(wf, UNIT_TEST_JOB, CODECOV_STEP)["if"]
+    found = re.findall(r"matrix\.python-version\s*==\s*'(\d+\.\d+)'", condition)
+    assert len(found) == 1, f"expected one version gate on {CODECOV_STEP!r}; got {found}"
+    return found[0]
+
+
+def test_coverage_cell_and_codecov_upload_name_the_same_version(
+    workflow: dict[str, Any],
+) -> None:
+    """One cell writes ``coverage.xml``; one cell uploads it. If they drift
+    apart the upload runs on a cell that produced no file, and
+    ``fail_ci_if_error: false`` turns that into a silent coverage blackout --
+    green lane, no report, nobody notified. The two conditions are written out
+    separately in YAML and cannot reference each other, so this is the only
+    thing holding them together."""
+    measured = _coverage_cell_version(workflow)
+    uploaded = _codecov_upload_version(workflow)
+    assert measured == uploaded, (
+        f"the coverage cell measures on Python {measured} but the {CODECOV_STEP!r} step "
+        f"is gated on {uploaded} -- coverage.xml would be written by one cell and looked "
+        f"for by another. Move both, in .github/workflows/ci.yml."
+    )
+
+
+def test_coverage_cell_can_use_pep669_tracing(workflow: dict[str, Any]) -> None:
+    """The coverage cell must sit on an interpreter where ``sys.monitoring``
+    exists. Measuring on the floor version looks tidy and costs ~2x the lane's
+    wall clock: coverage refuses sysmon below 3.12 with a warning and uses the
+    C tracer instead, which is how this lane came to run 36 minutes next to a
+    14-minute sibling running the same tests."""
+    measured = _coverage_cell_version(workflow)
+    parsed = tuple(int(part) for part in measured.split("."))
+    assert parsed >= SYSMON_MIN_PYTHON, (
+        f"coverage is measured on Python {measured}, below the "
+        f"{'.'.join(map(str, SYSMON_MIN_PYTHON))} that `sys.monitoring` requires -- the "
+        f"lane is paying the C tracer's overhead for identical numbers."
+    )
+
+
+def test_coverage_cell_arms_the_sysmon_core(workflow: dict[str, Any]) -> None:
+    """Being eligible for PEP 669 is not the same as using it: coverage only
+    defaults to sysmon at 3.14+, so on 3.12/3.13 the env var is what actually
+    selects it. Dropping it re-buys the 2x without changing a single flag."""
+    env = _find_named_step(workflow, UNIT_TEST_JOB, "Run unit tests").get("env", {})
+    name, value = SYSMON_ENV
+    assert env.get(name) == value, (
+        f"the 'Run unit tests' step must set {name}: {value} -- without it coverage.py "
+        f"picks the C tracer by default below Python 3.14. Found {env.get(name)!r}."
+    )
+
+
+def test_coverage_cell_is_a_version_the_matrix_actually_runs(workflow: dict[str, Any]) -> None:
+    """A coverage cell naming a version absent from the matrix measures
+    nothing at all, and would fail none of the pins above."""
+    versions = workflow["jobs"][UNIT_TEST_JOB]["strategy"]["matrix"]["python-version"]
+    measured = _coverage_cell_version(workflow)
+    assert measured in versions, (
+        f"coverage is measured on Python {measured}, which the matrix does not run "
+        f"({versions}) -- no cell would produce coverage.xml."
+    )
+
+
+def test_coverage_cell_pins__mutation_versions_drift_apart() -> None:
+    """The failure this set exists for: someone moves one condition and not
+    the other."""
+    mutated = copy.deepcopy(_load_workflow())
+    step = _find_named_step(mutated, UNIT_TEST_JOB, CODECOV_STEP)
+    original = step["if"]
+    step["if"] = original.replace("'3.12'", "'3.11'")
+    assert step["if"] != original, "Codecov version gate not found -- mutation is stale"
+    assert _coverage_cell_version(mutated) != _codecov_upload_version(mutated)
+
+
+def test_coverage_cell_pins__mutation_back_to_the_floor_version() -> None:
+    """Reverting the cell to 3.11 must fail the PEP 669 pin rather than pass
+    quietly -- the whole point is that the slow path is invisible at runtime."""
+    mutated = copy.deepcopy(_load_workflow())
+    step = _find_named_step(mutated, UNIT_TEST_JOB, "Run unit tests")
+    original = step["run"]
+    step["run"] = original.replace('}}" = "3.12" ]', '}}" = "3.11" ]')
+    assert step["run"] != original, "coverage-cell guard not found -- mutation is stale"
+    assert _coverage_cell_version(mutated) == "3.11"
 
 
 def _conftest_source() -> str:
@@ -2422,6 +2551,7 @@ CLI_DEPENDENT_JOBS = (
     "e2e-tests",
     "channel-finder-benchmarks",
     SCAN_AGENTIC_JOB,
+    TARGET_SWITCH_AGENTIC_JOB,
 )
 
 BUNDLED_CLI_STEP = "Put the SDK's bundled Claude CLI on PATH"
@@ -2604,8 +2734,10 @@ def _container_jobs(wf: dict[str, Any]) -> set[str]:
     """Jobs that touch a container engine, derived rather than listed.
 
     Derived on purpose: a hand-maintained list is exactly what a newly added
-    Docker lane forgets to join. Comments cannot pollute the match because
-    ``yaml.safe_load`` has already dropped them.
+    Docker lane forgets to join. YAML comments cannot pollute the match because
+    ``yaml.safe_load`` has already dropped them — but a ``#`` line *inside* a
+    ``run:`` block is part of the shell script, so it is data and it does match.
+    Prose about the engine belongs above the ``run:`` key for that reason.
     """
     pattern = re.compile(r"\b(docker|podman)\b")
     return {
@@ -2831,6 +2963,33 @@ def test_unit_lane_does_not_set_faulthandler_timeout(workflow: dict[str, Any]) -
     )
 
 
+def test_unit_lane_passes_per_test_timeout(workflow: dict[str, Any]) -> None:
+    """The complement of the pin above: no watchdog in-process, but a real cap.
+
+    Without one, a single hung test is indistinguishable from "still running"
+    until the step cap fires 40 minutes later and cancels the job — which
+    truncates the log, so the run ends with no name for the test that hung
+    (#743). ``--timeout=600`` turns that into a named failure inside ten
+    minutes and still clears a cold image pull, so the container-starting
+    files need no exemption.
+
+    ``--timeout-method=signal`` is the other half. pytest-timeout's ``thread``
+    method ends the test with ``os._exit`` of the worker, and a dead worker
+    under ``--dist loadgroup`` takes the whole lane with it rather than one
+    test — see the docstring of tests/ci_diagnostics.py. The cost of ``signal``
+    is that it cannot interrupt a hang inside a C extension holding the GIL;
+    for that case the step cap is still the backstop.
+    """
+    line = _unit_test_pytest_line(workflow)
+    missing = [flag for flag in PER_TEST_TIMEOUT_FLAGS if flag not in line]
+    assert missing == [], (
+        f"the '{UNIT_TEST_JOB}' job in .github/workflows/ci.yml must invoke pytest with "
+        f"{' '.join(PER_TEST_TIMEOUT_FLAGS)} — missing {missing} in: {line.strip()!r}. "
+        f"The timeout belongs on this line and not in [tool.pytest.ini_options]: an ini "
+        f"default would also apply to every e2e lane, none of which passes a --timeout."
+    )
+
+
 def _sole_heavy_step(job: dict[str, Any]) -> dict[str, Any] | None:
     """The lane's single pytest-running step, or None if there isn't exactly one.
 
@@ -2891,6 +3050,30 @@ def test_unit_lane_does_not_set_faulthandler_timeout__mutation_restores_the_ini_
     )
     with pytest.raises(AssertionError):
         test_unit_lane_does_not_set_faulthandler_timeout(mutated)
+
+
+def test_unit_lane_passes_per_test_timeout__mutation_drops_it() -> None:
+    mutated = copy.deepcopy(_load_workflow())
+    step = _find_named_step(mutated, UNIT_TEST_JOB, "Run unit tests")
+    original = step["run"]
+    for flag in PER_TEST_TIMEOUT_FLAGS:
+        step["run"] = step["run"].replace(f" {flag}", "")
+    assert step["run"] != original, "timeout flags not found; mutation is stale"
+    with pytest.raises(AssertionError):
+        test_unit_lane_passes_per_test_timeout(mutated)
+
+
+def test_unit_lane_passes_per_test_timeout__mutation_switches_to_the_thread_method() -> None:
+    """The method is pinned, not just the presence of a timeout: ``thread`` is
+    the variant that ``os._exit``s the xdist worker, turning "one hung test"
+    into "the lane is wedged"."""
+    mutated = copy.deepcopy(_load_workflow())
+    step = _find_named_step(mutated, UNIT_TEST_JOB, "Run unit tests")
+    original = step["run"]
+    step["run"] = original.replace("--timeout-method=signal", "--timeout-method=thread")
+    assert step["run"] != original, "method flag not found; mutation is stale"
+    with pytest.raises(AssertionError):
+        test_unit_lane_passes_per_test_timeout(mutated)
 
 
 # The two-shape boot lane: podman-compose forced and PROVEN, the network axis
@@ -4172,3 +4355,700 @@ def test_proxy_teardown_runs_even_when_the_assertion_fails__mutation_drops_the_c
     del _find_named_step(mutated, DOCKERFILE_E2E_JOB, PROXY_STOP_STEP)["if"]
     with pytest.raises(AssertionError, match="always"):
         test_proxy_teardown_runs_even_when_the_assertion_fails(mutated)
+
+
+# ---------------------------------------------------------------------------
+# (p) privilege-split-e2e gates the merge, and the gate has no orphan jobs
+# ---------------------------------------------------------------------------
+
+PRIVSPLIT_JOB = "privilege-split-e2e"
+
+#: Jobs deliberately OUTSIDE ``all-checks-passed.needs``. Every entry needs a
+#: reason: ``channel-finder-benchmarks`` is a manually dispatched quality score
+#: (pinned by ``test_benchmarks_job_is_dispatch_gated_and_lane_ignores_it``),
+#: and the gate cannot depend on itself. Anything else that is not in
+#: ``needs`` can go red forever inside a green check — the 17 privilege-split
+#: Docker tests did exactly that for a phase.
+JOBS_OUTSIDE_THE_GATE = frozenset({BENCHMARKS_JOB, GATE_JOB})
+
+
+def test_all_checks_passed_needs_privilege_split(workflow: dict[str, Any]) -> None:
+    """The privilege-split lane is the only EXECUTED proof that the render
+    zone is root-owned and the served process runs as uid 1000. It must
+    gate the merge like every other e2e lane."""
+    assert PRIVSPLIT_JOB in _jobs(workflow)[GATE_JOB]["needs"]
+    assert f"needs.{PRIVSPLIT_JOB}.result" in _gate_run_text(workflow)
+
+
+def test_all_checks_passed_needs_privilege_split__mutation_drops_needs_entry() -> None:
+    mutated = copy.deepcopy(_load_workflow())
+    _jobs(mutated)[GATE_JOB]["needs"].remove(PRIVSPLIT_JOB)
+    with pytest.raises(AssertionError):
+        test_all_checks_passed_needs_privilege_split(mutated)
+
+
+def _jobs_missing_from_the_gate(wf: dict[str, Any]) -> list[str]:
+    needs = set(_jobs(wf)[GATE_JOB]["needs"])
+    return sorted(set(_jobs(wf)) - needs - JOBS_OUTSIDE_THE_GATE)
+
+
+def test_every_job_is_gated_or_deliberately_excluded(workflow: dict[str, Any]) -> None:
+    """The reverse of ``test_gate_checks_every_needed_job``: that one proves
+    ``needs`` ⊆ checked, this one proves jobs ⊆ ``needs`` ∪ allowlist. A new
+    lane that nobody adds to ``needs`` is otherwise invisible — the roll-up
+    stays green whatever the lane does."""
+    assert _jobs_missing_from_the_gate(workflow) == []
+
+
+def test_every_job_is_gated_or_deliberately_excluded__mutation_adds_orphan_job() -> None:
+    mutated = copy.deepcopy(_load_workflow())
+    _jobs(mutated)["orphan-lane"] = {"runs-on": "ubuntu-latest", "steps": []}
+    assert _jobs_missing_from_the_gate(mutated) == ["orphan-lane"]
+
+
+# ---------------------------------------------------------------------------
+# (q) posture-toggle browser test: named in the browser lane (same vacuous-
+# green shape as (h)/(h2) — the unit lane skips it without chromium)
+# ---------------------------------------------------------------------------
+
+POSTURE_BROWSER_TEST_FILE = "tests/interfaces/web_terminal/test_posture_toggle_browser.py"
+
+
+def test_posture_toggle_browser_test_runs_in_the_browser_lane(workflow: dict[str, Any]) -> None:
+    """The toggle's only end-to-end proof (badge agrees with the store)
+    must be NAMED in the lane's explicit file list; nowhere else in CI has
+    Chromium installed."""
+    assert POSTURE_BROWSER_TEST_FILE in _browser_lane_files(workflow)
+
+
+def test_posture_toggle_browser_test_runs_in_the_browser_lane__mutation_drops_the_file() -> None:
+    mutated = copy.deepcopy(_load_workflow())
+    step = _find_named_step(mutated, BROWSER_JOB, BROWSER_RUN_STEP)
+    step["run"] = step["run"].replace(f"{POSTURE_BROWSER_TEST_FILE} \\\n", "")
+    assert POSTURE_BROWSER_TEST_FILE not in _browser_lane_files(mutated)
+
+
+# The control-target switch lane: registered in both halves of the gate
+# ---------------------------------------------------------------------------
+#
+# This lane needs no secrets — two Channel Access servers and a deterministic
+# switch between them — which makes it the easiest lane in the file to add and
+# the easiest to leave half-wired. The triple below is the same one every other
+# lane carries, for the same reason: a lane nothing reads is a lane nobody
+# notices going red.
+
+
+def test_all_checks_passed_needs_target_switch(workflow: dict[str, Any]) -> None:
+    """Both halves of the gate, for the reason spelled out on the gchat pair:
+    ``needs:`` makes the roll-up wait, ``check_pr_lane`` makes it care."""
+    assert TARGET_SWITCH_JOB in _jobs(workflow)[GATE_JOB]["needs"]
+    assert f"needs.{TARGET_SWITCH_JOB}.result" in _gate_run_text(workflow)
+
+
+def test_all_checks_passed_needs_target_switch__mutation_drops_needs_entry() -> None:
+    mutated = copy.deepcopy(_load_workflow())
+    _jobs(mutated)[GATE_JOB]["needs"].remove(TARGET_SWITCH_JOB)
+    with pytest.raises(AssertionError):
+        test_all_checks_passed_needs_target_switch(mutated)
+
+
+def test_all_checks_passed_needs_target_switch__mutation_drops_check_pr_lane_line() -> None:
+    """The dangerous half: the job is still waited on, but nothing reads its
+    result — the lane could go red forever inside a green check."""
+    mutated = copy.deepcopy(_load_workflow())
+    step = _find_named_step(mutated, GATE_JOB, "Check all jobs status")
+    kept = [line for line in step["run"].splitlines(keepends=True) if TARGET_SWITCH_JOB not in line]
+    assert len(kept) == len(step["run"].splitlines()) - 1, "expected exactly one line dropped"
+    step["run"] = "".join(kept)
+    assert TARGET_SWITCH_JOB in _jobs(mutated)[GATE_JOB]["needs"]  # the needs entry survives
+    with pytest.raises(AssertionError):
+        test_all_checks_passed_needs_target_switch(mutated)
+
+
+# ---------------------------------------------------------------------------
+# The agent-driven control-target switch lane: the same triple, one tier riskier
+# ---------------------------------------------------------------------------
+#
+# Its sibling above needs no secrets; this one needs the LLM key AND the SDK's
+# bundled CLI, which is two more ways to go vacuously green. Two of those are
+# covered elsewhere in this file and both cover this lane by construction: the
+# ``CLI_DEPENDENT_JOBS`` parametrization (the bundled-CLI step) and
+# ``_als_apg_probe_steps`` discovery (the pre-flight probe honours
+# ``ALS_APG_BASE_URL``). What is left is the gate wiring, pinned here.
+
+
+def test_all_checks_passed_needs_target_switch_agentic(workflow: dict[str, Any]) -> None:
+    """Both halves of the gate, for the reason spelled out on the gchat pair:
+    ``needs:`` makes the roll-up wait, ``check_pr_lane`` makes it care.
+
+    Worth its own pair rather than folding into the sibling's: these two lanes
+    can be added, reverted or re-landed independently — they share only the two
+    images — and a gate entry that quietly covers "the target-switch lane"
+    without saying which one is exactly how the expensive half goes unwatched.
+    """
+    assert TARGET_SWITCH_AGENTIC_JOB in _jobs(workflow)[GATE_JOB]["needs"]
+    assert f"needs.{TARGET_SWITCH_AGENTIC_JOB}.result" in _gate_run_text(workflow)
+
+
+def test_all_checks_passed_needs_target_switch_agentic__mutation_drops_needs_entry() -> None:
+    mutated = copy.deepcopy(_load_workflow())
+    _jobs(mutated)[GATE_JOB]["needs"].remove(TARGET_SWITCH_AGENTIC_JOB)
+    with pytest.raises(AssertionError):
+        test_all_checks_passed_needs_target_switch_agentic(mutated)
+
+
+def test_all_checks_passed_needs_target_switch_agentic__mutation_drops_check_pr_lane_line() -> None:
+    """The dangerous half, and dangerous twice over here: this is the lane that
+    spends real API budget on five agent sessions, so nobody re-reads its log
+    once the roll-up is green."""
+    mutated = copy.deepcopy(_load_workflow())
+    step = _find_named_step(mutated, GATE_JOB, "Check all jobs status")
+    kept = [
+        line
+        for line in step["run"].splitlines(keepends=True)
+        if TARGET_SWITCH_AGENTIC_JOB not in line
+    ]
+    assert len(kept) == len(step["run"].splitlines()) - 1, "expected exactly one line dropped"
+    step["run"] = "".join(kept)
+    # the needs entry survives
+    assert TARGET_SWITCH_AGENTIC_JOB in _jobs(mutated)[GATE_JOB]["needs"]
+    with pytest.raises(AssertionError):
+        test_all_checks_passed_needs_target_switch_agentic(mutated)
+
+
+# ---------------------------------------------------------------------------
+# deploy-e2e skips Dependabot; lint proves the lockfile before sync can heal it
+# ---------------------------------------------------------------------------
+
+DEPLOY_JOB = "deploy-e2e"
+LINT_JOB = "lint"
+LOCK_CHECK_STEP = "Lockfile is current with pyproject"
+INSTALL_STEP = "Install dependencies"
+_DEPENDABOT_GUARD = "github.actor != 'dependabot[bot]'"
+
+
+def test_deploy_e2e_skips_dependabot(workflow: dict[str, Any]) -> None:
+    """Dependabot branches live in this repo, so the same-repo fork check does
+    not exclude them — but Dependabot runs resolve secrets against the (empty)
+    Dependabot store, and `osprey up`'s .env preflight then fails on the
+    missing ALS_APG_API_KEY. The lane must carry the same actor guard and
+    revalidation arm as every other secret-gated lane."""
+    condition = _jobs(workflow)[DEPLOY_JOB]["if"]
+    assert _DEPENDABOT_GUARD in condition
+    assert "inputs.revalidate_secret_lanes" in condition
+
+
+def test_deploy_e2e_skips_dependabot__mutation_reverts_to_fork_only_guard() -> None:
+    """The exact guard this lane shipped with for months: same-repo check
+    only, which Dependabot passes — and then reds every one of its PRs."""
+    mutated = copy.deepcopy(_load_workflow())
+    _jobs(mutated)[DEPLOY_JOB]["if"] = (
+        "github.event_name == 'pull_request'"
+        " && github.event.pull_request.head.repo.full_name == github.repository"
+    )
+    with pytest.raises(AssertionError):
+        test_deploy_e2e_skips_dependabot(mutated)
+
+
+def test_gate_summary_names_the_deploy_lane(workflow: dict[str, Any]) -> None:
+    """The Dependabot run summary enumerates the lanes the gate cannot vouch
+    for; a skipped lane missing from that list is a silent coverage gap."""
+    step = _find_named_step(workflow, GATE_JOB, "Check all jobs status")
+    assert "Deploy E2E Test (build + deploy pipeline)" in step["run"]
+
+
+def test_gate_summary_names_the_deploy_lane__mutation_drops_the_line() -> None:
+    mutated = copy.deepcopy(_load_workflow())
+    step = _find_named_step(mutated, GATE_JOB, "Check all jobs status")
+    kept = [
+        line
+        for line in step["run"].splitlines(keepends=True)
+        if "Deploy E2E Test (build + deploy pipeline)" not in line
+    ]
+    assert len(kept) == len(step["run"].splitlines()) - 1, "expected exactly one line dropped"
+    step["run"] = "".join(kept)
+    with pytest.raises(AssertionError):
+        test_gate_summary_names_the_deploy_lane(mutated)
+
+
+def _step_names(wf: dict[str, Any], job_name: str) -> list[str]:
+    return [step.get("name", "") for step in _jobs(wf)[job_name]["steps"]]
+
+
+def test_lint_checks_the_lockfile_before_installing(workflow: dict[str, Any]) -> None:
+    """`uv lock --check` is the only place a pyproject/uv.lock split can
+    surface: every other lane runs a plain `uv sync`, which re-locks a stale
+    lockfile in the runner and goes green. Ordering is the pin's sharp edge —
+    `uv sync` rewrites the lock on disk, so a check placed after the install
+    step always passes."""
+    step = _find_named_step(workflow, LINT_JOB, LOCK_CHECK_STEP)
+    assert "uv lock --check" in step["run"]
+    names = _step_names(workflow, LINT_JOB)
+    assert names.index(LOCK_CHECK_STEP) < names.index(INSTALL_STEP)
+
+
+def test_lint_checks_the_lockfile__mutation_drops_the_step() -> None:
+    mutated = copy.deepcopy(_load_workflow())
+    steps = _jobs(mutated)[LINT_JOB]["steps"]
+    steps[:] = [s for s in steps if s.get("name") != LOCK_CHECK_STEP]
+    with pytest.raises(AssertionError):
+        test_lint_checks_the_lockfile_before_installing(mutated)
+
+
+def test_lint_checks_the_lockfile__mutation_moves_it_after_sync() -> None:
+    """The subtle regression: the step survives a refactor but lands after
+    `uv sync`, which has just healed the very staleness it was checking for."""
+    mutated = copy.deepcopy(_load_workflow())
+    steps = _jobs(mutated)[LINT_JOB]["steps"]
+    (check,) = [s for s in steps if s.get("name") == LOCK_CHECK_STEP]
+    steps.remove(check)
+    steps.insert(next(i for i, s in enumerate(steps) if s.get("name") == INSTALL_STEP) + 1, check)
+    with pytest.raises(AssertionError):
+        test_lint_checks_the_lockfile_before_installing(mutated)
+
+
+# ---------------------------------------------------------------------------
+# the changelog-fragment gate runs in lint, and premerge_check.sh runs the same
+# ---------------------------------------------------------------------------
+#
+# One rule, two callers: `scripts/changelog_fragments.py check` decides whether
+# a PR that touches src/ or packages/ carries a fragment in changelog.d/ and
+# whether anyone hand-edited CHANGELOG.md's [Unreleased] block. The local script
+# has to run the *same command* as the lane, or the pre-PR sweep goes green on
+# work CI then rejects.
+
+CHANGELOG_STEP = "Run changelog-fragment guard"
+CHANGELOG_SCRIPT = "scripts/changelog_fragments.py"
+PREMERGE_SCRIPT = "scripts/premerge_check.sh"
+#: What the CRITICAL block used to be: proof that CHANGELOG.md was *touched*,
+#: which the fragment workflow makes both unsatisfiable (fragments are the
+#: entry) and meaningless (touching the file proves nothing about content).
+_CHANGELOG_TOUCH_GREP = "grep -q CHANGELOG.md"
+
+
+@pytest.fixture()
+def premerge_source() -> str:
+    return _script_source(PREMERGE_SCRIPT)
+
+
+def test_lint_runs_the_changelog_fragment_guard(workflow: dict[str, Any]) -> None:
+    """Four things at once, because each has its own way of silently going
+    missing: the step exists and calls `check`; the base ref reaches the shell
+    through ``env:`` and never through ``${{ }}`` inside ``run:`` (a branch
+    name is attacker-controlled text — interpolated into the run line it is
+    executed); the env value comes from the pull-request event rather than a
+    hardcoded ``main``; and ``!cancelled()`` keeps a ruff failure above from
+    hiding a missing fragment and buying a second full CI cycle."""
+    step = _find_named_step(workflow, LINT_JOB, CHANGELOG_STEP)
+    assert CHANGELOG_SCRIPT + " check --base" in step["run"]
+    assert "${{" not in step["run"], (
+        f"{CHANGELOG_STEP} interpolates an expression into `run:`: {step['run']!r}"
+    )
+    assert "github.event.pull_request.base.ref" in step["env"]["BASE_REF"]
+    assert "!cancelled()" in step["if"]
+    assert "pull_request" in step["if"]
+
+
+def test_lint_runs_the_changelog_fragment_guard__mutation_drops_the_step() -> None:
+    mutated = copy.deepcopy(_load_workflow())
+    steps = _jobs(mutated)[LINT_JOB]["steps"]
+    steps[:] = [s for s in steps if s.get("name") != CHANGELOG_STEP]
+    with pytest.raises(AssertionError):
+        test_lint_runs_the_changelog_fragment_guard(mutated)
+
+
+def test_lint_runs_the_changelog_fragment_guard__mutation_interpolates_the_base_ref_into_run() -> (
+    None
+):
+    """The regression the ``env:`` indirection exists to prevent: the same
+    command, written the obvious way. A PR from a branch named with shell
+    metacharacters then runs them on the lint runner."""
+    mutated = copy.deepcopy(_load_workflow())
+    step = _find_named_step(mutated, LINT_JOB, CHANGELOG_STEP)
+    step["run"] = step["run"].replace(
+        '"origin/$BASE_REF"', '"origin/${{ github.event.pull_request.base.ref }}"'
+    )
+    assert "${{" in step["run"], "the run line no longer uses $BASE_REF; this mutation is stale"
+    with pytest.raises(AssertionError):
+        test_lint_runs_the_changelog_fragment_guard(mutated)
+
+
+def test_premerge_check_runs_the_same_gate(premerge_source: str) -> None:
+    """The local sweep must run the gate itself, not a proxy for it. Its old
+    CRITICAL check grepped the diff for CHANGELOG.md, which under the fragment
+    workflow is red on every ordinary PR and green on a PR that hand-edited
+    [Unreleased] — wrong in both directions."""
+    assert CHANGELOG_SCRIPT in premerge_source
+    assert "check --base" in premerge_source
+    assert _CHANGELOG_TOUCH_GREP not in premerge_source
+
+
+def test_premerge_check_runs_the_same_gate__mutation_restores_the_grep() -> None:
+    source = _script_source(PREMERGE_SCRIPT)
+    mutated = source.replace(
+        f'uv run python {CHANGELOG_SCRIPT} check --base "$BASE"',
+        f"git diff $BASE...HEAD --name-only | {_CHANGELOG_TOUCH_GREP}",
+    )
+    assert mutated != source, "the gate invocation moved; this mutation is stale"
+    with pytest.raises(AssertionError):
+        test_premerge_check_runs_the_same_gate(mutated)
+
+
+# ---------------------------------------------------------------------------
+# (j) every dockerbuild-marked module reaches a lane that gates the merge
+# ---------------------------------------------------------------------------
+#
+# Section (e) proves a marked module LEFT the shared e2e lane. Nothing proved it
+# ARRIVED anywhere: the per-lane "job exists"/"needs"/"check_pr_lane" assertions
+# above are hand-written one lane at a time, so a lane nobody remembered to pin
+# could be deleted whole and this module stayed green. That is not hypothetical
+# — it was true of both halves of the auth/audit wiring (the full-chain lane and
+# the audit two-container step) until this section existed.
+#
+# The general guard below closes it for every marked module, present and future,
+# in the same shape as (e): scan the marker, then require the file to be named by
+# some job's run step, that job to appear in the gate's `needs:`, and the gate
+# script to actually examine its result. The `needs:` half is self-enforcing (a
+# dangling needs entry is a workflow error); the other two are not. The per-lane
+# assertions that follow are redundant with it on purpose — a partial removal
+# then names the lane it broke instead of only reporting a set.
+
+FULL_CHAIN_JOB = "full-chain-auth-e2e"
+FULL_CHAIN_TEST_FILE = "tests/e2e/test_full_chain_auth.py"
+FULL_CHAIN_RUN_STEP = "Run full-chain auth E2E"
+FULL_CHAIN_SKIP_GATE_STEP = "Fail the lane on any skipped test"
+#: The two lanes full-chain-auth strictly subsumes: each builds ONE real image
+#: (the deployed sidecar Dockerfile / the production project image), this one
+#: builds both in a single job. Its budget must therefore exceed both of theirs,
+#: which is the property pinned below — not the particular minute counts.
+SINGLE_BUILD_AUTH_JOBS = ("auth-perimeter-e2e", "terminal-auth-multiuser-e2e")
+PRIVSPLIT_JOB = "privilege-split-e2e"
+PRIVSPLIT_TEST_FILE = "tests/e2e/test_privilege_split.py"
+PRIVSPLIT_SKIP_GATE_STEP = "Fail the lane on a lane-wide skip"
+AUDIT_2C_TEST_FILE = "tests/e2e/test_audit_two_container.py"
+AUDIT_2C_STEP = "Run audit two-container mechanism E2E"
+#: `success() || failure()`, never the default `success()`: the module runs as a
+#: SECOND step behind test_privilege_split.py, so a red first step would skip it
+#: — and a skipped step reads like a passing one in a run summary.
+AUDIT_2C_STEP_IF = "success() || failure()"
+
+
+def _jobs_running_e2e_file(wf: dict[str, Any], test_file: str) -> list[str]:
+    """Job names with a step whose ``run`` actually EXECUTES *test_file*.
+
+    ``--ignore=<file>`` is stripped before matching, so the shared ``e2e-tests``
+    lane — which names every marked file precisely to skip it — is never counted
+    as a home. That subtraction is what makes this the "arrived" half of the
+    marker guard rather than a restatement of the "left" half.
+    """
+    homes = []
+    for name, spec in _jobs(wf).items():
+        for step in spec.get("steps") or []:
+            if test_file in str(step.get("run", "")).replace(f"--ignore={test_file}", ""):
+                homes.append(name)
+                break
+    return sorted(homes)
+
+
+def _gate_checks_lane(wf: dict[str, Any], job: str) -> bool:
+    """Does the gate script's ``check_pr_lane`` roll-up examine *job*'s result?"""
+    pattern = rf'check_pr_lane\s+"[^"]*"\s+"\$\{{\{{\s*needs\.{re.escape(job)}\.result\s*\}}\}}"'
+    return re.search(pattern, _gate_run_text(wf)) is not None
+
+
+def _unwired_dockerbuild_modules(wf: dict[str, Any]) -> dict[str, list[str]]:
+    """Marked e2e files with no lane that both runs them and gates the merge."""
+    needs = _jobs(wf)[GATE_JOB]["needs"]
+    unwired = {}
+    for test_file in _dockerbuild_marked_e2e_files():
+        homes = _jobs_running_e2e_file(wf, test_file)
+        gating = [j for j in homes if j in needs and _gate_checks_lane(wf, j)]
+        if not gating:
+            unwired[test_file] = homes
+    return unwired
+
+
+def test_every_dockerbuild_marked_module_reaches_a_gating_lane(workflow: dict[str, Any]) -> None:
+    """A marked module is ``--ignore``'d out of the shared lane, so the only
+    thing that can run it is a job of its own — and the only thing that makes
+    that job's result matter is the gate. Delete either end and the module
+    silently runs nowhere, or runs and is never looked at, while every check
+    stays green. This is the guard the e2e modules' own CI-HONESTY docstrings
+    point at, in the general form: a lane added tomorrow is covered the day the
+    marker lands, not whenever someone remembers to hand-write four assertions.
+    """
+    files = _dockerbuild_marked_e2e_files()
+    assert files, "expected at least one dockerbuild-marked e2e file (marker scan broke?)"
+    unwired = _unwired_dockerbuild_modules(workflow)
+    assert unwired == {}, (
+        "dockerbuild-marked e2e module(s) with no lane that runs them AND gates the "
+        f"merge (file -> jobs that run it): {unwired} — each needs a job, a "
+        f"`needs:` entry on '{GATE_JOB}', and a check_pr_lane line reading its result"
+    )
+
+
+def test_every_dockerbuild_marked_module_reaches_a_gating_lane__mutation_lane_stops_running_it() -> (
+    None
+):
+    """The lane survives as a green job that no longer runs the module — the
+    cheapest way to lose an e2e lane, and invisible to every other check here."""
+    mutated = copy.deepcopy(_load_workflow())
+    _find_named_step(mutated, FULL_CHAIN_JOB, FULL_CHAIN_RUN_STEP)["run"] = "echo LANE-DELETED\n"
+    assert FULL_CHAIN_TEST_FILE in _unwired_dockerbuild_modules(mutated)
+    assert AUDIT_2C_TEST_FILE not in _unwired_dockerbuild_modules(mutated)  # others survive
+    with pytest.raises(AssertionError):
+        test_every_dockerbuild_marked_module_reaches_a_gating_lane(mutated)
+
+
+def test_every_dockerbuild_marked_module_reaches_a_gating_lane__mutation_gate_drops_the_need() -> (
+    None
+):
+    """Dropping a lane's ``needs`` entry unhooks BOTH modules that ride it."""
+    mutated = copy.deepcopy(_load_workflow())
+    _jobs(mutated)[GATE_JOB]["needs"].remove(PRIVSPLIT_JOB)
+    assert sorted(_unwired_dockerbuild_modules(mutated)) == [
+        AUDIT_2C_TEST_FILE,
+        PRIVSPLIT_TEST_FILE,
+    ]
+    with pytest.raises(AssertionError):
+        test_every_dockerbuild_marked_module_reaches_a_gating_lane(mutated)
+
+
+def test_every_dockerbuild_marked_module_reaches_a_gating_lane__mutation_gate_stops_checking() -> (
+    None
+):
+    """The one-line regression the finding named: the ``needs`` entry stays (so
+    the roll-up still waits) but the gate stops reading the result, and a red
+    lane sits inside a green merge gate."""
+    mutated = copy.deepcopy(_load_workflow())
+    step = _find_named_step(mutated, GATE_JOB, "Check all jobs status")
+    kept = [line for line in step["run"].splitlines(keepends=True) if FULL_CHAIN_JOB not in line]
+    assert len(kept) == len(step["run"].splitlines()) - 1, "expected exactly one line dropped"
+    step["run"] = "".join(kept)
+    assert FULL_CHAIN_JOB in _jobs(mutated)[GATE_JOB]["needs"]  # the self-enforcing half survives
+    with pytest.raises(AssertionError):
+        test_every_dockerbuild_marked_module_reaches_a_gating_lane(mutated)
+
+
+def test_full_chain_auth_job_exists(workflow: dict[str, Any]) -> None:
+    assert FULL_CHAIN_JOB in _jobs(workflow)
+
+
+def test_full_chain_auth_job_exists__mutation_drops_job() -> None:
+    mutated = copy.deepcopy(_load_workflow())
+    del mutated["jobs"][FULL_CHAIN_JOB]
+    with pytest.raises(AssertionError):
+        assert FULL_CHAIN_JOB in _jobs(mutated)
+
+
+def test_full_chain_auth_job_runs_its_module(workflow: dict[str, Any]) -> None:
+    """The named step is the lane's whole point; the generic guard above reports
+    the module as homeless if it goes, this one says which step to look at."""
+    assert (
+        FULL_CHAIN_TEST_FILE
+        in _find_named_step(workflow, FULL_CHAIN_JOB, FULL_CHAIN_RUN_STEP)["run"]
+    )
+
+
+def test_full_chain_auth_job_runs_its_module__mutation_drops_the_module() -> None:
+    mutated = copy.deepcopy(_load_workflow())
+    step = _find_named_step(mutated, FULL_CHAIN_JOB, FULL_CHAIN_RUN_STEP)
+    step["run"] = step["run"].replace(FULL_CHAIN_TEST_FILE, "tests/e2e/test_something_else.py")
+    with pytest.raises(AssertionError):
+        test_full_chain_auth_job_runs_its_module(mutated)
+
+
+def test_all_checks_passed_needs_full_chain_auth(workflow: dict[str, Any]) -> None:
+    assert FULL_CHAIN_JOB in _jobs(workflow)[GATE_JOB]["needs"]
+
+
+def test_all_checks_passed_needs_full_chain_auth__mutation_drops_needs_entry() -> None:
+    mutated = copy.deepcopy(_load_workflow())
+    _jobs(mutated)[GATE_JOB]["needs"].remove(FULL_CHAIN_JOB)
+    with pytest.raises(AssertionError):
+        assert FULL_CHAIN_JOB in _jobs(mutated)[GATE_JOB]["needs"]
+
+
+def test_check_pr_lane_covers_full_chain_auth(workflow: dict[str, Any]) -> None:
+    """Only lane in the repo that exercises login -> nginx -> sidecar -> persona
+    container end to end. Its result must be read where the merge is decided."""
+    assert _gate_checks_lane(workflow, FULL_CHAIN_JOB), (
+        f"the gate script has no check_pr_lane line reading needs.{FULL_CHAIN_JOB}.result"
+    )
+
+
+def test_check_pr_lane_covers_full_chain_auth__mutation_drops_the_check_line() -> None:
+    mutated = copy.deepcopy(_load_workflow())
+    step = _find_named_step(mutated, GATE_JOB, "Check all jobs status")
+    kept = [line for line in step["run"].splitlines(keepends=True) if FULL_CHAIN_JOB not in line]
+    assert len(kept) == len(step["run"].splitlines()) - 1, "expected exactly one line dropped"
+    step["run"] = "".join(kept)
+    with pytest.raises(AssertionError):
+        test_check_pr_lane_covers_full_chain_auth(mutated)
+
+
+def test_privilege_split_job_runs_the_audit_two_container_module(workflow: dict[str, Any]) -> None:
+    """The audit two-container module rides as a SECOND step in an existing lane
+    rather than a job of its own, so neither the ``needs`` half nor the
+    check_pr_lane half says anything about it: delete the step and the lane keeps
+    its green check. It must also run on a red first step — the default
+    ``success()`` would skip it, and skipped reads like passed."""
+    step = _find_named_step(workflow, PRIVSPLIT_JOB, AUDIT_2C_STEP)
+    assert AUDIT_2C_TEST_FILE in step["run"]
+    assert step.get("if") == AUDIT_2C_STEP_IF, (
+        f"'{AUDIT_2C_STEP}' must carry `if: {AUDIT_2C_STEP_IF}` so a red "
+        f"'{PRIVSPLIT_TEST_FILE}' step cannot hide it; got {step.get('if')!r}"
+    )
+
+
+def test_privilege_split_job_runs_the_audit_two_container_module__mutation_drops_the_step() -> None:
+    mutated = copy.deepcopy(_load_workflow())
+    steps = _jobs(mutated)[PRIVSPLIT_JOB]["steps"]
+    kept = [s for s in steps if s.get("name") != AUDIT_2C_STEP]
+    assert len(kept) == len(steps) - 1, "expected exactly one step to run the audit module"
+    _jobs(mutated)[PRIVSPLIT_JOB]["steps"] = kept
+    with pytest.raises(AssertionError):
+        test_privilege_split_job_runs_the_audit_two_container_module(mutated)
+
+
+def test_privilege_split_job_runs_the_audit_two_container_module__mutation_defaults_the_if() -> (
+    None
+):
+    """The quiet half of the same regression: the step survives but only runs
+    when the module ahead of it passed, so one red step hides the other."""
+    mutated = copy.deepcopy(_load_workflow())
+    del _find_named_step(mutated, PRIVSPLIT_JOB, AUDIT_2C_STEP)["if"]
+    with pytest.raises(AssertionError, match="must carry"):
+        test_privilege_split_job_runs_the_audit_two_container_module(mutated)
+
+
+def _lane_pytest_steps(wf: dict[str, Any], job: str) -> list[dict[str, Any]]:
+    return [s for s in _jobs(wf)[job]["steps"] if "uv run pytest" in str(s.get("run", ""))]
+
+
+def _lane_junit_reports(wf: dict[str, Any], job: str) -> list[str]:
+    return [r for step in _lane_pytest_steps(wf, job) for r in _JUNIT_RE.findall(step["run"])]
+
+
+def test_full_chain_auth_job_fails_on_any_skipped_test(workflow: dict[str, Any]) -> None:
+    """Every way this lane can skip is a misconfiguration, not an environment
+    gap: the module's only skip paths are "no container runtime" and "daemon not
+    responding", and this lane exists precisely to have both. pytest exits 0 on
+    an all-skipped run, so the lane would report a green check over a stack it
+    never built. The junit report closes that — zero skips, and a non-zero test
+    count so an empty selection cannot pass the same check trivially."""
+    steps = _lane_pytest_steps(workflow, FULL_CHAIN_JOB)
+    reports = _lane_junit_reports(workflow, FULL_CHAIN_JOB)
+    assert len(reports) == len(steps), (
+        f"every pytest step in '{FULL_CHAIN_JOB}' must write a --junitxml report; got {reports}"
+    )
+    gate = _find_named_step(workflow, FULL_CHAIN_JOB, FULL_CHAIN_SKIP_GATE_STEP)["run"]
+    unread = [r for r in reports if r not in gate]
+    assert unread == [], f"'{FULL_CHAIN_SKIP_GATE_STEP}' never reads: {unread}"
+    assert 'get("skipped"' in gate, "the gate must read the junit skipped count"
+    assert "sys.exit(1)" in gate, "the gate must fail the job, not just print"
+
+
+def test_full_chain_auth_job_fails_on_any_skipped_test__mutation_drops_the_report() -> None:
+    mutated = copy.deepcopy(_load_workflow())
+    step = _lane_pytest_steps(mutated, FULL_CHAIN_JOB)[0]
+    step["run"] = _JUNIT_RE.sub("", step["run"])
+    with pytest.raises(AssertionError, match="must write a --junitxml report"):
+        test_full_chain_auth_job_fails_on_any_skipped_test(mutated)
+
+
+def test_full_chain_auth_job_fails_on_any_skipped_test__mutation_gate_stops_failing() -> None:
+    """A gate that prints the skip count without exiting non-zero is decorative:
+    the job still reports success over a lane that ran nothing."""
+    mutated = copy.deepcopy(_load_workflow())
+    step = _find_named_step(mutated, FULL_CHAIN_JOB, FULL_CHAIN_SKIP_GATE_STEP)
+    step["run"] = step["run"].replace("sys.exit(1)", "pass")
+    with pytest.raises(AssertionError, match="must fail the job"):
+        test_full_chain_auth_job_fails_on_any_skipped_test(mutated)
+
+
+def test_privilege_split_lane_fails_on_a_lane_wide_skip(workflow: dict[str, Any]) -> None:
+    """Deliberately NOT the zero-skip gate the single-module lanes use.
+    ``test_audit_two_container.py`` carries per-test guards for runtimes that
+    remap ids or rewrite bind-mount ownership, each documenting the half of the
+    property that still holds, and its own ``_degraded_host`` helper already
+    FAILS rather than skips on a CI runner for the class it considers a lane
+    misconfiguration. What no in-test guard can catch is the module skipping
+    WHOLE — no runtime, an unusable mount source, a module-level skipif — because
+    then nothing runs to fail. So a report that collected nothing, or in which
+    every test skipped, must fail the lane."""
+    steps = _lane_pytest_steps(workflow, PRIVSPLIT_JOB)
+    reports = _lane_junit_reports(workflow, PRIVSPLIT_JOB)
+    assert len(reports) == len(steps), (
+        f"every pytest step in '{PRIVSPLIT_JOB}' must write a --junitxml report; got {reports}"
+    )
+    step = _find_named_step(workflow, PRIVSPLIT_JOB, PRIVSPLIT_SKIP_GATE_STEP)
+    gate = step["run"]
+    unread = [r for r in reports if r not in gate]
+    assert unread == [], f"'{PRIVSPLIT_SKIP_GATE_STEP}' never reads: {unread}"
+    assert 'get("skipped"' in gate, "the gate must read the junit skipped count"
+    assert "skipped == total" in gate, "the gate must fail on a module that skipped in full"
+    assert "sys.exit(1)" in gate, "the gate must fail the job, not just print"
+    assert step.get("if") == AUDIT_2C_STEP_IF, (
+        f"'{PRIVSPLIT_SKIP_GATE_STEP}' must carry `if: {AUDIT_2C_STEP_IF}`, or a red "
+        "step ahead of it skips the very check that reads what the run proved"
+    )
+
+
+def test_privilege_split_lane_fails_on_a_lane_wide_skip__mutation_drops_a_report() -> None:
+    """One module reported and one not is the silent-partial-fix shape."""
+    mutated = copy.deepcopy(_load_workflow())
+    step = _lane_pytest_steps(mutated, PRIVSPLIT_JOB)[1]
+    step["run"] = _JUNIT_RE.sub("", step["run"])
+    with pytest.raises(AssertionError, match="must write a --junitxml report"):
+        test_privilege_split_lane_fails_on_a_lane_wide_skip(mutated)
+
+
+def test_privilege_split_lane_fails_on_a_lane_wide_skip__mutation_gate_tolerates_all_skipped() -> (
+    None
+):
+    """Downgrading the all-skipped arm to a warning is the whole regression: the
+    lane goes back to reporting success over a module that built nothing."""
+    mutated = copy.deepcopy(_load_workflow())
+    step = _find_named_step(mutated, PRIVSPLIT_JOB, PRIVSPLIT_SKIP_GATE_STEP)
+    step["run"] = step["run"].replace("skipped == total", "skipped < 0")
+    with pytest.raises(AssertionError, match="skipped in full"):
+        test_privilege_split_lane_fails_on_a_lane_wide_skip(mutated)
+
+
+def test_full_chain_auth_lane_outbudgets_the_single_build_lanes(workflow: dict[str, Any]) -> None:
+    """The lane builds BOTH real framework images — the deployed sidecar
+    Dockerfile and the production project image — where each sibling below
+    builds one, and its neighbours measure a single such build at 7-11 minutes
+    cold. Held to the SAME cap as a one-build lane, the worst legal in-test path
+    runs past the ceiling and the lane reds on wall clock rather than on
+    anything it asserts. What is pinned is the relation, not the minute counts:
+    strictly more work must carry strictly more budget, at both the job cap and
+    the step cap under it."""
+    jobs = _jobs(workflow)
+    job_cap = jobs[FULL_CHAIN_JOB]["timeout-minutes"]
+    step_cap = _sole_heavy_step(jobs[FULL_CHAIN_JOB])["timeout-minutes"]
+    for sibling in SINGLE_BUILD_AUTH_JOBS:
+        sibling_job_cap = jobs[sibling]["timeout-minutes"]
+        sibling_step_cap = _sole_heavy_step(jobs[sibling])["timeout-minutes"]
+        assert job_cap > sibling_job_cap, (
+            f"'{FULL_CHAIN_JOB}' builds two images where '{sibling}' builds one, but "
+            f"carries the same or less job budget ({job_cap} vs {sibling_job_cap} minutes)"
+        )
+        assert step_cap > sibling_step_cap, (
+            f"'{FULL_CHAIN_JOB}''s pytest step carries the same or less budget than "
+            f"'{sibling}''s ({step_cap} vs {sibling_step_cap} minutes)"
+        )
+
+
+def test_full_chain_auth_lane_outbudgets_the_single_build_lanes__mutation_back_to_sibling_cap() -> (
+    None
+):
+    """The shipped-before state: two builds held to a one-build lane's ceiling."""
+    mutated = copy.deepcopy(_load_workflow())
+    sibling = _jobs(mutated)[SINGLE_BUILD_AUTH_JOBS[0]]
+    job = _jobs(mutated)[FULL_CHAIN_JOB]
+    job["timeout-minutes"] = sibling["timeout-minutes"]
+    _sole_heavy_step(job)["timeout-minutes"] = _sole_heavy_step(sibling)["timeout-minutes"]
+    with pytest.raises(AssertionError, match="job budget"):
+        test_full_chain_auth_lane_outbudgets_the_single_build_lanes(mutated)

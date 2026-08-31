@@ -49,7 +49,11 @@ def test_bluesky_server_env():
     assert bluesky["env"]["OSPREY_CONFIG"] == "/tmp/test-project/build/config.yml"
     assert bluesky["env"]["CONFIG_FILE"] == "/tmp/test-project/build/config.yml"
     # Shell variable references pass through untouched for runtime expansion.
-    assert bluesky["env"]["BLUESKY_BRIDGE_URL"] == "${BLUESKY_BRIDGE_URL:-http://127.0.0.1:8090}"
+    # No literal default on the URL: unset must reach the server EMPTY so the
+    # resolver falls back to the rendered config's `services.bluesky.port` —
+    # a baked loopback URL was a second copy of the port that a
+    # moved bridge could never correct.
+    assert bluesky["env"]["BLUESKY_BRIDGE_URL"] == "${BLUESKY_BRIDGE_URL:-}"
     assert bluesky["env"]["BLUESKY_LAUNCH_TOKEN"] == "${BLUESKY_LAUNCH_TOKEN:-}"
 
 
@@ -76,6 +80,7 @@ _EXPECTED_ALLOW = [
     "list_runs",
     "get_run_data",
     "get_run_figure",
+    "get_plan_source",
     "get_draft",
     "set_draft",
     "clear_draft",
@@ -90,7 +95,7 @@ def test_bluesky_permissions_allow():
 
 
 def test_bluesky_surface_has_no_bypass_of_the_panel_visible_draft():
-    """The agent-facing surface is exactly 17 tools and exposes no launch bypass.
+    """The agent-facing surface is exactly 19 tools and exposes no launch bypass.
 
     ``create_run_intent`` (the old intent-composing read tool) and
     ``launch_run`` (the old direct launch) are both gone: every agent execution
@@ -101,7 +106,7 @@ def test_bluesky_surface_has_no_bypass_of_the_panel_visible_draft():
     surface = [*bluesky["permissions_allow"], *bluesky["permissions_ask"]]
     assert "create_run_intent" not in surface
     assert "launch_run" not in surface
-    assert len(surface) == 17
+    assert len(surface) == 19
 
 
 def test_bluesky_permissions_ask():
@@ -110,6 +115,7 @@ def test_bluesky_permissions_ask():
         "queue_add",
         "queue_start",
         "queue_stop",
+        "queue_remove",
         "stop_run",
         "write_plan",
         "validate_plan",
@@ -128,6 +134,7 @@ def test_bluesky_hooks_pre_structure():
         "mcp__bluesky__queue_add",
         "mcp__bluesky__queue_start",
         "mcp__bluesky__queue_stop",
+        "mcp__bluesky__queue_remove",
         "mcp__bluesky__stop_run",
         "mcp__bluesky__write_plan",
         "mcp__bluesky__validate_plan",
@@ -142,15 +149,17 @@ def test_bluesky_hooks_pre_structure():
         assert any("osprey_writes_check.py" in c for c in commands)
         assert any("osprey_approval.py" in c for c in commands)
 
-    # queue_stop and stop_run must NEVER be writes-check-gated — the kill
-    # switch must not block halting (the safe direction). queue_stop's one
-    # arming case (cancel=true) is gated in-tool and at the bridge instead, so
-    # that a PLAIN stop keeps working with writes disabled.
+    # queue_stop, queue_remove and stop_run must NEVER be writes-check-gated —
+    # the kill switch must not block halting or clearing (the safe direction).
+    # queue_stop's one arming case (cancel=true) is gated in-tool and at the
+    # bridge instead, so that a PLAIN stop keeps working with writes disabled;
+    # queue_remove only discards pending work and is the sole way past the
+    # interrupted-item start refusal.
     #
     # write_plan/validate_plan reach no hardware either way — write
     # only emits a file, validate only dry-runs mock devices in an
     # EPICS_CA_*-scrubbed subprocess — so they sit in the same tier.
-    for tool in ("queue_stop", "stop_run", "write_plan", "validate_plan"):
+    for tool in ("queue_stop", "queue_remove", "stop_run", "write_plan", "validate_plan"):
         rule = by_matcher[f"mcp__bluesky__{tool}"]
         commands = [h["command"] for h in rule["hooks"]]
         assert len(rule["hooks"]) == 1
@@ -183,7 +192,7 @@ def test_bluesky_authoring_tools_never_writes_check_gated():
         assert any("osprey_writes_check.py" in h.command for h in rule.hooks)
         assert any("osprey_approval.py" in h.command for h in rule.hooks)
 
-    for tool in ("queue_stop", "stop_run"):
+    for tool in ("queue_stop", "queue_remove", "stop_run"):
         rule = by_matcher[f"mcp__bluesky__{tool}"]
         assert len(rule.hooks) == 1
         assert "osprey_approval.py" in rule.hooks[0].command
@@ -255,6 +264,7 @@ def test_bluesky_can_be_extended_like_other_framework_servers():
         "queue_add",
         "queue_start",
         "queue_stop",
+        "queue_remove",
         "stop_run",
         "write_plan",
         "validate_plan",
@@ -264,6 +274,7 @@ def test_bluesky_can_be_extended_like_other_framework_servers():
         "mcp__bluesky2__queue_add",
         "mcp__bluesky2__queue_start",
         "mcp__bluesky2__queue_stop",
+        "mcp__bluesky2__queue_remove",
         "mcp__bluesky2__stop_run",
         "mcp__bluesky2__write_plan",
         "mcp__bluesky2__validate_plan",

@@ -12,6 +12,7 @@ import logging
 import shutil
 from pathlib import Path
 
+from osprey.build.build_tiers import VALID_CHANNEL_FINDER_MODES
 from osprey.cli.templates._rendering import render_template
 
 logger = logging.getLogger("osprey.cli.templates")
@@ -25,6 +26,70 @@ logger = logging.getLogger("osprey.cli.templates")
 # resolves to at build time. Bump deliberately, alongside the dispatch-worker
 # pin.
 _DEFAULT_CLAUDE_CLI_VERSION = "2.1.146"
+
+CONFIG_TEMPLATE = "config.yml.j2"
+"""The project-file template that renders ``config.yml``."""
+
+
+def _default_cli_version(ctx: dict) -> None:
+    """Expose ``claude_code.cli_version`` to Dockerfile.j2's CLAUDE_CLI_VERSION
+    ARG default, so the same version pin that ``osprey chat``/``osprey web``
+    honor at runtime (osprey.utils.claude_launcher) also pins the image's
+    build-time CLI install. Callers may pre-populate
+    ``ctx["claude_code_cli_version"]`` (flat) or ``ctx["claude_code"]["cli_version"]``
+    (nested, mirroring config.yml's shape); absent either, fall back to the
+    framework's last verified pin."""
+    if "claude_code_cli_version" not in ctx:
+        ctx["claude_code_cli_version"] = (
+            ctx.get("claude_code", {}).get("cli_version") or _DEFAULT_CLAUDE_CLI_VERSION
+        )
+
+
+def project_template_for(template_root: Path, data_bundle: str, template_file: str) -> str | None:
+    """The template that renders project file *template_file* for *data_bundle*.
+
+    An app template's own copy wins over the shared ``project/`` default
+    (``apps/control_assistant/config.yml.j2`` over ``project/config.yml.j2``).
+
+    Returns:
+        The template's path relative to the templates root, in the spelling the
+        Jinja environment loads by, or ``None`` when neither ships the file.
+    """
+    name = template_file if template_file.endswith(".j2") else template_file + ".j2"
+    if (template_root / "apps" / data_bundle / name).exists():
+        return f"apps/{data_bundle}/{name}"
+    if (template_root / "project" / template_file).exists():
+        return f"project/{template_file}"
+    return None
+
+
+def render_project_config(
+    template_root: Path,
+    jinja_env,
+    output_path: Path,
+    data_bundle: str,
+    ctx: dict,
+) -> None:
+    """Render ``config.yml`` alone — the one file of a project render that
+    says what the project deploys and where — with the template
+    :func:`create_project_structure` would pick for *data_bundle* and the
+    same context.
+
+    Args:
+        template_root: Path to osprey's bundled templates directory
+        jinja_env: Jinja2 environment for template rendering
+        output_path: Where the rendered ``config.yml`` is written
+        data_bundle: Name of the data bundle (apps/ subdirectory) to use
+        ctx: Template context variables
+
+    Raises:
+        ValueError: If neither the bundle nor ``project/`` ships the template.
+    """
+    _default_cli_version(ctx)
+    template_path = project_template_for(template_root, data_bundle, CONFIG_TEMPLATE)
+    if template_path is None:
+        raise ValueError(f"App template {data_bundle!r} renders no config.yml")
+    render_template(jinja_env, template_path, ctx, output_path)
 
 
 def provider_api_key_entries() -> list[dict[str, str]]:
@@ -57,9 +122,31 @@ _SERVICE_TOKEN_VAR_NOTES: dict[str, str] = {
     "DISPATCH_WORKER_TOKEN": "authenticates the dispatch worker back to the dispatcher",
     "BLUESKY_LAUNCH_TOKEN": "arms the Bluesky bridge's plan-launch endpoint",
     "BLUESKY_TILED_API_KEY": "the key the bridge presents to the co-deployed Tiled catalog",
+    # The opt-in SECOND plan lane's own launch token. One per control-system
+    # target a lane can serve, so three names — but a deployment renders at most
+    # one second lane, so at most one of them exists in any repo's `.env`, and
+    # none at all without `bluesky.second_lane`: a lane is named for the target
+    # it serves, and which target the second lane serves depends on which
+    # machine the deployment baseline is. All three are documented anyway,
+    # because this file lists what a repo's `.env` MAY hold rather than what
+    # this one deployment does.
+    "BLUESKY_VA_LAUNCH_TOKEN": (
+        "arms the plan-launch endpoint of the second Bluesky lane, the one serving the "
+        "virtual accelerator (only on a deployment with `bluesky.second_lane`)"
+    ),
+    "BLUESKY_LIVE_LAUNCH_TOKEN": (
+        "arms the plan-launch endpoint of the second Bluesky lane, the one serving the live "
+        "machine (only on a deployment with `bluesky.second_lane`)"
+    ),
+    "BLUESKY_STANDIN_LAUNCH_TOKEN": (
+        "arms the plan-launch endpoint of the Bluesky lane serving the live stand-in soft "
+        "IOC (only on a deployment with `bluesky.second_lane`)"
+    ),
+    "OSPREY_TERMINAL_SECRET": "the operator login secret for the bluesky-web panel's web gate",
     "ZO_ROOT_USER_PASSWORD": "OpenObserve root/ingest credential",
     "ARIEL_DB_PASSWORD": "ARIEL Postgres password (also fills the agent's derived DSN)",
     "MONGO_ROOT_PASSWORD": "archiver store root password (the seeder, recorder and agent all authenticate with it)",
+    "GRAPHDB_PASSWORD": "graph store password (the seeder, health check and deploy staging all authenticate with it)",
 }
 
 
@@ -125,22 +212,12 @@ def create_project_structure(
         ctx: Template context variables
     """
     project_template_dir = template_root / "project"
-    app_template_dir = template_root / "apps" / data_bundle
 
-    # Expose claude_code.cli_version to Dockerfile.j2's CLAUDE_CLI_VERSION ARG
-    # default, so the same version pin that `osprey chat`/`osprey web`
-    # honor at runtime (osprey.utils.claude_launcher) also pins the image's
-    # build-time CLI install. Callers may pre-populate ctx["claude_code_cli_version"]
-    # (flat) or ctx["claude_code"]["cli_version"] (nested, mirroring config.yml's
-    # shape); absent either, fall back to the framework's last verified pin.
-    if "claude_code_cli_version" not in ctx:
-        ctx["claude_code_cli_version"] = (
-            ctx.get("claude_code", {}).get("cli_version") or _DEFAULT_CLAUDE_CLI_VERSION
-        )
+    _default_cli_version(ctx)
 
     # Render template files (no pyproject.toml or requirements.txt -- no src/ package)
     files_to_render = [
-        ("config.yml.j2", "config.yml"),
+        (CONFIG_TEMPLATE, "config.yml"),
         ("env.example.j2", ".env.example"),
         ("README.md.j2", "README.md"),
         # Reference container image — rendered once at build; regen never touches it
@@ -150,26 +227,21 @@ def create_project_structure(
     # Copy static files
     static_files = [
         # requirements.txt moved to rendered templates to handle {{ framework_version }}
+        #
+        # The container entrypoint. Copied rather than rendered: it derives the
+        # render it maintains from its own location, so there is nothing
+        # project-specific to substitute — and a file with no Jinja in it is one
+        # fewer thing that can be broken by a context key going missing. It
+        # lands in the render, beside the Dockerfile that installs it, because
+        # that is what makes it part of the deployment the image copies in
+        # rather than a sidecar the build has to remember to carry.
+        ("entrypoint.sh", "entrypoint.sh"),
     ]
 
     for template_file, output_file in files_to_render:
-        # Check if app template has its own version first (e.g., requirements.txt.j2)
-        app_specific_template = app_template_dir / (
-            template_file + ".j2" if not template_file.endswith(".j2") else template_file
-        )
-        default_template = project_template_dir / template_file
-
-        if app_specific_template.exists():
-            # Use app-specific template
-            render_template(
-                jinja_env,
-                f"apps/{data_bundle}/{app_specific_template.name}",
-                ctx,
-                project_dir / output_file,
-            )
-        elif default_template.exists():
-            # Use default project template
-            render_template(jinja_env, f"project/{template_file}", ctx, project_dir / output_file)
+        template_path = project_template_for(template_root, data_bundle, template_file)
+        if template_path is not None:
+            render_template(jinja_env, template_path, ctx, project_dir / output_file)
 
     # Copy static files
     for src_name, dst_name in static_files:
@@ -302,9 +374,21 @@ def copy_template_data(
     # ``template_root`` through a package-rooted Jinja loader, which cannot
     # reach a tree outside the osprey package at all.
     if data_root is not None:
+        from osprey.utils.workspace import RUNTIME_DATA_DIR_NAME
+
         dst_data = project_dir / "data"
+
+        def _drop_runtime_output(directory: str, names: list[str]) -> set[str]:
+            # data/.runtime/ is runtime-minted material (`osprey up`'s CURVE
+            # certificates) — private keys that must not be staged into
+            # build/ or into the images built from it. Top level only, the
+            # same anchoring the fingerprint fold applies to the same name.
+            if Path(directory) == Path(data_root) and RUNTIME_DATA_DIR_NAME in names:
+                return {RUNTIME_DATA_DIR_NAME}
+            return set()
+
         # dirs_exist_ok is defensive — no build path reaches here with data/ present.
-        shutil.copytree(data_root, dst_data, dirs_exist_ok=True)
+        shutil.copytree(data_root, dst_data, dirs_exist_ok=True, ignore=_drop_runtime_output)
         logger.debug("Copied profile data files from %s to %s", data_root, dst_data)
         return
 
@@ -347,7 +431,10 @@ def copy_template_data(
             return
 
 
-_ALL_PARADIGMS: tuple[str, ...] = ("in_context", "hierarchical", "middle_layer")
+#: Alias of the paradigm registry in :mod:`osprey.build.build_tiers`, kept
+#: under the local name this module's guard reads. Adding a paradigm to the
+#: registry admits it here with no edit.
+_ALL_PARADIGMS: tuple[str, ...] = VALID_CHANNEL_FINDER_MODES
 
 
 def materialize_tier_artifacts(project_dir: Path, tier: int, channel_finder_mode: str) -> None:
@@ -367,6 +454,14 @@ def materialize_tier_artifacts(project_dir: Path, tier: int, channel_finder_mode
     - prunes both the ``tiers/`` and ``benchmarks/cross_paradigm/`` subtrees
       so only the active artifacts remain.
 
+    ``graph`` takes the query file and nothing else: its store is a seeded
+    graph service, so the preset ships no ``tiers/tier{N}/graph.json`` and the
+    build materializes no channel database for it. The queries still land,
+    because the graph benchmark lane scores the same tier-3 ground truth as
+    the file-database paradigms. Graph only ever reaches this function at the
+    derived tier 3 — :func:`osprey.build.build_tiers.tier_mode_conflict`
+    rejects an explicit ``tier`` paired with it.
+
     Facility profiles overlaying their own DB files don't care which tier
     was selected — their overlay overwrites the preset DB after this step.
     Tier itself is build-time only and is NOT written into ``config.yml``.
@@ -377,13 +472,15 @@ def materialize_tier_artifacts(project_dir: Path, tier: int, channel_finder_mode
             ships only the ``in_context`` paradigm; the build-profile validator
             rejects tier 1 paired with a non-in_context channel_finder_mode
             before this step, so a missing tier1/<paradigm>.json here is a bug.
+            For ``graph`` the tier selects the query file only.
         channel_finder_mode: Paradigm selector from the build profile. Must
-            be one of ``"in_context"``, ``"hierarchical"``, ``"middle_layer"``.
+            be one of the paradigms in
+            :data:`osprey.build.build_tiers.VALID_CHANNEL_FINDER_MODES`.
 
     Raises:
-        ValueError: If ``channel_finder_mode`` is not one of the three valid
-            paradigms (the build-profile validator and ``manager.py`` should
-            catch this earlier, but this is a defensive guard).
+        ValueError: If ``channel_finder_mode`` is not a registered paradigm
+            (the build-profile validator and ``manager.py`` should catch this
+            earlier, but this is a defensive guard).
         FileNotFoundError: If a required source artifact is missing. Raised
             BEFORE any destination file is overwritten or any directory is
             removed, so the project tree is left untouched on failure.
@@ -401,7 +498,10 @@ def materialize_tier_artifacts(project_dir: Path, tier: int, channel_finder_mode
             f"Unknown channel_finder_mode {channel_finder_mode!r}; "
             f"expected one of {sorted(_ALL_PARADIGMS)!r}"
         )
-    paradigms: set[str] = {channel_finder_mode}
+    # The paradigms that have a channel database to flatten. ``graph`` is
+    # backed by a seeded graph service rather than a database file, so it
+    # contributes no (src, dst) DB pair — only the query file below.
+    paradigms: set[str] = set() if channel_finder_mode == "graph" else {channel_finder_mode}
 
     tier_dir = tiers_root / f"tier{tier}"
     flat_root = project_dir / "data" / "channel_databases"
@@ -441,8 +541,9 @@ def materialize_tier_artifacts(project_dir: Path, tier: int, channel_finder_mode
         shutil.rmtree(queries_src_root)
 
     logger.debug(
-        "Materialized tier%s artifacts (channel DB + queries) for %r to %s",
+        "Materialized tier%s artifacts for %r (channel DBs: %r) to %s",
         tier,
+        channel_finder_mode,
         sorted(paradigms),
         project_dir / "data",
     )
@@ -454,8 +555,8 @@ def prune_csv_build_artifacts(project_dir: Path, channel_finder_mode: str) -> No
     The bundled ``osprey channel-finder build-database`` tool consumes a flat
     CSV (``data/raw/address_list.csv``) and emits a flat in_context-format
     JSON. Hierarchical and middle_layer databases have a nested structure
-    that the CSV format cannot express, so the ``raw/`` directory is dead
-    weight in those projects.
+    that the CSV format cannot express, and a graph build has no database file
+    at all, so the ``raw/`` directory is dead weight in those projects.
 
     Args:
         project_dir: Root directory of the rendered project.

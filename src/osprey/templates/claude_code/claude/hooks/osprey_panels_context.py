@@ -48,6 +48,16 @@ Injects three independent pieces of session context as ``additionalContext``:
    is *unknown* rather than empty (see below) — an unobserved workspace is never
    described as an empty one.
 
+## Terminal-API authorization
+
+The ``GET /api/panels`` call carries ``Authorization: Bearer
+<OSPREY_PANEL_TOKEN>`` whenever that variable holds a non-blank value in the
+environment the hook inherits — the web terminal exports it into the agent it
+launches.  When it is unset, empty or whitespace-only the header is omitted
+entirely rather than sent blank, matching how the server-side
+``mcp_server.http._panel_auth_headers`` reads the same carrier.  Either way the call stays fail-open: a refused fetch (401
+included) drops the live-state parts and leaves the session unblocked.
+
 ## Workspace snapshot
 
 Besides the context lines, this hook seeds the *workspace snapshot* — the file
@@ -89,6 +99,17 @@ Uses only ``json``, ``os``, ``sys``, ``tempfile``, ``urllib.request``,
 ``urllib.error``.  The SessionStart hook runs under ``python3`` (possibly system
 Python 3.9, not the venv interpreter), so this file must be 3.9-safe.
 
+That contract is why the web terminal's port is the one number written out
+here rather than looked up: ``osprey.port_layout`` is where every framework
+port lives, and this file may not import it.  The literal is the ``web`` slot
+at the layout's default base — what ``default_port('web', 0)`` returns — and it
+is a *fallback*, reached only when ``OSPREY_WEB_PORT`` is unset, which is the
+plain ``claude`` session run beside a default-base ``osprey web``.  A
+deployment that moved its block exports the variable, so the literal is never
+what such a deployment dials.  It carries the ``osprey:not-a-port`` marker so
+the retired-number lint reads it as the stated exception it is; move it if the
+layout's ``web`` offset or default base ever moves.
+
 Fails open on any error — stays silent and exits 0.  A down web terminal is not
 a session-blocking condition.
 """
@@ -102,6 +123,11 @@ import urllib.request
 
 #: Characters a session id may contain before it is joined into a file name.
 _SESSION_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+
+#: The web terminal's port when ``OSPREY_WEB_PORT`` names none.  Written out
+#: rather than looked up because this file may not import osprey; the module
+#: docstring states the contract and why the literal is the honest fallback.
+_DEFAULT_WEB_PORT = "10100"  # osprey:not-a-port — stdlib-only hook contract (see module docstring); equals default_port('web', 0)
 
 
 def _read_session_id(stream=None):
@@ -294,19 +320,47 @@ def _build_inventory(data):
     )
 
 
+def _panels_target(url):
+    """Build what ``urlopen`` should be handed for a terminal-API GET.
+
+    The web terminal exports ``OSPREY_PANEL_TOKEN`` into the environment of the
+    agent it launches, so a hook running under that agent inherits the token
+    without reading any file or importing anything.
+
+    Args:
+        url: Absolute URL of the terminal-API endpoint to fetch.
+
+    Returns:
+        A ``urllib.request.Request`` carrying ``Authorization: Bearer <token>``
+        when the variable holds a non-blank value; otherwise *url* unchanged,
+        so no ``Authorization`` header is sent at all. A blank bearer would be
+        a credential claim this hook cannot back, and the token being absent is
+        exactly the unauthenticated read every caller here already expected.
+        Whitespace-only counts as absent for the same reason the empty string
+        does — an uninterpolated compose variable arrives as ``""`` and a
+        hand-edited one can arrive as ``"   "`` — and it is how
+        ``mcp_server.http._panel_auth_headers`` reads the same carrier, so both
+        sides agree on what "no token" means.
+    """
+    token = (os.environ.get("OSPREY_PANEL_TOKEN") or "").strip()
+    if not token:
+        return url
+    return urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+
+
 def main():
     try:
         ux_context = _build_ux_context(os.environ.get("OSPREY_WEB_UX"))
         session_id = _read_session_id()
 
-        port = os.environ.get("OSPREY_WEB_PORT", "8087")
+        port = os.environ.get("OSPREY_WEB_PORT", _DEFAULT_WEB_PORT)
         host = "127.0.0.1"
         base = f"http://{host}:{port}"
 
         inventory = None
         tile_line = None
         try:
-            req = urllib.request.urlopen(f"{base}/api/panels", timeout=2)
+            req = urllib.request.urlopen(_panels_target(f"{base}/api/panels"), timeout=2)
             data = json.loads(req.read())
             inventory = _build_inventory(data)
             state = _workspace_state(data)

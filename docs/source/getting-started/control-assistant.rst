@@ -37,7 +37,7 @@ control-room operator skills.
 
    New to Osprey? Start with the :doc:`Hello World Tutorial <hello-world-tutorial>`.
    It covers project layout, the ``controls`` MCP server, and the safety model
-   in detail — everything below builds directly on it.
+   in detail — everything on this page builds directly on it.
 
 Step 1: Build the Project and Bring It Up
 ------------------------------------------
@@ -71,9 +71,10 @@ Then bring the stack up (this needs Docker or Podman):
 
    osprey up
 
-This starts the containers the preset declares: the Virtual Accelerator
-soft-IOC the agent reads and writes, and the **archive** — a MongoDB store and a
-recorder service — that holds what those channels did.
+This starts the containers the preset declares: the Virtual Accelerator the
+agent reads and writes — a containerized simulator with LUME-backed physics, laid
+out in :doc:`../architecture/virtual-accelerator` — and the **archive**, a
+MongoDB store and a recorder service that holds what those channels did.
 
 **The first deploy seeds the archive**, and it is the step that takes the
 longest. It writes about a month of history for every channel the machine
@@ -133,8 +134,8 @@ same safety hooks, then adds production capabilities. The most visible additions
        deploy, then recorded from the running machine; the ``data-visualizer``
        sub-agent turns it into interactive and publication-quality plots.
    * - **Operator skills**
-     - ``/diagnose``, ``/session-report``, ``setup-mode``, ``demo-gallery``, and
-       ``demo-ui`` support common control-room workflows.
+     - ``/diagnose``, ``/session-report``, ``demo-gallery``, and ``demo-ui``
+       support common control-room workflows.
    * - **Web terminal**
      - A browser split-pane UI with logbook and channel-finder panels
        (documented separately — see :doc:`../how-to/web-terminal/operate`).
@@ -300,11 +301,20 @@ connection errors, configuration drift) and produces a structured root-cause
 report — it is for diagnosing the *assistant*, not the accelerator.
 
 **Other skills:** ``demo-gallery`` generates a showcase of plot and report
-artifacts to explore the gallery's capabilities, ``demo-ui`` runs a short
+artifacts to explore the gallery's capabilities, and ``demo-ui`` runs a short
 scripted demonstration of the agent driving the web workspace — switching
-panel tabs, focusing artifacts, composing layouts — and ``setup-mode``
-inspects and repairs the project's configuration when something looks
-misconfigured.
+panel tabs, focusing artifacts, composing layouts.
+
+.. note::
+
+   Editing this deployment's own configuration is deliberately not one of the
+   skills here. The preset withholds the ``setup-mode`` skill and the agent's
+   ``setup_patch`` tool from the control-room agent — including the one this
+   tutorial runs — because rewriting the project is administration rather than
+   control-room work. The multi-user stack grants both to a single admin
+   login; see :ref:`the tier table <multi-user-tiers>`. To change something in
+   this tutorial, edit ``profile.yml`` and run ``osprey build``, which is what
+   the rest of this page does.
 
 .. note::
 
@@ -358,10 +368,14 @@ in ``profile.yml``:
 
    osprey set connector=epics
    osprey set config.archiver.type=epics_archiver
+   osprey set va_archiver=null
 
 The archive this tutorial deploys is a *simulated* machine's history, which is
 not what you want against hardware — so the archiver moves to your facility's
-appliance at the same time as the control system.
+appliance at the same time as the control system, and the recorded store is
+dropped. All three lines are needed: the build refuses a facility baseline that
+still carries a ``va_archiver:`` block, because that store would be served as
+the real machine's past.
 
 Because these are build-time inputs, re-render the agent's artifacts and
 relaunch:
@@ -396,4 +410,4 @@ search, historical plotting, and operator skills. Where to go next:
 - **Architecture deep dive**: the :doc:`conceptual-tutorial` and the
   :doc:`Architecture <../architecture/index>` section explain the agent + MCP
   design, the connector system, and the safety mechanisms.
-- **CLI reference**: see :doc:`../cli-reference/index` for all ``osprey`` commands.
+- **CLI reference**: see :doc:`/reference/cli` for all ``osprey`` commands.

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import warnings
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -22,11 +23,22 @@ from osprey.build.build_tiers import (
     default_tier_for_mode,
     tier_mode_conflict,
 )
+from osprey.deployment.graphdb_service import (
+    GRAPHDB_SERVICE_NAME,
+    resolve_graphdb_service_config,
+)
+from osprey.deployment.qmd_service import DEFAULT_PORT as QMD_DEFAULT_PORT
+from osprey.deployment.qmd_service import (
+    QMD_SERVICE_NAME,
+    resolve_qmd_service_config,
+)
 from osprey.errors import BuildProfileError
+from osprey.port_layout import LAYOUT, WORKER_MAX, PortSlot, default_port, resolve_port_base
 from osprey.profiles.web_panels import BUILTIN_PANELS
 
 from .build_profile_archiver import (
     VAArchiverConfig,
+    _expand_dotted,
     va_archiver_errors,
     va_mock_archiver_errors,
 )
@@ -34,6 +46,7 @@ from .build_profile_deploy import DeployConfig
 from .build_profile_presets import _triggers_dir
 from .build_profile_schema import (
     _ENV_VAR_RE,
+    SECOND_LANE_PORT_STRIDE,
     BlueskyConfig,
     BlueskyWebConfig,
     DispatchConfig,
@@ -46,7 +59,13 @@ from .build_profile_schema import (
     ProfileProvenance,
     ServiceDef,
     VAConfig,
+    env_names_errors,
     network_mode_errors,
+)
+from .build_profile_va_faults import (
+    live_standin_errors,
+    standin_archive_errors,
+    standin_baseline_errors,
 )
 from .profile_conventions import validate_convention_sources
 
@@ -54,6 +73,211 @@ DISPATCH_PAIR_SERVICES = ("event_dispatcher", "dispatch_worker")
 """The two services the ``dispatch:`` block deploys as one unit. They share a
 network by construction, so ``dispatch.network:`` is their only network knob
 and a per-half ``network:`` is rejected rather than honored."""
+
+_GRAPH_MODE = "graph"
+"""The one channel-finder paradigm that answers from a graph store rather than a
+channel-database file, and so the one with a service prerequisite. A member name
+of :data:`VALID_CHANNEL_FINDER_MODES`, not a second enumeration — the rule below
+is about this paradigm alone, exactly as ``tier_mode_conflict`` is."""
+
+_APP_TEMPLATE_ROOT = Path(__file__).resolve().parent.parent / "templates" / "apps"
+"""Where the bundled app templates live; ``app_template:`` names one by directory."""
+
+_GRAPHDB_CONFIG_PREFIX = f"services.{GRAPHDB_SERVICE_NAME}"
+"""Dotted-key spelling of the graph-store block on a profile's ``config:`` surface."""
+
+_QMD_CONFIG_PREFIX = f"services.{QMD_SERVICE_NAME}"
+"""Dotted-key spelling of the qmd sidecar's block on a profile's ``config:`` surface."""
+
+_CHANNEL_FINDER_SERVER_ENABLED_KEY = "claude_code.servers.channel-finder.enabled"
+"""The switch a persona flips to take the channel finder out of its render."""
+
+_HYBRID_SEARCH_BLOCK_KEY = "ariel.search_modules.hybrid"
+"""The ARIEL search module the qmd sidecar answers; ``None`` here removes it."""
+
+_HYBRID_SEARCH_ENABLED_KEY = f"{_HYBRID_SEARCH_BLOCK_KEY}.enabled"
+"""The switch that takes hybrid logbook search out of a render."""
+
+_MISSING = object()
+"""Sentinel for "this profile says nothing about that key"."""
+
+_HOST_NETWORK_MODE = "host"
+"""The member of ``VALID_NETWORK_MODES`` whose services share the host's own
+network namespace, and so bind host ports directly instead of publishing them
+through compose. Two rules below turn on it: the dispatch workers spend host
+ports only in this mode, and only in this mode can they overrun the layout."""
+
+_UNSEEDED_SLOTS = frozenset({"worker", "bluesky_second_lane", "va_standin", "facility"})
+"""Layout slots :meth:`BuildProfile._layout_seed` deliberately leaves out.
+
+``worker`` is walked from the dispatch block instead, under the host-network
+predicate that decides whether the band is published at all. ``va_standin`` is
+the very port the ledger's consumer is testing — seeding it would make
+``live_standin: true``, which resolves to exactly that slot, collide with
+itself. ``bluesky_second_lane`` is opt-in and derived, and is claimed from the
+lane it is derived from. ``facility`` is the band a deployment spends on its
+own services, so the framework publishes nothing there to claim.
+"""
+
+_SLOT_CLAIM_ALIASES: dict[str, tuple[str, ...]] = {
+    "dispatcher": ("dispatch.dispatcher_port",),
+    "tiled": ("bluesky.tiled_port",),
+    "bluesky": ("bluesky.port",),
+    "bluesky_web": ("bluesky_web.port",),
+    "mongo": ("va_archiver.port_host",),
+}
+"""Ledger keys that move a layout slot under a name other than the slot's own.
+
+A slot is seeded only when nothing already in the ledger names it. The
+``services.<name>.<field>`` key the slot itself declares is checked directly;
+these are the slots a profile ALSO moves from a top-level block, whose key is
+not that spelling. Seeding beside one of them would claim the layout port a
+service has just been moved off.
+"""
+
+
+def _config_lookup(config: Any, dotted_key: str) -> Any:
+    """Read *dotted_key* off a profile's ``config:`` overlay, or ``_MISSING``.
+
+    The overlay is authored in dotted keys and that is the only spelling the
+    renderer applies, but a hand-written profile can nest the same path — and
+    can nest part of it (``claude_code.servers:`` holding a ``channel-finder:``
+    mapping). Longest match at each step, so a key that IS spelled dotted is
+    found before the walk tries to descend into it.
+
+    Args:
+        config: A profile's ``config:`` block, whatever shape it parsed as.
+        dotted_key: The full path, in the dotted spelling.
+
+    Returns:
+        The value, or :data:`_MISSING` when no spelling of that path is set.
+    """
+    node: Any = config
+    parts = dotted_key.split(".")
+    index = 0
+    while index < len(parts):
+        if not isinstance(node, dict):
+            return _MISSING
+        for end in range(len(parts), index, -1):
+            candidate = ".".join(parts[index:end])
+            if candidate in node:
+                node = node[candidate]
+                index = end
+                break
+        else:
+            return _MISSING
+    return node
+
+
+def _app_template_lookup(data_bundle: str, dotted_path: str) -> Any:
+    """Read what app template *data_bundle* declares at *dotted_path*.
+
+    Read off the template source rather than off a render: this validator runs
+    before anything reaches disk, and what a template declares is a fixed part
+    of it — what varies per profile is the ``config:`` overlay applied after
+    the render, which the ``BuildProfile`` readers below consult themselves.
+
+    The file is walked by indentation rather than parsed: it is a Jinja
+    template, not YAML, until it is rendered. Each mapping key is pushed onto a
+    stack as its line is met and popped when a shallower line arrives, so the
+    stack at any line spells the dotted path that line sits under. Comments,
+    blank lines, Jinja statements and list items are stepped over, and the
+    body of a block scalar (``key: |``) is skipped wholesale so its prose
+    cannot pose as keys. A template that spells a section twice under
+    different Jinja branches — ``services:`` with a block, ``services: {}``
+    without — answers with the first spelling, which is the declaring one.
+
+    Args:
+        data_bundle: App template directory name (the ``app_template:`` key).
+        dotted_path: The path to read, in the dotted spelling.
+
+    Returns:
+        :data:`_MISSING` when no line of the template sits at that path — also
+        how a bundle that ships no ``config.yml.j2`` reads, and so how an
+        unknown bundle name reads: the build names that fault itself, and
+        reporting it twice would not help. ``None`` when the path heads a
+        nested mapping and so carries no scalar of its own. Otherwise the
+        scalar's source text, inline comment removed, exactly as the template
+        spells it — ``true``, ``{{ osprey_ports.qmd }}``, ``{{ default_model }}``.
+        A framework port reads as the second of those, not as a number: the
+        templates derive every one of them from the layout at render time, so
+        what is on the line is the derivation and not its result.
+    """
+    template = _APP_TEMPLATE_ROOT / data_bundle / "config.yml.j2"
+    try:
+        text = template.read_text(encoding="utf-8")
+    except OSError:
+        return _MISSING
+    target = dotted_path.split(".")
+    stack: list[tuple[int, str]] = []  # (indent, key) per enclosing mapping
+    block_scalar_indent: int | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        indent = len(line) - len(line.lstrip())
+        if block_scalar_indent is not None:
+            if indent > block_scalar_indent:
+                continue
+            block_scalar_indent = None
+        if stripped.startswith(("#", "{%", "{{", "-")):
+            continue
+        key, separator, rest = stripped.partition(":")
+        if not separator or (rest and not rest[0].isspace()):
+            # `http://host` is a scalar with a colon in it, not a key.
+            continue
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        stack.append((indent, key.strip()))
+        value = rest.split(" #", 1)[0].strip()
+        if value[:1] in ("|", ">") and value[1:2] in ("", "-", "+"):
+            block_scalar_indent = indent
+        if [name for _, name in stack] == target:
+            return value or None
+    return _MISSING
+
+
+def _app_template_declares_graphdb(data_bundle: str) -> bool:
+    """Whether app template *data_bundle* renders a ``services.graphdb`` block.
+
+    Args:
+        data_bundle: App template directory name (the ``app_template:`` key).
+
+    Returns:
+        Whether that template's ``services:`` section carries a ``graphdb``
+        key; see :func:`_app_template_lookup` for how that is read.
+    """
+    return _app_template_lookup(data_bundle, _GRAPHDB_CONFIG_PREFIX) is not _MISSING
+
+
+def _app_template_declares_qmd(data_bundle: str) -> bool:
+    """Whether app template *data_bundle* renders a ``services.qmd`` block.
+
+    Args:
+        data_bundle: App template directory name (the ``app_template:`` key).
+
+    Returns:
+        Whether that template's ``services:`` section carries a ``qmd`` key;
+        see :func:`_app_template_lookup` for how that is read.
+    """
+    return _app_template_lookup(data_bundle, _QMD_CONFIG_PREFIX) is not _MISSING
+
+
+def _app_template_enables_hybrid_search(data_bundle: str) -> bool:
+    """Whether app template *data_bundle* switches hybrid logbook search on.
+
+    Args:
+        data_bundle: App template directory name (the ``app_template:`` key).
+
+    Returns:
+        Whether the template spells ``enabled: true`` under
+        ``ariel.search_modules.hybrid``. A template with no ``ariel:`` section
+        at all — the channel-finder one — reads as off, which is what it
+        renders.
+    """
+    value = _app_template_lookup(data_bundle, _HYBRID_SEARCH_ENABLED_KEY)
+    return isinstance(value, str) and value.lower() == "true"
+
 
 # VALID_CHANNEL_FINDER_MODES / default_tier_for_mode / tier_mode_conflict are
 # imported from the build-time kernel (osprey.build.build_tiers) so the
@@ -382,15 +606,71 @@ class BuildProfile:
 
         return errors
 
+    def _validate_service_key_shapes(self) -> list[str]:
+        """Return the errors for service/config keys that are not strings.
+
+        A bare ``on:``/``no:`` used as a service name or a ``config:`` key is
+        read on the YAML 1.1 resolver as a boolean, which would reach the
+        dotted-key formatting in the per-service axis scans as a non-string.
+        Reported here, once for the whole profile, rather than inside each
+        scan, so one malformed key is one message however many axes walk it.
+
+        Returns:
+            Human-readable error messages; empty when every key is a string.
+        """
+        errors: list[str] = []
+        for name in self.services:
+            if not isinstance(name, str):
+                errors.append(
+                    f"services keys must be strings (got {name!r}); a bare "
+                    "yes/no/on/off in YAML parses as a boolean — quote the service name"
+                )
+        if isinstance(self.config, dict):
+            for key in self.config:
+                if not isinstance(key, str):
+                    errors.append(
+                        f"config keys must be strings (got {key!r}); a bare "
+                        "yes/no/on/off in YAML parses as a boolean — quote the key"
+                    )
+        return errors
+
+    def _service_axis_declarations(self, axis: str) -> Iterator[tuple[str, Any, str]]:
+        """Yield ``(service, value, key)`` for every declaration of one axis.
+
+        Walks BOTH authoring surfaces — the ``services:`` block and the dotted
+        ``config:`` overrides — because either spelling reaches the same key in
+        the rendered ``config.yml``, so a rule reading only one of them would be
+        trivially bypassable. Non-string keys are skipped; they are reported by
+        :meth:`_validate_service_key_shapes`.
+
+        Args:
+            axis: The per-service key to collect (e.g. ``"network"``).
+
+        Yields:
+            The service name, the declared value, and the dotted path to quote
+            back at the author.
+        """
+        for name, svc in self.services.items():
+            if not isinstance(name, str):
+                continue
+            if isinstance(svc.config, dict) and axis in svc.config:
+                yield name, svc.config[axis], f"services.{name}.{axis}"
+
+        if isinstance(self.config, dict):
+            for key, value in self.config.items():
+                if not isinstance(key, str):
+                    continue
+                parts = key.split(".")
+                if len(parts) == 3 and parts[0] == "services" and parts[2] == axis:
+                    yield parts[1], value, key
+
     def _validate_network_axis(self) -> list[str]:
         """Return validation errors for every ``network:`` declaration.
 
         Runs on the profile as authored, BEFORE the build injects anything, so
         a ``network:`` on a dispatch-pair half is caught as something a person
         wrote rather than as the value the build is about to write there
-        itself. Both authoring surfaces are checked — the ``services:`` block
-        and the dotted ``config:`` overrides — because either spelling reaches
-        the same key in the rendered ``config.yml``.
+        itself.
 
         Returns:
             Human-readable error messages; empty when every declaration names a
@@ -399,11 +679,13 @@ class BuildProfile:
         errors: list[str] = []
         pair_reported: set[str] = set()
 
-        def check(name: str, value: Any, key: str) -> None:
-            """Record the problem with one service's declared mode, if any."""
+        if self.dispatch is not None:
+            errors.extend(network_mode_errors(self.dispatch.network, "dispatch.network"))
+
+        for name, value, key in self._service_axis_declarations("network"):
             if name in DISPATCH_PAIR_SERVICES:
                 if name in pair_reported:
-                    return
+                    continue
                 pair_reported.add(name)
                 errors.append(
                     f"{key} is not a per-service knob: the event dispatcher and its "
@@ -413,35 +695,564 @@ class BuildProfile:
             else:
                 errors.extend(network_mode_errors(value, key))
 
-        if self.dispatch is not None:
-            errors.extend(network_mode_errors(self.dispatch.network, "dispatch.network"))
+        return errors
 
-        for name, svc in self.services.items():
-            # A bare `on:`/`no:` service name is read on the YAML 1.1 resolver
-            # as a boolean, which would reach the dotted-key formatting below as
-            # a non-string. Report the resolver rather than crash on it.
-            if not isinstance(name, str):
-                errors.append(
-                    f"services keys must be strings (got {name!r}); a bare "
-                    "yes/no/on/off in YAML parses as a boolean — quote the service name"
-                )
-                continue
-            if isinstance(svc.config, dict) and "network" in svc.config:
-                check(name, svc.config["network"], f"services.{name}.network")
+    def _validate_env_axis(self) -> list[str]:
+        """Return validation errors for every ``env:`` name-list declaration.
 
-        if isinstance(self.config, dict):
-            for key, value in self.config.items():
-                if not isinstance(key, str):
-                    errors.append(
-                        f"config keys must be strings (got {key!r}); a bare "
-                        "yes/no/on/off in YAML parses as a boolean — quote the key"
-                    )
+        Same two authoring surfaces and the same as-authored timing as the
+        network axis. The dispatch pair is excluded for a different reason than
+        it is there: the two halves need no shared value, but the dispatch
+        injection rewrites both service config blocks wholesale, so an ``env:``
+        authored on a half would be dropped before it could reach a container.
+        Refused rather than honored-looking, and pointed at the env chain both
+        halves already read.
+
+        Returns:
+            Human-readable error messages; empty when every declaration lists
+            valid environment variable names on a service the build leaves alone.
+        """
+        errors: list[str] = []
+        pair_reported: set[str] = set()
+
+        for name, value, key in self._service_axis_declarations("env"):
+            if name in DISPATCH_PAIR_SERVICES:
+                if name in pair_reported:
                     continue
-                parts = key.split(".")
-                if len(parts) == 3 and parts[0] == "services" and parts[2] == "network":
-                    check(parts[1], value, key)
+                pair_reported.add(name)
+                errors.append(
+                    f"{key} is not a per-service knob: the dispatch: block rewrites the "
+                    f"event dispatcher's and the workers' service config, so {key} would "
+                    f"be dropped before it reached a container (got {value!r}). Both "
+                    f"halves already read the project's env chain — put the variable in "
+                    f".env and declare it under env.required instead."
+                )
+            else:
+                errors.extend(env_names_errors(value, key))
 
         return errors
+
+    def _runs_the_channel_finder(self) -> bool:
+        """Whether this profile keeps the channel-finder MCP server switched on.
+
+        A persona narrows the deployment it is rendered from by switching
+        servers off in its ``config:`` overlay, and one of them takes the whole
+        channel finder — server, tools and subagent — out of that render. Such a
+        persona still inherits ``channel_finder_mode`` from the profile it
+        extends, because the mode belongs to the deployment rather than to the
+        login; it simply has no channel finder for the mode to configure.
+
+        Only an explicit ``false`` counts. The key is absent from every profile
+        that keeps the server, so absence reads as on.
+
+        Returns:
+            Whether the rendered project has a channel finder at all.
+        """
+        return _config_lookup(self.config, _CHANNEL_FINDER_SERVER_ENABLED_KEY) is not False
+
+    def _renders_graphdb_block(self) -> bool:
+        """Whether this profile's build renders a ``services.graphdb`` block.
+
+        Assembled from the two surfaces that decide it. The app template carries
+        the block for a deployment that runs its own store; the profile's
+        ``config:`` overlay, applied after the render, is how a store the
+        facility already runs is named instead (``services.graphdb.uri``) and
+        how a template's block is dropped. Whether what those produce counts as
+        a store is
+        :func:`~osprey.deployment.graphdb_service.resolve_graphdb_service_config`'s
+        own decision, borrowed rather than re-implemented so this validator and
+        the render-time ``graphdb_configured`` gate that ships the graph MCP
+        server cannot disagree about whether one exists.
+
+        Returns:
+            Whether the rendered ``config.yml`` will carry a graph store to dial.
+        """
+        overrides = self.config if isinstance(self.config, dict) else {}
+        sub_keys = [
+            key
+            for key in overrides
+            if isinstance(key, str) and key.startswith(f"{_GRAPHDB_CONFIG_PREFIX}.")
+        ]
+        if sub_keys:
+            # `services.graphdb.uri:` and its siblings write into the block,
+            # creating it when the app template carries none.
+            block: Any = {key.split(".", 2)[2]: overrides[key] for key in sub_keys}
+        elif _GRAPHDB_CONFIG_PREFIX in overrides:
+            # A whole-block override replaces what the template rendered —
+            # including the bare `services.graphdb:` that removes it.
+            block = overrides[_GRAPHDB_CONFIG_PREFIX]
+        else:
+            # An attached project renders `services: {}` whatever its app
+            # template says — but it is built beside the deployment it
+            # narrows, whose render carries the block, and the build projects
+            # the store's address into it (osprey.deployment.reach). Its
+            # profile IS that deployment's profile plus a delta, so the same
+            # question answers for both. An attached profile built with no
+            # host in its repo is caught by the build's post-render refusal,
+            # which reads the rendered config and finds nothing projected.
+            return GRAPHDB_SERVICE_NAME in self.services or _app_template_declares_graphdb(
+                self.data_bundle
+            )
+
+        try:
+            resolved = resolve_graphdb_service_config({"services": {GRAPHDB_SERVICE_NAME: block}})
+        except ValueError:
+            # A malformed key (a port out of range, a heap size the JVM would
+            # not parse) still names a store this profile means to dial. The
+            # resolver raises about it where it can be acted on — the deploy
+            # preflight — and answering "no block" here would report the wrong
+            # fault.
+            return True
+        return resolved is not None
+
+    def _renders_qmd_block(self) -> bool:
+        """Whether this profile's build renders a ``services.qmd`` block.
+
+        The same two surfaces as :meth:`_renders_graphdb_block`, read the same
+        way. The app template carries the block for a deployment that runs its
+        own sidecar; the profile's ``config:`` overlay is how an attached
+        render names the sidecar of the deployment it shares a host with
+        (``services.qmd.port``) and how a template's block is dropped. Whether
+        what those produce counts as a sidecar is
+        :func:`~osprey.deployment.qmd_service.resolve_qmd_service_config`'s
+        own decision, borrowed rather than re-implemented so this validator and
+        the hybrid search module that resolves its endpoint through the same
+        function cannot disagree about whether one exists.
+
+        Returns:
+            Whether the rendered ``config.yml`` will carry a sidecar to dial.
+        """
+        overrides = self.config if isinstance(self.config, dict) else {}
+        sub_keys = [
+            key
+            for key in overrides
+            if isinstance(key, str) and key.startswith(f"{_QMD_CONFIG_PREFIX}.")
+        ]
+        if sub_keys:
+            # `services.qmd.port:` and its siblings write into the block,
+            # creating it when the app template carries none.
+            block: Any = {key.split(".", 2)[2]: overrides[key] for key in sub_keys}
+        elif _QMD_CONFIG_PREFIX in overrides:
+            # A whole-block override replaces what the template rendered —
+            # including the bare `services.qmd:` that removes it.
+            block = overrides[_QMD_CONFIG_PREFIX]
+        else:
+            # Same reasoning as the graph store above: an attached project is
+            # told the sidecar's port by the build, from the hosting
+            # deployment's render, and the profile that decides whether that
+            # render carries a sidecar is the one this profile extends.
+            return QMD_SERVICE_NAME in self.services or _app_template_declares_qmd(self.data_bundle)
+
+        try:
+            resolved = resolve_qmd_service_config({"services": {QMD_SERVICE_NAME: block}})
+        except ValueError:
+            # A malformed key (a port that is not a positive integer, a relative
+            # models_dir) still names a sidecar this profile means to dial. The
+            # resolver raises about it where it can be acted on — the deploy
+            # preflight — and answering "no block" here would report the wrong
+            # fault.
+            return True
+        return resolved is not None
+
+    def _enables_hybrid_search(self) -> bool:
+        """Whether this profile's build switches hybrid logbook search on.
+
+        The switch lives in the rendered ``config.yml``, so it is read from the
+        two places that write it: the ``config:`` overlay first, because it is
+        applied last, and the app template for a profile whose overlay says
+        nothing — the common case, since the key is absent from every profile
+        that keeps the template's default. On the overlay only an explicit
+        ``false`` counts, the same way the channel-finder switch reads for the
+        graph rule; a bare ``ariel.search_modules.hybrid:`` that removes the
+        whole module counts as off too, since there is then no module to answer.
+
+        Returns:
+            Whether the rendered project offers the ``hybrid`` search mode.
+        """
+        if _config_lookup(self.config, _HYBRID_SEARCH_BLOCK_KEY) is None:
+            return False
+        switch = _config_lookup(self.config, _HYBRID_SEARCH_ENABLED_KEY)
+        if switch is _MISSING:
+            return _app_template_enables_hybrid_search(self.data_bundle)
+        return switch is not False
+
+    def _claimed_ports(self) -> dict[str, int]:
+        """Every port this profile already spends, keyed by the line that moves it.
+
+        One sweep over the port-bearing blocks, so a check that has to clear a
+        new port against all of them does not have to learn where each of them
+        lives. Keyed by DOTTED KEY rather than by service, because a collision
+        report is only actionable if it names the entry an author would edit —
+        the same reason :data:`~osprey.deployment.host_ports._SERVICE_REMEDY_KEYS`
+        answers a compose conflict with a config key.
+
+        ``virtual_accelerator.port`` is deliberately absent: the stand-in's rule
+        against it is its own, with a message naming both halves, and reporting
+        the same collision twice would not help anyone.
+
+        A port a profile never spells is spent all the same. The framework's own
+        services take the layout's slots at whatever base the deployment
+        resolved, and the templates derive those numbers rather than pinning
+        them, so the ledger would be blind to every one of them if it only read
+        what the profile writes. :meth:`_layout_seed` fills them in — only for
+        the slots this profile actually deploys, and only at the indices its
+        roster actually allocates.
+
+        Returns:
+            Dotted key → port. A derived port appears under the key it is
+            derived from; a derivation that raises is skipped, since the block
+            that owns it reports that failure itself.
+        """
+        claimed: dict[str, int] = {}
+        try:
+            base: int | None = self._resolved_port_base()
+        except ValueError:
+            # An unusable `deployment.port_base`. That is the base's own fault
+            # to report, and every port derived from it would be a second
+            # complaint about the one typo — so the derived and seeded halves
+            # are skipped and the ledger records only what the profile spells.
+            base = None
+
+        if self.bluesky is not None:
+            b = self.bluesky
+            claimed["bluesky.port"] = b.port
+            if b.tiled_enabled:
+                claimed["bluesky.tiled_port"] = b.tiled_port
+            if b.second_lane and base is not None:
+                # The derivation is re-checked against the layout at the base
+                # THIS deployment resolved, so it is handed that base rather
+                # than falling through to the layout's own default.
+                try:
+                    derived = b.second_lane_port(base)
+                except ValueError:
+                    # Out of range, or already on a sibling's port. Both are
+                    # raised at the lane's own site and reported from there.
+                    pass
+                else:
+                    claimed[f"bluesky.port + {SECOND_LANE_PORT_STRIDE} (lane 2's bridge)"] = derived
+
+        if self.bluesky_web is not None:
+            claimed["bluesky_web.port"] = self.bluesky_web.port
+
+        if self.dispatch is not None:
+            d = self.dispatch
+            claimed["dispatch.dispatcher_port"] = d.dispatcher_port
+            # The workers spend host ports ONLY on the host network: a
+            # bridge-mode worker owns its own namespace and binds nothing a
+            # second deployment could collide with. Same predicate and same
+            # arithmetic — base plus index TIMES STRIDE — as the authoritative
+            # derivation in :mod:`osprey.deployment.host_ports`, so the ledger
+            # and the host-port preflight describe one set of ports.
+            #
+            # Walked only when that range is itself valid: an invalid one is
+            # already reported by the dispatch stanza, and walking it anyway
+            # would bury that one fault under thousands of entries.
+            if (
+                d.network == _HOST_NETWORK_MODE
+                and d.worker_count >= 1
+                and d.worker_port_stride >= 1
+                and 1 <= d.worker_port_base <= 65535
+                and d.worker_port_base + (d.worker_count - 1) * d.worker_port_stride <= 65535
+            ):
+                for index in range(d.worker_count):
+                    offset = index * d.worker_port_stride
+                    key = "dispatch.worker_port_base"
+                    if offset:
+                        key = f"dispatch.worker_port_base + {offset}"
+                    claimed[key] = d.worker_port_base + offset
+
+        if self.va_archiver is not None:
+            claimed["va_archiver.port_host"] = self.va_archiver.port_host
+
+        if isinstance(self.artifact_server, dict):
+            port = self.artifact_server.get("port")
+            if isinstance(port, int) and not isinstance(port, bool):
+                claimed["artifact_server.port"] = port
+
+        for name, server in self.mcp_servers.items():
+            port = getattr(server, "port", None)
+            if isinstance(port, int) and not isinstance(port, bool):
+                claimed[f"mcp_servers.{name}.port"] = port
+
+        # The `config:` block is the other surface a service's port is authored
+        # on — an attached render names the hosting deployment's ports there,
+        # and a facility service declares its own. Read through the path tree
+        # so a dotted key and a nested mapping are seen alike, since either
+        # spelling reaches the same leaf at render time.
+        services = _expand_dotted(self.config).get("services")
+        if isinstance(services, dict):
+            for name, block in services.items():
+                if not isinstance(block, dict):
+                    continue
+                for field_name in ("port", "port_host"):
+                    port = block.get(field_name)
+                    if isinstance(port, int) and not isinstance(port, bool):
+                        claimed[f"services.{name}.{field_name}"] = port
+
+        # Last, so that everything a profile actually spells wins: the seed
+        # fills the slots nothing above has named, and never overwrites one.
+        if base is not None:
+            for key, port in self._layout_seed(claimed, base).items():
+                claimed.setdefault(key, port)
+
+        return claimed
+
+    def _resolved_port_base(self) -> int:
+        """Return the port base this profile's ``config:`` block resolves to.
+
+        The layout's one rule is that a port comes from the base the deployment
+        actually resolved and never from the layout's own default, so the
+        ledger has to read ``deployment.port_base`` before it can place a slot.
+        A ``config:`` block is a flat bag of dotted keys that may spell that
+        path at any depth, which is what ``effective_config_subtree`` folds into
+        one subtree; re-wrapping the result keeps
+        :func:`~osprey.port_layout.resolve_port_base` on its single input shape,
+        so its range refusal fires on this path too.
+
+        Returns:
+            The base this profile configures, or the layout default when it
+            configures none.
+
+        Raises:
+            ValueError: If the profile names a base whose thousand-port block
+                could not exist (below 1024, or running past port 65535).
+        """
+        # Imported inside the method on purpose: build_profile_emit reaches
+        # this module through build_profile_load at import time, so a
+        # module-level import would close the cycle.
+        from .build_profile_emit import effective_config_subtree
+
+        return resolve_port_base(
+            {"deployment": effective_config_subtree(self.config, ("deployment",))}
+        )
+
+    def _renders_service_block(self, service: str) -> bool:
+        """Whether the built project carries a ``services.<service>`` block.
+
+        Asked of the two surfaces that write one, in the order they are
+        applied: the profile's ``config:`` overlay, which lands last and so
+        answers outright — including the bare ``services.<name>:`` that removes
+        the block — and the app template underneath it, which is what a profile
+        that says nothing about the service gets.
+
+        Args:
+            service: The service's key in the rendered ``services:`` section
+                (``openobserve``, ``postgresql``, …), not its compose name.
+
+        Returns:
+            Whether the rendered ``config.yml`` will carry that block.
+        """
+        declared = _config_lookup(self.config, f"services.{service}")
+        if declared is not _MISSING:
+            return declared is not None
+        if service in self.services:
+            return True
+        return _app_template_lookup(self.data_bundle, f"services.{service}") is not _MISSING
+
+    def _deploys_slot(self, entry: PortSlot) -> bool:
+        """Whether this profile publishes the host port of one layout slot.
+
+        Args:
+            entry: The slot to ask about. Only slots whose override key names a
+                ``services.<name>.<field>`` path reach here; the gateway and the
+                per-user families are decided by
+                :meth:`_web_terminal_seed` instead.
+
+        Returns:
+            Whether the build stands the slot's service up. Always ``False``
+            for an attached project, which scaffolds no services stack of its
+            own and reaches a shared one over ports it does not publish.
+        """
+        if not self.deploy_services:
+            return False
+        service = (entry.config_key or "").split(".")[1]
+        if service == GRAPHDB_SERVICE_NAME:
+            return self._renders_graphdb_block()
+        if service == QMD_SERVICE_NAME:
+            return self._renders_qmd_block()
+        return self._renders_service_block(service)
+
+    def _layout_seed(self, claimed: dict[str, int], base: int) -> dict[str, int]:
+        """Return the layout ports this profile spends but never spells.
+
+        Every framework port is its slot's offset from the base this deployment
+        resolved, and the templates derive it there rather than pinning a
+        number, so a profile that is happy with the defaults writes none of
+        them down. This is the other half of the ledger: the slots that are
+        spent by virtue of being deployed.
+
+        Only what is really published is seeded. A slot whose service the build
+        does not stand up is left out, the per-user families are seeded at the
+        indices the roster allocates and nowhere else, and a slot something in
+        ``claimed`` already names — under its own key or one of
+        :data:`_SLOT_CLAIM_ALIASES` — is skipped, because that entry is where
+        the service actually is.
+
+        Args:
+            claimed: The ledger built so far, read to decide what is already
+                named. Not mutated.
+            base: The base this deployment resolved. Passed in rather than
+                looked up again so that every derived port in one ledger comes
+                from one resolution of one key.
+
+        Returns:
+            Dotted key → port for the slots that were missing.
+        """
+        seed: dict[str, int] = {}
+        for entry in LAYOUT:
+            key = entry.config_key
+            if entry.name in _UNSEEDED_SLOTS or entry.per_index:
+                continue
+            if key is None or not key.startswith("services."):
+                continue
+            if key in claimed or any(a in claimed for a in _SLOT_CLAIM_ALIASES.get(entry.name, ())):
+                continue
+            if self._deploys_slot(entry):
+                seed[key] = default_port(entry.name, base=base)
+
+        seed.update(self._web_terminal_seed(base))
+        return seed
+
+    def _web_terminal_seed(self, base: int) -> dict[str, int]:
+        """Return the web stack's host ports at ``base``, keyed by their override.
+
+        The gateway — nginx, and the auth sidecar when the stanza's method puts
+        one in front of it — plus one port per per-user family per ROSTER USER,
+        never the whole ``+100``–``+799`` span, which describes a hundred users
+        a deployment does not have. An override in ``modules.web_terminals`` is
+        an absolute port and wins, the same way it wins at render time, so the
+        seed describes where a family really lands rather than where the layout
+        would have put it.
+
+        Args:
+            base: The base this deployment resolved.
+
+        Returns:
+            Dotted key → port, empty when the profile stands up no web stack.
+            A key carries its index (``…_base_port + 3``) for every user but
+            the first, mirroring how the dispatch workers are keyed.
+        """
+        # Imported here rather than at module scope: build_profile_emit would
+        # close an import cycle, and the render stack pulls in the registry and
+        # the persona layer, which a profile parse that never asks about ports
+        # should not pay for.
+        from osprey.deployment.web_terminals.personas import normalize_users
+        from osprey.deployment.web_terminals.ports import (
+            allocate_ports,
+            base_ports_from_config,
+            resolve_nginx_port,
+        )
+        from osprey.deployment.web_terminals.render import _auth_tls_context
+
+        from .build_profile_emit import effective_web_terminals
+
+        web_terminals = effective_web_terminals(self.config)
+        if not web_terminals or web_terminals.get("enabled") is False:
+            return {}
+
+        seed: dict[str, int] = {}
+        wrapped = {"deployment": {"port_base": base}, "modules": {"web_terminals": web_terminals}}
+        try:
+            seed["modules.web_terminals.nginx_port"] = resolve_nginx_port(wrapped)
+        except ValueError:
+            # A non-port `nginx_port` is the stanza's own fault to report; the
+            # lint names it, and guessing a number for it here would put a
+            # wrong port in a collision report.
+            pass
+
+        # The auth sidecar is a container only under the two methods that put a
+        # wall in front of the terminals; `token` and `none` bind nothing on the
+        # gateway's second port. Asked of the render's own single parse point
+        # rather than re-derived, so the ledger and the compose overlay cannot
+        # disagree about whether the port is spent or where it is.
+        try:
+            auth_context = _auth_tls_context(web_terminals, base=base)
+        except ValueError:
+            # An unsupported `auth.method`. The render refuses it by name and
+            # the lint reports it; there is no port to record for a stanza that
+            # cannot be built.
+            auth_context = {}
+        if auth_context.get("sidecar_active"):
+            seed["modules.web_terminals.auth.port"] = auth_context["auth_port"]
+
+        try:
+            base_ports = base_ports_from_config(web_terminals, base=base)
+        except ValueError:
+            return seed
+        users_raw = web_terminals.get("users")
+        for user in normalize_users(users_raw if isinstance(users_raw, list) else []):
+            index = user.get("index")
+            try:
+                allocation = allocate_ports(base_ports, index)
+            except ValueError:
+                # An index past the end of a family band. `allocate_ports`
+                # refuses it by name and the lint reports it; a seed built on
+                # it would be a port no container ever binds.
+                continue
+            for family, port in allocation.items():
+                key = f"modules.web_terminals.{family}_base_port"
+                if index:
+                    key = f"{key} + {index}"
+                seed.setdefault(key, port)
+        return seed
+
+    def _worker_band_errors(self) -> list[str]:
+        """Return the refusal for a worker fan-out that runs out of its band.
+
+        The layout gives the dispatch workers a window — ``worker`` slot plus
+        one, up to plus :data:`~osprey.port_layout.WORKER_MAX` — and everything
+        above it belongs to a service the same deployment publishes. On the
+        host network the workers bind those ports for real, so a
+        ``worker_count`` (or a ``worker_port_stride``) that walks past the end
+        of the window is a collision the build can see coming, and refusing it
+        here is the difference between a named fault and a container dying on
+        "address already in use" minutes into a deploy.
+
+        Bridge mode is exempt: those workers publish nothing on the host, so
+        the count is bounded by the machine and not by the layout. So is a
+        profile that has moved worker 1 clean out of the band with an absolute
+        ``worker_port_base`` — that is the layout's documented escape from a
+        band, and what bounds the workers afterwards is the host-port preflight
+        rather than a window they are no longer in.
+
+        Returns:
+            One message naming the derived top port, the slot the layout puts
+            there, and the end of the window — or nothing, when the fan-out
+            fits (or when this profile's rules are decided elsewhere).
+        """
+        d = self.dispatch
+        if d is None or d.network != _HOST_NETWORK_MODE:
+            return []
+        if d.worker_count < 1 or d.worker_port_stride < 1:
+            return []  # already refused by name, above.
+        try:
+            base = self._resolved_port_base()
+            band_first = default_port("worker", 1, base=base)
+            band_last = default_port("worker", WORKER_MAX, base=base)
+        except ValueError:
+            return []
+        if not band_first <= d.worker_port_base <= band_last:
+            return []
+
+        top = d.worker_port_base + (d.worker_count - 1) * d.worker_port_stride
+        if top <= band_last:
+            return []
+        # Non-empty by construction: `top` is past `band_last`, which is
+        # already above the lowest slot's offset, so at least one slot's offset
+        # is below the derived one.
+        hit = max((s for s in LAYOUT if s.offset <= top - base), key=lambda s: s.offset)
+        # At least one, since the gate above put worker 1 inside the band.
+        fits = (band_last - d.worker_port_base) // d.worker_port_stride + 1
+        return [
+            f"dispatch.worker_count {d.worker_count} would publish worker {d.worker_count} on "
+            f"port {top}, past the end of the layout's worker band at {band_last} "
+            f"(dispatch.worker_port_base {d.worker_port_base} + ({d.worker_count} - 1) * "
+            f"dispatch.worker_port_stride {d.worker_port_stride}). {top} falls in "
+            f"the '{hit.name}' slot ({base + hit.offset}), which this deployment publishes for "
+            f"itself. Run at most {fits} worker(s) at this stride, or set "
+            f"dispatch.worker_port_base to an absolute port outside the block to run the "
+            f"workers off the layout."
+        ]
 
     def validate(self, profile_dir: Path) -> None:
         """Validate profile consistency. Raises BuildProfileError with all issues."""
@@ -467,6 +1278,22 @@ class BuildProfile:
                 f"(got {type(self.config).__name__})"
             )
 
+        # The empty whole-block override is refused by name. `{}` is not the
+        # removal spelling — an empty mapping reads as "a store at the
+        # defaults" everywhere the block is resolved — but as a replacement it
+        # drops the `path` the compose render locates the service's fragment
+        # by, so the deploy it describes can only fail. Both working spellings
+        # are handed back instead of letting that failure surface as a missing
+        # compose file three phases later.
+        if isinstance(self.config, dict) and self.config.get(_GRAPHDB_CONFIG_PREFIX) == {}:
+            errors.append(
+                f"config: `{_GRAPHDB_CONFIG_PREFIX}: {{}}` replaces the rendered block "
+                f"with an empty mapping, which keeps the store but drops the `path` its "
+                f"compose fragment is rendered from. Write the bare "
+                f"`{_GRAPHDB_CONFIG_PREFIX}:` (no value) to remove the graph store, or "
+                f"set `{_GRAPHDB_CONFIG_PREFIX}.<key>:` entries to re-point it."
+            )
+
         if self.tier is not None and self.tier not in (1, 3):
             errors.append(f"tier must be 1 or 3 (got {self.tier!r})")
 
@@ -485,6 +1312,62 @@ class BuildProfile:
             errors.append(
                 f"channel_finder_mode must be one of {VALID_CHANNEL_FINDER_MODES} "
                 f"(got {self.channel_finder_mode!r})"
+            )
+
+        # `graph` is the one paradigm whose store is a service rather than a
+        # database file, so it is the one paradigm with a prerequisite outside
+        # the profile's own artifacts. Without a `services.graphdb` block the
+        # build would render a channel finder with nothing behind it, and the
+        # same `graphdb_configured` gate the registry applies would leave the
+        # graph MCP server out without a word — an agent holding the mode and
+        # none of its tools. Named here instead, on every configuration path.
+        #
+        # Skipped for a profile that switches the channel-finder server off — a
+        # persona rendered as a logbook terminal, say. It inherits the mode from
+        # the deployment it narrows, because the mode is the deployment's, but
+        # it ships no channel finder for the mode to leave toolless. Requiring a
+        # store there would make every graph deployment configure one for a
+        # login that cannot query it.
+        if (
+            self.channel_finder_mode == _GRAPH_MODE
+            and self._runs_the_channel_finder()
+            and not self._renders_graphdb_block()
+        ):
+            attached = "" if self.deploy_services else ", deploy_services: false"
+            errors.append(
+                f"channel_finder_mode: {_GRAPH_MODE} needs a "
+                f"services.{GRAPHDB_SERVICE_NAME} block and this build renders none "
+                f"(app_template: {self.data_bundle}{attached}). Build on an app "
+                f"template that deploys a graph store, or name one the facility "
+                f"already runs with `config: services.{GRAPHDB_SERVICE_NAME}.uri: "
+                f"bolt://host:7687` plus GRAPHDB_PASSWORD in the project .env."
+            )
+
+        # Hybrid logbook search is the one ARIEL search mode answered by a
+        # service rather than by Postgres, so it is the one with a prerequisite
+        # outside the ARIEL database: the `services.qmd` sidecar, which the
+        # module locates through that block and nothing else. Without the block
+        # the build would render the mode switched on with nothing behind it,
+        # and unlike semantic search it does not degrade — every query then
+        # fails, by design, with "no qmd sidecar is configured". Named here
+        # instead, on every configuration path, because where it would surface
+        # otherwise is the worst place for it: inside a per-user web-terminal
+        # container, on the first logbook question, for a persona whose render
+        # emptied `services:` on purpose.
+        #
+        # Skipped for a profile that switches the module off, whichever way it
+        # spells that. A deployment that drops the sidecar is expected to drop
+        # the module with it (the template's own comment says so); this is the
+        # rule that catches a deployment that dropped one and not the other.
+        if self._enables_hybrid_search() and not self._renders_qmd_block():
+            attached = "" if self.deploy_services else ", deploy_services: false"
+            errors.append(
+                f"{_HYBRID_SEARCH_BLOCK_KEY} is enabled and needs a "
+                f"{_QMD_CONFIG_PREFIX} block, and this build renders none "
+                f"(app_template: {self.data_bundle}{attached}). Name the sidecar of "
+                f"the deployment this profile shares a host with using `config: "
+                f"{_QMD_CONFIG_PREFIX}.port: {QMD_DEFAULT_PORT}`, or switch the "
+                f"module off with `config: {_HYBRID_SEARCH_ENABLED_KEY}: false`."
             )
 
         # The data tree may legitimately sit above the profile dir (persona
@@ -529,8 +1412,11 @@ class BuildProfile:
                 elif not (tmpl_path / "docker-compose.yml.j2").exists():
                     errors.append(f"Service '{name}' template dir missing docker-compose.yml.j2")
 
-        # Validate the network axis across both authoring surfaces
+        # Validate the per-service axes across both authoring surfaces, after
+        # reporting any key the YAML resolver handed back as a non-string.
+        errors.extend(self._validate_service_key_shapes())
         errors.extend(self._validate_network_axis())
+        errors.extend(self._validate_env_axis())
 
         # Validate lifecycle steps
         for phase_name in ("pre_build", "post_build", "validate"):
@@ -556,6 +1442,19 @@ class BuildProfile:
         for var in self.env.required:
             if not _ENV_VAR_RE.match(var):
                 errors.append(f"Invalid env var name: {var}")
+
+        # `pinned` names the same kind of thing as `required` and is held to the
+        # same pattern. It is checked harder on shape because a deploy-side probe
+        # reads it back: a scalar written where a list belongs would iterate as
+        # characters, and a misspelled name would pin nothing while reading as
+        # though it had.
+        if not isinstance(self.env.pinned, list):
+            spelled = type(self.env.pinned).__name__
+            errors.append(f"env.pinned must be a list of env var names (got {spelled})")
+        else:
+            for var in self.env.pinned:
+                if not isinstance(var, str) or not _ENV_VAR_RE.match(var):
+                    errors.append(f"Invalid env.pinned var name: {var!r}")
 
         # Validate env file path
         if self.env.file:
@@ -689,6 +1588,18 @@ class BuildProfile:
                     f"dispatch.worker_port_base + worker_count - 1 exceeds 65535 "
                     f"({d.worker_port_base} + {d.worker_count} - 1)"
                 )
+            # The stride is what turns a worker number into a port, so a value
+            # below one is not a narrow fan-out — it is workers stacked on one
+            # port (0) or numbered backwards down the band (negative).
+            if d.worker_port_stride < 1:
+                errors.append(
+                    f"dispatch.worker_port_stride must be >= 1 "
+                    f"(got {d.worker_port_stride}): worker i publishes on "
+                    f"worker_port_base + (i - 1) * worker_port_stride, so a stride of 0 puts "
+                    f"every worker on one port and a negative one runs them backwards out of "
+                    f"their band. Leave the key unset for the layout's own spacing of 1."
+                )
+            errors.extend(self._worker_band_errors())
             if d.workspace_mode not in ("isolated", "shared"):
                 errors.append(
                     f"dispatch.workspace_mode must be 'isolated' or 'shared' "
@@ -745,6 +1656,30 @@ class BuildProfile:
             va = self.virtual_accelerator
             if not (1 <= va.port <= 65535):
                 errors.append(f"virtual_accelerator.port must be in 1..65535 (got {va.port})")
+            # A live stand-in is a SECOND container claiming a second port and
+            # a THIRD control target, so it can collide with any port the
+            # profile already spends and with the simulation's own gateways.
+            # Its rules live beside the block (see build_profile_va_faults) and
+            # are reported from here, the way the archiver's are.
+            if va.live_standin is not None:
+                errors.extend(
+                    live_standin_errors(
+                        va.live_standin,
+                        va.port,
+                        self._claimed_ports(),
+                        self.config,
+                        profile_dir,
+                    )
+                )
+
+        # The stand-in as a TARGET rather than as a port, so both are asked
+        # whatever the `virtual_accelerator:` block says — a baseline naming
+        # the stand-in is a fault precisely when the block is absent, and the
+        # archive rule is about which machine's past this deployment records.
+        errors.extend(standin_baseline_errors(self.config, self.virtual_accelerator))
+        errors.extend(
+            standin_archive_errors(self.config, self.virtual_accelerator, self.va_archiver)
+        )
 
         # Validate bluesky_web configuration
         if self.bluesky_web is not None:

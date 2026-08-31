@@ -10,15 +10,20 @@ container or volume is ever created or removed by these tests.
 
 from __future__ import annotations
 
+import json
 import subprocess
 
 import pytest
 import yaml
 from ruamel.yaml import YAML
 
+from osprey.cli.templates.claude_code import DENY_DEFAULTS
 from osprey.deployment.compose_generator import resolve_user_volume_names
 from osprey.deployment.web_terminals import lifecycle
-from osprey.deployment.web_terminals.artifacts import BashLaunchTokenConflictError
+from osprey.deployment.web_terminals.artifacts import (
+    BashLaunchTokenConflictError,
+    OpenModeEgressError,
+)
 from osprey.deployment.web_terminals.auth_credentials import AUTH_ENV_FILENAME, PW_HASH_VAR_PREFIX
 from osprey.deployment.web_terminals.personas import resolve_personas
 from osprey.deployment.web_terminals.provision import AUTH_SERVICE_NAME
@@ -48,11 +53,6 @@ def _config(
     """
     web_terminals = {
         "enabled": True,
-        "nginx_port": 8080,
-        "web_base_port": 9000,
-        "artifact_base_port": 9100,
-        "ariel_base_port": 9200,
-        "lattice_base_port": 9300,
         "users": users,
     }
     if personas is not None:
@@ -73,6 +73,15 @@ def _config(
 def _write_config(tmp_path, config):
     path = tmp_path / "config.yml"
     path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    # The deploy project's own settings artifact, which a scaffolded root always
+    # ships. A bare-string roster entry runs the deploy project itself, so this is
+    # the file the open-mode gate reads for it — and that gate fails closed on an
+    # absent one, which would refuse every `auth.method: none` verb below for a
+    # reason none of them is about.
+    (tmp_path / ".claude").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".claude" / "settings.json").write_text(
+        json.dumps({"permissions": {"deny": list(DENY_DEFAULTS)}}), encoding="utf-8"
+    )
     return path
 
 
@@ -999,13 +1008,13 @@ def test_nuke_removes_label_verified_persona_local_image(tmp_path, monkeypatch, 
     monkeypatch.chdir(tmp_path)
     config = _persona_config(["alice"], project_name="demo-project")
     config_path = _write_config(tmp_path, config)
-    image_labels["acc-control-control-room:local"] = "demo-project"  # matches THIS deployment
+    image_labels["acc-control:local"] = "demo-project"  # matches THIS deployment
     _assert_no_input_prompt(monkeypatch)
 
     lifecycle.nuke_stack(str(config_path), assume_yes=True)
 
     image_rm_calls = [c for c in calls if c[1:3] == ["image", "rm"]]
-    assert image_rm_calls == [["docker", "image", "rm", "acc-control-control-room:local"]]
+    assert image_rm_calls == [["docker", "image", "rm", "acc-control:local"]]
 
 
 def test_nuke_skips_image_with_mismatched_project_label_and_warns(
@@ -1019,7 +1028,7 @@ def test_nuke_skips_image_with_mismatched_project_label_and_warns(
     monkeypatch.chdir(tmp_path)
     config = _persona_config(["alice"], project_name="demo-project")
     config_path = _write_config(tmp_path, config)
-    image_labels["acc-control-control-room:local"] = "some-other-project"
+    image_labels["acc-control:local"] = "some-other-project"
     _assert_no_input_prompt(monkeypatch)
 
     lifecycle.nuke_stack(str(config_path), assume_yes=True)
@@ -1028,7 +1037,7 @@ def test_nuke_skips_image_with_mismatched_project_label_and_warns(
     assert image_rm_calls == []
 
     out = capsys.readouterr().out
-    assert "acc-control-control-room:local" in out
+    assert "acc-control:local" in out
     assert "SKIPPED" in out
     assert "some-other-project" in out
 
@@ -1042,7 +1051,7 @@ def test_nuke_skips_image_with_missing_label_and_warns(
     monkeypatch.chdir(tmp_path)
     config = _persona_config(["alice"], project_name="demo-project")
     config_path = _write_config(tmp_path, config)
-    image_labels["acc-control-control-room:local"] = None  # exists, but unlabeled
+    image_labels["acc-control:local"] = None  # exists, but unlabeled
     _assert_no_input_prompt(monkeypatch)
 
     lifecycle.nuke_stack(str(config_path), assume_yes=True)
@@ -1095,7 +1104,7 @@ def test_nuke_dedupes_one_image_removal_per_shared_persona(
     monkeypatch.chdir(tmp_path)
     config = _persona_config(["alice", "bob"], project_name="demo-project")
     config_path = _write_config(tmp_path, config)
-    image_labels["acc-control-control-room:local"] = "demo-project"
+    image_labels["acc-control:local"] = "demo-project"
     _assert_no_input_prompt(monkeypatch)
 
     lifecycle.nuke_stack(str(config_path), assume_yes=True)
@@ -1106,13 +1115,13 @@ def test_nuke_dedupes_one_image_removal_per_shared_persona(
             "docker",
             "image",
             "inspect",
-            "acc-control-control-room:local",
+            "acc-control:local",
             "--format",
             "{{json .Config.Labels}}",
         ]
     ]
     image_rm_calls = [c for c in calls if c[1:3] == ["image", "rm"]]
-    assert image_rm_calls == [["docker", "image", "rm", "acc-control-control-room:local"]]
+    assert image_rm_calls == [["docker", "image", "rm", "acc-control:local"]]
 
 
 def test_nuke_image_removal_happens_after_compose_down_and_volume_removal(
@@ -1122,7 +1131,7 @@ def test_nuke_image_removal_happens_after_compose_down_and_volume_removal(
     monkeypatch.chdir(tmp_path)
     config = _persona_config(["alice"], project_name="demo-project")
     config_path = _write_config(tmp_path, config)
-    image_labels["acc-control-control-room:local"] = "demo-project"
+    image_labels["acc-control:local"] = "demo-project"
     _assert_no_input_prompt(monkeypatch)
 
     lifecycle.nuke_stack(str(config_path), assume_yes=True)
@@ -1143,7 +1152,7 @@ def test_nuke_prints_image_plan_before_confirmation(
     monkeypatch.chdir(tmp_path)
     config = _persona_config(["alice"], project_name="demo-project")
     config_path = _write_config(tmp_path, config)
-    image_labels["acc-control-control-room:local"] = "demo-project"
+    image_labels["acc-control:local"] = "demo-project"
 
     prompts: list[str] = []
 
@@ -1156,7 +1165,7 @@ def test_nuke_prints_image_plan_before_confirmation(
     lifecycle.nuke_stack(str(config_path), assume_yes=False)
 
     out = capsys.readouterr().out
-    assert "acc-control-control-room:local" in out
+    assert "acc-control:local" in out
     # "image(s)", not "persona image(s)": the set now also carries the auth
     # sidecar's own local tag when authentication is on in local mode.
     assert "image(s)" in out
@@ -1174,7 +1183,7 @@ def test_nuke_without_confirmation_never_removes_or_inspects_images_when_decline
     monkeypatch.chdir(tmp_path)
     config = _persona_config(["alice"], project_name="demo-project")
     config_path = _write_config(tmp_path, config)
-    image_labels["acc-control-control-room:local"] = "demo-project"
+    image_labels["acc-control:local"] = "demo-project"
     monkeypatch.setattr("builtins.input", lambda prompt="": "")
 
     with pytest.raises(RuntimeError):
@@ -1192,7 +1201,7 @@ def test_nuke_argv_safety_image_rm_is_single_exact_named_tag(
     monkeypatch.chdir(tmp_path)
     config = _persona_config(["alice", "bob"], project_name="demo-project")
     config_path = _write_config(tmp_path, config)
-    image_labels["acc-control-control-room:local"] = "demo-project"
+    image_labels["acc-control:local"] = "demo-project"
 
     lifecycle.nuke_stack(str(config_path), assume_yes=True)
 
@@ -2002,7 +2011,7 @@ def test_nuke_auth_sidecar_image_is_removed_when_label_verified(
     monkeypatch.chdir(tmp_path)
     config_path = _write_config(tmp_path, _auth_persona_config(["alice"]))
     image_labels["dls-assistant-auth:local"] = "demo-project"
-    image_labels["acc-control-control-room:local"] = "demo-project"
+    image_labels["acc-control:local"] = "demo-project"
     _assert_no_input_prompt(monkeypatch)
 
     lifecycle.nuke_stack(str(config_path), assume_yes=True)
@@ -2028,7 +2037,7 @@ def test_nuke_auth_sidecar_image_is_not_a_candidate(
     monkeypatch.chdir(tmp_path)
     config_path = _write_config(tmp_path, _auth_persona_config(["alice"], **kwargs))
     image_labels["dls-assistant-auth:local"] = "demo-project"  # exists and is ours
-    image_labels["acc-control-control-room:local"] = "demo-project"
+    image_labels["acc-control:local"] = "demo-project"
     _assert_no_input_prompt(monkeypatch)
 
     lifecycle.nuke_stack(str(config_path), assume_yes=True)
@@ -2339,6 +2348,9 @@ def _conflicted_persona_config(tmp_path, users, *, personas):
 
     `personas` maps a persona name to `(writes_enabled, denies_bash)`, so a case
     can pair the launch-token entitlement with either shipped permission state.
+    Every project runs the bluesky server explicitly -- the server is opt-in in
+    the registry, so omitting the key would leave no project entitled and no
+    conflict to refuse -- which leaves `writes_enabled` as the only tier switch.
     """
     import json as _json
 
@@ -2347,7 +2359,13 @@ def _conflicted_persona_config(tmp_path, users, *, personas):
         project_dir = tmp_path / "profiles" / name
         (project_dir / ".claude").mkdir(parents=True)
         (project_dir / "config.yml").write_text(
-            yaml.safe_dump({"project_name": name, "control_system": {"writes_enabled": writes}}),
+            yaml.safe_dump(
+                {
+                    "project_name": name,
+                    "control_system": {"writes_enabled": writes},
+                    "claude_code": {"servers": {"bluesky": {"enabled": True}}},
+                }
+            ),
             encoding="utf-8",
         )
         (project_dir / ".claude" / "settings.json").write_text(
@@ -2383,6 +2401,73 @@ def test_decommission_refuses_before_touching_the_roster_when_a_survivor_is_conf
     assert [entry["name"] for entry in _reload_users(config_path)] == ["alice", "bob"]
     # And nothing downstream ran.
     assert [c for c in fake_runtime if c[1] == "rm"] == []
+
+
+def _open_mode_roster_config(tmp_path, users, *, personas):
+    """A roster running OPEN whose persona projects are really on disk.
+
+    `personas` maps a persona name to the tools its shipped settings LIFT from the
+    template's deny defaults, so a case can pair the open posture with a persona
+    that can still reach the host network and one that cannot.
+    """
+    catalog = {}
+    for name, lifted in personas.items():
+        project_dir = tmp_path / "profiles" / name
+        (project_dir / ".claude").mkdir(parents=True)
+        (project_dir / "config.yml").write_text(
+            yaml.safe_dump({"project_name": name, "control_system": {"writes_enabled": False}}),
+            encoding="utf-8",
+        )
+        (project_dir / ".claude" / "settings.json").write_text(
+            json.dumps({"permissions": {"deny": [e for e in DENY_DEFAULTS if e not in lifted]}}),
+            encoding="utf-8",
+        )
+        catalog[name] = {"project": name, "project_path": f"profiles/{name}"}
+    config = _config(users, personas=catalog)
+    config["modules"]["web_terminals"]["auth"] = {"method": "none"}
+    return config
+
+
+_OPEN_USERS = [
+    {"name": "alice", "index": 0, "persona": "reaching"},
+    {"name": "bob", "index": 1, "persona": "contained"},
+]
+_OPEN_PERSONAS = {"reaching": ("Bash",), "contained": ()}
+
+
+def test_decommission_refuses_before_touching_the_roster_when_open_mode_is_unsafe(
+    tmp_path, monkeypatch, fake_runtime
+):
+    """The open-mode gate is wired into decommission for the reason the Bash gate
+    is: the roster edit is what makes a failed decommission half-applied, so the
+    refusal has to land before it rather than at the re-render that follows."""
+    monkeypatch.chdir(tmp_path)
+    config_path = _write_config(
+        tmp_path, _open_mode_roster_config(tmp_path, _OPEN_USERS, personas=_OPEN_PERSONAS)
+    )
+
+    with pytest.raises(OpenModeEgressError) as excinfo:
+        lifecycle.decommission_user(str(config_path), "bob", assume_yes=True)
+
+    assert "reaching" in str(excinfo.value)
+    assert [entry["name"] for entry in _reload_users(config_path)] == ["alice", "bob"]
+    assert [c for c in fake_runtime if c[1] == "rm"] == []
+
+
+def test_decommission_of_the_open_mode_offenders_own_user_still_succeeds(
+    tmp_path, monkeypatch, fake_runtime
+):
+    """The same escape hatch, on the same POST-removal roster: removing the
+    offending persona's last user drops it from the referenced set, and that
+    removal is the one remediation needing no image rebuild."""
+    monkeypatch.chdir(tmp_path)
+    config_path = _write_config(
+        tmp_path, _open_mode_roster_config(tmp_path, _OPEN_USERS, personas=_OPEN_PERSONAS)
+    )
+
+    lifecycle.decommission_user(str(config_path), "alice", assume_yes=True)
+
+    assert [entry["name"] for entry in _reload_users(config_path)] == ["bob"]
 
 
 def test_decommission_of_the_conflicted_personas_own_user_still_succeeds(

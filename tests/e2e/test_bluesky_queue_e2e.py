@@ -15,10 +15,10 @@ Redis durability, the CurveZMQ control socket, the document plane, and the
 capability record's dependence on the deployed connector are the other half,
 and only a real deploy exercises them.
 
-**The preset is the subject, not a fixture detail.** ``control-assistant`` now
-defaults ``control_system.type`` to ``virtual_accelerator``, so this module
+**The preset is the subject, not a fixture detail.** ``control-assistant``
+baselines ``control_system.type`` on its live stand-in, so this module
 deliberately does NOT override it (unlike ``tests/e2e/_orm_stack.py``, written
-when ``mock`` was the default): stage 1 asserts the *shipped default* is the
+when ``mock`` was the default): stage 1 asserts the *shipped baseline* is the
 executable one. The three ``--override`` entries and four ``--set`` ports are
 host-hygiene only -- drop the event-dispatcher/web-terminal stacks this proof
 never touches, and move every published port off the defaults so this can run
@@ -155,18 +155,20 @@ _PREVIEW_KEYS = {
 _ANALYSIS_KEYS = {"available", "reason", "x_channel", "x_column", "points", "channels"}
 
 # ---------------------------------------------------------------------------
-# Ports + names. Every published port is deliberately distinct from BOTH the
-# preset defaults (8090/8091/8095/5064/5432/5080/27017) and every sibling e2e
-# module's pinned port (18090/18095/18099/18101/18102/18103/18105/18106), so
-# this module can run on a shared dev machine beside an already-deployed
-# tutorial stack without touching -- or being blocked by -- anything it does
-# not own.
+# Ports + names. Every published port is deliberately outside BOTH the
+# thousand-port block a deployment claims from ``deployment.port_base``
+# (10000-10999 at the default base, plus the VA's Channel Access 5064, the one
+# port the base does not move) and every sibling e2e module's pinned port
+# (18090/18095/18099/18101/18102/18103/18105/18106), so this module can run on
+# a shared dev machine beside an already-deployed tutorial stack without
+# touching -- or being blocked by -- anything it does not own.
 #
 # The list has to be COMPLETE to be worth anything: `osprey up` runs a host
-# port preflight and aborts the whole deploy on the first service left on a
-# default port, so one unmoved port takes every stage below down at fixture
-# setup. The support services follow one rule -- default + 20000 -- so a
-# service that joins the stack later has an obvious slot.
+# port preflight and aborts the whole deploy on the first service left inside
+# the block, so one unmoved port takes every stage below down at fixture
+# setup. The support services keep their historical pins -- each one's protocol
+# default plus 20000 -- which the block never reaches, so a service that joins
+# the stack later has an obvious slot.
 # ---------------------------------------------------------------------------
 BRIDGE_PORT = 18108
 BRIDGE_URL = f"http://localhost:{BRIDGE_PORT}"
@@ -240,6 +242,22 @@ LONG_POINTS = 4000
 
 _LAUNCH_TOKEN_HEADER = "X-Launch-Token"
 
+#: The sidecar is gated by WebAuthMiddleware like every interface app, so its
+#: helper authenticates the way any non-browser operator client does: the
+#: minted operator secret in this header. The bridge keeps its own, separate
+#: launch-token gate above.
+_OPERATOR_SECRET_HEADER = "X-Osprey-Terminal-Secret"
+
+#: Set by the ``queue_stack`` fixture from the .env ``osprey up`` wrote; module
+#: state rather than a fixture return so the plain helpers need no
+#: threading-through.
+_sidecar_secret: str | None = None
+
+
+def _auth_headers() -> dict[str, str]:
+    return {_OPERATOR_SECRET_HEADER: _sidecar_secret} if _sidecar_secret else {}
+
+
 pytestmark = [
     pytest.mark.e2e,
     pytest.mark.slow,
@@ -304,6 +322,7 @@ def _request(
     body: dict[str, Any] | None = None,
     *,
     token: str | None = None,
+    extra_headers: dict[str, str] | None = None,
     timeout: float = 20.0,
 ) -> tuple[int, Any]:
     """One HTTP call, returning ``(status, parsed_body)`` for 2xx AND 4xx/5xx.
@@ -326,6 +345,8 @@ def _request(
         data = b""
     if token:
         headers[_LAUNCH_TOKEN_HEADER] = token
+    if extra_headers:
+        headers.update(extra_headers)
     req = urllib.request.Request(  # noqa: S310 - localhost only
         f"{base}{path}", data=data, method=method, headers=headers
     )
@@ -353,7 +374,7 @@ def _post(path: str, body: dict[str, Any] | None = None, **kw: Any) -> tuple[int
 
 
 def _sidecar_get(path: str, **kw: Any) -> tuple[int, Any]:
-    return _request(PANELS_URL, path, "GET", **kw)
+    return _request(PANELS_URL, path, "GET", extra_headers=_auth_headers(), **kw)
 
 
 def _code_of(body: Any) -> Any:
@@ -475,34 +496,6 @@ def _env_value(repo: Path, key: str) -> str:
     value = parse_dotenv_file(env_path).get(key)
     assert value, f"{key} missing/empty in the deployment repo's .env"
     return value
-
-
-def _parse_setpoints(value: str) -> dict[str, tuple[str, str]]:
-    """Parse ``BLUESKY_EPICS_SETPOINTS`` (``name=SP|RB,...``) back into a mapping.
-
-    Read from the .env that ``osprey up`` itself wrote rather than
-    re-derived here: the device names this test composes plans against are then
-    exactly the ones the deployed worker registered, by construction.
-    """
-    out: dict[str, tuple[str, str]] = {}
-    for chunk in value.split(","):
-        if not chunk.strip():
-            continue
-        name, _, spec = chunk.partition("=")
-        sp, _, rb = spec.partition("|")
-        out[name.strip()] = (sp.strip(), rb.strip())
-    return out
-
-
-def _parse_readbacks(value: str) -> dict[str, str]:
-    """Parse ``BLUESKY_EPICS_READBACKS`` (``name=RB,...``) back into a mapping."""
-    out: dict[str, str] = {}
-    for chunk in value.split(","):
-        if not chunk.strip():
-            continue
-        name, _, rb = chunk.partition("=")
-        out[name.strip()] = rb.strip()
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -668,7 +661,7 @@ def _override_yaml() -> str:
     first, none of which this proof reads. Nothing here touches what the stack
     IS, which is the property the docstring above is about: this module inherits
     ``control_system.type`` from the preset on purpose, so that a preset that
-    stopped defaulting to the virtual accelerator would fail these stages rather
+    stopped baselining on an executable machine would fail these stages rather
     than be papered over here.
 
     Written as flat dotted-string keys under ``config:`` (the preset's own
@@ -761,6 +754,12 @@ def stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[QueueStack]:
             f"bluesky.tiled_port={TILED_PORT}",
             "--set",
             f"bluesky_web.port={PANELS_PORT}",
+            # This module's own thousand-port block (see
+            # test_dispatch_deploy.py's 20700 note): everything not pinned
+            # explicitly follows it instead of landing on a real deployment's
+            # default 10000 block.
+            "--set",
+            "port_base=22000",
         ],
         cwd=base,
         timeout=BUILD_TIMEOUT_SEC,
@@ -782,16 +781,12 @@ def stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[QueueStack]:
             f"--- stdout ---\n{build.stdout}\n--- stderr ---\n{build.stderr}"
         )
 
-    # The repo root's .env is the deployment's whole secret store and the file
-    # every compose invocation is pointed at, so `up` refuses to start without
-    # one. `osprey init` writes it only when the shell exports a key for this
-    # profile's provider, and nothing in this proof shells out to an LLM — this
-    # is the `cp .env.example .env` the CLI itself recommends, done for the
-    # operator. It is also where `up` mints BLUESKY_LAUNCH_TOKEN and derives
-    # BLUESKY_EPICS_SETPOINTS/_DETECTORS, both read back below.
-    env_path = repo / ".env"
-    if not env_path.exists():
-        shutil.copy(repo / ".env.example", env_path)
+    # The repo root's `.env` — the deployment's whole secret store, and the file
+    # `osprey up` refuses to start without. It is also where `up` mints
+    # BLUESKY_LAUNCH_TOKEN, read back below. The plan devices are NOT here: they
+    # reach the worker as the device file the build staged (read back below from
+    # the render).
+    _orm_stack.seed_repo_env(repo)
 
     # Force fresh --dev builds so the deployed containers run CURRENT source
     # (`osprey up` does not pass --build to compose, so it would otherwise
@@ -822,24 +817,25 @@ def stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[QueueStack]:
 
         _drain_leftover_queue_items()
 
-        # Device names come from the .env `osprey up` itself wrote
-        # (_ensure_bluesky_substrate_env derives them from the render's own
-        # channel_limits.json) -- so the plans this test composes name
-        # exactly the devices the deployed worker registered, and a change in
-        # that derivation shows up here as a real failure rather than a
-        # silently-diverging second copy of the same logic.
-        correctors = _parse_setpoints(_env_value(repo, "BLUESKY_EPICS_SETPOINTS"))
-        bpms = _parse_readbacks(_env_value(repo, "BLUESKY_EPICS_READBACKS"))
-        assert correctors, "osprey up wrote no BLUESKY_EPICS_SETPOINTS -- no device to drive"
-        assert bpms, "osprey up wrote no BLUESKY_EPICS_READBACKS -- no device to read"
+        # `osprey up` minted the sidecar's operator secret into the repo .env;
+        # arm the sidecar helper with it before any stage talks to the gate.
+        global _sidecar_secret
+        _sidecar_secret = _env_value(repo, "OSPREY_TERMINAL_SECRET")
 
-        # The render's copy, not the operator-owned source under <repo>/data/:
-        # the limits database resolves against CONFIG_FILE's directory, which
-        # the render points at <repo>/build/config.yml, so this is the file
-        # whose channels the deployed containers see.
-        limits = json.loads(
-            (repo / "build" / "data" / "channel_limits.json").read_text(encoding="utf-8")
-        )
+        # Device names come from the device file the BUILD staged and the
+        # worker mounts -- this lane authors none of its own, so what is read
+        # back here is the turn-key derivation from the deployment's own
+        # channel_limits.json. Reading it rather than re-deriving is what makes
+        # the plans this test composes name exactly the devices the deployed
+        # worker registered, and a change in that derivation show up here as a
+        # real failure rather than a silently-diverging second copy of the logic.
+        correctors, bpms = _orm_stack.staged_devices(repo)
+        assert correctors, "the build staged no settable device -- nothing to drive"
+        assert bpms, "the build staged no readable device -- nothing to read"
+
+        # The repo's own copy, which the build copies into build/data verbatim:
+        # same bytes, same channels the deployed containers see.
+        limits = json.loads((repo / "data" / "channel_limits.json").read_text(encoding="utf-8"))
 
         yield QueueStack(
             repo=repo,
@@ -879,8 +875,8 @@ def test_1_capability_is_executable_on_the_shipped_preset(stack: QueueStack) -> 
 
     capability = body["capability"]
     assert capability["can_execute"] is True, (
-        "the shipped control-assistant preset must deploy EXECUTABLE (it defaults "
-        f"control_system.type to virtual_accelerator): {capability}"
+        "the shipped control-assistant preset must deploy EXECUTABLE (it baselines "
+        f"control_system.type on the live stand-in): {capability}"
     )
     assert capability["reason"] == REASON_EXECUTABLE, f"unexpected reason: {capability}"
     assert capability["detail"], "capability carries no operator-facing detail sentence"

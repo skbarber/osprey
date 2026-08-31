@@ -10,6 +10,26 @@ import { fetchJSON } from './api.js';
 import { esc } from './utils.js';
 
 /**
+ * Every statistic the header can show, as ``[payload key, badge label]``, in
+ * render order. A paradigm reports the subset it can count and omits the rest,
+ * so the order here — not the payload's — is what the reader sees; a key that
+ * is absent or null simply renders no badge. A new statistic adds one row.
+ * @type {ReadonlyArray<readonly [string, string]>}
+ */
+const BADGE_KEYS = [
+  ['total_devices', 'devices'],
+  ['total_channels', 'channels'],
+  ['total_classes', 'classes'],
+  ['total_signals', 'signals'],
+  ['total_sections', 'sections'],
+  ['total_systems', 'systems'],
+  ['total_families', 'families'],
+  ['total_templates', 'templates'],
+  ['total_standalone', 'standalone'],
+  ['total_chunks_at_50', 'chunks'],
+];
+
+/**
  * Fetch statistics and render compact badges into the header.
  * Call on init and after every CRUD mutation.
  */
@@ -19,26 +39,13 @@ export async function refreshStatsBadges() {
 
   try {
     const stats = await fetchJSON('/api/statistics');
-    /** @type {Array<{value: string|number, label: string}>} */
+    /** @type {Array<{value: string, label: string}>} */
     const badges = [];
 
-    if (stats.total_channels !== null && stats.total_channels !== undefined) {
-      badges.push({ value: stats.total_channels.toLocaleString(), label: 'channels' });
-    }
-    if (stats.total_systems !== null && stats.total_systems !== undefined) {
-      badges.push({ value: stats.total_systems, label: 'systems' });
-    }
-    if (stats.total_families !== null && stats.total_families !== undefined) {
-      badges.push({ value: stats.total_families, label: 'families' });
-    }
-    if (stats.total_templates !== null && stats.total_templates !== undefined) {
-      badges.push({ value: stats.total_templates, label: 'templates' });
-    }
-    if (stats.total_standalone !== null && stats.total_standalone !== undefined) {
-      badges.push({ value: stats.total_standalone, label: 'standalone' });
-    }
-    if (stats.total_chunks_at_50 !== null && stats.total_chunks_at_50 !== undefined) {
-      badges.push({ value: stats.total_chunks_at_50, label: 'chunks' });
+    for (const [key, label] of BADGE_KEYS) {
+      const value = stats[key];
+      if (value === null || value === undefined) continue;
+      badges.push({ value: value.toLocaleString(), label });
     }
 
     container.innerHTML = badges.map(b =>

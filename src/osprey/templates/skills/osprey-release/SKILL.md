@@ -54,7 +54,7 @@ distinguishable from the release it descends from.
 | File | Purpose | Updated by |
 | --- | --- | --- |
 | `RELEASE_NOTES.md` | First-line title with the release version | This skill |
-| `CHANGELOG.md` | Add `## [vYYYY.M.P] - YYYY-MM-DD` heading; rotate `## [Unreleased]` content | This skill |
+| `CHANGELOG.md` | Fold `changelog.d/` fragments into `## [Unreleased]` (`changelog_fragments.py apply`), then rotate it to `## [YYYY.M.P] - YYYY-MM-DD` | This skill |
 | `README.md` | "Latest Release" line with version + theme | This skill |
 | `pyproject.toml` | `[tool.hatch.version] source = "vcs"` | **Do not edit** |
 | `src/osprey/_version.py` | Build-time stamp, gitignored | **Never commit** |
@@ -68,8 +68,9 @@ when the tag is not on the commit being built, or when the checkout is shallow
 
 ## Step 0: Read the CHANGELOG and decide the theme
 
-Open `CHANGELOG.md`, read the `## [Unreleased]` section, and answer three
-questions before doing anything else:
+Open `CHANGELOG.md` and read the `## [Unreleased]` section together with the
+pending fragments in `changelog.d/` — both are this release's content. Then
+answer three questions before doing anything else:
 
 1. **What is this release about?** Pick a short theme (e.g., "plan
    authoring & branch-protection enforcement"). It goes into the release
@@ -104,7 +105,42 @@ deactivate && rm -rf .venv-release-test
 
 Any failures stop the release. Fix forward, then re-run.
 
-## Step 2: Release-notes PR
+## Step 2: Refresh the doc screenshots
+
+The published docs embed committed PNGs, and each caption names the OSPREY
+version its image was captured with. Nothing refreshes them automatically —
+there is no CI job and no release step — so they age quietly, and a release is
+where that staleness becomes public.
+
+Read `docs/source/_static/screenshots/manifest.json`: every entry carries the
+version and timestamp of its last capture. Compare that against the UI work in
+this release. If a screen shown in the docs changed, re-capture it now, so the
+images and their captions ship with the version being released.
+
+```bash
+python -m docs.screenshots list      # every recipe, its kind, its output files
+cd docs && make screenshots          # all container-free recipes — no containers, no agent
+```
+
+Two recipes are opt-in because they cost more:
+
+- `ariel` needs a container runtime and a free port 10800 (the layout's postgres
+  slot at the default base; `services.postgresql.port_host` if the deployment
+  moved it) — `make screenshots SCREENSHOTOPTS=--stack`.
+- `web_terminal_hero` drives a live agent session on that stack —
+  `python -m docs.screenshots --agentic --only web_terminal_hero`. It spends
+  real subscription budget, so re-capture it when the Web Terminal's appearance
+  has actually changed, not on every release.
+
+`channel_finder_*.png` has no recipe at all — it is hand-captured, so it can
+only be redone by hand.
+
+The framework itself — environments, provenance, and why it is capture-only and
+never a CI gate — is documented in the contributing guide under "Refreshing
+documentation screenshots". Whatever changed (the PNGs and the updated
+`manifest.json`) rides along in the release-notes PR below.
+
+## Step 3: Release-notes PR
 
 Release-notes commits cannot be pushed directly to `main` — branch protection
 rejects it. Open a PR instead.
@@ -114,23 +150,42 @@ git checkout main && git pull --ff-only origin main
 git checkout -b release/vYYYY.M.P
 ```
 
-There is **no version literal to edit** — the tag in Step 4 sets the version.
+First fold the fragments in, so the rotation below has the full section to
+rotate:
+
+```bash
+uv run python scripts/changelog_fragments.py apply
+```
+
+This inserts each fragment under its `### <Type>` heading in `## [Unreleased]`
+and deletes the fragment files. Show the maintainer the resulting
+`CHANGELOG.md` diff before continuing.
+
+There is **no version literal to edit** — the tag in Step 5 sets the version.
 This PR carries only the human-facing notes. Show the maintainer each diff
 before applying:
 
 | File | Change |
 | --- | --- |
 | `RELEASE_NOTES.md` | First line: `# Osprey Framework - Latest Release (vYYYY.M.P)` followed by the theme tagline |
-| `CHANGELOG.md` | Convert `## [Unreleased]` to `## [YYYY.M.P] - YYYY-MM-DD`; insert a fresh empty `## [Unreleased]` above it |
+| `CHANGELOG.md` | After the fold, convert `## [Unreleased]` to `## [YYYY.M.P] - YYYY-MM-DD`; insert a fresh empty `## [Unreleased]` above it |
+| `changelog.d/` | Fragment files deleted by `apply`; only `README.md` remains |
 | `README.md` | Update the "Latest Release" line with version + theme |
+| `docs/source/_static/screenshots/` | Any images re-captured in Step 2, plus the updated `manifest.json` |
 
-Then run a consistency check — every line should mention the same version:
+Stage the fold and the rotation together — `git add -A changelog.d/ CHANGELOG.md`
+(pathspec-scoped, so the fragment deletions are included).
+
+Then run a consistency check — every line should mention the same version, and
+no fragment should be left behind:
 
 ```bash
 echo "=== VERSION CONSISTENCY CHECK ==="
 echo "RELEASE_NOTES:  $(head -1 RELEASE_NOTES.md)"
 echo "README.md:      $(grep 'Latest Release:' README.md)"
 echo "CHANGELOG.md:   $(grep -m1 '^## \[' CHANGELOG.md)"
+echo "changelog.d/:   $(ls changelog.d | grep -vc '^README.md$') fragment(s) on disk (must be 0)"
+echo "staged:         $(git diff --cached --name-only -- changelog.d/ CHANGELOG.md | tr '\n' ' ')"
 ```
 
 Now hand off to `osprey-contribute` for the rest of the PR mechanics:
@@ -141,7 +196,7 @@ The PR title should be `release: vYYYY.M.P — <theme>`. The PR body should
 include the CHANGELOG entries verbatim so reviewers see exactly what's being
 released.
 
-## Step 3: Merge the PR
+## Step 4: Merge the PR
 
 After CI passes (all 8 required checks green):
 
@@ -157,7 +212,7 @@ git checkout main && git pull --ff-only origin main
 
 Verify the latest commit on `main` is the version bump.
 
-## Step 4: Tag and push
+## Step 5: Tag and push
 
 Tags can be pushed directly — branch protection covers branches, not tags:
 
@@ -177,23 +232,36 @@ triggers on `v*.*.*` and:
 
 If step 2 fails, the publish aborts before any PyPI write — safe.
 
-## Step 5: Verify
+## Step 6: Verify
 
 ```bash
 gh run watch                                 # follow the release.yml run
 gh release view vYYYY.M.P                    # confirm GitHub Release exists
 pip install --upgrade osprey-framework       # in a fresh shell
 python -c "import osprey; print(osprey.__version__)"
+open https://als-apg.github.io/osprey/        # switcher button reads vYYYY.M.P
 ```
 
-Three success signals:
+Four success signals:
 
 - `release.yml` finished green.
 - `https://pypi.org/project/osprey-framework/YYYY.M.P/` exists.
 - `https://github.com/als-apg/osprey/releases/tag/vYYYY.M.P` has the CHANGELOG
   entries as the body.
+- The version switcher *button* on `https://als-apg.github.io/osprey/` reads
+  `vYYYY.M.P`, not the previous release. (The dropdown lists the new tag
+  either way; the button is what proves the root was rebuilt.) If it still
+  reads the old release, check the docs runs first
+  (`gh run list --workflow=docs.yml --limit 5`): if no run for the tag ever
+  started, it was superseded while pending — GitHub keeps one pending run per
+  concurrency group — so `gh workflow run docs.yml -f tag=vYYYY.M.P` and
+  re-check.
 
-If any fail, stop and investigate before announcing the release.
+If any fail, stop and investigate before announcing the release. An empty
+answer — `gh run watch` finding no matching run, or a command returning
+nothing on an API hiccup — is neither success nor failure: re-query with an
+explicit run selector (`gh run watch <run-id>`) before treating anything as
+green.
 
 ---
 
@@ -221,6 +289,8 @@ This is a fallback. The default path is the automated workflow.
 | PyPI rejects the upload as a duplicate | This version was already published | CalVer means version numbers are unique; you cannot republish. Bump the patch counter and try again |
 | `gh pr merge --rebase` fails with "not mergeable" | Stale checks because `main` moved | `git rebase origin/main` on the release branch, force-push with lease, wait for CI to re-run |
 | GitHub Release body is empty or wrong | CHANGELOG section heading didn't match the regex `release.yml` uses | Make sure the CHANGELOG heading is exactly `## [YYYY.M.P] - YYYY-MM-DD` |
+| `changelog_fragments.py apply` exits 1 | A fragment filename is malformed or carries an unrecognized type | Rename it `<name>.<type>.md` using one of added/changed/deprecated/removed/fixed/security/internal |
+| Released section is missing entries, or fragments are still on `main` after the release | `apply` was not run before the rotation, or its deletions were not staged | Fold the leftover fragments into the released section by hand, delete them, and open a PR carrying just `CHANGELOG.md` and the fragment deletions (`git add -A changelog.d/ CHANGELOG.md`) |
 
 ## Out of Scope
 
@@ -230,5 +300,7 @@ This is a fallback. The default path is the automated workflow.
 - **Release candidates / beta tags** — not currently supported by
   `release.yml`, which triggers on `v*.*.*` only. If you need an RC channel,
   the workflow needs changes first.
-- **Documentation builds** — handled separately by `docs.yml`; no manual
-  step needed in the release flow.
+- **Documentation builds** — `docs.yml` publishes the docs from the tag on
+  its own: the site root shows the newest release and `main` publishes at
+  `/latest/`. Nothing to run by hand unless the root did not pick up the new
+  tag, in which case Step 5's re-dispatch applies.

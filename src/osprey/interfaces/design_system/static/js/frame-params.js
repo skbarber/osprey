@@ -8,6 +8,10 @@
  * - `embedded` — `"true"` marks the page as running inside a host frame; see
  *   {@link applyEmbedded}, which adds the `embedded` class to `document.body`
  *   when set.
+ * - `mode` — a one-shot Expert/Simple hint, resolved pre-paint by
+ *   mode-boot.js. It is not re-read here, but {@link stripQueryMode} drops it
+ *   from the URL once the operator makes an explicit choice, so a leftover
+ *   `?mode=` can't out-rank that choice on the next reload.
  * - `theme` — owned and read pre-paint by theme-boot.js / theme-manager.js.
  *   It is deliberately NOT read here: theme-boot.js is a non-module inline
  *   script that resolves and applies `data-theme` before first paint, so
@@ -20,7 +24,8 @@
  *
  * Note (decision OC-1): a generic `frameParam()` / `frameParams()` getter is
  * intentionally NOT provided here — that surface is deferred until a second
- * consumer actually needs it.
+ * consumer actually needs it. What this module does export are helpers for
+ * one named param each ({@link applyEmbedded}, {@link stripQueryMode}).
  *
  * Beyond query params, this module also owns the receive side of the host's
  * runtime `osprey-mode-change` postMessage broadcast — see
@@ -38,6 +43,20 @@
 export const CONTRACT_VERSION = '1';
 
 /**
+ * Whether this page was loaded as an embedded panel: the `embedded` query
+ * param is exactly `"true"` (any other value -- `"false"`, `"1"`, absent --
+ * reads as standalone). The one predicate behind {@link applyEmbedded},
+ * exposed so a page can branch on it before `<body>` carries the class -- a
+ * standalone page runs theme-manager.js in the `hub` role (persisting picks
+ * from its own `<osprey-display-menu>`), an embedded one as a `follower`.
+ *
+ * @returns {boolean}
+ */
+export function isEmbedded() {
+  return new URLSearchParams(window.location.search).get('embedded') === 'true';
+}
+
+/**
  * Read the `embedded` query param and, when it is exactly `"true"`, add the
  * `embedded` class to `document.body`. No-op otherwise (including when the
  * param is absent, or set to any other value such as `"false"` or `"1"`).
@@ -45,10 +64,29 @@ export const CONTRACT_VERSION = '1';
  * @returns {void}
  */
 export function applyEmbedded() {
-  const embedded = new URLSearchParams(window.location.search).get('embedded') === 'true';
-  if (embedded) {
+  if (isEmbedded()) {
     document.body.classList.add('embedded');
   }
+}
+
+/**
+ * Strip a one-shot `mode` param from the URL's query string, if present,
+ * without adding a history entry — the mode-axis twin of theme-manager's
+ * _stripQueryTheme(). Once the user makes an explicit choice, a leftover
+ * `?mode=` must not out-rank it (or localStorage) on the next reload. Other
+ * params and the hash are preserved.
+ *
+ * @returns {void}
+ */
+export function stripQueryMode() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has('mode')) return;
+    params.delete('mode');
+    const query = params.toString();
+    const url = `${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`;
+    window.history.replaceState(window.history.state, '', url);
+  } catch { /* non-browser environment or a blocked history API — non-fatal */ }
 }
 
 /**

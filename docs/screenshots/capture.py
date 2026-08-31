@@ -28,12 +28,14 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -43,7 +45,14 @@ from typing import TYPE_CHECKING
 
 from docs.screenshots import recipes
 
-from osprey.interfaces._serving import free_port, run_app_server, wait_for_port
+from osprey.interfaces._serving import (
+    authorize_browser_context,
+    free_port,
+    run_app_server,
+    wait_for_port,
+)
+from osprey.interfaces.web_auth import OPERATOR_SECRET_ENV, mint_secret
+from osprey.port_layout import default_port
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -51,8 +60,10 @@ if TYPE_CHECKING:
     from docs.screenshots.recipes import DocShot
     from playwright.sync_api import Browser
 
-# Host TCP port Postgres publishes once ``osprey up -d`` is healthy.
-_POSTGRES_PORT = 5432
+# Host TCP port Postgres publishes once ``osprey up -d`` is healthy. This module
+# builds its own throwaway control-assistant deployment below and never sets
+# ``deployment.port_base``, so the layout's default base is the right one here.
+_POSTGRES_PORT = default_port("postgres")
 
 # Directory name for the throwaway tutorial deployment repo. ``osprey init
 # <dir>/<name> --preset control-assistant`` creates the repo; ``osprey build``
@@ -244,6 +255,11 @@ def capture_shot(browser: Browser, base_url: str, shot: DocShot) -> list[Path]:
                 device_scale_factor=device_scale,
             )
             try:
+                # The interface app is gated by WebAuthMiddleware; a bare page is
+                # refused with 401 and never renders. This runner serves the app
+                # in-process (via run_app_server), so authorize the context
+                # directly with a session cookie the in-process gate accepts.
+                authorize_browser_context(page.context)
                 url = _build_url(base_url, view.path, theme, view.hash)
                 page.goto(url, wait_until="domcontentloaded", timeout=15_000)
 
@@ -288,6 +304,42 @@ def _capture_standalone(browser: Browser, shot: DocShot) -> list[Path]:
     app = factory()
     with run_app_server(app) as base_url:
         return capture_shot(browser, base_url, shot)
+
+
+def _capture_static_page(browser: Browser, shot: DocShot) -> list[Path]:
+    """Serve a ``static_page`` recipe's committed HTML file and capture it.
+
+    The file's parent directory is served by a throwaway threaded
+    ``http.server`` on a free port (an ``http://`` origin, because chromium
+    treats ``file://`` query parameters — the theme switch — inconsistently),
+    and :func:`capture_shot` then drives the usual theme × view matrix against
+    the file's own URL. The page maps ``?theme=`` onto its CSS itself.
+    """
+    import http.server
+    import threading
+    from dataclasses import replace
+    from functools import partial
+
+    repo_root = Path(__file__).parent.parent.parent
+    source = repo_root / shot.source_file
+    if not source.is_file():
+        raise ScreenshotSkip(f"source file not found: {shot.source_file}")
+
+    class _QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *args: object) -> None:  # keep the run quiet
+            pass
+
+    handler = partial(_QuietHandler, directory=str(source.parent))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{server.server_address[1]}"
+        return capture_shot(browser, base_url, replace(shot, path=f"/{source.name}"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def _run_stack_step(cmd: list[str], *, cwd: Path | None, what: str) -> None:
@@ -503,6 +555,15 @@ def _capture_agentic(
     web server is stopped with the repo-scoped ``osprey web stop --repo``.
     """
     web_port = free_port()
+    # Unlike the standalone runner, this launches a SEPARATE process, whose
+    # credential holder is its own — a session minted here would not be one it
+    # recognises, so authorize_browser_context (a same-process cookie) cannot
+    # reach it. Instead pin a known operator secret into the child's environment
+    # and follow the real ``?token=`` login below: the child then mints its own
+    # session and sets the cookie the browser carries for every later request
+    # (including the terminal websocket).
+    operator_secret = mint_secret()
+    child_env = {**os.environ, OPERATOR_SECRET_ENV: operator_secret}
     try:
         proc = subprocess.Popen(
             [
@@ -513,7 +574,8 @@ def _capture_agentic(
                 "--detach",
                 "--port",
                 str(web_port),
-            ]
+            ],
+            env=child_env,
         )
     except FileNotFoundError as exc:
         raise ScreenshotSkip(f"osprey CLI unavailable to launch web terminal: {exc}") from exc
@@ -535,8 +597,14 @@ def _capture_agentic(
                 viewport={"width": shot.viewport[0], "height": shot.viewport[1]}
             )
             try:
+                # First navigation carries the operator secret as ``?token=``:
+                # the gate admits this GET to ``/``, the root handler mints a
+                # session, sets the session cookie, and redirects to the
+                # token-stripped URL. Every later request (and the PTY websocket)
+                # then authenticates with the cookie the child issued.
+                token = urllib.parse.quote(operator_secret, safe="")
                 page.goto(
-                    f"{base_url}/?theme={theme}",
+                    f"{base_url}/?theme={theme}&token={token}",
                     wait_until="domcontentloaded",
                     timeout=30_000,
                 )
@@ -635,7 +703,12 @@ def capture_tutorial_stack(
 
         from osprey.interfaces.ariel.app import create_app
 
-        app = create_app(config_path=str(project_dir / "config.yml"))
+        # The rendered config moved under build/; older layouts kept it at the repo root.
+        config_path = project_dir / "build" / "config.yml"
+        if not config_path.is_file():
+            config_path = project_dir / "config.yml"
+
+        app = create_app(config_path=str(config_path))
         with run_app_server(app) as ariel_url:
             return capture_shot(browser, ariel_url, shot)
 
@@ -649,6 +722,7 @@ def run(shots: list[DocShot], *, stack: bool = False, agentic: bool = False) -> 
     """Capture the selected recipes, sharing one headless browser for the run.
 
     ``standalone_interface`` recipes are booted and captured directly;
+    ``static_page`` recipes are served from their committed HTML file;
     ``tutorial_stack`` recipes are delegated to :func:`capture_tutorial_stack`
     and skipped per-recipe (with a clear notice) where its runtime is absent.
     Absent chromium/Playwright skips the whole run gracefully. One manifest
@@ -664,6 +738,12 @@ def run(shots: list[DocShot], *, stack: bool = False, agentic: bool = False) -> 
             for shot in shots:
                 if shot.environment == "standalone_interface":
                     paths = _capture_standalone(browser, shot)
+                elif shot.environment == "static_page":
+                    try:
+                        paths = _capture_static_page(browser, shot)
+                    except ScreenshotSkip as exc:
+                        print(f"skipped {shot.name}: {exc}", file=sys.stderr)
+                        continue
                 else:
                     try:
                         paths = capture_tutorial_stack(lambda: browser, shot, agentic=agentic)

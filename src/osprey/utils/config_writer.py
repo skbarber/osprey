@@ -18,6 +18,7 @@ Typical usage:
     # Apply structured key-value updates
     config_update_fields(Path("config.yml"), {
         "control_system.writes_enabled": True,
+        "control_system.connector.virtual_accelerator.writes_enabled": True,
         "approval.tools.channel_write": "always",
     })
 """
@@ -25,6 +26,7 @@ Typical usage:
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -155,7 +157,155 @@ def anchored_append(seq: Any, value: Any) -> None:
         _attach_section_comment(seq, moved)
 
 
-def anchored_put(mapping: Any, key: Any, value: Any) -> None:
+def _mapping_column(mapping: Any) -> int:
+    """The column *mapping*'s own keys sit at — the indent a before-comment needs.
+
+    ruamel emits a pre-key comment at the column recorded on its token and does
+    not re-indent it to the block it introduces, so the default column 0 puts
+    the comment flush left above a deeply nested key. A mapping built in memory
+    carries no position information; 0 is then the only answer available, and it
+    is also the right one whenever such a mapping is the document root.
+    """
+    column = getattr(getattr(mapping, "lc", None), "col", None)
+    return column if isinstance(column, int) else 0
+
+
+def _rendered_comment_lines(comment: str) -> list[str]:
+    """The lines ``yaml_set_comment_before_after_key`` will emit for *comment*.
+
+    Mirrors ruamel's own renderer so :func:`_drop_before_comment` can recognise
+    a block it wrote on an earlier run: a blank source line becomes a blank
+    output line rather than a bare ``#``, and one trailing newline is dropped.
+    """
+    if len(comment) > 1 and comment.endswith("\n"):
+        comment = comment[:-1]
+    return [(f"# {line}" if line else "") + "\n" for line in comment.split("\n")]
+
+
+def _preceding_comment_slot(mapping: Any, key: Any) -> tuple[Any, Any, int] | None:
+    """Address the comment slot ruamel parks *key*'s leading comment block on.
+
+    A round-trip load gives a key no "comment above me" storage of its own
+    unless it is the mapping's first: a block written above key *N* comes back
+    appended to the end-of-line comment token of key *N-1* — or of the deepest
+    last node inside *N-1*'s value, when a nested block is what physically
+    precedes it. Returns None for the first key, whose block ruamel does keep
+    separately, on the mapping's own ``ca.comment``.
+    """
+    keys = list(mapping)
+    index = keys.index(key)
+    if index == 0:
+        return None
+    previous = keys[index - 1]
+    value = mapping[previous]
+    if isinstance(value, (CommentedMap, CommentedSeq)) and len(value):
+        return _deepest_trailing_slot(value)
+    return mapping, previous, 2
+
+
+def _drop_before_comment(mapping: Any, key: Any, comment: str) -> None:
+    """Remove an earlier rendering of *comment* from above *key*.
+
+    What makes a commented put idempotent: a build that writes the same key on
+    every run must replace its own note rather than stack another copy above the
+    previous one. Only an exact trailing match of the lines about to be written
+    is removed, so template prose or a hand-written note sitting above the key
+    survives untouched. The cost of that narrowness is that a note whose
+    *wording* changed is no longer recognisable — once written it is just
+    comment lines on the same token at the same indent as the prose above it —
+    and is left for a human to remove rather than guessed at.
+    """
+    entry = mapping.ca.items.get(key)
+    if entry is not None and entry[1]:
+        entry[1] = []
+
+    rendered = [line.strip() for line in _rendered_comment_lines(comment)]
+    found = _preceding_comment_slot(mapping, key)
+    if found is None:
+        tokens = (mapping.ca.comment or [None, None])[1]
+        if tokens and [token.value.strip() for token in tokens[-len(rendered) :]] == rendered:
+            del tokens[-len(rendered) :]
+        return
+
+    owner, last, slot = found
+    entry = owner.ca.items.get(last)
+    token = entry[slot] if entry else None
+    if token is None:
+        return
+    lines = token.value.splitlines(keepends=True)
+    if [line.strip() for line in lines[-len(rendered) :]] != rendered:
+        return
+    remaining = "".join(lines[: -len(rendered)])
+    if remaining:
+        token.value = remaining
+    else:
+        # An empty token value crashes ruamel's emitter, so drop the slot.
+        entry[slot] = None
+        if not any(entry):
+            del owner.ca.items[last]
+
+
+def _steal_trailing_block(container: Any) -> str | None:
+    """Detach the standalone comment block trailing *container*'s last entry.
+
+    The continuation-safe counterpart to :func:`_steal_section_comment`, which
+    reads everything past the first line of the entry's comment token as
+    detachable. That is wrong when the entry's own inline comment WRAPS: the
+    continuation lines sit in the same token and belong to the entry, so moving
+    them tears one comment in half. This variant splits at the first line
+    indented less far than the inline comment — where a block written at the
+    mapping's own column begins — and moves only that.
+    """
+    found = _deepest_trailing_slot(container)
+    if found is None:
+        return None
+    owner, last, slot = found
+    entry = owner.ca.items.get(last)
+    token = entry[slot] if entry else None
+    if token is None:
+        return None
+    lines = token.value.splitlines(keepends=True)
+    column = token.start_mark.column
+    start = next(
+        (i for i, line in enumerate(lines[1:], 1) if len(line) - len(line.lstrip(" \t")) < column),
+        None,
+    )
+    if start is None:
+        return None  # inline comment only, wrapped or not — nothing to move
+    kept, block = "".join(lines[:start]), "".join(lines[start:])
+    if kept.strip():
+        # The extra "\n" restores the line terminator the inline comment's
+        # token no longer provides at the new location.
+        token.value = kept
+        return "\n" + block
+    entry[slot] = None
+    if not any(entry):
+        del owner.ca.items[last]
+    return kept + block
+
+
+def _put_with_before_comment(mapping: Any, key: Any, value: Any, comment: str) -> None:
+    """Assign ``mapping[key] = value`` and hang *comment* above the key."""
+    if not isinstance(mapping, CommentedMap):
+        mapping[key] = value
+        return
+    if key in mapping:
+        _drop_before_comment(mapping, key, comment)
+    value = _to_commented(value)
+    relocatable = bool(
+        key not in mapping
+        and len(mapping)
+        and not (isinstance(value, (CommentedMap, CommentedSeq)) and not len(value))
+    )
+    moved = _steal_trailing_block(mapping) if relocatable else None
+    mapping[key] = value
+    column = _mapping_column(mapping)
+    mapping.yaml_set_comment_before_after_key(key, before=comment, indent=column)
+    if moved:
+        _attach_section_comment(mapping, moved)
+
+
+def anchored_put(mapping: Any, key: Any, value: Any, *, comment: str | None = None) -> None:
     """Set ``mapping[key] = value``, keeping a trailing section comment at the end.
 
     Drop-in replacement for item assignment on a round-trip-loaded mapping:
@@ -166,7 +316,19 @@ def anchored_put(mapping: Any, key: Any, value: Any) -> None:
     block parked inside the old value; that block is carried over. *value*
     must be complete — an empty dict/list cannot carry the re-anchored
     comment beneath it, so such values are assigned without relocation.
+
+    *comment* writes a ``# ...`` block (one line per line of the text) directly
+    above the key, indented to the mapping's own column, and replaces a block
+    this function wrote on an earlier run so a build that re-injects the key
+    stays idempotent. It still relocates the trailing block, but splits it more
+    carefully than the plain path does (:func:`_steal_trailing_block`): a key
+    whose own inline comment wraps keeps its continuation lines, which the plain
+    path would move along with the block and thereby tear the inline comment in
+    half. The shipped ``target_switch`` block is exactly that shape.
     """
+    if comment is not None:
+        _put_with_before_comment(mapping, key, value, comment)
+        return
     if not isinstance(mapping, CommentedMap) or not len(mapping):
         mapping[key] = value
         return
@@ -186,6 +348,128 @@ def anchored_put(mapping: Any, key: Any, value: Any) -> None:
 # =============================================================================
 # Core I/O
 # =============================================================================
+
+
+#: Directory, under the agent-data (state) root, holding config backups.
+#:
+#: Config backups deliberately do NOT sit beside the file they copy. A project's
+#: ``config.yml`` lives in the render, and the render becomes root-owned when the
+#: container split lands: creating a *new* file next to it needs write permission
+#: on the render directory, which the admin image will not have. Every backup
+#: here runs *before* its writer touches anything, so under the old sibling
+#: scheme the ``PermissionError`` would have turned each of these config writes
+#: into a 500 in that image, without a byte being written. The state zone is the
+#: tree that stays writable across the split and survives a rebuild, so backups
+#: belong there. This is a hard precondition for the split, not a tidy-up.
+#:
+#: The zone is never spelled literally: it is read from ``agent_data.base_dir``
+#: through :func:`agent_data_base_dir` and anchored with :func:`anchored_path`,
+#: so a project that relocates its state zone moves its config backups with it.
+CONFIG_BACKUP_DIRNAME = "config-backups"
+
+
+def config_backup_path(config_path: Path) -> Path:
+    """Where a backup of *config_path* belongs: inside the agent-data state zone.
+
+    The single spelling of the backup scheme. Three writers take config backups
+    — this module's :func:`update_yaml_file`, the Web Terminal's ``/api/config``
+    and ARIEL's ``PUT /config`` — and each of them writes into a project that the
+    container split will make read-only. One helper so the three cannot drift on
+    a location that has to be right in all three for the split to work at all.
+
+    **The anchor is a fact about the config file, not a caller's choice.**
+    ``agent_data.base_dir`` is documented and rendered relative to the deployment
+    repo ROOT — the directory holding ``profile.yml`` and ``var/`` — never
+    relative to the render that ``config.yml`` sits in. So the anchor is derived
+    from the config itself, applying the same precedence
+    :func:`~osprey.utils.workspace.resolve_project_root` applies at runtime: the
+    config's own ``project_root`` key when it names a directory that exists
+    here, and :func:`repo_root_for_config` otherwise. That is the helper every
+    other state-zone consumer resolves the root with:
+
+    * flat layout (``<project>/config.yml``) → ``<project>``, whose state zone
+      is ``<project>/var/agent_data``;
+    * deployment repo (``<repo>/build/config.yml``) → ``<repo>``, so the backup
+      lands in the durable ``var/`` and not in the disposable render;
+    * container (``/app/<project>/build/config.yml``) → ``/app/<project>``,
+      which is exactly the directory ``Dockerfile.j2`` pre-creates and chowns
+      ``var/agent_data/config-backups`` under.
+
+    That last one is why this takes no ``project_dir`` override any more. A
+    caller passing the *render* directory (the web panel's ``project_cwd``) made
+    the route mkdir ``<render>/var`` inside the root-owned render zone, which
+    fails with ``PermissionError`` before a byte of the save is written — the
+    admin Config panel could not save at all. One anchor rule, derived from the
+    one input every caller already holds, so no caller can disagree with the
+    runtime about where the state zone is.
+
+    The filename keeps the source file's own name, so two configs backed up into
+    one zone cannot land on each other; there is one slot per name, overwritten
+    on each save, which is the retention the sibling scheme had.
+
+    Args:
+        config_path: The config file that would be backed up.
+
+    Returns:
+        The path the backup should be written to. Nothing is created.
+    """
+    from osprey.utils.workspace import agent_data_base_dir, anchored_path, repo_root_for_config
+
+    try:
+        config = _load(config_path)
+    except Exception:  # noqa: BLE001 -- an unreadable config still deserves a backup
+        # Falls back to the framework default rather than to the file's own
+        # directory: a config too broken to name its own state zone is precisely
+        # the one worth having a copy of, and the default is where every other
+        # reader would look for that copy anyway.
+        config = None
+
+    # The SAME precedence workspace.resolve_project_root applies, in the same
+    # order: the config's own ``project_root`` when it names a directory that
+    # exists here, and filesystem truth otherwise. Mirrored rather than
+    # delegated because resolve_project_root() re-reads the ambient config
+    # (OSPREY_CONFIG / the process-global cache), which would anchor a panel
+    # driving another project on whichever project this PROCESS was started in.
+    # The config is already loaded above, so the key can be read from it
+    # directly and the two cannot disagree.
+    #
+    # They diverge on exactly one shape, and it is not hypothetical: a project
+    # directory literally NAMED ``build`` reads as a render to
+    # repo_root_for_config (its documented non-goal), so without this the
+    # backup would land one level above the project while every runtime reader
+    # of the state zone looked inside it.
+    configured = (config or {}).get("project_root")
+    candidate = (
+        Path(configured).expanduser() if isinstance(configured, str) and configured else None
+    )
+    root = (
+        candidate
+        if candidate is not None and candidate.is_dir()
+        else repo_root_for_config(config_path)
+    )
+
+    zone = anchored_path(agent_data_base_dir(config), root)
+    return zone / CONFIG_BACKUP_DIRNAME / f"{config_path.name}.bak"
+
+
+def write_config_backup(config_path: Path) -> Path:
+    """Copy *config_path* into the state zone and return where it landed.
+
+    Not guarded: a backup that cannot be taken must stop the write, which is the
+    contract every caller already had. The failure mode this location exists to
+    prevent is exactly that stop happening for a reason nobody can fix — see
+    :data:`CONFIG_BACKUP_DIRNAME`.
+
+    Args:
+        config_path: The config file to copy.
+
+    Returns:
+        Path to the backup that was written.
+    """
+    backup_path = config_backup_path(config_path)
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(config_path, backup_path)
+    return backup_path
 
 
 def _load(path: Path) -> Any:
@@ -376,6 +660,34 @@ def config_update_fields(
     logger.debug("config_update_fields: updated %d field(s) in %s", len(updates), config_path)
 
 
+def config_delete_field(config_path: Path, dotted_key: str) -> bool:
+    """Remove one dotted key from a YAML config, preserving comments.
+
+    The inverse of one :func:`config_update_fields` entry. Never creates
+    anything: a missing parent or leaf is a no-op.
+
+    Args:
+        config_path: Path to the YAML file.
+        dotted_key: ``"dot.separated.key"`` of the entry to remove.
+
+    Returns:
+        Whether the key was present and removed.
+    """
+    data = _load(config_path)
+    parts = dotted_key.split(".")
+    node = data
+    for part in parts[:-1]:
+        if not isinstance(node, dict) or part not in node:
+            return False
+        node = node[part]
+    if not isinstance(node, dict) or parts[-1] not in node:
+        return False
+    del node[parts[-1]]
+    _save(config_path, data)
+    logger.debug("config_delete_field: removed %s from %s", dotted_key, config_path)
+    return True
+
+
 def _set_dotted_anchored(
     root: Any, data: Any, dotted_key: str, value: Any, *, create_only: bool
 ) -> None:
@@ -461,7 +773,8 @@ def update_yaml_file(
         updates: Dictionary of updates to apply. Supports nested paths using
                 dot notation in keys (e.g., {"control_system.type": "epics"})
                 or nested dictionaries that will be merged.
-        create_backup: If True, creates a .bak file before modifying
+        create_backup: If True, copies the file into the agent-data state zone
+                before modifying it (see :func:`config_backup_path`)
         section_comments: Optional dict mapping top-level keys to comment headers.
                          Comments are added with a blank line before them.
                          Example: {"simulation": "Simulation Configuration"}
@@ -486,8 +799,8 @@ def update_yaml_file(
     # Create backup before modifying
     backup_path = None
     if create_backup:
-        backup_path = file_path.with_suffix(".yml.bak")
-        backup_path.write_text(file_path.read_text(encoding="utf-8"), encoding="utf-8")
+        # Into the state zone, not beside the file -- see CONFIG_BACKUP_DIRNAME.
+        backup_path = write_config_backup(file_path)
 
     # Track which keys are being added (for comment placement)
     new_keys = set()
@@ -597,7 +910,8 @@ def set_control_system_type(
         config_path: Path to config.yml
         control_type: 'mock', 'epics', or 'virtual_accelerator'
         archiver_type: Optional archiver type ('mock_archiver', 'epics_archiver')
-        create_backup: If True, creates a .bak file before modifying
+        create_backup: If True, copies the file into the agent-data state zone
+                before modifying it (see :func:`config_backup_path`)
 
     Returns:
         Tuple of (updated_content, preview) where updated_content is the new file content
@@ -646,7 +960,8 @@ def set_epics_gateway_config(
         config_path: Path to config.yml
         facility: 'aps', 'als', or 'custom'
         custom_config: For 'custom', dict with 'read_only' and 'write_access' gateways
-        create_backup: If True, creates a .bak file before modifying
+        create_backup: If True, copies the file into the agent-data state zone
+                before modifying it (see :func:`config_backup_path`)
 
     Returns:
         Tuple of (updated_content, preview) where updated_content is the new file content
@@ -761,9 +1076,11 @@ def get_facility_from_gateway_config(config_path: Path) -> str | None:
             ):
                 return preset["name"]
 
+    # The template ships no gateway values, so any authored address that
+    # matched no facility preset above is the operator's own.
     if "read_only" in current_gateways:
         read_addr = current_gateways["read_only"].get("address", "")
-        if read_addr and read_addr != "cagw-alsdmz.als.lbl.gov":
+        if read_addr:
             return "Custom"
 
     return None

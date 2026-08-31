@@ -6,13 +6,20 @@ Bluesky bridge + co-deployed Tiled catalog with
 enabled (``default_enabled=False`` in the framework registry; opted in here
 via ``claude_code.servers.bluesky.enabled``). ``BLUESKY_LAUNCH_TOKEN`` is
 minted unconditionally by ``osprey up``, so no execution-method
-override is needed to get the agent armed. Corrector
-setpoints and BPM readbacks are wired into ``BLUESKY_EPICS_SETPOINTS``/
-``_READBACKS`` from the *built* project's own ``channel_limits.json`` --
-never a hardcoded preset channel (mirrors
+override is needed to get the agent armed. Corrector setpoints and BPM
+readbacks reach the queueserver worker as a DEVICE FILE -- authored at
+``<repo>/data/bluesky_devices.yml`` before ``osprey build``, staged by the
+build into ``build/services/bluesky/bluesky_devices.yml`` and bind-mounted
+into the worker -- derived from the deployment repo's own
+``channel_limits.json``, never a hardcoded preset channel (mirrors
 ``tests/e2e/test_va_substrate_equivalence.py``'s ``_select_sp_echo_pairs``,
 restricted here to correctors/BPMs specifically since the ORM plan sweeps
 correctors and reads BPMs, not arbitrary writable setpoints).
+
+Authoring that file is why the builders take a ``pre_build`` hook: the device
+file has to exist in the repo's source zone by the time ``osprey build`` runs,
+and ``osprey init`` must have created that zone first. Anything a caller wants
+to put into the repo between the two verbs goes through that hook.
 
 Not a test module itself (no ``test_`` functions) -- the single source of
 this config for:
@@ -21,31 +28,35 @@ this config for:
   * the real-container round-trip e2e (task 5.2, ``test_orm_roundtrip.py``),
   * the agentic-discovery e2e (tasks 5.3/5.4),
 via ``build_project_subprocess`` + ``select_correctors``/``select_bpms``/
-``write_substrate_env``.
+``write_devices_file``.
 
 Building this config never touches Docker by itself -- only a subsequent
 ``osprey up`` does (left to each caller, since only the real e2e/agentic
 tests need a live stack).
 
-``select_correctors``/``select_bpms``/``write_substrate_env`` delegate to the
+``select_correctors``/``select_bpms``/``write_devices_file`` delegate to the
 canonical derivation in
-``osprey.services.bluesky_bridge.substrate_devices`` (the single source of
-this logic, also used by ``osprey up`` to auto-configure a VA-backed
-plan stack's ``.env`` -- see ``container_lifecycle._ensure_bluesky_substrate_env``).
-This module keeps its own public API/signatures/defaults unchanged so every
-existing e2e importer is unaffected.
+``osprey.services.bluesky_bridge.substrate_devices`` -- the single source of
+this logic, shared with the build path
+(``compose_generator._stage_bluesky_devices``, which derives the very same
+document for a VA-backed stack that authored no file of its own). Delegating
+rather than re-deriving is what keeps a harness-authored device set and a
+turn-key derived one from ever disagreeing about what the worker is handed.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -62,10 +73,22 @@ if TYPE_CHECKING:
 # `control_system.connector.virtual_accelerator.gateways.*.port` UNSET, so the
 # connector follows `services.virtual_accelerator.port` and moving the deployed
 # soft-IOC's port is a one-place edit that carries the connector with it.
-# Callers that must coexist with another VA deploy on the same host -- 5064 is
-# the tutorial's default and routinely held -- should pass an explicit
-# `va_port=` rather than assume this default is free.
-VA_CA_PORT = 5064
+# The default is an ephemeral free port rather than 5064: the tutorial default
+# is routinely held by a real deployment on a dev host (`port_layout.
+# CA_DEFAULT_PORT` keeps VA instance 1 there on purpose), and every caller of
+# this module already gets the one value plumbed through both the service port
+# and the connector. Pass an explicit `va_port=` to pin one.
+
+
+def _reserve_free_va_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+# import-time required because VA_CA_PORT binds into `va_port=` default
+# arguments across the importing e2e modules, which evaluate at import.
+VA_CA_PORT = _reserve_free_va_port()
 
 # Bluesky bridge HTTP port. Distinct from the other e2e modules' pinned
 # ports (test_bluesky_deploy.py's 18090, test_va_substrate_equivalence.py's
@@ -262,6 +285,7 @@ def init_args(
     output_dir: Path,
     bridge_port: int = BRIDGE_PORT,
     va_port: int = VA_CA_PORT,
+    port_base: int | None = None,
     provider: str | None = None,
     model: str | None = None,
     extra_config: dict[str, Any] | None = None,
@@ -316,11 +340,110 @@ def init_args(
         "--set",
         "bluesky.tiled_enabled=true",
     ]
+    if port_base is not None:
+        # Every framework port the caller does NOT pin explicitly follows this
+        # block (`deployment.port_base`); a caller that actually starts the
+        # stack passes its own thousand-port block so the deploy cannot land
+        # on a real deployment's default 10000 block (openobserve, tiled,
+        # live-standin, the stores). Build-only callers may leave it unset —
+        # a render binds nothing.
+        args += ["--set", f"port_base={port_base}"]
     if provider is not None:
         args += ["--set", f"provider={provider}"]
     if model is not None:
         args += ["--set", f"model={model}"]
     return args
+
+
+def _calling_module() -> str:
+    """The module that called into this one — for a guard's failure message.
+
+    A shared helper's assertion is read by whoever owns the LANE, not by
+    whoever owns the helper, so the message has to say which lane it is
+    talking about. The stack is the only thing that knows: the first frame
+    outside this file is the caller's.
+    """
+    frame = inspect.currentframe()
+    try:
+        while frame is not None:
+            if frame.f_code.co_filename != __file__:
+                return str(frame.f_globals.get("__name__") or frame.f_code.co_filename)
+            frame = frame.f_back
+        return __name__
+    finally:
+        # Frames hold references to this one; dropping the local keeps the
+        # cycle off the collector's desk.
+        del frame
+
+
+def assert_off_default_block(repo: Path, project_name: str) -> None:
+    """Refuse a rendered deployment that would bind the framework's DEFAULT
+    thousand-port block.
+
+    ``deployment.port_base`` names the first port of the block a deployment
+    claims, and :data:`~osprey.port_layout.DEFAULT_PORT_BASE` (10000) is where
+    a deployment lands when nobody moves it — including the real deployment a
+    developer is already running on the host, and every e2e lane that forgot to
+    pick a band. Two stacks in one block do not fail cleanly: they fail as a
+    connection error or a wrong-service answer, minutes into a container build,
+    in a lane that looks broken rather than colliding.
+
+    So the check happens HERE, on the render, before anything binds. It reads
+    the base back out of ``<repo>/build/config.yml`` rather than trusting the
+    ``port_base=`` argument that was passed in: an overlay key that failed to
+    land looks identical at the call site and only differs on disk, and that is
+    precisely the failure this exists to catch.
+
+    Deliberately a ``!=`` default check and not an ``==`` some-expected-value
+    one: this is the shared seam, and it cannot know which band a given lane
+    booked. A lane that knows its own number should assert that number too (see
+    ``tests/e2e/test_full_chain_auth.py``'s ``_make_repo``) — the two checks
+    are complementary, and this one is the floor.
+
+    :param repo: The deployment REPO (the directory holding ``build/``), as
+        :func:`build_project_subprocess` returns.
+    :param project_name: The name the stack was built under, for the message.
+    :raises AssertionError: If the render produced no config, or resolved the
+        default base — whether by naming it or by never setting one.
+    """
+    from osprey.port_layout import (
+        BLOCK_SIZE,
+        DEFAULT_PORT_BASE,
+        PORT_BASE_CONFIG_KEY,
+        resolve_port_base,
+    )
+
+    caller = _calling_module()
+    config_path = repo / "build" / "config.yml"
+    if not config_path.is_file():
+        raise AssertionError(
+            f"{project_name} (built by {caller}) rendered no config at {config_path}, so "
+            f"nothing can say which port block this deployment would claim"
+        )
+
+    rendered = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if not isinstance(rendered, dict):
+        raise AssertionError(f"{config_path} is not a config mapping: {rendered!r}")
+
+    declared = (rendered.get("deployment") or {}).get("port_base")
+    if resolve_port_base(rendered) != DEFAULT_PORT_BASE:
+        return
+
+    block_top = DEFAULT_PORT_BASE + BLOCK_SIZE - 1
+    raise AssertionError(
+        f"{project_name} (built by {caller}) resolved "
+        f"{PORT_BASE_CONFIG_KEY}={declared!r} — the framework DEFAULT block "
+        f"{DEFAULT_PORT_BASE}-{block_top}, which a real deployment on this host "
+        f"already claims and which every lane that books no band of its own lands "
+        f"in together. Starting this stack would collide with them, and the first "
+        f"symptom would be a connection error minutes into a container build.\n"
+        f"Fix in {caller}: give this lane its own thousand-port band — pass "
+        f"`port_base=<band>` to this module's builder (which emits "
+        f"`--set port_base=<band>`, the profile shorthand for "
+        f"`{PORT_BASE_CONFIG_KEY}=<band>`), or set `{PORT_BASE_CONFIG_KEY}=<band>` "
+        f"in the lane's --override config block. Bands in use are listed at the "
+        f"top of each e2e lane that pins one."
+    )
 
 
 def build_via_cli_runner(
@@ -330,6 +453,7 @@ def build_via_cli_runner(
     project_name: str = "orm-stack",
     bridge_port: int = BRIDGE_PORT,
     va_port: int = VA_CA_PORT,
+    pre_build: Callable[[Path], None] | None = None,
 ) -> Path:
     """In-process ``osprey init`` + ``osprey build`` (``CliRunner``, no
     subprocess/Docker) for fast render-only gates -- see
@@ -340,6 +464,15 @@ def build_via_cli_runner(
     Returns the RENDER -- ``<repo>/build`` -- because that is the directory
     holding config.yml and the compose files a caller goes on to read. The repo
     root above it is ``result.parent``.
+
+    ``pre_build``, when given, is called with the deployment REPO after
+    ``osprey init`` has written it and before ``osprey build`` renders it --
+    the only window in which a caller can put a file into the repo's source
+    zone and still have the build stage it (``<repo>/data/bluesky_devices.yml``
+    is what every plan-stack caller writes there; see
+    :func:`write_devices_file`). It must not run BEFORE ``init``: init copies
+    the preset's ``data/`` into place without ``dirs_exist_ok``, so a
+    pre-created ``data/`` makes the copy fail outright.
     """
     from osprey.cli.build_cmd import build
     from osprey.cli.init_cmd import init
@@ -360,6 +493,9 @@ def build_via_cli_runner(
     )
     if result.exit_code != 0:
         raise AssertionError(f"osprey init failed (exit={result.exit_code}):\n{result.output}")
+
+    if pre_build is not None:
+        pre_build(repo)
 
     result = runner.invoke(build, ["--repo", str(repo), "--skip-deps", "--skip-lifecycle"])
     if result.exit_code != 0:
@@ -390,10 +526,12 @@ def build_project_subprocess(
     output_dir: Path,
     bridge_port: int = BRIDGE_PORT,
     va_port: int = VA_CA_PORT,
+    port_base: int | None = None,
     timeout: int = BUILD_TIMEOUT_SEC,
     provider: str | None = None,
     model: str | None = None,
     extra_config: dict[str, Any] | None = None,
+    pre_build: Callable[[Path], None] | None = None,
 ) -> Path:
     """Real ``osprey init`` + ``osprey build`` subprocesses for a deployment a
     caller will later ``osprey up`` (that step needs Docker; these don't -- they
@@ -409,6 +547,15 @@ def build_project_subprocess(
     ``init_args`` (see its docstring). All ``None`` by default, which preserves
     the exact default deploy shape -- including a byte-identical override file
     (an empty ``extra_config`` is likewise a no-op).
+
+    ``pre_build``, when given, is called with the deployment REPO after
+    ``osprey init`` has written it and before ``osprey build`` renders it --
+    the only window in which a caller can put a file into the repo's source
+    zone and still have the build stage it (``<repo>/data/bluesky_devices.yml``
+    is what every plan-stack caller writes there; see
+    :func:`write_devices_file`). It must not run BEFORE ``init``: init copies
+    the preset's ``data/`` into place without ``dirs_exist_ok``, so a
+    pre-created ``data/`` makes the copy fail outright.
     """
     osprey_bin = find_osprey_console_script()
     override_path = output_dir / "override.yml"
@@ -423,27 +570,15 @@ def build_project_subprocess(
             output_dir=output_dir,
             bridge_port=bridge_port,
             va_port=va_port,
+            port_base=port_base,
             provider=provider,
             model=model,
             extra_config=extra_config,
         ),
     ]
     repo = output_dir / project_name
-    for label, argv in (
-        ("osprey init", cmd),
-        (
-            "osprey build",
-            [
-                str(osprey_bin),
-                "build",
-                "--repo",
-                str(repo),
-                "--skip-deps",
-                "--skip-lifecycle",
-                "--dev",
-            ],
-        ),
-    ):
+
+    def run_step(label: str, argv: list[str]) -> None:
         result = subprocess.run(
             argv,
             cwd=str(output_dir),
@@ -457,13 +592,48 @@ def build_project_subprocess(
                 f"{label} failed (rc={result.returncode}):\n"
                 f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
             )
+
+    run_step("osprey init", cmd)
+
+    # STRICTLY between the two verbs -- see the ``pre_build`` paragraph above.
+    if pre_build is not None:
+        pre_build(repo)
+
+    run_step(
+        "osprey build",
+        [
+            str(osprey_bin),
+            "build",
+            "--repo",
+            str(repo),
+            "--skip-deps",
+            "--skip-lifecycle",
+            "--dev",
+        ],
+    )
+
+    # The render is done and nothing is bound yet — the one moment a port-block
+    # mistake is still cheap. See :func:`assert_off_default_block`. Checked here
+    # rather than on the ``port_base=`` argument because only the render knows
+    # whether the override actually landed, and checked in THIS builder rather
+    # than in ``init_args`` because ``build_via_cli_runner`` renders without
+    # binding anything and may legitimately leave the base alone.
+    assert_off_default_block(repo, project_name)
     return repo
 
 
 def channel_limits(project_dir: Path) -> dict[str, Any]:
-    """The BUILT project's own ``data/channel_limits.json`` — the source of
-    every device name the plan-stack e2es use, so no preset channel is ever
-    hardcoded."""
+    """The project's own ``data/channel_limits.json`` — the source of every
+    device name the plan-stack e2es use, so no preset channel is ever
+    hardcoded.
+
+    Callers pass the deployment REPO. ``osprey build`` copies ``<repo>/data``
+    into the build zone verbatim, so ``<repo>/data/channel_limits.json`` and
+    the render's ``build/data/channel_limits.json`` are the same bytes and name
+    the same channels to the deployed containers — but only the repo copy
+    exists before the build, which is when a ``pre_build`` hook has to choose
+    the plan devices.
+    """
     return json.loads((project_dir / "data" / "channel_limits.json").read_text(encoding="utf-8"))
 
 
@@ -668,8 +838,8 @@ def select_correctors(
     that case, regardless of how many pairs are found.
 
     Returns a dict of ``sp_address -> (sp_address, rb_address)`` -- the setpoint's
-    device name is its own ``:SP`` address -- ready for ``write_substrate_env``'s
-    ``BLUESKY_EPICS_SETPOINTS`` wiring.
+    device name is its own ``:SP`` address -- ready to hand to
+    :func:`write_devices_file` as the device file's ``settables``.
 
     Thin wrapper: delegates to the canonical
     ``osprey.services.bluesky_bridge.substrate_devices.select_correctors``
@@ -693,8 +863,8 @@ def select_bpms(limits: dict[str, Any], count: int | None = DEFAULT_BPM_COUNT) -
     instead of a fixed-size slice -- no assertion is raised in that case.
 
     Returns a dict of ``read_address -> read_address`` -- the readback's
-    device name is its own read address -- ready for ``write_substrate_env``'s
-    ``BLUESKY_EPICS_READBACKS`` wiring.
+    device name is its own read address -- ready to hand to
+    :func:`write_devices_file` as the device file's ``readables``.
 
     Thin wrapper: delegates to the canonical
     ``osprey.services.bluesky_bridge.substrate_devices.select_bpms`` (same
@@ -706,48 +876,167 @@ def select_bpms(limits: dict[str, Any], count: int | None = DEFAULT_BPM_COUNT) -
     return _select_bpms(limits, count)
 
 
-def write_substrate_env(
+def write_devices_file(
     repo: Path,
     *,
     correctors: dict[str, tuple[str, str]],
     bpms: dict[str, str],
     launch_token: str | None = None,
-) -> None:
-    """Wire correctors + BPMs into ``BLUESKY_EPICS_SETPOINTS``/``_READBACKS``
-    and set ``BLUESKY_EPICS_SUBSTRATE=1``, appended to the deployment repo's
-    ``.env`` BEFORE ``osprey up`` (the bridge compose template passes these
-    through from that file, same mechanism as ``BLUESKY_LAUNCH_TOKEN``).
+) -> dict[str, list[dict[str, str]]]:
+    """Author the queueserver worker's plan devices at
+    ``<repo>/data/bluesky_devices.yml`` -- BEFORE ``osprey build``, from a
+    ``pre_build`` hook -- and return the document written.
 
-    ``repo`` is the repo ROOT, not its render: one repo has exactly one
-    ``.env``, it sits beside ``profile.yml``, and it is the file every compose
-    invocation is pointed at with ``--env-file``.
+    ``repo`` is the repo ROOT, not its render. That is deliberate and is the
+    whole reason the hook exists: the build copies ``<repo>/data`` into the
+    build zone verbatim, and only then resolves ``bluesky.devices_file``
+    against the rendered config -- so a file authored here is the AUTHORED
+    device set the render stages into
+    ``build/services/bluesky/bluesky_devices.yml`` and the worker mounts. Write
+    it after the build and the render has already chosen (deriving its own set
+    from the project's channel limits) and nothing picks this file up.
 
-    ``launch_token``, if given, is also written. The container-exec path
-    normally auto-mints one on ``osprey up``; callers that need a
-    deterministic value for a scripted launch call supply their own (the
-    same operator-provides-a-token path used elsewhere in this e2e suite).
+    ``correctors``/``bpms`` carry the same shapes
+    :func:`select_correctors`/:func:`select_bpms` return, and select WHICH
+    channels reach the worker: only these devices are registered, and each one
+    is a Channel Access connection the RE worker opens at startup.
 
-    Formatting delegates to the canonical
-    ``osprey.services.bluesky_bridge.substrate_devices`` formatters (same
-    ``name=SP|RB`` / ``name=RB`` syntax the product deploy-time producer
-    uses -- one source of the wire format).
+    ``launch_token``, if given, is written to the repo's ``.env``. The deploy
+    path normally mints one on ``osprey up``; callers that need a deterministic
+    value for a scripted launch call supply their own.
+
+    The document itself is produced and written by the canonical
+    ``osprey.services.bluesky_bridge.substrate_devices`` -- the same producer
+    the build path uses -- rather than assembled here, so a harness-authored
+    device set and a turn-key derived one are byte-identical for the same
+    channels. That producer derives from a channel-limits mapping, so the
+    requested devices reach it as the SLICE of channel keys naming exactly them
+    (it reads keys, never values), and the document it returns is checked to
+    name exactly what was asked for.
     """
+    from osprey.cli.build_profile_schema import BlueskyConfig
+    from osprey.services.bluesky_bridge.devices._specs_from_file import (
+        READABLES_KEY,
+        SETTABLES_KEY,
+    )
     from osprey.services.bluesky_bridge.substrate_devices import (
-        format_readbacks_env,
-        format_setpoints_env,
+        write_devices_file as _write_devices_file,
     )
 
-    values = {
-        "BLUESKY_EPICS_SUBSTRATE": "1",
-        "BLUESKY_EPICS_SETPOINTS": format_setpoints_env(correctors),
-        "BLUESKY_EPICS_READBACKS": format_readbacks_env(bpms),
-    }
-    if launch_token:
-        values["BLUESKY_LAUNCH_TOKEN"] = launch_token
+    limits_slice: dict[str, Any] = {address: {} for pair in correctors.values() for address in pair}
+    limits_slice.update({address: {} for address in bpms.values()})
 
+    # ``BlueskyConfig.devices_file`` is authored relative to the rendered
+    # config's directory; joining that same relative path onto the REPO root
+    # lands it inside ``<repo>/data``, which the build copies into the build
+    # zone -- so the render finds it exactly where it looks.
+    devices_path = repo / BlueskyConfig.devices_file
+    devices_path.parent.mkdir(parents=True, exist_ok=True)
+    document = _write_devices_file(devices_path, limits_slice)
+
+    written_settables = {entry["name"] for entry in document[SETTABLES_KEY]}
+    written_readables = {entry["name"] for entry in document[READABLES_KEY]}
+    if written_settables != set(correctors) or written_readables != set(bpms):
+        raise AssertionError(
+            "the authored device file does not name the requested devices "
+            f"(settables {sorted(written_settables)} vs {sorted(correctors)}, "
+            f"readables {sorted(written_readables)} vs {sorted(bpms)}) -- a "
+            "requested channel is one the canonical derivation does not "
+            "classify as a corrector/BPM"
+        )
+
+    if launch_token:
+        env_path = repo / ".env"
+        existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+        env_path.write_text(f"{existing}BLUESKY_LAUNCH_TOKEN={launch_token}\n", encoding="utf-8")
+
+    return document
+
+
+def assert_devices_authored(correctors: dict[str, tuple[str, str]], bpms: dict[str, str]) -> None:
+    """Fail HERE if the ``pre_build`` device-authoring hook never ran.
+
+    Every plan-lane fixture seeds its corrector/BPM dicts empty and fills them
+    from inside its ``pre_build`` hook, so a hook that was dropped -- from the
+    builder call, or by a builder that stopped invoking it -- leaves both empty
+    and the fixture goes on to deploy a browse-only worker. Without this the
+    first symptom is a plan a hundred lines later naming no devices, which reads
+    as a queueserver fault rather than as a fixture that skipped a step.
+
+    The counterpart of ``test_bump_roundtrip``'s ``assert stack is not None``,
+    for the fixtures whose hook fills dicts rather than building an object.
+    """
+    assert correctors and bpms, (
+        "the pre-build hook did not run -- no plan devices were authored, so "
+        "`osprey build` staged no device file and the queueserver worker comes "
+        "up browse-only"
+    )
+
+
+def seed_repo_env(repo: Path) -> None:
+    """Give the deployment repo the ``.env`` ``osprey up`` refuses to start
+    without.
+
+    The repo root's ``.env`` is the deployment's whole secret store and the
+    file every compose invocation is pointed at, so ``up`` aborts when it is
+    absent. ``osprey init`` writes one only when the shell exports a key for
+    the profile's provider, which the plan-stack lanes do not need — this is
+    the ``cp .env.example .env`` the CLI itself recommends, done for the
+    operator. Everything ``up`` mints (the launch token, the service secrets)
+    is appended to whatever is here.
+
+    Its own step because nothing else creates that file any more: the plan
+    devices moved out of ``.env`` and into the mounted device file, so the
+    deployment's secret store and its device set are now two separate concerns
+    and neither may quietly depend on the other having run.
+    """
     env_path = repo / ".env"
-    existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
-    if existing and not existing.endswith("\n"):
-        existing += "\n"
-    new_lines = "".join(f"{k}={v}\n" for k, v in values.items())
-    env_path.write_text(existing + new_lines, encoding="utf-8")
+    if not env_path.exists():
+        shutil.copy(repo / ".env.example", env_path)
+
+
+def staged_devices_file(repo: Path) -> Path:
+    """Where ``osprey build`` stages the worker's device file inside the render.
+
+    The compose template mounts this literal path, so the name is part of the
+    contract and is imported from the generator rather than re-spelled here.
+    """
+    from osprey.deployment.compose_generator import BLUESKY_DEVICES_FILENAME
+
+    return repo / "build" / "services" / "bluesky" / BLUESKY_DEVICES_FILENAME
+
+
+def staged_devices(repo: Path) -> tuple[dict[str, tuple[str, str]], dict[str, str]]:
+    """Read the device file the BUILD staged, as ``(correctors, bpms)`` -- the
+    same shapes the selectors return.
+
+    For the turn-key lanes, which author no device file of their own and so
+    prove that the build derives one from the deployment's own channel limits.
+    Read back from the staged file rather than re-derived here, so the devices
+    a test names are exactly the ones the deployed worker registered and a
+    change in that derivation surfaces as a real failure instead of a silently
+    diverging second copy of the logic.
+    """
+    from osprey.services.bluesky_bridge.devices._specs_from_file import (
+        READABLES_KEY,
+        SETTABLES_KEY,
+    )
+
+    path = staged_devices_file(repo)
+    if not path.is_file():
+        raise AssertionError(
+            f"the build staged no plan device file at {path} -- the worker came "
+            "up browse-only, so no plan this test composes can name a device"
+        )
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise AssertionError(f"{path} is not a device document mapping: {document!r}")
+
+    correctors = {
+        entry["name"]: (entry["setpoint"], entry.get("readback", entry["setpoint"]))
+        for entry in document.get(SETTABLES_KEY) or []
+    }
+    bpms = {entry["name"]: entry["pv"] for entry in document.get(READABLES_KEY) or []}
+    return correctors, bpms

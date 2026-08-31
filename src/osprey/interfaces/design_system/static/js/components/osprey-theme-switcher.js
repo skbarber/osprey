@@ -49,12 +49,13 @@
  *     behind `!customElements.get(...)`, so a double side-effect import is
  *     safe.
  *   - Token-only styling: every color this component's injected stylesheet
- *     sets is a `var(--…)` custom property from tokens.css; no raw hex.
- *     Non-color layout values (sizes, radii) are plain px, matching every
- *     other interface's own `.header-icon-btn`-style rules -- tokens.css
- *     does not yet emit `--space-*`/`--radius-*` custom properties (see
- *     core.json's `space`/`radius` primitives, generator-internal only
- *     today), so there is no token to reference for those.
+ *     sets is a tokens.css custom-property reference; no raw hex.
+ *     The same holds for the scale values that have a token -- radii use
+ *     `var(--radius-md)` and the family select's font size
+ *     `var(--text-md)`. What stays plain px is only the handful of one-off
+ *     box metrics the emitted scales have no step for (the 6px flex gap,
+ *     the 3px/6px select padding, the 28px mode-button square), matching
+ *     every other interface's own `.header-icon-btn`-style rules.
  *
  * D15 embedded-hidden default: per D14's dual-mode contract, a standalone
  * page shows its own theme switcher; an embedded panel defers all chrome
@@ -69,61 +70,28 @@
  */
 
 import {
-  familyLabel,
   getFamily,
   getTheme,
+  modeOf,
   setFamily,
   subscribe,
+  themeFamilies,
   toggleTheme,
 } from '/design-system/js/theme-manager.js';
-import { THEMES } from '/design-system/js/tokens.js';
-
-/** @typedef {{id: string, label: string, mode: string, family: string}} ThemeEntry */
 
 const STYLE_ID = 'osprey-theme-switcher-style';
 
-// tokens.js is plain (unchecked) generated JS -- cast to the documented
-// shape rather than relying on tsc's inference of the literal it emits
-// (same rationale as theme-manager.js's own `_themes` cast).
-const _themes = /** @type {ThemeEntry[]} */ (THEMES);
-
 /**
- * The available families, deduped, in `THEMES` declaration order -- the
- * same order theme-manager.js's `DEFAULT_FAMILY` fallback uses, so the
- * first `<option>` here is always that same fallback family.
- * @returns {{id: string, label: string}[]}
- */
-function _families() {
-  /** @type {Map<string, string>} */
-  const seen = new Map();
-  for (const theme of _themes) {
-    if (!seen.has(theme.family)) seen.set(theme.family, familyLabel(theme.family));
-  }
-  return Array.from(seen, ([id, label]) => ({ id, label }));
-}
-
-/**
- * The `mode` ('dark'|'light') of a concrete theme id, or null if `id` is
- * not a recognized theme (including `null` itself, e.g. before
- * theme-manager.js's `initTheme()` has resolved an initial theme).
- * @param {string|null} id
- * @returns {string|null}
- */
-function _modeOfId(id) {
-  if (id === null) return null;
-  const theme = _themes.find((entry) => entry.id === id);
-  return theme ? theme.mode : null;
-}
-
-/**
- * This instance's markup: a family `<select>` (one `<option>` per family)
- * and a mode toggle `<button>` reusing the same sun/moon glyphs the
- * pre-1.9 binary toggle used. Classes only -- see the multi-instance note
- * in the module docstring for why no ids appear here.
+ * This instance's markup: a family `<select>` (one `<option>` per family, in
+ * theme-manager.js's `themeFamilies()` order, so the first `<option>` is
+ * always the same fallback family its `DEFAULT_FAMILY` resolves to) and a
+ * mode toggle `<button>` reusing the same sun/moon glyphs the pre-1.9 binary
+ * toggle used. Classes only -- see the multi-instance note in the module
+ * docstring for why no ids appear here.
  * @returns {string}
  */
 function _renderTemplate() {
-  const options = _families()
+  const options = themeFamilies()
     .map((family) => `<option value="${family.id}">${family.label}</option>`)
     .join('');
   return `
@@ -156,9 +124,9 @@ function _ensureStyleInjected() {
       background: var(--bg-elevated);
       color: var(--text-primary);
       border: 1px solid var(--border-default);
-      border-radius: 4px;
+      border-radius: var(--radius-md);
       font-family: var(--font-display);
-      font-size: 12px;
+      font-size: var(--text-md);
       line-height: 1.4;
       padding: 3px 6px;
       cursor: pointer;
@@ -170,7 +138,7 @@ function _ensureStyleInjected() {
     osprey-theme-switcher .theme-switcher-mode {
       background: transparent;
       border: 1px solid transparent;
-      border-radius: 4px;
+      border-radius: var(--radius-md);
       color: var(--text-muted);
       width: 28px;
       height: 28px;
@@ -288,7 +256,7 @@ export class OspreyThemeSwitcher extends HTMLElement {
       this._familySelect.value = family;
     }
 
-    const mode = _modeOfId(getTheme());
+    const mode = modeOf(getTheme());
     const isLight = mode === 'light';
     if (this._sunIcon) this._sunIcon.style.display = isLight ? 'none' : 'block';
     if (this._moonIcon) this._moonIcon.style.display = isLight ? 'block' : 'none';

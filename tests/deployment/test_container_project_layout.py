@@ -47,6 +47,7 @@ from osprey.cli.build_cmd import (
 from osprey.cli.build_cmd import build as build_command
 from osprey.cli.profile_root import PERSONA_DIRNAME
 from osprey.cli.repo_resolver import PROFILE_FILENAME, RepoNotFoundError, find_repo_root
+from osprey.port_layout import DEFAULT_PORT_BASE, layout_ports
 from osprey.registry.mcp import RENDERED_CONFIG_ENV_VALUE
 from osprey.utils.workspace import (
     BUILD_DIR_NAME,
@@ -69,6 +70,8 @@ def _rendered_dockerfile(project_name: str = PROJECT_NAME) -> str:
     return Template(template.read_text(encoding="utf-8")).render(
         project_name=project_name,
         claude_code_cli_version="1.2.3",
+        port_base=DEFAULT_PORT_BASE,
+        osprey_ports=layout_ports(DEFAULT_PORT_BASE),
     )
 
 
@@ -281,7 +284,9 @@ def test_the_context_root_dockerignore_matches_at_container_depth(tmp_path: Path
 #: deployment's — the defect that made persona deltas invisible to their own
 #: MCP servers. ``ariel`` is the standalone logbook terminal: not a control tier
 #: at all, and it pins the key off for the same reason the read-only tier does.
-PERSONA_WRITES = {"ariel": False, "readonly": False, "readwrite": True}
+#: ``admin`` is the deployment-editing tier: it pins writes ON because admin is
+#: a superset of readwrite, not a third posture beside it.
+PERSONA_WRITES = {"admin": True, "ariel": False, "readonly": False, "readwrite": True}
 
 
 @pytest.fixture(scope="module")

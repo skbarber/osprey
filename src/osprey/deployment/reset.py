@@ -58,10 +58,11 @@ in). Both conditions, never one:
   deploy*, so an unlabelled volume can only ever be removed by hand.
 
 Images are the one class this scoping cannot cover, and the plan says why.
-``<project>:local`` and the persona tags are host-global and derived from the
-project name alone: two same-named checkouts do not have one image each, they
-share one image. There is no identity label to check because there is no
-per-checkout image to put it on. Each candidate tag is instead individually
+The project image (``<project>:local``, or whatever the image axes renamed it
+to) and the persona tags are host-global and derived from the project name
+alone: two same-named checkouts do not have one image each, they share one
+image. There is no identity label to check because there is no per-checkout
+image to put it on. Each candidate tag is instead individually
 ``image inspect``-verified against its own ``com.osprey.project`` label — the
 same check ``nuke`` uses — so a same-named tag belonging to something that is
 not an OSPREY deployment is never touched. The residual exposure is bounded and
@@ -104,6 +105,7 @@ from osprey.deployment.compose_generator import (
     COMPOSE_ENV_FILENAME,
     REPO_ID_LABEL,
     repo_identity,
+    resolve_image_defaults,
     resolve_project_name,
 )
 from osprey.deployment.compose_merge import MERGED_COMPOSE_FILENAME
@@ -134,30 +136,32 @@ COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
 #: is verified against before removal — exactly as ``nuke`` verifies it.
 OSPREY_PROJECT_LABEL = "com.osprey.project"
 
-#: The web tier's credential files, as ``(filename, what it holds, how it is
-#: refreshed)``. Each is written once — a deploy creates it when it is absent
-#: and never rewrites an existing one — and reset removes none of them, which is
-#: why they are disclosed (:meth:`ResetPlan._kept_lines`) rather than left for an
-#: operator to discover after wiping the deployment they belong to.
+#: The web tier's credential files reset KEEPS, as ``(filename, what it holds,
+#: how it is refreshed)``. Each is written once — a deploy creates it when it is
+#: absent and never rewrites an existing one — and reset removes neither, which
+#: is why they are disclosed (:meth:`ResetPlan._kept_lines`) rather than left
+#: for an operator to discover after wiping the deployment they belong to.
+#:
+#: ``.env.auth`` is deliberately NOT here: reset removes it (it is on the
+#: plan's path list, with its own removal note). A password hash survives
+#: routine redeploys untouched so sessions outlive a deploy, but a reset ends
+#: every session and re-seeds ``.env`` from the profile — a hash carried across
+#: that boundary is the previous deployment's password contradicting the
+#: freshly seeded one, which is how a closing card comes to print a login the
+#: sidecar refuses.
 #:
 #: The refresh clauses are per-file because these do NOT behave alike: the same
 #: removal that gets the first re-derived (and stops a registry-mode deploy
-#: outright) costs every user their password in the second, while the third is
-#: a superseded copy nothing refreshes at all and the operator is free to drop.
-#: Every spelling comes from the module that writes it, so no disclosure here
-#: can name a file this system stopped producing.
+#: outright) leaves the second a superseded copy nothing refreshes at all and
+#: the operator is free to drop. Every spelling comes from the module that
+#: writes it, so no disclosure here can name a file this system stopped
+#: producing.
 WEB_CREDENTIAL_FILES: tuple[tuple[str, str, str], ...] = (
     (
         USERS_ENV_FILENAME,
         "the runtime secrets every web-terminal container reads",
         "Remove it and a local-mode deploy re-derives one from .env; a registry-mode "
         "deploy expects it to be there already.",
-    ),
-    (
-        AUTH_ENV_FILENAME,
-        "the web terminals' password hashes and cookie-signing secrets",
-        "Remove it and the next deploy mints a NEW password for every user; "
-        "`osprey users decommission` is what drops one departed user's entries.",
     ),
     (
         SUPERSEDED_USERS_ENV_FILENAME,
@@ -213,6 +217,15 @@ MINTED_ENV_BANNERS: tuple[str, ...] = (
     # test_lifecycle_invariants' retired-spelling scan grandfathers exactly the
     # older three and nothing else, which is what keeps this from drifting back.
     "Service account names (osprey up) — not secrets",
+    # The one credential in this list the deploy did not choose: OpenObserve
+    # issues its service account's token, and `osprey up` only records it. It
+    # belongs here for a sharper reason than the rest. A reset destroys the
+    # store's data volume, and the account lives INSIDE that volume — so a token
+    # left behind in `.env` is not merely stale, it names an account that no
+    # longer exists, and the next deploy's telemetry would be refused by a store
+    # that is otherwise brand new. Stripping it is what lets the provisioner
+    # create the account again and write the token the new store issued.
+    "Harvested OpenObserve ingest token (osprey up)",
 )
 
 
@@ -833,16 +846,22 @@ class ResetPlan:
             f"    {STATE_DIR_NAME}/  everything outside the entries listed above, including "
             "any --archive tarballs."
         )
-        curve_dir = self.repo_root / "data" / "bluesky_curve"
-        if curve_dir.is_dir():
-            kept.append(
-                "    data/bluesky_curve/  the document-plane CURVE certificates, which live "
-                "in the source zone. They are"
-            )
-            kept.append(
-                "      regenerated only when absent, so a reset leaves this deployment's "
-                "existing key material in place."
-            )
+        # Both spellings: data/.runtime/ is where `osprey up` mints today, and
+        # data/bluesky_curve/ is where a deployment that has not started since
+        # the #716 relocation still holds its keys.
+        for curve_dir, shown in (
+            (self.repo_root / "data" / ".runtime", "data/.runtime/"),
+            (self.repo_root / "data" / "bluesky_curve", "data/bluesky_curve/"),
+        ):
+            if curve_dir.is_dir():
+                kept.append(
+                    f"    {shown}  the document-plane CURVE certificates, which live "
+                    "in the source zone. They are"
+                )
+                kept.append(
+                    "      regenerated only when absent, so a reset leaves this deployment's "
+                    "existing key material in place."
+                )
         return kept
 
     def _path_note(self, path: Path) -> str:
@@ -863,6 +882,12 @@ class ResetPlan:
             )
         if path == self.repo_root / MERGED_COMPOSE_FILENAME:
             return "  the merged compose document — rewritten by the next `osprey up`"
+        if path == self.repo_root / AUTH_ENV_FILENAME:
+            return (
+                "  the web logins' password hashes and cookie-signing secrets — the next "
+                "deploy re-mints them from .env, so passwords an operator set only with "
+                "`osprey users passwd` are lost"
+            )
         if path == self.audit_dir:
             return "  the safety audit log — not recoverable"
         return ""
@@ -1045,20 +1070,55 @@ def resolve_agent_data_target(repo_root: Path, config: dict | None) -> tuple[Pat
     return target, target.is_relative_to(repo_root) and target != repo_root
 
 
+def _as_built_config(repo_root: Path) -> dict:
+    """The rendered ``build/config.yml``, or ``{}`` when there is none to read.
+
+    Leniently: a deployment with no build, and one whose build cannot be parsed,
+    both resolve to "nothing configured" rather than to an exception. Reset must
+    still be able to remove what it can name from the project name alone.
+    """
+    config_path = as_built_config_path(repo_root)
+    if not config_path.is_file():
+        return {}
+    try:
+        from osprey.utils.config import ConfigBuilder
+
+        return ConfigBuilder(str(config_path)).raw_config or {}
+    except Exception as exc:  # noqa: BLE001 - an unreadable build must not block a reset
+        logger.warning(
+            "Could not read this deployment's rendered config from %s (%s). Reset will "
+            "fall back to the image names derivable from the project name alone.",
+            config_path,
+            exc,
+        )
+        return {}
+
+
 def _candidate_image_tags(repo_root: Path, project: str) -> list[str]:
     """Every locally-built tag this deployment could own, deduplicated.
 
-    ``<project>:local`` is the project image ``osprey up`` builds for the
-    dispatch worker. The rest are the web-terminal persona images and the auth
-    sidecar, resolved from the rendered config exactly as ``nuke`` resolves them
-    — leniently, so a stale persona reference degrades to "not a candidate"
-    rather than blocking the reset. A deployment with no build, or no web
-    terminals, contributes only the project tag.
-    """
-    tags = [f"{project}:local"]
+    The project image ``osprey up`` builds for the dispatch worker is named by
+    :func:`~osprey.deployment.compose_generator.resolve_image_defaults`, the same
+    function the compose render and the build itself consume, so the tag reset
+    looks for is the tag the build produced. It is ``<project>:local`` until the
+    registry or tag axis moves it (``OSPREY_IMAGE_REGISTRY`` / ``OSPREY_IMAGE_TAG``
+    over ``images.registry`` / ``images.tag``); restating the ``:local`` literal
+    here would leave an axis-set deployment's image behind on every reset.
 
-    config_path = as_built_config_path(repo_root)
-    if not config_path.is_file():
+    The rest are the web-terminal persona images and the auth sidecar, resolved
+    from the rendered config exactly as ``nuke`` resolves them — leniently, so a
+    stale persona reference degrades to "not a candidate" rather than blocking
+    the reset. A deployment with no build, or no web terminals, contributes only
+    the project tag.
+    """
+    config = _as_built_config(repo_root)
+    # The caller already resolved the project name (from the build, else from the
+    # directory), and the labels being matched carry THAT name — so it is pinned
+    # here rather than re-derived, while the axes still come off the config.
+    image_defaults = resolve_image_defaults({**config, "project_name": project})
+    tags = [image_defaults["worker"]]
+
+    if not config:
         return tags
 
     try:
@@ -1067,9 +1127,7 @@ def _candidate_image_tags(repo_root: Path, project: str) -> list[str]:
             effective_image_source,
             resolve_personas,
         )
-        from osprey.utils.config import ConfigBuilder
 
-        config = ConfigBuilder(str(config_path)).raw_config
         web_terminals = as_dict(as_dict(config.get("modules")).get("web_terminals"))
         if not web_terminals:
             return tags
@@ -1079,9 +1137,20 @@ def _candidate_image_tags(repo_root: Path, project: str) -> list[str]:
             as_dict(config.get("facility")).get("prefix") or "",
             strict=False,
         )
+        built_here = set(image_defaults.values())
         for entry in personas:
             image = entry.get("image")
-            if isinstance(image, str) and image.endswith(":local") and image not in tags:
+            if not isinstance(image, str) or image in tags:
+                continue
+            # ``:local`` is the persona/auth naming convention, which the image
+            # axes do not move. Membership in the axis-derived defaults is the
+            # other half: a roster naming one of THIS project's built images
+            # carries the registry prefix and tag the axes resolved, so the
+            # suffix test alone would walk past it. Exact membership, never a
+            # bare tag match — a registry-mode persona image is PULLED, and
+            # matching ``:<tag>`` alone would put an upstream image on the
+            # removal list the moment the axis tag and ``image_tag`` agreed.
+            if image.endswith(":local") or image in built_here:
                 tags.append(image)
 
         from osprey.deployment.web_terminals.provision import auth_sidecar_local_tag
@@ -1089,7 +1158,7 @@ def _candidate_image_tags(repo_root: Path, project: str) -> list[str]:
 
         auth_ctx = _auth_tls_context(web_terminals)
         if (
-            auth_ctx["auth_method"] != "none"
+            auth_ctx["sidecar_active"]
             and effective_image_source(web_terminals) == "local"
             and not auth_ctx["auth_image"]
         ):
@@ -1101,7 +1170,7 @@ def _candidate_image_tags(repo_root: Path, project: str) -> list[str]:
             "Could not resolve this deployment's web-terminal image tags from %s (%s). "
             "Reset will remove the project image only; any persona image is left in "
             "place and can be removed by hand.",
-            config_path,
+            as_built_config_path(repo_root),
             exc,
         )
     return tags
@@ -1260,7 +1329,18 @@ def plan_reset(repo_root: Path, *, probe: RuntimeProbe, purge_audit: bool = Fals
 
     agent_data, contained = resolve_agent_data_target(repo_root, config)
 
-    paths = [repo_root / BUILD_DIRNAME, repo_root / MERGED_COMPOSE_FILENAME]
+    # `.env.auth` goes with the generation being discarded: a hash normally
+    # survives redeploys untouched (`ensure_auth_credentials` rule 1, so routine
+    # deploys never log anyone out), which after a reset would carry the
+    # PREVIOUS deployment's passwords into a repo whose `.env` was just
+    # re-seeded with the profile defaults — the closing card then names a login
+    # the sidecar refuses. Reset is the verb that ends sessions anyway; the next
+    # deploy re-mints every hash from `.env`.
+    paths = [
+        repo_root / BUILD_DIRNAME,
+        repo_root / MERGED_COMPOSE_FILENAME,
+        repo_root / AUTH_ENV_FILENAME,
+    ]
     if contained:
         paths.insert(0, agent_data)
     if purge_audit:
@@ -1502,7 +1582,15 @@ def execute_reset(plan: ResetPlan, *, probe: RuntimeProbe) -> None:
     for resource in plan.images:
         probe.remove_image(resource.name)
 
-    derived = {plan.repo_root / BUILD_DIRNAME, plan.repo_root / MERGED_COMPOSE_FILENAME}
+    # Left absent, never recreated: `build/` because its absence is what
+    # `osprey up` reads as "no build found", and the two FILES because the next
+    # deploy that needs them writes each whole (an empty directory in a file's
+    # place would fail that write).
+    derived = {
+        plan.repo_root / BUILD_DIRNAME,
+        plan.repo_root / MERGED_COMPOSE_FILENAME,
+        plan.repo_root / AUTH_ENV_FILENAME,
+    }
     for path in plan.paths:
         _wipe_directory(path, recreate=path not in derived)
 

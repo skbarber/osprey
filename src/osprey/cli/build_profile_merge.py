@@ -533,6 +533,54 @@ def _warn_unmatched_exclusions(root_dir: Path, artifacts: set[str]) -> None:
         )
 
 
+# Hook short names, as the built-in library spells them
+# (``_hook_short_name``). ``target-state`` is a helper library rather than a
+# wired hook: selecting it is the only thing that copies it into
+# ``.claude/hooks/`` beside the gates that import it.
+TARGET_STATE_HOOK = "target-state"
+WRITE_POSTURE_HOOKS: tuple[str, ...] = ("writes-check", "approval")
+
+
+def _warn_missing_target_state(root_dir: Path, resolved: dict[str, Any]) -> None:
+    """Warn when a write gate is selected without the posture helper it imports.
+
+    ``writes-check`` and ``approval`` resolve a target's write posture by
+    importing ``target-state`` from beside them in ``.claude/hooks/``. A profile
+    that selects a gate but not the helper builds and runs — the gates fall back
+    to the most restrictive answer — so the deployment comes out silently
+    write-less, with nothing in the build saying which line caused it. Warning
+    rather than refusing: the selection lists are the author's to compose, and a
+    profile may have its own reason to run a gate with no posture source.
+
+    Args:
+        root_dir: The profile root, named in the warning.
+        resolved: The fully resolved profile mapping.
+    """
+    hooks = resolved.get("hooks")
+    if not isinstance(hooks, list):
+        return
+    selected = {entry for entry in hooks if isinstance(entry, str)}
+    # A profile shipping its own ``hooks/osprey_target_state.py`` renders it
+    # whether or not the short name is selected, so the import resolves.
+    if TARGET_STATE_HOOK in selected or _profile_ships(root_dir, f"hooks/{TARGET_STATE_HOOK}"):
+        return
+    triggering = [name for name in WRITE_POSTURE_HOOKS if name in selected]
+    if not triggering:
+        return
+    _LOGGER.warning(
+        "Profile %s selects %s but not %r. Those hooks import the %r helper from "
+        "beside them in .claude/hooks/, and selecting it is what puts it there — "
+        "without it the hooks resolve write posture to the most restrictive "
+        "answer and refuse writes this deployment is configured to allow. Add "
+        "%r to the profile's 'hooks:' list.",
+        root_dir,
+        ", ".join(repr(name) for name in triggering),
+        TARGET_STATE_HOOK,
+        TARGET_STATE_HOOK,
+        TARGET_STATE_HOOK,
+    )
+
+
 @dataclass(frozen=True)
 class ResolvedProfileDocument:
     """One profile document resolved into what the build actually reads.
@@ -576,12 +624,13 @@ def resolve_profile_document(
         raw: The profile document as read.
         profile_path: Where that document lives — the classification is made
             from its location, not its contents.
-        warn: Whether to log the diagnostic for exclusions that match no file.
-            ``False`` for the hash path, which resolves the same document a
-            build already loaded — without it every build reports each stale
-            exclusion twice, and a warning that repeats is one people learn to
+        warn: Whether to log the resolution diagnostics — exclusions that match
+            no file, and a write gate selected without the posture helper it
+            imports. ``False`` for the hash path, which resolves the same
+            document a build already loaded — without it every build reports
+            each one twice, and a warning that repeats is one people learn to
             skip. The loader is the user-facing surface, so it keeps the
-            warning.
+            warnings.
 
     Returns:
         The resolved document and its anchor.
@@ -597,15 +646,17 @@ def resolve_profile_document(
     shadowed: set[str] = set()
 
     def finish(resolved: dict[str, Any], as_delta: bool) -> ResolvedProfileDocument:
-        """Report the exclusion diagnostics, then package the result.
+        """Report the resolution diagnostics, then package the result.
 
-        Both branches end the same way, and they must: the two diagnostics read
-        the sets every layer of either branch fed, so a branch that skipped one
-        would leave that whole shape of profile without the warning.
+        Both branches end the same way, and they must: the diagnostics read the
+        sets every layer of either branch fed — and the resolved selection lists
+        only both branches produce — so a branch that skipped one would leave
+        that whole shape of profile without the warning.
         """
         if warn:
             _warn_unmatched_exclusions(root_dir, artifacts)
             _warn_shadowed_bare_exclusions(root_dir, shadowed)
+            _warn_missing_target_state(root_dir, resolved)
         return ResolvedProfileDocument(resolved, root_dir, as_delta, frozenset(artifacts))
 
     if not is_persona_delta:
@@ -652,7 +703,9 @@ def resolve_profile_document(
 # ---------------------------------------------------------------------------
 
 
-def _fold_source_tree(digest: Any, label: str, source: Path) -> None:
+def _fold_source_tree(
+    digest: Any, label: str, source: Path, *, skip_runtime_output: bool = False
+) -> None:
     """Fold one file-or-directory build input into ``digest``, in place.
 
     Every regular file under ``source`` contributes its path relative to
@@ -660,6 +713,14 @@ def _fold_source_tree(digest: Any, label: str, source: Path) -> None:
     joined with the SHA-256 of its bytes. Entries are sorted by that relative
     path, and directories themselves contribute nothing — only their files —
     so the digest depends on content alone and not on filesystem walk order.
+
+    ``skip_runtime_output`` is passed for the ``data:`` tree only: the
+    top-level :data:`~osprey_connectors.workspace.RUNTIME_DATA_DIR_NAME`
+    subtree is where ``osprey up`` mints its own material (per-lane CURVE
+    certificates), and hashing it would make every successful start mark its
+    own build OUT OF DATE (#716). The subtree is skipped statically — by its
+    reserved name, not by a manifest — so the fold and the writer cannot fall
+    out of sync about which files a start is allowed to create.
 
     A ``source`` that does not exist folds only its ``label``: the profile keys
     that name it are already in the canonical JSON, so a vanished tree still
@@ -685,15 +746,18 @@ def _fold_source_tree(digest: Any, label: str, source: Path) -> None:
     """
     import hashlib
 
+    from osprey.utils.workspace import RUNTIME_DATA_DIR_NAME
+
     if source.is_dir():
-        entries = sorted(
-            (
-                (path.relative_to(source).as_posix(), path)
-                for path in source.rglob("*")
-                if path.is_file()
-            ),
-            key=lambda entry: entry[0],
-        )
+        entries = []
+        for path in source.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(source).as_posix()
+            if skip_runtime_output and rel.split("/", 1)[0] == RUNTIME_DATA_DIR_NAME:
+                continue
+            entries.append((rel, path))
+        entries.sort(key=lambda entry: entry[0])
     elif source.is_file():
         entries = [(source.name, source)]
     else:
@@ -723,7 +787,13 @@ def _fold_profile_material(
 
     * the ``data:`` tree, anchored via
       :meth:`~osprey.cli.build_profile_model.BuildProfile.resolved_data_root`
-      so it resolves exactly where the build copies it from;
+      so it resolves exactly where the build copies it from — minus the
+      reserved ``data/.runtime/`` subtree
+      (:data:`~osprey_connectors.workspace.RUNTIME_DATA_DIR_NAME`), which is
+      runtime-minted material (the Bluesky lanes' CURVE certificates) and
+      never build input: fold it and every successful ``osprey up`` marks its
+      own build OUT OF DATE, stranding a bare ``osprey up -d`` boot unit at
+      the drift gate (#716);
     * every convention directory the profile carries
       (:data:`~osprey.cli.profile_conventions.CONVENTION_SOURCES`, which
       includes the ``project/`` verbatim mirror), folded in sorted name order
@@ -775,7 +845,9 @@ def _fold_profile_material(
 
     data_root = BuildProfile(name="", data=resolved.get("data")).resolved_data_root(profile_dir)
     if data_root is not None:
-        _fold_source_tree(digest, "data", data_root)
+        # data/.runtime/ is runtime-minted material, never build input — see
+        # the docstring above and _fold_source_tree's skip contract (#716).
+        _fold_source_tree(digest, "data", data_root, skip_runtime_output=True)
 
     if not conventions:
         return
@@ -806,7 +878,11 @@ def _fold_profile_material(
 
 
 def _hash_resolved_profile(
-    raw: dict[str, Any], profile_path: Path, *, conventions: bool = True
+    raw: dict[str, Any],
+    profile_path: Path,
+    *,
+    conventions: bool = True,
+    overlay: Path | None = None,
 ) -> str:
     """Canonical content hash of a profile dict after ``extends`` resolution.
 
@@ -846,6 +922,16 @@ def _hash_resolved_profile(
     the same as one that did — the YAML-surface rename must not move any
     profile's hash. Normalizing before ``extends`` resolution (rather than
     after) keeps the deep merge child-wins across a mixed-spelling chain.
+
+    ``overlay`` is the host-variant profile this repo builds, when one is
+    selected — the layer ``raw`` does not carry, because the hash resolves the
+    TRACKED document while the render merges the overlay over it. It is folded
+    as file material rather than merged in: :func:`_fold_source_tree`
+    contributes the file's NAME beside its content, so an edit to the selected
+    overlay and a switch between two byte-identical overlays both move the hash,
+    while an overlay this host did not select folds nothing. No overlay folds
+    nothing at all, which is what keeps every repo that defines no variants
+    hashing exactly as it did before variants existed.
     """
     import hashlib
     import json
@@ -854,6 +940,8 @@ def _hash_resolved_profile(
     canonical = json.dumps(document.raw, sort_keys=True, default=str)
     digest = hashlib.sha256(canonical.encode("utf-8"))
     _fold_profile_material(digest, document.raw, document.root_dir, conventions=conventions)
+    if overlay is not None:
+        _fold_source_tree(digest, "variant", overlay)
     # Sorted so the record's iteration order cannot move a hash; a profile with
     # no exclusions folds nothing and keeps the digest it had before.
     for artifact in sorted(document.excluded_artifacts):
@@ -889,12 +977,23 @@ def compute_profile_hash(profile_path: Path) -> str | None:
     Counterpart of :func:`compute_preset_hash` for profile-built repos — the
     drift-fingerprint input, hashed against the profile path the manifest
     recorded. Returns ``None`` when the file is missing or unreadable.
+
+    The host variant is folded in from the profile's own directory rather than
+    passed by the caller. That is deliberate: this one function is what the
+    build stamps and what ``osprey up``/``status`` recompute, and a fingerprint
+    whose variant arrived as an argument would be a fingerprint two call sites
+    could spell differently — the exact way a stale build goes unnoticed. Read
+    off the directory, both sides of the comparison see the same selection, and
+    a directory with no ``.env.variant`` (a persona delta's, a preset's) folds
+    nothing.
     """
     try:
+        from .variant_selection import active_variant_overlay
+
         path = Path(profile_path)
         raw = _read_profile_document(path)
         if not isinstance(raw, dict):
             return None
-        return _hash_resolved_profile(raw, path)
+        return _hash_resolved_profile(raw, path, overlay=active_variant_overlay(path.parent))
     except Exception:
         return None

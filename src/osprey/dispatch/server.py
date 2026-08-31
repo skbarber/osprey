@@ -41,6 +41,7 @@ from osprey.dispatch.worker_client import (
     WorkerAuthRejectedError,
     WorkerRequestError,
     cancel_worker_run,
+    clear_worker_history,
     dispatch_to_worker,
     fetch_worker_runs,
     proxy_worker_stream,
@@ -412,6 +413,23 @@ async def shared_font_asset(request: Request) -> FileResponse | JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+def _default_worker_port() -> int:
+    """Return worker 1's host port for this deployment.
+
+    Read from the project config this process can see, so the number follows
+    ``deployment.port_base``. A dispatcher that cannot see a config falls back
+    to the layout's default base, which is the only base there is when no
+    config exists.
+
+    Returns:
+        The ``worker`` slot at index 1, at the resolved base.
+    """
+    from osprey.port_layout import default_port, resolve_port_base
+    from osprey.utils.workspace import load_osprey_config
+
+    return default_port("worker", 1, base=resolve_port_base(load_osprey_config()))
+
+
 def create_server() -> FastMCP:
     """Initialize the event dispatcher server (factory time, fully synchronous).
 
@@ -433,8 +451,14 @@ def create_server() -> FastMCP:
         dispatcher_cfg, trigger_list = load_triggers(triggers_path)
     except FileNotFoundError:
         logger.warning("triggers.yml not found at %s — starting with no triggers", triggers_path)
+        # No triggers.yml to read the target from. The fallback is worker 1 of
+        # THIS deployment's block, resolved from the project config this
+        # process can see — the worker the dispatcher would have been pointed
+        # at. Never the layout's default base: on a host running two
+        # deployments that address belongs to the other one's worker.
         dispatcher_cfg = DispatcherConfig(
-            dispatch_target=os.environ.get("DISPATCH_TARGET", "http://localhost:9088")
+            dispatch_target=os.environ.get("DISPATCH_TARGET")
+            or f"http://localhost:{_default_worker_port()}"
         )
         trigger_list = []
 
@@ -494,17 +518,19 @@ def create_server() -> FastMCP:
     # prompts, and run history. The dashboard reaches them two ways:
     #   • In-terminal EVENTS tab: the web-terminal proxy injects the bearer token
     #     server-side (the browser never holds it).
-    #   • Standalone (direct to :8020): the dashboard JS supplies the token from a
-    #     one-time ``#token=`` fragment handoff (kept out of server logs) as an
-    #     Authorization header on its fetch/poll calls. The live SSE stream is
-    #     header-gated too, so it is unavailable on the standalone path (EventSource
-    #     cannot set headers, and we deliberately do NOT accept a ``?token=`` query
-    #     that would leak the bearer into access logs); polled state still renders.
-    # WRITE endpoints (/retry, /dashboard/cancel, /trigger/.../status) are gated the
-    # same way. The /dashboard HTML SHELL itself stays ungated on purpose: it carries
-    # no agent data, and the standalone token handoff requires the page to load so
-    # its JS can read the fragment. Secret-like source_config keys are still redacted
-    # in /dashboard/state. Production deployments should still network-isolate the port.
+    #   • Standalone (direct to the dispatcher's published port): the dashboard JS
+    #     supplies the token from a one-time ``#token=`` fragment handoff (kept
+    #     out of server logs) as an Authorization header on its fetch/poll calls.
+    #     The live SSE stream is header-gated too, so it is unavailable on the
+    #     standalone path (EventSource cannot set headers, and we deliberately do
+    #     NOT accept a ``?token=`` query that would leak the bearer into access
+    #     logs); polled state still renders.
+    # WRITE endpoints (/retry, /dashboard/cancel, /dashboard/clear-history and
+    # /trigger/.../status) are gated the same way. The /dashboard HTML SHELL itself
+    # stays ungated on purpose: it carries no agent data, and the standalone token
+    # handoff requires the page to load so its JS can read the fragment. Secret-like
+    # source_config keys are still redacted in /dashboard/state. Production
+    # deployments should still network-isolate the port.
     # -----------------------------------------------------------------------
 
     @mcp.custom_route("/dashboard", methods=["GET"])
@@ -749,6 +775,45 @@ def create_server() -> FastMCP:
         run_id = request.path_params["run_id"]
         try:
             result = await cancel_worker_run(dispatch_target, dispatch_token, run_id)
+        except WorkerAuthRejectedError:
+            return JSONResponse({"detail": "worker auth failed"}, status_code=502)
+        except WorkerRequestError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=502)
+        return JSONResponse(result)
+
+    @mcp.custom_route("/dashboard/clear-history", methods=["POST"])
+    async def dashboard_clear_history(request: Request) -> JSONResponse:
+        """Proxy a clear-history request to the worker.
+
+        Bearer-auth against the dispatcher's own token, like the cancel proxy;
+        the dispatcher holds the worker token itself so the browser never sees
+        it. POST rather than DELETE because this is the browser-facing hop and
+        the dashboard already speaks POST for every write.
+
+        Body is optional: ``{"older_than_days": N}`` keeps runs younger than N
+        days, and anything else (absent, empty, ``0``) clears every finished run.
+        """
+        unauth = _check_auth(request)
+        if unauth is not None:
+            return unauth
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return JSONResponse({"detail": "body must be an object"}, status_code=400)
+
+        raw = body.get("older_than_days") or 0
+        try:
+            older_than_days = int(raw)
+        except (TypeError, ValueError):
+            return JSONResponse({"detail": "older_than_days must be an integer"}, status_code=400)
+        if older_than_days < 0:
+            return JSONResponse({"detail": "older_than_days must not be negative"}, status_code=400)
+
+        try:
+            result = await clear_worker_history(dispatch_target, dispatch_token, older_than_days)
         except WorkerAuthRejectedError:
             return JSONResponse({"detail": "worker auth failed"}, status_code=502)
         except WorkerRequestError as exc:

@@ -3,6 +3,11 @@
 Sub-agents call this as their last action to save their synthesis to
 the artifact gallery so the parent session, other tools, and the gallery
 UI can all reference it.
+
+One agent, one call, one artifact: the answer as prose, filed under the
+category the agent's own definition names in ``data_type``. An agent that
+computes an array too large to write out saves it from inside the computing
+call (``save_artifact``) and cites the id in its answer.
 """
 
 import json
@@ -16,13 +21,19 @@ from osprey.mcp_server.workspace.server import mcp
 
 logger = logging.getLogger("osprey.mcp_server.tools.submit_response")
 
-# Map well-known agent names to categories
-_AGENT_CATEGORY_MAP: dict[str, str] = {
-    "channel-finder": "channel_finder",
-    "logbook-search": "logbook_research",
-    "logbook-deep-research": "logbook_research",
-    "pyat-specialist": "lattice_analysis",
-}
+
+def _describe(category: str, agent: str) -> str:
+    """The artifact's human-facing description line.
+
+    Uses the category's display label, not its key: the description is shown to
+    the operator, and a raw key ("agent_response from facility-knowledge-graph")
+    reads as leaked plumbing.
+    """
+    from osprey.stores.type_registry import get_categories
+
+    typedef = get_categories().get(category)
+    label = typedef.label if typedef else category
+    return f"{label} — {agent}" if agent else label
 
 
 @mcp.tool()
@@ -41,17 +52,23 @@ async def submit_response(
     Include all entry IDs, channel addresses, or other identifiers you
     cited in the entry_ids parameter for cross-referencing.
 
+    Everything your answer reports belongs in ``content``: put a handful of
+    values in a markdown table rather than leaving them out. An array too large
+    to write out is saved from inside the computing ``execute`` call with
+    ``save_artifact(...)``, and its id cited in your answer.
+
     Args:
         title: Short title for the response (e.g. "Vacuum Event Analysis").
         content: The full synthesized response text (markdown).
-        data_type: Category tag for filtering.  Must be a registered type:
-            "agent_response" (default), "channel_addresses",
-            "logbook_research", "search_results", or any other key from
-            the type registry.
+        data_type: Category tag for the answer. Must be a registered type:
+            "channel_addresses", "logbook_research", "facility_knowledge",
+            "lattice_analysis", or any other key from the type registry.
+            Name the one your agent definition tells you to; the default
+            ("agent_response") files under "Uncategorized".
         entry_ids: List of ARIEL entry IDs or channel addresses cited,
             stored as structured metadata for cross-referencing.
         source_agent: Name of the agent submitting the response
-            (e.g. "logbook-search", "wiki-search"). Used for filtering
+            (e.g. "logbook-search", "pyat-specialist"). Used for filtering
             and grouping results by agent.
         skip_artifact: If True, skip creating a new artifact (use when
             the agent already created plot/dashboard artifacts and wants
@@ -84,11 +101,12 @@ async def submit_response(
             ["Use one of the registered data_type or category values."],
         )
 
+    agent = source_agent or ""
+
     try:
         from osprey.stores.artifact_store import get_artifact_store
 
         cited = entry_ids or []
-        agent = source_agent or ""
 
         if skip_artifact:
             return json.dumps(
@@ -102,8 +120,10 @@ async def submit_response(
                 default=str,
             )
 
-        # Determine category from agent name or data_type
-        category = _AGENT_CATEGORY_MAP.get(agent, data_type)
+        # The category is the declared data_type, never the agent's name: it
+        # says what the answer is about, so two agents answering the same kind
+        # of question land together. Grouping by agent is source_agent's job.
+        category = data_type
 
         store = get_artifact_store()
         tool_name = agent if agent else "submit_response"
@@ -112,7 +132,7 @@ async def submit_response(
             filename=f"{tool_name}.md",
             artifact_type="markdown",
             title=title,
-            description=f"{category} from {agent}" if agent else category,
+            description=_describe(category, agent),
             mime_type="text/markdown",
             tool_source="submit_response",
             metadata={

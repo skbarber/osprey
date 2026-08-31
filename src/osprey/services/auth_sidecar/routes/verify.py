@@ -3,8 +3,15 @@
 nginx calls this once for every request under ``/u/<user>/`` — page loads, API
 calls, websocket handshakes alike — and turns any non-2xx answer into a denial.
 It is therefore on the hot path of the whole deployment and says as little as
-possible: an empty 200 or a bare 401, with no body, no redirect and no
-``WWW-Authenticate``. Where an unauthenticated browser should be *sent* is
+possible: a bodyless 200 or a bare 401, with no redirect and no
+``WWW-Authenticate``. The only things an authorized answer may carry are the
+four identity headers of
+:mod:`~osprey.services.auth_sidecar.identity_headers` — the roster card the
+request is on, who proved the login, the role that holds and where the role
+came from, all opaque identifiers and never a credential. The card rides every
+authorized answer, because an authorized request always has one; the other
+three ride only when the session holds them.
+Where an unauthenticated browser should be *sent* is
 nginx's decision (``error_page 401``, content-negotiated), not this route's; a
 redirect issued here would be followed by the subrequest instead of the user.
 
@@ -35,9 +42,17 @@ from fastapi import APIRouter, Cookie, Depends, Query, Response
 
 from ..app import AuthSettings, get_revocation_store, get_session_codec, get_settings
 from ..exceptions import InvalidSessionError
+from ..identity_headers import (
+    ACCOUNT_HEADER,
+    ROLE_HEADER,
+    ROLE_SOURCE_HEADER,
+    SUBJECT_HEADER,
+    is_header_safe,
+)
 from ..passwords import verify_generation_tag
 from ..revocation import RevocationStore
-from ..sessions import SESSION_COOKIE_NAME, SessionCodec
+from ..sessions import SESSION_COOKIE_NAME, SessionCodec, UnlockedUser
+from .recheck import session_role, session_role_source, session_subject
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +136,10 @@ async def verify(
         session_cookie: The signed session cookie, if the browser sent one.
 
     Returns:
-        An empty 200 when the request is authorized, a bare 401 otherwise.
+        An empty 200 when the request is authorized, a bare 401 otherwise. An
+        authorized answer additionally carries the identity headers — always the
+        roster card the request is on, plus whichever of the login's subject,
+        role and role source the session can fill (see :func:`_authorized`).
     """
     requested = user or []
     if len(requested) != 1:
@@ -185,4 +203,130 @@ async def verify(
             # longer matches means the password was rotated under this session.
             return _deny(username, "credential generation tag does not match")
 
-    return Response(status_code=200)
+    return _authorized(username, state.entry(username), settings)
+
+
+def _subject_for(username: str, entry: UnlockedUser | None, settings: AuthSettings) -> str:
+    """Which account this authorized session names, by method.
+
+    Delegated to :func:`~osprey.services.auth_sidecar.routes.recheck.session_subject`
+    so that "which method names which account" has exactly one definition. The
+    login routes ask the same table what a *fresh* login may carry; this is the
+    same table asked what an already-minted session names, and a rule that lived
+    in both places would drift the first time one of them grew a method.
+
+    Args:
+        username: The roster user this subrequest authorized. Verified against
+            the roster, and byte-identical to the entry's own username.
+        entry: The unlocked entry, or ``None`` on the defensive path.
+        settings: The deployment's frozen settings, read for the method.
+
+    Returns:
+        The subject to report, or ``""`` when this session names no account.
+    """
+    return session_subject(method=settings.method, username=username, entry=entry)
+
+
+def _authorized(username: str, entry: UnlockedUser | None, settings: AuthSettings) -> Response:
+    """The bare 200, carrying the account and whatever else the session can fill.
+
+    ``is_unlocked`` has already established that ``entry`` exists, so ``None`` is
+    only a defensive guard.
+
+    Four headers may ride the 200. ``X-Osprey-Auth-Account`` names the roster
+    card the request is on — the username this subrequest authorized, which a
+    consumer can compare against the account it believes it is serving.
+    ``X-Osprey-Auth-Subject`` names who proved the login — the provider subject
+    under OIDC, the roster username otherwise — so a later layer can tell who is
+    behind the request without re-reading the cookie. The two coincide in
+    password mode and diverge on a shared card under OIDC, which is the case
+    they exist separately for. ``X-Osprey-Auth-Role`` names the role that
+    account holds.
+
+    **The account is the one header that always rides.** An authorized request
+    is by definition on a card, so there is no session state that can leave it
+    empty; the other three are *omitted* rather than emitted empty when the
+    session has nothing to put in them, so a present header always means a known
+    value and no consumer has to tell blank from absent: presence of the subject
+    means a known login, and absence of the role means no privileges. An
+    authorized answer with no account header therefore means a sidecar older
+    than this release, not a request without an account.
+
+    **The role is the one the login granted, not the roster's current answer.**
+    It is read off the session and never re-derived here, so a retired role
+    lapses with the session rather than at the moment the config is edited: an
+    operator who removes a ``role:`` (or an OIDC claim binding) takes it away
+    from the next login, while sessions already outstanding keep carrying it
+    until they expire or are revoked. Deliberate — re-deriving on every
+    subrequest would turn a config edit into a live privilege change on browsers
+    mid-session, and it would put a second reading of the identity matrix on the
+    hot path. If retiring a role must retire outstanding sessions too, the
+    generation tag is the mechanism to copy: it already revokes on a credential
+    change, and it does so by invalidating the session rather than by rewriting
+    what it says.
+
+    **A changed METHOD is a different question, and it does not lapse.** The
+    paragraph above is about a role that is no longer *granted*; switching
+    ``auth.method`` from ``password`` to ``oidc`` is about a proof this
+    deployment no longer *accepts*. The signing secret survives a re-render, so
+    those password cookies stay readable, and under ``oidc`` the generation-tag
+    check that a password rotation would have tripped is skipped. Both halves of
+    the identity therefore go through the matrix rather than off the entry:
+    :func:`~osprey.services.auth_sidecar.routes.recheck.session_subject` already
+    named nobody for such a session, and
+    :func:`~osprey.services.auth_sidecar.routes.recheck.session_role` now grants
+    it no role either.
+
+    **The source rides only beside the role.** ``X-Osprey-Auth-Role-Source``
+    names which authority resolved the role in the header above it — ``roster``
+    for the entry the render bound, ``claim`` for a validated ID token — and it
+    comes from the same matrix rather than off the entry, so it is absent on
+    every path the role is absent from: a session holding no role has no
+    provenance to explain. Unlike the role, it is display only: it says where a
+    privilege came from and confers none of its own.
+
+    **An uncarryable value denies.** Every value is checked against
+    :func:`~osprey.services.auth_sidecar.identity_headers.is_header_safe` even
+    though the session codec refuses to store one that fails — the roster
+    username reaches here without passing through the codec at all, so a
+    deployment rendered past its lint with a non-ASCII username would otherwise
+    have its identity mangled across the boundary or fail the response encoding
+    on the hot path. Denying instead is the closed answer, and it is the same
+    bare 401 as every other refusal.
+
+    Args:
+        username: The roster user this subrequest authorized.
+        entry: The unlocked entry backing the decision.
+        settings: The deployment's frozen settings.
+
+    Returns:
+        A 200 carrying the account and as many of the other three identity
+        headers as this session can fill — or a 401 if an identity this
+        deployment cannot carry was about to be reported.
+    """
+    headers: dict[str, str] = {}
+    if not is_header_safe(username):
+        return _deny(username, "the roster account cannot be carried in an identity header")
+    headers[ACCOUNT_HEADER] = username
+
+    subject = _subject_for(username, entry, settings)
+    if subject:
+        if not is_header_safe(subject):
+            return _deny(username, "the session subject cannot be carried in an identity header")
+        headers[SUBJECT_HEADER] = subject
+
+    role = session_role(method=settings.method, entry=entry)
+    if role:
+        if not is_header_safe(role):
+            return _deny(username, "the session role cannot be carried in an identity header")
+        headers[ROLE_HEADER] = role
+
+        source = session_role_source(method=settings.method, entry=entry)
+        if source:
+            if not is_header_safe(source):
+                return _deny(
+                    username, "the session role source cannot be carried in an identity header"
+                )
+            headers[ROLE_SOURCE_HEADER] = source
+
+    return Response(status_code=200, headers=headers)

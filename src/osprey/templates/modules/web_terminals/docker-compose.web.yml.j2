@@ -61,6 +61,24 @@
                                         #   Joined in Python for the same reason as
                                         #   container_agent_data_dir above.
                                         #   Pairs with the file-level `facility_bundle_source`.
+          "container_mirror_dir": str | None,
+                                        # where the DEPLOYMENT's ARIEL qmd mirror mounts for
+                                        #   this user, or None when the user is not entitled
+                                        #   (its persona's project runs no qmd export) or the
+                                        #   deployment writes no mirror. Built by
+                                        #   render._container_mirror_dir() from
+                                        #   `qmd_export.mirror_path` anchored on
+                                        #   container_project_dir — the path this persona's own
+                                        #   exporter writes. Pairs with the file-level
+                                        #   `ariel_mirror_source`.
+          "audit_identity": str,        # WHO this container's audit records are written as —
+                                        #   the roster user name (OSPREY_AUDIT_IDENTITY).
+          "container_audit_dir": str,   # where those records are written inside the container
+                                        #   (`<container_project_dir>/var/audit/<identity>`,
+                                        #   render._container_audit_dir()).
+          "audit_mount_source": str,    # the host directory backing it, spelled as a compose
+                                        #   bind source (`./var/audit/<identity>`,
+                                        #   render._audit_mount_source()).
           "extra_mounts": [str, ...],   # resolved by resolve_personas() from the persona's
                                         #   `extra_mounts` -> extra per-user `volumes:` lines
                                         #   (compose volume strings, e.g. "/opt/data:/app/data:ro").
@@ -98,19 +116,72 @@
       mount for anyone. Note this mount SHADOWS whatever the persona image baked
       at that path; the reasoning is at the mount line itself.
 
+    ariel_mirror_source: str, required (may be "")
+      The deployment's ARIEL qmd mirror on the HOST, spelled as a compose bind
+      source the same way as `facility_bundle_source`, and paired with each
+      service's own `container_mirror_dir` target. ONE directory for every user
+      and for the host's own exporter — the sidecar indexes the union. `""` when
+      the deployment runs no qmd export, which emits no mount for anyone.
+
+    ariel_mirror_gid: str, required (may be "")
+      Group id of that host directory, for the same `group_add:` reason as
+      `facility_bundle_gid` below. Like the bundle, the mirror is ALSO named
+      to the entrypoint (OSPREY_ARIEL_MIRROR_DIR) so its group is joined
+      before the privilege drop, which `group_add:` alone does not survive.
+
     facility_bundle_gid: str, required (may be "")
       Group id of that host directory, read off disk by the deploy and emitted as
-      `group_add:` on every entitled service. Without it the directory's shared
-      group bits reach no container: setgid decides which group OWNS a new file,
-      not which groups a process belongs to. `""` (directory not provisioned yet,
-      or a platform with no gids) emits no `group_add` rather than a guess.
+      `group_add:` on every entitled service. Setgid decides which group OWNS a
+      new file, not which groups a process belongs to, so membership has to be
+      granted separately: this gid is the RUNTIME half of that grant, reaching
+      the container's initial process. In a framework-built image the membership
+      the serving process keeps comes from the entrypoint's own `/etc/group` join
+      for OSPREY_FACILITY_BUNDLE_DIR instead, because `gosu` re-derives
+      supplementary groups from that file and discards the runtime grant; the
+      runtime half is what carries access when that join never runs (a container
+      started with `--user`, or an image with no OSPREY entrypoint). Reasoning at
+      the `group_add:` line itself. `""` (directory not provisioned yet, or a
+      platform with no gids) emits no `group_add` rather than a guess.
 
     nginx_port: int, required
       Host port nginx publishes for the landing page + per-user redirects.
 
+    perimeter_open: bool, required
+      True only under the OPEN posture (`auth.method: none`), where nginx
+      injects every user's operator secret and so authenticates every request
+      that reaches it. Resolved by render.py from `_auth_tls_context()` —
+      this template never recombines the derived booleans itself. False
+      suppresses BOTH perimeter lines below, byte for byte, so `token`,
+      `password` and `oidc` carry no stamp at all.
+
+    perimeter_deny_ports: str, required (never empty — always contains at
+    least the nginx port)
+      The deployment's own web ports as a comma-separated, ascending list of
+      integers ("10000,10100,10101") — nginx's published port, the TLS listener
+      (`tls.port`, default 443) when `tls.enabled` puts the real content server
+      behind it, and every roster user's terminal port. Nothing else: companion
+      panel families are excluded because they are not what the injected secret
+      opens, the in-container panel proxy addresses them legitimately, and none
+      of them fronts a terminal, an agent session, or an approval prompt —
+      which is what this deny-list guards. Emitted as
+      OSPREY_WEB_PERIMETER_DENY_PORTS beside the OSPREY_WEB_PERIMETER=open
+      marker, gated on `perimeter_open`.
+
+      These are LITERALS, not credentials — a port list, held by a container
+      that already knows its own port — so they travel as plain
+      `environment:` values rather than through `.env.users` (see the
+      SECRETS section below, which is about values that must not be rendered
+      into this file).
+
+      Both are read by the MCP server PROCESS in this container, which passes
+      the parsed list to the execution sandbox it spawns and drops both names
+      from that child's environment. That is the point of stamping them: the
+      sandbox is told which ports are off limits by its parent and cannot
+      re-derive, widen or empty the list for itself.
+
     landing_url: str, required when `services` is non-empty
       The fully-qualified origin browsers use to reach nginx, e.g.
-      "http://als-deploy.lbl.gov:9080" (scheme + deploy host + nginx_port, no
+      "http://als-deploy.lbl.gov:10000" (scheme + deploy host + nginx_port, no
       trailing slash). Passed to every per-user service as
       OSPREY_TERMINAL_LANDING_URL so the in-app logout control has a target.
       This can't be computed the way nginx.conf.j2 computes its targets (from
@@ -134,10 +205,20 @@
     AUTH SIDECAR (all from render.py's `_auth_tls_context()`, the single parser
     of `modules.web_terminals.auth`/`tls` — this template re-parses nothing):
 
-    auth_method: str, required ("none" | "password" | "oidc")
-      "none" (the default posture) renders NO `auth:` service at all — the
-      whole block below is suppressed, byte for byte, so a deployment that has
-      not opted into authentication carries no login surface.
+    auth_method: str, required ("none" | "token" | "password" | "oidc";
+      defaults to "token"). Informational — the gate below reads the derived
+      boolean, never the name.
+    sidecar_active: bool, required (auth_method is "password" or "oidc")
+      False renders NO `auth:` service at all — the whole block below is
+      suppressed, byte for byte, so a deployment without a login wall ("token"
+      or "none") carries no login surface.
+    inject_secret, walled, token_exchange: bool, required
+      The other derived booleans, passed for contract symmetry with
+      nginx.conf.j2; unread here. In particular `inject_secret` is TRUE for
+      "none", which renders no sidecar service at all — the secret carrier
+      below (the templates mount, the envsubst output tmpfs, the per-user
+      `OSPREY_TERMINAL_SECRET_*` reference) is emitted unconditionally and
+      already covers that method with no gate of its own.
     auth_port: int, required
       Host port the sidecar's uvicorn binds — on `bind_host` only, exactly like
       the per-user apps. nginx (same host netns) is the only thing that reaches
@@ -145,13 +226,25 @@
       there. Joined into lint's port-collision check against the per-user
       families, so this port is guaranteed not to be some user's panel port.
     auth_session_lifetime: int, required (seconds) -> OSPREY_AUTH_SESSION_LIFETIME
+      (sidecar) + OSPREY_TERMINAL_SESSION_LIFETIME (every per-user terminal)
+      One number, emitted twice, on both sides of the auth/terminal namespace
+      line. Which of the two actually expires an operator's session is an
+      ENTRY-level question, not a deployment-level one: wherever the terminal's
+      own token->cookie gate is the one left standing — every entry under `token`,
+      the `login: false` entries under `none`/`password`/`oidc` — this number,
+      not the sidecar's, is what expires it; elsewhere it is inert and
+      harmless. Emitted unconditionally because the container cannot know at
+      build time which it is, and it cannot ride in the persona's `config.yml`,
+      which is baked into the image at build time and so cannot see a
+      deploy-time edit.
     auth_image: str | None
       Registry-mode image for the sidecar. When unset, the local-build tag
       `<facility_prefix>-assistant-auth:local` is referenced instead — the
-      persona-image pattern (`<project>-<persona>:local`, personas.py) applied
-      to the sidecar, whose `<project>` is resolve_personas()'s default
-      `<facility_prefix>-assistant`. Producing that image is the runtime build's
-      job; this template only names the tag.
+      suffixed local-tag pattern personas.py keeps for entries without their
+      own render (`<project>-<suffix>:local`) applied to the sidecar, whose
+      `<project>` is resolve_personas()'s default `<facility_prefix>-assistant`.
+      Producing that image is the runtime build's job; this template only
+      names the tag.
     auth_oidc_issuer: str | None, auth_oidc_client_id_env / auth_oidc_client_secret_env: str
       Emitted only in `oidc` mode. The two `*_env` values are env-var NAMES, not
       credentials: the sidecar reads the named variable out of its `.env.auth`
@@ -162,6 +255,17 @@
       `None` (the common case) emits NO env line, leaving the sidecar's own
       documented default — so the default is defined once, in the sidecar,
       rather than restated here.
+    authorization_claim: str | None / authorization_claim_map: {claim value: role}
+      The group binding, from render.py's `_authorization_context()` (the single
+      parser of `modules.web_terminals.authorization`) -> OSPREY_AUTH_ROLE_CLAIM
+      and OSPREY_AUTH_ROLE_MAP. Emitted only in `oidc` mode: the claim is read
+      out of an ID token, and a password login has none — that posture's role
+      comes from the roster entry instead.
+      Both lines or neither, never one. The sidecar reads half a binding as a
+      broken deployment and refuses every login needing a role
+      (`RoleBinding.configured` is `claim OR claim_map`), which is the right
+      reading for a deployment that LOST a half and the wrong one to render for
+      a deployment that never declared either.
     services[].oidc_subject: str, optional — this user's expected IdP identity
       (the non-secret half of the roster->identity mapping; the credential half
       lives in `.env.auth`, keyed by the same suffix). Resolved from the roster
@@ -173,9 +277,47 @@
       the username->env-var mapping has exactly one definition, and a template
       that re-derived it could key a subject differently from the password hash
       keyed by the same user.
+    services[].role: str, optional — this user's static role, straight off the
+      roster entry's `role:` -> OSPREY_AUTH_ROSTER_ROLE_<SUFFIX>. Emitted under
+      BOTH login methods, unlike the group binding above, because it does two
+      jobs: under `password` it IS the session role, and under `oidc` it is the
+      cross-check the sidecar refuses a disagreeing ID token against — a `role:`
+      is what the render resolved this user's persona from, so it already
+      decided which container their login lands in.
+      Absent (no `role:` on the entry) emits no line at all, and the sidecar
+      resolves "" — no privileges — for that user. Note this is the role NAME,
+      not the persona it binds: the persona already reached this file as the
+      service's image and project.
+    services[].role_env: str — the env-var name the above is emitted under,
+      pre-resolved by render.py through personas.env_var_suffix(). Always
+      present; read only when `role` is set. Pre-resolved for the same reason
+      `oidc_subject_env` is. The `ROSTER_` infix is load-bearing:
+      OSPREY_AUTH_ROLE_CLAIM / OSPREY_AUTH_ROLE_MAP above are the deployment's
+      group binding, so a user named `claim` or `map` under a plain
+      OSPREY_AUTH_ROLE_ prefix would have read that binding as their own role.
+    services[].terminal_secret_env: str, required
+      The env-var NAME this user's operator secret travels in
+      (`OSPREY_TERMINAL_SECRET_<SUFFIX>`), pre-resolved by render.py through
+      terminal_secret_env_var(). A NAME, never a value — see the OPERATOR
+      SECRET section below for the whole carrier. Pre-resolved for the same
+      reason `oidc_subject_env` is: the username->env-var mapping has exactly
+      one definition, and a template that re-derived it could read a secret
+      back under a spelling it was never minted under.
+    services[].external_origin: str, required (may be "" only on a roster-less
+      render, which emits no per-user service at all)
+      The one origin browsers reach this deployment on -> each per-user
+      service's OSPREY_TERMINAL_EXTERNAL_ORIGIN. The app inside the container
+      checks a mutating request's `Origin` against it (the CSRF half of the
+      carrier). Deployment-wide, so it always equals `landing_url` and the
+      file-level `external_origin` below; carried per service only because
+      that is where it is read.
+
     external_origin: str -> OSPREY_AUTH_EXTERNAL_ORIGIN
       The one origin browsers reach nginx on; the OIDC `redirect_uri` is built
-      from it. Same derivation the landing link uses (render.py::_external_origin).
+      from it. Same derivation the landing link uses (render.py::_external_origin)
+      — `modules.web_terminals.external_origin` when the operator set it (the
+      shape where a load balancer in front of this nginx is what browsers
+      reach), and `deploy.fqdn` + scheme/port otherwise.
     tls_enabled: bool -> OSPREY_AUTH_TLS_ENABLED
       Whether that origin is HTTPS. The sidecar terminates no TLS itself (nginx
       does) — this only decides the `Secure` attribute on the cookies it issues,
@@ -204,11 +346,17 @@
      and every secret VALUE must be free of `$`. Both halves are load-bearing.
 
      Keeping secrets out of `environment:` keeps them out of the rendered
-     compose file (and out of `docker inspect` output for the per-user
-     services). But do NOT read that as "an env_file value is passed through
-     literally" — it is not. Every compose implementation interpolates `${...}`
-     in env_file values too, and Docker Compose additionally replaces every `$`
-     followed by an identifier character with the empty string. That is why the stored hash is separated by `.` rather
+     compose file AND out of `docker inspect` for the service that reads them —
+     compose interpolates an `environment:` value at container-create time and
+     stores the result in the container's own Config.Env, while an `env_file`
+     value is handed to the runtime without being baked into the definition. The
+     per-user operator secret is the ONE knowing exception to this rule; the
+     OPERATOR SECRET section below states exactly what it costs and why
+     `env_file` cannot express it. But do NOT read that as "an env_file value is
+     passed through literally" — it is not. Every compose implementation
+     interpolates `${...}` in env_file values too, and Docker Compose
+     additionally replaces every `$` followed by an identifier character with
+     the empty string. That is why the stored hash is separated by `.` rather
      than the conventional `$` (osprey.services.auth_sidecar.passwords
      `FIELD_SEP`): a `$`-separated hash arrives here with its salt and key
      eaten, verifies against nothing, and refuses every login — silently, and
@@ -220,6 +368,93 @@
      (method, lifetime, roster, origin, OIDC issuer and per-user subject
      mapping) come from the template variables above and stay in
      `environment:`.
+
+     The proxy settings the sidecar's OIDC fetches need (`HTTP_PROXY`,
+     `HTTPS_PROXY`, `NO_PROXY`) are non-secret in the same sense and reach it
+     the same way: `${VAR:-}` passthrough in `environment:`, interpolated from
+     the deploy env chain, NOT a second `env_file`. `.env.auth` therefore
+     remains the sidecar's only env file and rule 1 above is untouched. An
+     operator who puts credentials in a proxy URL is opting that value into
+     `docker inspect` like any other `environment:` value; see the EGRESS
+     comment on those three entries for the rest, including why they are
+     uppercase-only.
+
+  ----------------------------------------------------------------------------
+  OPERATOR SECRET (the per-user carrier, and why no VALUE is rendered here)
+
+  Every request nginx proxies to a per-user terminal carries that user's own
+  secret as the `X-Osprey-Terminal-Secret` header, and the terminal refuses any
+  request arriving without it. That is what makes nginx the only way in: the
+  per-user apps bind loopback, but loopback is visible to every process sharing
+  the host netns (see NETWORKING below), so the bind alone stops nothing that is
+  already on the box — a neighbouring container included.
+
+  One secret PER USER, so a value leaked from one container cannot be replayed
+  against another user's terminal. Both ends of one user's carrier name the same
+  variable, `svc.terminal_secret_env` (`OSPREY_TERMINAL_SECRET_<SUFFIX>`,
+  pre-resolved by render.py::terminal_secret_env_var):
+
+    * the per-user service reads it into the container-shape `OSPREY_TERMINAL_SECRET`
+      (`interfaces.web_auth.OPERATOR_SECRET_ENV`) — the app pops it at construction,
+    * the nginx service exports it under its own name, and nginx's entrypoint
+      substitutes it into that user's snippet at container start.
+
+  NO SECRET VALUE APPEARS IN THIS FILE, in any other rendered artifact, or in
+  any image layer. Every reference is `${VAR:-}`, which compose interpolates at
+  container-create time from the pinned deploy `.env` (--env-file; see
+  provision.web_stack_compose_cmd) — the same file `ensure_terminal_secrets`
+  mints into during preflight. The `:-` default only suppresses compose's
+  unset-variable warning; it does NOT half-authenticate, because a blank value
+  fails closed at app construction rather than at compose parse — which is where
+  an operator can still read the error.
+
+  WHAT `${VAR:-}` DOES AND DOES NOT BUY, precisely — because the rule at
+  SECRETS ISOLATION above says secrets travel only as `env_file` entries, and
+  this carrier is a deliberate exception to it.
+
+  It keeps the value out of: this rendered file, `git status`, and every image
+  layer. It does NOT keep it out of `docker inspect` or `docker compose config`:
+  compose interpolates `environment:` values at container-create time and stores
+  the result in the container's own `Config.Env`, so the per-user secret is
+  readable there for the nginx service (the whole roster) and for each `web-*`
+  service (its own). An `env_file` entry is what avoids that, and it is not
+  available here: the value has to arrive at nginx under a per-user NAME and at
+  that user's own container under the fixed name `OSPREY_TERMINAL_SECRET`, and
+  `env_file` carries a file's variables verbatim — it cannot rename one. Writing
+  per-service env files instead would put the secret VALUES on disk in `build/`,
+  which is the thing this carrier exists to avoid and the strictly worse trade.
+
+  So the exception is accepted knowingly, and it costs less than it looks:
+  reading `docker inspect` means already holding the container runtime's socket,
+  which is root-equivalent on this host and can read the deploy `.env` (and
+  everything else) directly. The isolation the carrier does establish — one
+  secret per user, so a value leaked from one container cannot be replayed
+  against a neighbour's terminal — is unaffected by any of this.
+
+  ENVSUBST, and the three settings that must travel together:
+
+    NGINX_ENVSUBST_FILTER=^OSPREY_TERMINAL_SECRET_
+      The base image's entrypoint otherwise substitutes EVERY variable in its
+      environment into every template. Restricting it to this prefix keeps any
+      other credential that happens to be in nginx's environment from being
+      written into a file under the output directory.
+    NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx/osprey
+      NOT the entrypoint's default of `/etc/nginx/conf.d`, which the base image
+      globs into its `http{}` block: a `proxy_set_header` spliced in at http
+      level would send one user's secret to EVERY upstream, the auth sidecar
+      included. `/etc/nginx/osprey` is read only by the per-user `include`
+      nginx.conf.j2 emits inside each authenticated `location`.
+    ./build/nginx/templates:/etc/nginx/templates:ro
+      The source directory render.py writes `secret-<user>.conf.template` into
+      and `clear_nginx_templates_dir` empties before every render, so a
+      decommissioned user's snippet cannot survive. Render output, hence
+      build-relative (see MOUNT PATHS below). Read-only: nothing in the stack
+      has any reason to write it.
+
+  All three are emitted whatever the roster size. They describe where this
+  service reads templates from and writes them to, which is not a function of
+  how many users happen to be configured — and leaving OUTPUT_DIR unset for the
+  0-user case would put the dangerous conf.d default one roster edit away.
 
   ----------------------------------------------------------------------------
   NETWORKING
@@ -269,12 +504,34 @@ services:
       com.osprey.repo-id: "{{ repo_id }}"
     environment:
       - TZ={{ facility_timezone | default("UTC") }}
+      {#- Where the base image's entrypoint writes the envsubst'd snippets, and
+         which variables it may substitute. Both are spelled out in the OPERATOR
+         SECRET section of the header; the short version is that the default
+         output directory (conf.d) would splice a per-user `proxy_set_header`
+         into `http{}` and leak one user's secret to every upstream, and an
+         unfiltered pass would substitute unrelated credentials into files on
+         disk. #}
+      - NGINX_ENVSUBST_FILTER=^OSPREY_TERMINAL_SECRET_
+      - NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx/osprey
+{%- for svc in services %}
+      {#- One roster user's operator secret, under the SAME variable name the
+         user's own service reads (svc.terminal_secret_env) and the same one
+         that user's snippet references. A NAME here, never a value: compose
+         interpolates it at container-create time from the deploy .env. #}
+      - {{ svc.terminal_secret_env }}=${{ "{" }}{{ svc.terminal_secret_env }}:-}
+{%- endfor %}
     volumes:
       {#- Render output, so it is addressed under build/ — see the MOUNT PATHS
          note in the header for why these are build-relative while the env
          files below are repo-root-relative. #}
       - ./build/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ./build/nginx/landing.html:/usr/share/nginx/html/landing.html:ro
+      {#- The per-user secret snippets, as nginx TEMPLATES — their `${...}` is
+         resolved by the entrypoint at container start, not by Jinja2 at render
+         time, which is what keeps the values off disk. Cleared and rewritten
+         whole by every render (render.clear_nginx_templates_dir), so this
+         directory holds exactly the current roster and nothing else. #}
+      - ./build/nginx/templates:/etc/nginx/templates:ro
 {%- if tls_host_cert_dir and tls_mount_target %}
       {#- The operator's certificate directory, read-only, landing at the
          directory `tls.cert` names so nginx's ssl_certificate finds it. Emitted
@@ -285,6 +542,48 @@ services:
          directory, so one mount is known to deliver both files. #}
       - {{ tls_host_cert_dir }}:{{ tls_mount_target }}:ro
 {%- endif %}
+    {#- The envsubst OUTPUT directory (NGINX_ENVSUBST_OUTPUT_DIR, above),
+       provided as a tmpfs so it EXISTS and is WRITABLE before the base image's
+       entrypoint runs. The entrypoint's 20-envsubst-on-templates.sh does not
+       create its own output directory — a bare `-w` guard makes it skip the
+       whole substitution when the directory is not already writable — and the
+       base image ships no `/etc/nginx/osprey`. Without this the per-user secret
+       snippets are never rendered, and nginx then dies at start on the
+       unconditional `include /etc/nginx/osprey/secret-<user>.conf` every
+       secret-injecting location carries (nginx.conf.j2 emits it under
+       `inject_secret`, so `none` needs this directory exactly as `password`
+       and `oidc` do). A tmpfs, not a bind or a
+       named volume: the content is regenerated from the mounted templates on
+       every start and must never outlive the container or touch disk — the
+       secret VALUES are what land here after substitution. Emitted at every
+       roster size, alongside the NGINX_ENVSUBST_* environment it backs.
+
+       WHY THE MODE, AND WHY THIS SPELLING OF IT. A tmpfs mounted without a mode
+       lands at 1777, world-writable and world-readable, and the envsubst'd files
+       inside it are 0644: every roster user's operator secret, in plaintext,
+       readable by any process in this container. 0700 with a root-owned
+       directory is what the two readers actually need — the base image's
+       entrypoint runs as root and writes the files there, and nginx's MASTER
+       process (also root) is what reads the `include`s at startup and on reload.
+       The unprivileged workers never open a config file, so nothing is lost by
+       shutting them out.
+
+       The mode rides as a MOUNT OPTION on the service-level `tmpfs:` short form,
+       `<path>:mode=0700`, and NOT as the long-form `volumes:` entry
+       (`{type: tmpfs, target: ..., tmpfs: {mode: 0700}}`) that would express the
+       same thing to Docker Compose alone. OSPREY supports podman-compose as a
+       first-class provider, and the two forms do not survive it equally. In the
+       long form `0700` is YAML octal, so it parses to the INTEGER 448: Docker
+       Compose sends that to the daemon as a numeric filemode and the directory
+       comes up `drwx------`, but podman-compose formats the same value straight
+       into `--tmpfs <path>:mode=448`, and podman passes tmpfs options through to
+       the kernel verbatim — where `mode=` is parsed as OCTAL, so 448 is rejected
+       and the container never starts. Quoting it (`mode: "0700"`) does not
+       reconcile them either: Docker Compose refuses a string there outright. The
+       option string below has no such ambiguity — both providers hand
+       `mode=0700` to the kernel unchanged. #}
+    tmpfs:
+      - /etc/nginx/osprey:mode=0700
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:{{ nginx_port }}/ || exit 1"]
       interval: 15s
@@ -298,7 +597,7 @@ services:
    that ended `start_period: 10s`. Service key "auth" cannot collide with a
    roster user — users render as `web-<user>` — nor with nginx or any base
    docker-compose.yml service. #}
-{%- if auth_method != "none" %}
+{%- if sidecar_active %}
 
   auth:
     {#- Registry mode pins `auth.image`; local mode leaves it unset and the
@@ -341,6 +640,24 @@ services:
 {%- endif %}
     environment:
       - TZ={{ facility_timezone | default("UTC") }}
+      {#- The sidecar's audit identity and the directory it writes to. It is one
+         service rather than one per user, so the identity is the FIXED name
+         `sidecar` (render.AUTH_SIDECAR_AUDIT_IDENTITY) — the users its login and
+         denial events name are their SUBJECTS, never their writers, and a
+         record filed under a username here would read as that user having
+         written it.
+
+         The directory arrives under the auth-specific name because this
+         container reads it that way: it is not an OSPREY project (WORKDIR
+         /app, one uvicorn app), it resolves no project root, and an unset
+         value degrades to a log line rather than a guess. It is also the one
+         service excluded from the entrypoint's group step — it runs as root
+         with no entrypoint and no `user:`, so it needs no supplementary group
+         and writes root-owned records. The generic OSPREY_AUDIT_DIR is
+         deliberately NOT emitted here: it is the variable that step is to
+         iterate, and this image has no root phase to read it. #}
+      - OSPREY_AUDIT_IDENTITY={{ auth_audit_identity }}
+      - OSPREY_AUTH_AUDIT_DIR={{ auth_audit_dir }}
       - OSPREY_AUTH_METHOD={{ auth_method }}
       - OSPREY_AUTH_SESSION_LIFETIME={{ auth_session_lifetime }}
       - OSPREY_AUTH_TLS_ENABLED={{ "true" if tls_enabled else "false" }}
@@ -350,6 +667,31 @@ services:
          the per-user containers and nginx locations come from, so a user can
          never exist in one and be missing from the other. #}
       - OSPREY_AUTH_USERS={{ services | map(attribute="user") | join(",") }}
+      {#- EGRESS. The sidecar's only outbound traffic is the OIDC discovery,
+         token and userinfo fetches below, and on a site behind a corporate
+         proxy they fail unless the host's proxy settings reach this container.
+         They are not secrets, so they arrive as `${VAR:-}` passthrough
+         interpolated from the deploy env chain (`.env.shared`/`.env`, where
+         `osprey init` writes the commented-out block that documents them);
+         the `env_file` chain stays `.env.auth` and nothing else.
+
+         UPPERCASE ONLY, deliberately. httpx — Authlib's transport for every
+         fetch above, with `trust_env` left at its default — and requests read
+         the UPPERCASE names. CPython's own
+         `urllib.request.getproxies_environment` reads both, lowercase last and
+         winning: a present-but-EMPTY lowercase `http_proxy` reads as "this
+         scheme is configured, to nothing" and POPS the scheme the uppercase
+         pass just set, while an empty UPPERCASE variable is skipped. Adding
+         the lowercase pair here would therefore hand every stdlib caller a
+         cancelled proxy on any host that sets none — which is exactly what
+         `${VAR:-}` renders when the host has no proxy. No CA-bundle variable
+         joins them: nothing mounts a CA into this image, `SSL_CERT_FILE`
+         naming a path that does not exist crashes httpx at client
+         construction, and nothing in the sidecar reads `REQUESTS_CA_BUNDLE`.
+         Custom-CA support is a mount plus a variable, and its own change. #}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-}
 {#- Everything OIDC — issuer, credential-variable names, claim, and the per-user
    subject mapping — is gated on the mode, so a `password` deployment carries no
    OIDC settings at all even if a roster entry still declares an `oidc_subject`
@@ -369,6 +711,42 @@ services:
          one place instead of being restated by the renderer. #}
       - OSPREY_AUTH_OIDC_CLAIM={{ auth_oidc_claim }}
 {%- endif %}
+{%- set role_claim = authorization_claim | default("") %}
+{%- set role_map = authorization_claim_map | default({}) %}
+{%- if role_claim and role_map %}
+      {#- The group binding: which ID-token claim carries group membership, and
+         the table turning that claim's values into one of the roles
+         `authorization.roles` declared. Rendered as a PAIR or not at all —
+         `RoleBinding.configured` is `claim OR claim_map`, so the sidecar reads
+         either half alone as a deployment whose authorization block broke and
+         refuses every login that needs a role. That is the right reading for a
+         half that went missing and the wrong thing to render for a deployment
+         that declared neither, which is why the condition tests both.
+         render.py already refuses half a `claims:` stanza, so these two ctx
+         keys arrive both-or-neither; this is the second guard, so a later
+         change there cannot quietly emit one line on its own.
+
+         The map is COMPACT JSON — no space after the `:` — assembled pair by
+         pair rather than through `tojson`, whose object form spaces its
+         separators. Both parse, but the compact spelling is the wire format
+         the sidecar documents, and it is what keeps this a plain scalar rather
+         than something a reader has to check against the YAML flow-mapping
+         syntax it resembles.
+
+         Each key and value is JSON-quoted, and the whole `KEY=value` is quoted
+         again (the `oidc_subject` treatment above): group values belong to the
+         provider, and an LDAP-backed IdP emits DN-style names carrying `,`,
+         `=` and `": "` — the last of which would otherwise derail the YAML
+         parse of this list item. Jinja's `tojson` is HTML-safe, so `&`, `<`,
+         `>` and `'` come out as `\uXXXX` escapes rather than literally; that
+         is still one JSON object and still round-trips to the same string. #}
+      {%- set role_map_pairs = [] %}
+      {%- for claim_value, role_name in role_map.items() %}
+      {%- set _ = role_map_pairs.append((claim_value | tojson) ~ ":" ~ (role_name | tojson)) %}
+      {%- endfor %}
+      - {{ ("OSPREY_AUTH_ROLE_CLAIM=" ~ role_claim) | tojson }}
+      - {{ ("OSPREY_AUTH_ROLE_MAP={" ~ role_map_pairs | join(",") ~ "}") | tojson }}
+{%- endif %}
 {%- for svc in services %}
 {%- if svc.oidc_subject %}
       {#- This user's expected IdP identity — the non-secret half of the
@@ -383,6 +761,51 @@ services:
 {%- endif %}
 {%- endfor %}
 {%- endif %}
+{#- The roster's own roles, which do TWO jobs and are therefore emitted under
+   BOTH login methods (under `none` there is no sidecar at all, so this whole
+   service — and this family with it — is absent):
+
+     * password — the roster IS the session role. No third party is involved,
+       so the entry's `role:` is the whole answer.
+     * oidc — the roster is the CROSS-CHECK TARGET. A `role:` is what the render
+       resolved this user's persona from, so it already decided which container
+       the login lands in; the sidecar refuses a login whose validated ID token
+       maps to a different role, because that session would name one role while
+       sitting in another's container. Where the deployment binds no `claims:`
+       at all, nothing asked the provider about privilege and this stays the
+       session role, exactly as under password.
+
+   One line per entry that declares a role; an entry with none emits nothing and
+   the sidecar resolves "" for it, which is "no privileges" rather than a role
+   named "". Entries opted out of the login wall (`login: false`) are NOT
+   filtered out here: they are on OSPREY_AUTH_USERS above, which is the roster
+   this table is keyed from, and a role table that disagreed with that roster is
+   the drift worth avoiding. Nothing is granted by it — an exempt entry has no
+   password provisioned, so no login of theirs ever reaches the lookup.
+
+   The variable NAME arrives pre-resolved as `svc.role_env` (render.py, via
+   personas.env_var_suffix()) and is emitted verbatim, for the reason spelled
+   out on `oidc_subject_env` above. tojson quotes the WHOLE `KEY=value`, the
+   same treatment: a role name is config, and `": "` in one would otherwise
+   turn this list item into a YAML mapping and hand the sidecar a truncated
+   role.
+
+   Ungated on the method, unlike the `claims:` family above: the enclosing
+   `sidecar_active` around this whole service is what keeps it out of a
+   login-free deployment, and there is no method that mints a session without a
+   container behind it to have been rendered. #}
+{%- for svc in services %}
+{%- if svc.role %}
+      - {{ (svc.role_env ~ "=" ~ svc.role) | tojson }}
+{%- endif %}
+{%- endfor %}
+    volumes:
+      {#- The sidecar's own audit subdirectory, mount-isolated exactly like
+         every user's: it holds the LOGIN half of the trail (who authenticated,
+         who was refused), and no terminal container has a mount through which
+         it could read or edit it. Provisioned host-side before this mount
+         exists, for the usual root-owned-bind-source reason. #}
+      - {{ auth_audit_mount_source }}:{{ auth_audit_dir }}
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://{{ bind_host }}:{{ auth_port }}/health').status==200 else 1)\""]
       interval: 15s
@@ -414,10 +837,182 @@ services:
       - HOME=/data/claude-config
       - TZ={{ facility_timezone | default("UTC") }}
       - OSPREY_TERMINAL_USER={{ svc.user }}
+      {#- WHO this container's audit records are written as, and WHERE. Both
+         rendered from the same roster name that names the mount below
+         (render._audit_mount_source / _container_audit_dir), so the identity
+         stamped into a record and the directory the record lands in can never
+         name two different users — an audit trail that attributes alice's
+         actions to bob is worse than no trail at all.
+
+         Unconditional, and deliberately so: the audit mount follows the
+         MIDDLEWARE, not the login wall. This container hosts an interface app
+         and launches framework MCP servers whatever `auth.method` says, so it
+         records under its own identity on an unauthenticated deployment
+         exactly as it does behind a login.
+
+         OSPREY_AUDIT_DIR is also the CONTRACT this file offers the image's
+         entrypoint: the render names the directories, and the entrypoint's root
+         phase is to join their groups before dropping privileges — compose
+         `group_add:` alone does not survive `gosu`, and the script reads no
+         config, so a directory it is not told about is one it cannot join. The
+         value is the CONTAINER path, never the host one: the entrypoint stats
+         the directory it can actually see. #}
+      - OSPREY_AUDIT_IDENTITY={{ svc.audit_identity }}
+      - OSPREY_AUDIT_DIR={{ svc.container_audit_dir }}
+{%- if facility_bundle_source and svc.container_bundle_dir %}
+      {#- The bundle mount's target, named for the same entrypoint contract: the
+         root phase is to iterate exactly the directories these two variables
+         name, so the group the bundle is shared through is granted the same way
+         the audit group is, and neither is guessed. Gated on the same pair as
+         the mount itself — a service with no bundle bound has no second
+         directory to name, and the step skips what is unset. #}
+      - OSPREY_FACILITY_BUNDLE_DIR={{ svc.container_bundle_dir }}
+{%- endif %}
+{%- if ariel_mirror_source and svc.container_mirror_dir %}
+      {#- The mirror mount's target, for the same contract: the qmd_export
+         module writing it runs as the DROPPED user, and `group_add:` (below)
+         reaches only the initial process. Gated on the same pair as the mount
+         itself, never on the gid — a platform that reads no gid back still
+         binds the directory, and the entrypoint stats the group off what it
+         can see. #}
+      - OSPREY_ARIEL_MIRROR_DIR={{ svc.container_mirror_dir }}
+{%- endif %}
       - OSPREY_TERMINAL_LANDING_URL={{ landing_url }}
       - OSPREY_TERMINAL_BIND_HOST={{ bind_host }}
       - OSPREY_TERMINAL_WEB_PORT={{ svc.web }}
       - OSPREY_WEB_PORT={{ svc.web }}
+      {#- How long this terminal's OWN session cookie stays valid — the
+         deployment's `auth.session_lifetime`, emitted under every method
+         because every method can leave a terminal standing on that cookie.
+         The one place it is minted is this app's `?token=` exchange, which
+         trades a magic link for a session. Under `token` every entry enters
+         that way; under `none`/`password`/`oidc` the `login: false` entries
+         do, reaching their terminal by the same `?token=` URL. For a
+         NON-exempt entry under those three the injected terminal secret
+         authenticates the request instead (and under `password`/`oidc` nginx
+         cuts the cookie jar as well), so this number is inert for that
+         container and it is the sidecar's own cookie, carrying
+         OSPREY_AUTH_SESSION_LIFETIME, that expires the session. A container
+         cannot know at build time which of the two it is, so the line is
+         emitted unconditionally.
+
+         It travels as an environment variable rather than through this
+         persona's `config.yml` because that file is BAKED INTO the persona
+         image at build time — a deploy-time edit of `auth.session_lifetime`
+         re-renders this overlay but not the image, so env is the only carrier
+         that tracks the edit.
+
+         Deliberately in the `OSPREY_TERMINAL_*` namespace, not
+         `OSPREY_AUTH_*`: no `web-*` service may carry an `OSPREY_AUTH*`
+         variable at all (test_render pins it both ways), because that prefix
+         is the sidecar's, and the sidecar's environment holds the session
+         signing key. Same number, two names, one per side of that line. #}
+      - OSPREY_TERMINAL_SESSION_LIFETIME={{ auth_session_lifetime }}
+{%- if perimeter_open %}
+      {#- The navigation-only perimeter, and the ports it fronts. Under
+         `auth.method: none` nginx injects this user's operator secret on every
+         proxied location, so anything that reaches a web port from THIS host
+         is already authenticated as whoever owns it — including a request made
+         by agent-generated code running inside this very container, which
+         shares the host network namespace with every other terminal.
+
+         The MCP server process reads these two, hands the parsed port list to
+         the execution sandbox as a constructor argument, and drops both names
+         from the sandbox's own environment: the deny-list is passed DOWN, never
+         re-derived inside the sandbox — a child that derived its own could
+         equally derive an empty one.
+
+         Emitted only under the open posture. The other three methods still
+         require a credential the sandbox does not hold, so there is nothing
+         here to deny and no line is rendered. Plain `environment:` values,
+         not `.env.users` entries: a list of the ports this deployment already
+         publishes is a literal, not a secret. #}
+      - OSPREY_WEB_PERIMETER=open
+      - OSPREY_WEB_PERIMETER_DENY_PORTS={{ perimeter_deny_ports }}
+{%- endif %}
+      {#- Where the telemetry store is from inside this container. The agent's
+         launch derives its OTLP endpoint from `claude_code.telemetry` with the
+         host chosen for the running context, and the context it would sniff
+         here is wrong: `/.dockerenv` says "container", which selects the
+         compose DNS name `openobserve` — a name that resolves to nothing under
+         `network_mode: host`, so every metric and log would be dropped with no
+         error anywhere. Under host networking this container's loopback IS
+         the deployment host's, and the store answers there on the port it
+         PUBLISHES — which the emitter reads from `services.openobserve.port`
+         in this persona's own config (inherited from the hosting profile), so
+         no port is declared here. Same convention, same reason, as the
+         dispatch worker's compose. Inert unless telemetry is enabled with
+         backend: openobserve. #}
+      - OSPREY_OTEL_OPENOBSERVE_HOST={{ bind_host }}
+      {#- This user's operator secret, in the container-shape variable the app
+         pops at construction (web_auth.OPERATOR_SECRET_ENV). The per-user
+         variable it is interpolated FROM is the same one nginx exports and this
+         user's snippet substitutes, so the two ends of the carrier cannot be
+         minted under one spelling and read under another — see the OPERATOR
+         SECRET section in the header.
+
+         `${VAR:-}` rather than a rendered value, exactly as ZO_INGEST_SA_TOKEN
+         above and for the same reason: the secret stays in the deploy .env and
+         out of this file, out of `git status`, and out of every image layer. It
+         is NOT out of `docker inspect` — compose interpolates this at
+         container-create time and the result is stored in the container's
+         Config.Env — which is the accepted exception the OPERATOR SECRET
+         section of the header spells out, along with why `env_file` cannot
+         express this particular carrier. The `:-` default suppresses compose's
+         unset warning only — an empty value fails closed at app construction,
+         which is a startup error naming the variable rather than a terminal
+         that quietly trusts everything. #}
+      - OSPREY_TERMINAL_SECRET=${{ "{" }}{{ svc.terminal_secret_env }}:-}
+      {#- The origin this deployment is reached on, which the app checks a
+         mutating request's `Origin` against (common_middleware.EXTERNAL_ORIGIN_ENV)
+         — the CSRF half of the carrier: without it a page on any other origin
+         could drive this terminal using the browser's own credentials.
+
+         Baked in here rather than derived per request from nginx's `$host`,
+         because a container reads its environment once at start and because
+         `$host` carries no port — a deployment behind a non-443 plain-HTTP
+         nginx would then check against an origin no browser ever sends.
+         Deployment-wide, so it equals `landing_url`: a service believing in a
+         different origin would reject the very links the landing page hands
+         out. A deployment fronted by a TLS-terminating load balancer sets
+         `modules.web_terminals.external_origin` to the address that balancer
+         answers on, and it lands here — the browser's origin is that host, and
+         nothing derivable from this config could name it. Not quoted, for the
+         same reason OSPREY_TERMINAL_LANDING_URL above is not — a URL holds no
+         `": "` and so is a plain YAML scalar. #}
+      - OSPREY_TERMINAL_EXTERNAL_ORIGIN={{ svc.external_origin }}
+      {#- The telemetry ingest identity's SECRET. Every persona's rendered
+         config.yml carries `password: ${ZO_INGEST_SA_TOKEN}` verbatim (the
+         build defers it — the store mints the token, so no build can resolve
+         it), and the agent this container starts re-resolves that reference
+         against its own environment. Without this line the placeholder is
+         still a placeholder inside the container and the terminal refuses to
+         start: `_openobserve_auth_header` is strict at runtime, so a web
+         terminal that cannot resolve it crash-loops behind the proxy.
+
+         Unconditional, unlike the three credentials below: this is not a
+         per-persona entitlement. Every terminal runs an agent that emits
+         telemetry as the same ingest account, so there is no tier to express
+         here — which is also why gating it on a persona set would only
+         produce terminals that fail to start.
+
+         NOT in `.env.users`, though, and that exclusion is deliberate
+         (`env_production._build_env_production_subset`): the account reads
+         back every log and metric in the store, and `.env.users` is a
+         rendered, operator-facing file that `osprey users env` re-writes
+         whole. `${VAR:-}` keeps the secret out of every rendered artifact
+         instead — compose interpolates it at container-create time from the
+         deploy `.env` (the pinned --env-file, see
+         provision.web_stack_compose_cmd), which is where `osprey up` harvests
+         it to (`container_lifecycle._stage_openobserve_identity`, which runs
+         before this stack is brought up).
+
+         The `:-` default only suppresses compose's unset-variable warning. An
+         empty value does NOT quietly half-authenticate: the same strict check
+         refuses a blank credential, so a deploy that never provisioned the
+         token fails where it is visible rather than shipping an agent whose
+         telemetry is silently dropped. #}
+      - ZO_INGEST_SA_TOKEN=${ZO_INGEST_SA_TOKEN:-}
 {%- if svc.display_name %}
       {#- Human-facing window/tab title. tojson quotes the WHOLE `KEY=value` as
          one double-quoted YAML scalar (never just the value — the compose
@@ -494,7 +1089,64 @@ services:
          from warning, and an empty value is falsy to `resolve_launch_token`,
          which then resolves no token and refuses the launch client-side — the
          same fail-closed outcome as never emitting this line at all. #}
-      - BLUESKY_LAUNCH_TOKEN=${BLUESKY_LAUNCH_TOKEN:-}
+{%- for var in svc.launch_token_env_vars %}
+      {#- One token PER PLAN LANE THIS user may arm (`BLUESKY_LAUNCH_TOKEN`
+         for lane 1; `BLUESKY_<LANE>_LAUNCH_TOKEN` — e.g. `_VA_`, `_LIVE_`,
+         `_STANDIN_` — for every additional lane), because each lane is a
+         whole bridge stack armed by its own token — one shared token would
+         let a launch approved against one machine be replayed against
+         another. Per lane rather than per deployment for the same reason: a
+         persona whose writes are armed on one lane alone is handed that
+         lane's token alone, and every other lane's stays out of its
+         container entirely. #}
+      - {{ var }}={{ '${' ~ var ~ ':-}' }}
+{%- endfor %}
+{%- endif %}
+{%- if svc.wants_graphdb %}
+      {#- The graph store's Neo4j password, for a persona that configures one.
+         The consumer is the `graph` MCP server in this container, which resolves
+         what to dial and with which password through
+         deployment.graphdb_service.resolve_graphdb_connection — from
+         `services.graphdb` plus this variable. Without it the server
+         authenticates with the shipped default while the store holds the
+         password `osprey up` minted, and every graph query fails on auth.
+
+         Per-user for the same reason as the credentials above: a shared
+         `.env.users` cannot say "the personas that configure a graph store".
+         Read-only personas ARE among them, unlike the launch token: Neo4j has a
+         single write-capable account, so read-only-ness is enforced by the
+         graph server's read transactions rather than by withholding this.
+
+         `:-ospreygraph` mirrors the graphdb service template's own
+         `NEO4J_AUTH: "neo4j/${GRAPHDB_PASSWORD:-ospreygraph}"`, so a deployment
+         that minted no password behaves identically inside this container and
+         outside it. An empty value would NOT — `resolve_graphdb_connection`
+         reads the variable with a `.get` default, which falls back only on an
+         UNSET variable and would otherwise authenticate with the empty
+         string. #}
+      - GRAPHDB_PASSWORD=${GRAPHDB_PASSWORD:-ospreygraph}
+{%- endif %}
+{%- if svc.archiver_password_env %}
+      {#- The archiver store's password, for a persona whose archiver connector
+         authenticates with one. The consumer is the connector inside this
+         container — the `control_system` MCP server's archiver tools and the
+         Python executor's `read_archiver` both open it — and it reads the
+         variable its own `archiver.<type>.password_env` names, which is why
+         this line carries a per-persona NAME rather than a fixed one: the
+         control-assistant preset spells it MONGO_ROOT_PASSWORD (minted by
+         `osprey up`), a facility-run store may spell it anything.
+
+         Per-user for the same reason as the four credentials above: a
+         shared `.env.users` cannot say "the personas whose archiver reads
+         this", and it excludes service tokens by design.
+
+         `${VAR:-}` is resolved by compose from the deploy `.env`, so the
+         secret is never written into this rendered file. The `:-` default
+         keeps compose from warning, and an empty value is refused by the
+         connector exactly as an unset one is — "Environment variable '…' is
+         not set" — so a deploy that never minted it fails where it is visible
+         rather than half-authenticating. #}
+      - {{ svc.archiver_password_env }}={{ "${" ~ svc.archiver_password_env ~ ":-}" }}
 {%- endif %}
     volumes:
       - {{ svc.user }}-claude-config:/data/claude-config
@@ -505,6 +1157,24 @@ services:
          mounted over an empty directory, while memory, sessions and artifacts
          accumulate in the writable layer and vanish at the next recreate. #}
       - {{ svc.user }}-agent-data:{{ svc.container_agent_data_dir }}
+      {#- This user's audit subdirectory, and ONLY this user's. A bind, not a
+         volume: the records are for the operator to read, grep and purge on the
+         host, which a named volume would bury inside the runtime's storage.
+
+         The isolation is the MOUNT, not a permission: alice's container is
+         handed `var/audit/alice` and nothing else under `var/audit`, so bob's
+         records are not merely unreadable to it — they are not in its
+         filesystem to read. Widening this to the audit root would hand every
+         terminal the whole deployment's trail.
+
+         Read-WRITE, and provisioned host-side before this mount is ever created
+         (compose_generator.ensure_audit_dir, called from the deploy path):
+         left to the container runtime, a rootful daemon creates the missing
+         source owned by root and the dropped `osprey` process inside can write
+         nothing. That helper also makes it setgid + group-writable, which is
+         what keeps the records the container writes purgeable on the host by
+         the operator who deployed it. #}
+      - {{ svc.audit_mount_source }}:{{ svc.container_audit_dir }}
 {%- if facility_bundle_source and svc.container_bundle_dir %}
       {#- THE DEPLOYMENT BUNDLE SHADOWS THE PERSONA'S BAKED COPY. BY DESIGN.
 
@@ -549,42 +1219,106 @@ services:
       #
       # SHARING: the deploy makes this directory setgid + group-writable, so
       # every file written into it is owned by the directory's group whichever
-      # container wrote it, and `group_add` below puts this container in that
-      # group. Both halves are needed -- setgid decides which group owns a new
-      # file, not which groups a process belongs to. If a concept drafted in one
-      # terminal is unreadable in another, check that pair first.
+      # container wrote it. Setgid decides which group OWNS a new file, not
+      # which groups a process belongs to, so membership still has to come
+      # from somewhere -- and this image gets it from TWO mechanisms that
+      # cover different processes. `group_add` below reaches this container's
+      # initial process; it does NOT survive this framework's own entrypoint
+      # dropping privileges with `gosu`, which re-derives the dropped
+      # process's supplementary groups from `/etc/group` and discards
+      # whatever `group_add` granted. The join that DOES survive is the
+      # entrypoint's own root-phase `/etc/group` entry for
+      # OSPREY_FACILITY_BUNDLE_DIR (below), which is why both are here. If a
+      # concept drafted in one terminal is unreadable in another, check both.
       # LIMIT: setgid does not change each file's permission BITS, which still
       # come from the writer's umask (usually 022 -> rw-r--r--). That is enough
       # for another container to READ a draft and for the qmd sidecar to index
       # it, but not for one container to overwrite another's file in place.
       - {{ facility_bundle_source }}:{{ svc.container_bundle_dir }}
 {%- endif %}
+{%- if ariel_mirror_source and svc.container_mirror_dir %}
+      {#- THE DEPLOYMENT'S ARIEL MIRROR, at the path THIS persona's exporter
+         writes. The `qmd_export` enhancement module runs inside every persona
+         container that enables it — an entry enhanced from a terminal is
+         mirrored by that terminal's own process — and it resolves `mirror_path`
+         against the project root, which in here is this persona's
+         container_project_dir (render._container_mirror_dir, the same
+         derivation as the bundle target above). Without this bind the mirror
+         it writes is a directory in the container's writable layer: the qmd
+         sidecar, which indexes the HOST's mirror, never sees those entries, and
+         the next recreate discards them.
+
+         Source is the ONE deployment mirror for every user and for the host's
+         own exporter, so the sidecar's corpus is the union of everything any
+         process enhanced. Read-write, like the bundle and unlike the sidecar's
+         `:ro` mount of the same directory; shared through the same setgid group
+         (see `group_add` below) and named to the entrypoint as
+         OSPREY_ARIEL_MIRROR_DIR (in `environment:` above) for the join that
+         survives the privilege drop. #}
+      # The DEPLOYMENT's ARIEL qmd mirror, written by this container's own
+      # qmd_export module and indexed by the qmd sidecar. Bound here so an entry
+      # enhanced from this terminal reaches the sidecar's corpus instead of a
+      # directory in the container's writable layer that nothing indexes and
+      # the next recreate discards.
+      - {{ ariel_mirror_source }}:{{ svc.container_mirror_dir }}
+{%- endif %}
 {%- for mount in svc.extra_mounts %}
       - {{ mount }}
 {%- endfor %}
-{%- if facility_bundle_gid and svc.container_bundle_dir %}
-    # Supplementary group for the shared bundle mounted above. This is the half
-    # of the sharing story setgid cannot supply: setgid decides which group OWNS
-    # a newly written file, but a process is a MEMBER of only the groups its
-    # image gives it, so without this line the directory's group bits would
-    # grant this container nothing and access would hold only where the
-    # deploying user's uid happened to equal the image's.
+{#- Every shared host directory bound above, and the group each was provisioned
+    with: the bundle and the mirror, where this service is entitled to them.
+    Collected into one list so one `group_add:` is emitted per service, with
+    each gid once — the deploy creates both as the same user, so they usually
+    share a group, and compose rejects nothing for a repeat, but a list that
+    says the same thing twice reads like two groups. This user's audit
+    subdirectory is deliberately NOT in the list: its membership is granted
+    inside the container by the entrypoint, which stats the mounted directory
+    itself, so no gid is read back for it at render time. #}
+{%- set shared_gids = [] %}
+{%- if facility_bundle_gid and svc.container_bundle_dir and facility_bundle_gid not in shared_gids %}
+{%- set _ = shared_gids.append(facility_bundle_gid) %}
+{%- endif %}
+{%- if ariel_mirror_gid and svc.container_mirror_dir and ariel_mirror_gid not in shared_gids %}
+{%- set _ = shared_gids.append(ariel_mirror_gid) %}
+{%- endif %}
+{%- if shared_gids %}
+    # Supplementary group(s) for the shared host directories mounted above (the
+    # knowledge bundle, the ARIEL mirror -- whichever this service binds),
+    # granted to this container's INITIAL process: a process is a MEMBER of
+    # only the groups its image or its runtime gives it, and this is the
+    # runtime half of that grant. On a framework-built image started the normal
+    # way that half is NOT what carries access: the initial process is root,
+    # which bypasses group checks anyway, and the grant the process actually
+    # SERVING requests keeps is the entrypoint's own root-phase `/etc/group`
+    # join for the mounted directories (above) -- `gosu` re-derives
+    # supplementary groups from that file for the target user and discards
+    # whatever this line granted the initial process.
     #
-    # The value is the bundle directory's OWN group id, read off the host at
-    # render time -- never a hardcoded id, which would be wrong on every host
-    # but the one it was chosen on. Retarget it by chgrp'ing the bundle and
+    # This line is what is left when that join never runs. A container started
+    # with `--user` takes the entrypoint's non-root branch (`if [ "$(id -u)"
+    # -ne 0 ] ... exec "$@"`), which skips both the join and the drop, so the
+    # groups the runtime granted are the only membership the serving process
+    # has. The same holds for any image started without this framework's
+    # entrypoint at all. Dropping this line would silently take the bundle
+    # and the mirror away from both.
+    #
+    # Each value is the directory's OWN group id, read off the host at render
+    # time -- never a hardcoded id, which would be wrong on every host but the
+    # one it was chosen on. Retarget it by chgrp'ing the directory and
     # re-running `osprey up`.
     group_add:
-      - "{{ facility_bundle_gid }}"
+{%- for gid in shared_gids %}
+      - "{{ gid }}"
+{%- endfor %}
 {%- endif %}
     healthcheck:
-      # osprey web's own default listen port is the fixed constant 8087
-      # (cli/web_cmd.py) — only relevant to a bare `osprey web` with no
-      # OSPREY_WEB_PORT override. Every per-user container here sets
-      # OSPREY_WEB_PORT above, so the probe targets the ACTUAL bound port,
-      # never the bare 8087 default. Probed via bind_host itself (not a
-      # hardcoded "127.0.0.1" literal) since that's the same loopback
-      # address OSPREY_TERMINAL_BIND_HOST bakes into the app's own bind.
+      # A bare `osprey web` with no OSPREY_WEB_PORT override falls back to the
+      # layout's `web` slot at the deployment's own base (resolve_web_port in
+      # cli/web_cmd.py). Every per-user container here sets OSPREY_WEB_PORT
+      # above, so the probe targets the ACTUAL bound port, never that
+      # fallback. Probed via bind_host itself (not a hardcoded "127.0.0.1"
+      # literal) since that's the same loopback address
+      # OSPREY_TERMINAL_BIND_HOST bakes into the app's own bind.
       test: ["CMD-SHELL", "curl -fsS http://{{ bind_host }}:{{ svc.web }}/health || exit 1"]
       interval: 15s
       timeout: 5s

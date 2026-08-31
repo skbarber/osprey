@@ -5,11 +5,10 @@
  * Single gallery for all artifacts with type filtering, pin flag,
  * and inline timeseries rendering.
  */
-import { initTheme, subscribe } from "/design-system/js/theme-manager.js";
-import { onModeChange } from "/design-system/js/frame-params.js";
-import { applyEmbedded } from "/design-system/js/frame-params.js";
+import { getTheme, initTheme, subscribe } from "/design-system/js/theme-manager.js";
+import { applyEmbedded, isEmbedded, onModeChange } from "/design-system/js/frame-params.js";
 import { contributeHeader, isSimpleMode, onHeaderAction } from "/design-system/js/header-contrib.js";
-import "/design-system/js/components/osprey-theme-switcher.js";
+import "/design-system/js/components/osprey-display-menu.js";
 import {
   getArtifacts,
   setArtifacts,
@@ -254,7 +253,10 @@ function renderSimple() {
     simpleResult?.classList.remove("hidden");
     if (simpleResultTitle) simpleResultTitle.textContent = latest.title;
     if (simpleResultBadge) simpleResultBadge.hidden = !isNewThisSession(latest, _sessionStart);
-    if (simpleOpenFull) simpleOpenFull.href = openUrl(latest);
+    if (simpleOpenFull) {
+      simpleOpenFull.href = openUrl(latest, getTheme());
+      simpleOpenFull.setAttribute("data-theme-link", "");
+    }
     if (simpleSave) { simpleSave.href = fileUrl(latest); simpleSave.setAttribute("download", latest.filename); }
     if (simpleResultPreview) {
       // Same dispatch the Expert preview pane renders through — Simple has no
@@ -517,40 +519,77 @@ function doRefresh() {
   connectSSE();
 }
 
-// ---- Theme: follower role; forward to nested previews + re-style plots ----
+// ---- Theme: forward to nested previews + re-style plots ----
 //
-// initTheme({role:'follower'}) replaces the old hand-rolled
-// 'osprey-theme-change' listener and data-theme MutationObserver: the
-// theme-manager runtime already applies broadcasts from the hub and
-// whatever ?theme=/localStorage/data-theme theme-boot.js resolved
-// pre-paint. subscribe() below is the one thing still gallery-specific:
-// re-forwarding to nested preview iframes (Plotly HTML artifacts) and
-// re-styling the visible timeseries chart. It fires on every apply, even
-// one that re-applies an unchanged id (the hidden-iframe repair path),
-// which is exactly what a hidden preview iframe needs on tab activation.
-
-initTheme({ role: "follower" });
+// initTheme() replaces the old hand-rolled 'osprey-theme-change' listener
+// and data-theme MutationObserver: the theme-manager runtime already applies
+// broadcasts from the hub and whatever ?theme=/localStorage/data-theme
+// theme-boot.js resolved pre-paint. subscribe() below is the one thing still
+// gallery-specific: re-forwarding to nested preview iframes (Plotly HTML
+// artifacts) and re-styling the visible timeseries chart. It fires on every
+// apply, even one that re-applies an unchanged id (the hidden-iframe repair
+// path), which is exactly what a hidden preview iframe needs on tab
+// activation.
+// Standalone, this page owns its own theme chrome (the header
+// <osprey-display-menu>), so it runs theme-manager.js in the hub role:
+// persistence, OS auto-follow and ?theme= handling all come with it, and
+// broadcast is a structural no-op on a page with no iframes. Embedded in the
+// Web Terminal hub it is a follower instead: theme-boot.js already applied
+// data-theme pre-paint, and this attaches the postMessage listener for the
+// hub's live broadcasts.
+initTheme({ role: isEmbedded() ? "follower" : "hub" });
 
 // Embedded mode (contract-version 1, see frame-params.js): hides the
 // logo (via gallery.css's `body.embedded .logo` rule) and, via the
-// theme-switcher component's own
-// injected rule, the <osprey-theme-switcher> in the header -- both defer
-// to the hub's chrome when this page is loaded inside a web_terminal panel.
+// component's own injected rule, the <osprey-display-menu> in the header --
+// both defer to the hub's chrome when this page is loaded inside a
+// web_terminal panel.
 applyEmbedded();
 
-/** @param {string} theme */
-function _forwardThemeToPreviewFrames(theme) {
-  document.querySelectorAll(".preview-viewport iframe, .browse-preview-pane iframe").forEach((iframe) => {
-    // Intentional '*' (same-origin contract exception): nested preview iframe may be null/cross-origin.
-    // eslint-disable-next-line no-empty -- intentional empty catch: postMessage to a stale/cross-origin frame is best-effort
-    try { /** @type {any} */ (iframe).contentWindow.postMessage({ type: "osprey-theme-change", theme }, "*"); } catch {}
+/**
+ * Send a theme to one embedded artifact page.
+ * @param {Element} iframe
+ * @param {string} theme
+ */
+function _sendThemeToFrame(iframe, theme) {
+  // Intentional '*' (same-origin contract exception): nested preview iframe may be null/cross-origin.
+  // eslint-disable-next-line no-empty -- intentional empty catch: postMessage to a stale/cross-origin frame is best-effort
+  try { /** @type {any} */ (iframe).contentWindow.postMessage({ type: "osprey-theme-change", theme }, "*"); } catch {}
+}
+
+/**
+ * The "Open in new tab" links carry `?theme=` (see types.js `openUrl`),
+ * computed when their pane was rendered; a theme change in between would
+ * otherwise open the new tab in the stale id -- and `?theme=` is the top
+ * rung of theme-boot.js's ladder, so it would win. Re-stamp them in place.
+ * @param {string} theme
+ */
+function _refreshThemeLinks(theme) {
+  document.querySelectorAll("a[data-theme-link]").forEach((a) => {
+    const url = new URL(/** @type {HTMLAnchorElement} */ (a).href, window.location.origin);
+    url.searchParams.set("theme", theme);
+    /** @type {HTMLAnchorElement} */ (a).href = `${url.pathname}${url.search}${url.hash}`;
   });
 }
 
 subscribe((theme) => {
-  _forwardThemeToPreviewFrames(theme);
+  // Every iframe the gallery mounts is a served artifact page (preview pane,
+  // browse pane, Simple's result card, each card thumbnail) running the same
+  // follower bridge, so there is no selector here to keep in step with the markup.
+  document.querySelectorAll("iframe").forEach((iframe) => _sendThemeToFrame(iframe, theme));
+  _refreshThemeLinks(theme);
   restyleMountedCharts();
 });
+
+// The load-time half of the same contract: an artifact page that finishes
+// loading after the last apply (a newly selected preview, a lazily loaded
+// card thumbnail scrolled into view) gets the theme in force right away
+// instead of waiting for the next change. `load` doesn't bubble, so it is
+// caught in the capture phase at the document.
+document.addEventListener("load", (e) => {
+  const theme = getTheme();
+  if (theme && e.target instanceof HTMLIFrameElement) _sendThemeToFrame(e.target, theme);
+}, true);
 
 // Session changes are unrelated to theming and stay a plain message
 // listener (theme-manager owns the 'osprey-theme-change' type now).

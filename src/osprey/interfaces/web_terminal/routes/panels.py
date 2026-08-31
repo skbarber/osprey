@@ -17,8 +17,8 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
+from osprey.interfaces.common_middleware import apply_url_prefix, compute_url_prefix
 from osprey.interfaces.web_terminal.routes.agent_activity import record_activity
-from osprey.interfaces.web_terminal.url_prefix import apply_url_prefix, compute_url_prefix
 from osprey.profiles.web_panels import BUILTIN_PANEL_LABELS, BUILTIN_PANELS
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,31 @@ async def health(request: Request):
         "session_id": session_id,
         "version": __version__,
     }
+
+
+@router.get("/api/session")
+async def session_probe():
+    """Authenticated liveness probe for the operator's session.
+
+    A tiny credentialed endpoint the frontend polls after a channel drops, so it
+    can tell an expired session apart from a flaky network. It is deliberately
+    **not** in the middleware exempt set: the auth gate runs ahead of this
+    handler, so a request carrying a live operator credential (the operator
+    secret header or a valid session cookie) reaches here and gets a 200, while
+    an absent or expired credential is refused with 401 by the gate itself and
+    never reaches this body.
+
+    That app-level 401 is the whole point. Single-user deployments have no nginx
+    perimeter in front of the app, so ``/health`` — which is exempt so the
+    container healthcheck can curl it credential-less — always answers 200 and
+    can never signal an expired session. This route can, because it sits behind
+    the same auth gate every other API route does.
+
+    Returns:
+        ``{"status": "ok"}`` with a 200. The body carries no session detail; the
+        status code (200 here, or 401 from the gate) is the entire signal.
+    """
+    return {"status": "ok"}
 
 
 @router.get("/api/artifact-server")
@@ -194,6 +219,9 @@ async def get_panels(request: Request):
             "open_tiles": [...]|None,   # last-reported service tiles, reading order
             "open_tiles_age_s": float|None,   # seconds since that report (None = never)
             "open_tiles_dock": bool|None,     # reporting client had a dock shell (None = never)
+            "docs_url": str,            # target of the rail's Documentation control
+            "feedback_github_repo": str,   # "owner/repo" for the prefilled new-issue URL
+            "feedback_email": str,      # recipient of the prefilled mailto: draft
         }
 
     ``project_key`` is an opaque, stable per-project identifier (16 hex chars,
@@ -262,14 +290,49 @@ async def get_panels(request: Request):
 
     So ``[]`` always means known-empty and ``null`` always means unknown; the
     age tells the two flavours of unknown apart.
+
+    ``docs_url``, ``feedback_github_repo`` and ``feedback_email`` are the
+    resolved ``web.docs_url`` / ``web.feedback.*`` values that address the two
+    utility controls at the far end of the rail: the Documentation link target,
+    and the two outbound channels the feedback dialog offers (a prefilled
+    GitHub issue and a prefilled ``mailto:`` draft). The store ceiling
+    (``web.feedback.max_store_bytes``) is deliberately not echoed — it governs
+    server-side pruning and nothing in the browser acts on it.
     """
     enabled = list(getattr(request.app.state, "enabled_panels", set()))
     custom_raw = getattr(request.app.state, "custom_panels", [])
     custom = [{**cp, "url": _browser_panel_url(cp)} for cp in custom_raw]
     default = getattr(request.app.state, "default_panel", None)
-    visible = getattr(request.app.state, "visible_panels", enabled)
+    visible = list(getattr(request.app.state, "visible_panels", enabled))
     active = getattr(request.app.state, "active_panel", None)
     labels = {pid: BUILTIN_PANEL_LABELS[pid] for pid in enabled if pid in BUILTIN_PANEL_LABELS}
+    # Whether the Config panel's SERVER surface is live (web.config_panel.enabled).
+    # `false` means /api/config and /api/claude-setup refuse every verb with 403,
+    # so this payload must not advertise the panel in any form: the client reads
+    # the flag to decide whether to render the Config tab at all, and a tab
+    # rendered against a refusing surface is a dead control, not a gated one.
+    # Default True mirrors app.coerce_config_flag's default for the key — a
+    # literal here for the same routes->app import-cycle reason as ui_mode.
+    config_panel_enabled = bool(getattr(request.app.state, "config_panel_enabled", True))
+    # Whether the scaffold gallery's write surface is live
+    # (web.scaffold_gallery.write_enabled). `false` means every write/delete
+    # verb under /api/scaffold answers 403, so the browser must stop painting
+    # the create/claim/save/delete/register controls that reach for them; the
+    # gallery reads this flag to do that (static/js/scaffold/write-gate.js).
+    # Default True mirrors the routes' own getattr default, as above.
+    scaffold_write_enabled = bool(getattr(request.app.state, "scaffold_write_enabled", True))
+    if not config_panel_enabled:
+        # Belt and braces for the id itself. ``config`` is not a built-in panel
+        # (it is a drawer tab, not a dock tile), so nothing puts it in these
+        # lists today — but a config-defined custom panel may claim any id, and
+        # a disabled deployment whose payload still named ``config`` would hand
+        # the client back exactly the entry this key exists to withhold.
+        enabled = [pid for pid in enabled if pid != _CONFIG_PANEL_ID]
+        visible = [pid for pid in visible if pid != _CONFIG_PANEL_ID]
+        custom = [cp for cp in custom if cp.get("id") != _CONFIG_PANEL_ID]
+        labels.pop(_CONFIG_PANEL_ID, None)
+        default = None if default == _CONFIG_PANEL_ID else default
+        active = None if active == _CONFIG_PANEL_ID else active
     allow_runtime = bool(getattr(request.app.state, "allow_runtime_panels", False))
     presets = list(getattr(request.app.state, "panel_presets", []))
     # Echo the resolved UI mode (server-rendered onto <html data-ui-mode>).
@@ -297,6 +360,12 @@ async def get_panels(request: Request):
     open_tiles_ts = getattr(request.app.state, "open_tiles_ts", None)
     open_tiles_age = None if open_tiles_ts is None else time.time() - open_tiles_ts
     open_tiles_dock = getattr(request.app.state, "open_tiles_dock", None)
+    # Utility-cluster targets. The defaults mirror app.DEFAULT_DOCS_URL /
+    # DEFAULT_FEEDBACK_GITHUB_REPO / DEFAULT_FEEDBACK_EMAIL, spelled as
+    # literals here for the same routes->app import-cycle reason as above.
+    docs_url = getattr(request.app.state, "docs_url", "https://als-apg.github.io/osprey")
+    feedback_github_repo = getattr(request.app.state, "feedback_github_repo", "als-apg/osprey")
+    feedback_email = getattr(request.app.state, "feedback_email", "thellert@lbl.gov")
     return {
         "enabled": enabled,
         "custom": custom,
@@ -315,6 +384,11 @@ async def get_panels(request: Request):
         "open_tiles": open_tiles,
         "open_tiles_age_s": open_tiles_age,
         "open_tiles_dock": open_tiles_dock,
+        "docs_url": docs_url,
+        "feedback_github_repo": feedback_github_repo,
+        "feedback_email": feedback_email,
+        "config_panel_enabled": config_panel_enabled,
+        "scaffold_write_enabled": scaffold_write_enabled,
     }
 
 
@@ -328,6 +402,12 @@ def _known_panel_ids(request: Request) -> set[str]:
     known |= {p["id"] for p in getattr(request.app.state, "custom_panels", [])}
     return known
 
+
+#: Panel id of the Config surface. It is not a built-in dock panel — the Config
+#: tab is static drawer markup served by ``index.html`` — so this is the id the
+#: payload must never carry while ``web.config_panel.enabled`` is false, whether
+#: it arrives as a built-in, a config-defined custom panel, or a focus target.
+_CONFIG_PANEL_ID = "config"
 
 #: Dock id of the native terminal/chat tile (``PANEL_TERMINAL`` in
 #: ``dock-workspace.js``). It carries no server-side panel state and is never a
@@ -865,7 +945,7 @@ def _allowlist_matches(host: str, port: int | None, scheme: str, allowlist: list
       entry ``"grafana.lan:80"`` matches ``http://grafana.lan/``.
 
     Entry parsing uses ``urlparse`` internally so that bracketed IPv6
-    literals (e.g. ``"[2001:db8::1]:9090"``) are handled correctly.  The
+    literals (e.g. ``"[2001:db8::1]:8443"``) are handled correctly.  The
     allowlist host must match the ``parsed.hostname`` form (no brackets).
 
     Args:
@@ -897,6 +977,114 @@ def _allowlist_matches(host: str, port: int | None, scheme: str, allowlist: list
     return False
 
 
+def _normalize_ip(raw_addr: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse one resolved address into a comparable :mod:`ipaddress` object.
+
+    A scope id (``fe80::1%en0``, as ``getsockname`` reports it on a link-local
+    interface) is dropped and an IPv4-mapped IPv6 address (``::ffff:10.0.0.5``)
+    is unwrapped, so the two spellings of one address compare equal wherever
+    they meet.
+
+    Args:
+        raw_addr: The address string from a ``sockaddr``.
+
+    Returns:
+        The parsed address, or ``None`` when the string is not an IP literal.
+    """
+    try:
+        ip = ipaddress.ip_address(raw_addr.split("%", 1)[0])
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
+#: How long a probe result stands before the interfaces are re-read. A host's
+#: own addresses change on the timescale of a DHCP lease or a VPN coming up,
+#: not of a panel registration, so a minute is short enough to follow a real
+#: change and long enough that a burst of registrations pays for one probe.
+_HOST_ADDRS_TTL_SECONDS = 60.0
+
+#: ``(monotonic timestamp, addresses)`` of the last probe, or ``None`` before
+#: the first one. Monotonic because this is an age, not a wall-clock date: a
+#: clock step must not make a fresh entry look expired or an old one fresh.
+_host_addrs_cache: tuple[float, frozenset[ipaddress.IPv4Address | ipaddress.IPv6Address]] | None = (
+    None
+)
+
+
+def _host_interface_addresses() -> frozenset[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Best-effort, dependency-free discovery of this host's own addresses.
+
+    Two independent, zero-traffic probes (the idiom the loopback-chokepoint
+    e2e test uses, brought into production for panel validation):
+
+    1. ``getaddrinfo(gethostname(), None)`` — every address the host's own
+       name resolves to, which catches interfaces with no default route.
+    2. The UDP-connect trick — ``connect()`` on a ``SOCK_DGRAM`` socket only
+       makes the kernel pick a route and sends no packet, and
+       ``getsockname()`` then reports the local address that route would use.
+       Run once per family so a v6-only interface is seen too.
+
+    Either probe failing (offline host, no default route, unresolvable
+    hostname) is expected rather than exceptional, so both are wrapped: the
+    function fails OPEN with an empty set, and the loopback / link-local /
+    unspecified checks in :func:`_validate_panel_url` still apply.
+
+    The result is memoized for :data:`_HOST_ADDRS_TTL_SECONDS`. Probe 1 is a
+    name resolution with no timeout of its own — on a host whose resolver is
+    slow or unreachable it blocks for however long the system resolver takes —
+    and running that unconditionally on every registration would put an
+    unbounded stall in the request path. The cache lives INSIDE this function
+    rather than around it so that tests, which patch this module attribute
+    wholesale, replace the caching along with the probing.
+
+    Blocking (it resolves and opens sockets), so callers on the event loop run
+    it in a thread pool. It is a module attribute so tests patch it directly.
+
+    Returns:
+        The discovered addresses, normalized by :func:`_normalize_ip`.
+    """
+    global _host_addrs_cache
+
+    cached = _host_addrs_cache
+    if cached is not None and (time.monotonic() - cached[0]) < _HOST_ADDRS_TTL_SECONDS:
+        return cached[1]
+
+    addresses: set[ipaddress.IPv4Address | ipaddress.IPv6Address] = set()
+
+    try:
+        for *_prefix, sockaddr in socket.getaddrinfo(socket.gethostname(), None):
+            ip = _normalize_ip(sockaddr[0])
+            if ip is not None:
+                addresses.add(ip)
+    except OSError:
+        pass
+
+    # RFC 5737 / RFC 3849 documentation addresses. Route selection works the
+    # same for them as for any off-link destination and no packet is sent, so
+    # nothing here depends on the destination existing — a documentation
+    # address just makes that explicit, where a real public resolver's address
+    # reads like traffic to a third party that never happens.
+    for family, destination in (
+        (socket.AF_INET, ("192.0.2.1", 80)),
+        (socket.AF_INET6, ("2001:db8::1", 80)),
+    ):
+        try:
+            with socket.socket(family, socket.SOCK_DGRAM) as probe:
+                probe.connect(destination)
+                ip = _normalize_ip(probe.getsockname()[0])
+            if ip is not None:
+                addresses.add(ip)
+        except OSError:
+            pass
+
+    resolved = frozenset(addresses)
+    _host_addrs_cache = (time.monotonic(), resolved)
+    return resolved
+
+
 async def _validate_panel_url(raw_url: str, allowlist: list[str] | None) -> str | None:
     """Validate a panel URL for SSRF-relevant categories.
 
@@ -910,17 +1098,31 @@ async def _validate_panel_url(raw_url: str, allowlist: list[str] | None) -> str 
     - Any resolved address that is loopback (127.0.0.0/8, ::1),
       link-local / cloud-metadata (169.254.0.0/16 incl. 169.254.169.254,
       fe80::/10), or unspecified (0.0.0.0/::).
+    - Any resolved address that is one of the deploy host's OWN interface
+      addresses (:func:`_host_interface_addresses`). The panel proxy fetches
+      server-side from inside the deployment, so a panel pointed at this
+      host's LAN address is a route back into the deployment's own web
+      terminals — nginx injects a per-user terminal secret on every request
+      under the ``open`` auth posture, which would make that a route into a
+      neighbour's terminal. The refusal is deliberately host-wide rather than
+      port-scoped: it costs an operator the ability to register an unrelated
+      dashboard that happens to be co-hosted with the deployment (the error
+      names the workarounds), and buys not having to trust a port number to
+      stay pointed at something other than the deployment's own front door.
     - IPv4-mapped IPv6 addresses (e.g. ``::ffff:169.254.169.254``) are
       unwrapped and then classified as their IPv4 equivalents.
 
-    Permits: ordinary private LAN ranges (10/8, 172.16/12, 192.168/16) —
-    real Grafana dashboards live there.
+    Permits: ordinary private LAN ranges (10/8, 172.16/12, 192.168/16) on
+    hosts other than this one — real Grafana dashboards live there.
 
     Out of scope: DNS rebinding *after* registration (host is validated at
-    registration time only; rebinding is a network-layer concern).
+    registration time only; rebinding is a network-layer concern); other
+    hosts inside the same deployment fleet, which are not distinguishable
+    from a genuine dashboard host from here.
 
-    ``getaddrinfo`` is executed in a thread pool so the async event loop is
-    not blocked.  Tests can mock ``socket.getaddrinfo`` directly.
+    ``getaddrinfo`` and the interface-address probes are executed in a thread
+    pool so the async event loop is not blocked.  Tests can mock
+    ``socket.getaddrinfo`` and ``_host_interface_addresses`` directly.
 
     Args:
         raw_url: The user-supplied URL to inspect.
@@ -955,16 +1157,31 @@ async def _validate_panel_url(raw_url: str, allowlist: list[str] | None) -> str 
     if not results:
         return f"Could not resolve host: {host!r}"
 
+    # Probed lazily, and at most once per call: an address rejected by a
+    # categorical check below never reaches the own-address comparison, so the
+    # common refusals (loopback, metadata) cost no interface probe at all.
+    own_addresses: frozenset[ipaddress.IPv4Address | ipaddress.IPv6Address] | None = None
+
     for _family, _type, _proto, _canonname, sockaddr in results:
         raw_addr = sockaddr[0]
-        ip = ipaddress.ip_address(raw_addr)
-        # Unwrap IPv4-mapped IPv6 (e.g. ::ffff:169.254.169.254).
-        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-            ip = ip.ipv4_mapped
+        ip = _normalize_ip(raw_addr)
+        if ip is None:
+            return f"Resolved address {raw_addr!r} for host {host!r} is not an IP address"
         if ip.is_loopback or ip.is_link_local or ip.is_unspecified:
             return (
                 f"Resolved address {raw_addr!r} for host {host!r} is not permitted "
                 "(loopback, link-local, cloud-metadata, or unspecified)"
+            )
+        if own_addresses is None:
+            # Fails open (empty set) when the host cannot be probed; the
+            # categorical checks above stand on their own.
+            own_addresses = await loop.run_in_executor(None, _host_interface_addresses)
+        if ip in own_addresses:
+            return (
+                f"Resolved address {raw_addr!r} for host {host!r} is the deployment "
+                "host itself; a panel proxied back into this deployment is not "
+                "permitted. Host the dashboard on another machine, or use the "
+                "deployment's landing page entries instead."
             )
 
     # Allowlist enforcement (after address validation so blocked IPs are always caught).

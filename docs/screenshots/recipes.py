@@ -6,10 +6,13 @@ its *kind*, themes, viewport, sub-views, and capture mode. The runner
 (:mod:`docs.screenshots.capture`) and the ``conf.py`` caption hook both read
 this list; adding a doc image is one ``DocShot`` line here.
 
-Two environments cover every real case:
+Three environments cover every real case:
 
 * ``standalone_interface`` — boot a single interface ``create_app()`` on a free
-  port (zero container, deterministic). The default target of ``make screenshots``.
+  port (zero container, deterministic). A default target of ``make screenshots``.
+* ``static_page`` — serve a committed HTML file (hand-authored architecture
+  diagrams under ``docs/diagrams/``) from a throwaway local HTTP server and crop
+  a figure element out of it. Zero app, zero container; also on by default.
 * ``tutorial_stack`` — build the ``control-assistant`` tutorial project, bring up
   Postgres, and seed ARIEL via the product's own commands. Opt-in (``--stack``);
   agentic recipes (the web-terminal hero) additionally need ``--agentic``.
@@ -57,7 +60,7 @@ class DocShot:
     """A single declarative screenshot recipe."""
 
     name: str
-    environment: Literal["standalone_interface", "tutorial_stack"]
+    environment: Literal["standalone_interface", "static_page", "tutorial_stack"]
     kind: Literal["static", "agentic"]
     themes: tuple[str, ...] = ("light", "dark")
     viewport: tuple[int, int] = (1280, 800)
@@ -67,6 +70,17 @@ class DocShot:
     """Dotted path to a ``create_app`` callable, e.g. ``"osprey.interfaces.artifacts.app:create_app"``."""
     path: str = "/"
     """URL path (relative to the app base) to capture."""
+
+    # static_page
+    source_file: str | None = None
+    """Repo-relative path to a committed HTML file (``static_page`` environment).
+
+    The runner serves the file's directory over a throwaway local HTTP server and
+    navigates to the file with the usual ``?theme=`` parameter appended, so the
+    page itself decides how a theme name maps onto its CSS (see
+    ``docs/diagrams/retrieval_map.html`` for the ``data-theme`` shim). Combine
+    with ``capture_mode="element"`` to crop a single ``<figure>`` out of a page
+    holding several diagrams."""
 
     # env → many files
     subviews: tuple[SubView, ...] = ()
@@ -98,20 +112,54 @@ class DocShot:
 
 REGISTRY: list[DocShot] = [
     # Default (container-free) target of ``make screenshots``: an element crop of
-    # the design-system theme switcher, light + dark, for the theming how-to. The
-    # switcher is embedded in every interface's header; ``ariel`` is the lightest
-    # to boot standalone — its ``create_app()`` needs no workspace or backend (it
-    # gracefully degrades to a DB-less mode), unlike ``artifacts``/``lattice``
-    # which require a workspace_root.
+    # the design-system display menu's open popover card, light + dark, for the
+    # theming how-to. ``channel_finder`` is the lightest interface that mounts
+    # the menu in its own standalone header — its ``create_app()`` takes no
+    # required argument and needs no workspace or backend, unlike
+    # ``artifacts``/``lattice`` which need a workspace_root to show anything
+    # useful. The card only exists open, so the single sub-view's anchor is the
+    # trigger to click before the crop.
     DocShot(
-        name="theme_switcher",
+        name="display_menu",
         environment="standalone_interface",
         kind="static",
-        app_factory="osprey.interfaces.ariel.app:create_app",
+        app_factory="osprey.interfaces.channel_finder.app:create_app",
         capture_mode="element",
-        element_selector="osprey-theme-switcher",
-        wait_selector="osprey-theme-switcher",
+        element_selector="osprey-display-menu .display-menu-card.open",
+        wait_selector="osprey-display-menu .display-menu-trigger",
+        subviews=(
+            SubView(
+                anchor="osprey-display-menu .display-menu-trigger",
+                out="display_menu",
+                wait_selector="osprey-display-menu .display-menu-card.open",
+            ),
+        ),
         themes=("light", "dark"),
+    ),
+    # Architecture diagrams: hand-authored SVG in a committed HTML page, one
+    # PNG per theme, cropped per figure at 2x. Edit docs/diagrams/*.html, then
+    # `make screenshots-<name>` regenerates the committed images.
+    DocShot(
+        name="retrieval_map",
+        environment="static_page",
+        kind="static",
+        source_file="docs/diagrams/retrieval_map.html",
+        capture_mode="element",
+        element_selector="#fig-retrieval-map",
+        wait_selector="#fig-retrieval-map svg",
+        themes=("light", "dark"),
+        viewport=(1400, 1000),
+    ),
+    DocShot(
+        name="qmd_query_pipeline",
+        environment="static_page",
+        kind="static",
+        source_file="docs/diagrams/retrieval_map.html",
+        capture_mode="element",
+        element_selector="#fig-qmd-query",
+        wait_selector="#fig-qmd-query svg",
+        themes=("light", "dark"),
+        viewport=(1400, 1000),
     ),
     # ARIEL views (opt-in ``--stack``). One tutorial stack → four PNGs, one per
     # hash-routed view. Keyword mode is ARIEL's default, so ``#search`` shows the
@@ -159,6 +207,7 @@ def validate_registry(registry: list[DocShot] | None = None) -> None:
       * ``kind="agentic"`` requires ``prompt`` and ``wait_for`` and lives on
         the ``tutorial_stack`` environment;
       * ``standalone_interface`` recipes require an ``app_factory``;
+      * ``static_page`` recipes require a ``source_file``;
       * ``themes`` is a non-empty subset of ``{light, dark}``.
     """
     reg = REGISTRY if registry is None else registry
@@ -192,6 +241,9 @@ def validate_registry(registry: list[DocShot] | None = None) -> None:
 
         if shot.environment == "standalone_interface" and not shot.app_factory:
             raise ValueError(f"{shot.name!r}: standalone_interface recipes require an app_factory")
+
+        if shot.environment == "static_page" and not shot.source_file:
+            raise ValueError(f"{shot.name!r}: static_page recipes require a source_file")
 
 
 # ---------------------------------------------------------------------------
@@ -236,15 +288,15 @@ def caption_substitutions(manifest: dict | None = None) -> dict[str, str]:
 def is_enabled(shot: DocShot, *, stack: bool, agentic: bool) -> bool:
     """Whether a recipe runs given the opt-in flags.
 
-    Default (no flags) runs only ``standalone_interface`` static recipes.
-    ``--stack`` adds ``tutorial_stack`` static recipes; ``--agentic`` adds
-    agentic recipes.
+    Default (no flags) runs the container-free recipes: ``standalone_interface``
+    and ``static_page`` statics. ``--stack`` adds ``tutorial_stack`` static
+    recipes; ``--agentic`` adds agentic recipes.
     """
     if shot.kind == "agentic":
         return agentic
     if shot.environment == "tutorial_stack":
         return stack
-    return True  # standalone_interface static — always on
+    return True  # standalone_interface / static_page static — always on
 
 
 def select_recipes(

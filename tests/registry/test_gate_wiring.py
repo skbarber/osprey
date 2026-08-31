@@ -30,6 +30,7 @@ source — route-safety style.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 from pathlib import Path
@@ -197,8 +198,13 @@ def test_write_tools_destructive_markers_is_shared_constant() -> None:
 # so they carry no literal. ``osprey_writes_check.py`` carries NO Bluesky
 # literal at all: its write-tool set is data-driven from ``hook_config.json``
 # (rendered from the registry HookRule), so the arming tools' kill-switch leg is
-# rename-safe without touching that source. Those are the load-bearing facts
-# this section pins.
+# rename-safe without touching that source. The one Bluesky literal on the
+# hooks' side is ``FALLBACK_WRITE_TOOLS`` in ``osprey_hook_log.py`` — the
+# degraded floor refused when ``hook_config.json`` cannot be read at all, which
+# is by definition the one set that cannot be data-driven — and the floor is
+# kept fresh by ``tests/registry/test_mixed_floor_driftguard.py``, which pins it
+# against ``registry.mcp.framework_write_tools()``. Those are the load-bearing
+# facts this section pins.
 # ---------------------------------------------------------------------------
 
 
@@ -226,11 +232,14 @@ def test_approval_template_source_carries_the_queue_control_constants() -> None:
 def test_writes_check_template_carries_no_bluesky_tool_literal() -> None:
     """The kill switch stays data-driven — no Bluesky tool name is hardcoded.
 
-    The arming tools' writes-check gating flows registry HookRule →
-    ``hook_config.json`` → this hook's runtime ``write_tools`` load, never a
-    literal here. Pinning the ABSENCE documents why a Bluesky tool rename never
-    needs to touch this standalone source (and flags anyone who reintroduces a
-    literal that would then silently drift on the next rename).
+    Both of the hook's tool-keyed decisions arrive as rendered data, never as a
+    literal here: which tools it gates at all flows registry HookRule →
+    ``hook_config.json`` → its runtime ``write_tools`` load, and which of them
+    skip the per-target stage because a plan lane addresses them flows
+    ``QUEUE_CONTROL_TOOLS`` → ``hook_config.json`` → its ``lane_addressed_tools``
+    load. Pinning the ABSENCE documents why a Bluesky tool rename never needs to
+    touch this standalone source (and flags anyone who reintroduces a literal
+    that would then silently drift on the next rename).
     """
     src = _hook_source("osprey_writes_check.py")
     present = [t for t in bsky.ALL_TOOLS if t in src]
@@ -240,6 +249,30 @@ def test_writes_check_template_carries_no_bluesky_tool_literal() -> None:
         f"hook_config.json rendered off the registry); keep the gate in the "
         f"registry HookRule, not this standalone hook source"
     )
+
+
+def test_hooks_write_floor_refuses_the_arming_pair_when_the_render_is_unreadable() -> None:
+    """The one literal that must be there.
+
+    A degraded render (missing/unreadable/malformed ``hook_config.json``) is
+    exactly when a deployment that enabled Bluesky has nothing left to refuse
+    ``queue_add``/``queue_start`` — arming and starting a plan queue, both
+    control-system writes. The floor lives in the hooks' shared
+    ``osprey_hook_log.py`` (both ``osprey_writes_check`` and ``osprey_approval``
+    read it through ``write_tools()``) and is kept in step with the registry by
+    ``tests/registry/test_mixed_floor_driftguard.py``, so this literal cannot
+    go stale on a rename the way an ungated one would.
+    """
+    src = _hook_source("osprey_hook_log.py")
+    tree = ast.parse(src)
+    floor = next(
+        ast.literal_eval(n.value)
+        for n in tree.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "FALLBACK_WRITE_TOOLS" for t in n.targets)
+    )
+    for tool in (bsky.QUEUE_ADD, bsky.QUEUE_START):
+        assert f"mcp__{bsky.SERVER_NAME}__{tool}" in floor
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +362,7 @@ def test_kill_switch_gates_exactly_the_arming_tools() -> None:
 
 
 def test_stop_tools_are_approval_only_never_kill_switched() -> None:
-    """``queue_stop`` and ``stop_run`` = approval only, in both directions.
+    """``queue_stop``, ``queue_remove`` and ``stop_run`` = approval only, in both directions.
 
     Halting is the safe direction, so the kill switch must never be able to
     block it: attaching the writes-check to ``queue_stop`` would make a plain
@@ -337,11 +370,13 @@ def test_stop_tools_are_approval_only_never_kill_switched() -> None:
     likely to want the queue halted. ``queue_stop``'s one arming case
     (``cancel=true``, which withdraws a pending halt) is gated in-tool and again
     at the bridge instead, so the arming half is covered without taking the
-    halting half hostage.
+    halting half hostage. ``queue_remove`` discards pending work and is the
+    sole way past the interrupted-item start refusal — a kill switch that
+    blocked it would trap a wedged queue exactly when writes are disabled.
     """
     by_matcher = {r["matcher"]: r for r in _resolve_bluesky()["hooks_pre"]}
 
-    for tool in (bsky.QUEUE_STOP, bsky.STOP_RUN):
+    for tool in (bsky.QUEUE_STOP, bsky.QUEUE_REMOVE, bsky.STOP_RUN):
         cmds = _hook_commands(by_matcher, tool)
         assert any("osprey_approval.py" in c for c in cmds), f"{tool!r} must be approval-gated"
         assert not any("osprey_writes_check.py" in c for c in cmds), (

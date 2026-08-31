@@ -24,7 +24,11 @@ Execution model
   first). A backstop expiry synthesizes the check's ``timeout_status``.
 * **Sync off-loading.** Callable categories that are plain functions run on a
   daemon thread via :func:`osprey.health.offload.run_sync`, so a hung sync check
-  can never wedge process exit.
+  can never wedge process exit. That thread has no event loop, so only an
+  ``async def`` callable may be handed the suite's shared
+  :class:`~osprey.health.runtime.HealthRuntime`; a sync one that asks for it is
+  refused with an ``error`` row, and a zero-argument callable of either kind is
+  unaffected. See :func:`_run_callable`.
 * **Cost gating.** ``on_demand`` categories run only when ``full`` is set;
   otherwise they are emitted as ``skip`` rows carrying a "run with --full" hint.
   ``--category`` selection never elevates cost class — ``full`` is the sole gate.
@@ -38,11 +42,18 @@ Execution model
   A callable-backed category that hits its budget yields exactly one synthesized
   ``error`` row named after the category. A run that synthesizes any such row
   sets :attr:`CheckReport.deadline_hit`.
+* **Baseline banner.** While the session is switched away from the deployment
+  baseline, the report opens with
+  :meth:`~osprey.health.runtime.HealthRuntime.baseline_pinned_row`'s
+  informational ``skip`` row naming both targets — the suite reports on the
+  deployment as configured, and every other row has to be read in that light.
+  On the baseline no row is added at all.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Iterable, Mapping, Sequence
 from time import perf_counter
 from typing import Any
@@ -222,9 +233,35 @@ async def _run_declarative(
     return [results[c.name] for c in checks], deadline_hit
 
 
+def _accepts_runtime(func: Any) -> bool:
+    """Whether a category callable asks for the suite's shared ``HealthRuntime``.
+
+    The parameter must be nameable as a keyword — ``POSITIONAL_OR_KEYWORD`` or
+    ``KEYWORD_ONLY`` — because the runtime is bound *by keyword*. Matching on
+    the parameter's kind rather than only its name lets the natural
+    ``def check(*, runtime)`` spelling work, while keyword binding makes
+    ``def check(cache=None, runtime=None)`` impossible to misbind (a positional
+    call would hand the runtime to ``cache``). A callable whose signature cannot
+    be read at all is treated as zero-argument, the older and safer shape.
+    """
+    try:
+        param = inspect.signature(func).parameters.get("runtime")
+    except Exception:  # noqa: BLE001 - an unreadable signature is the zero-arg shape
+        # ``signature()`` documents TypeError and ValueError, but it also reads
+        # ``__signature__`` and follows ``__wrapped__``, and plugin code owns
+        # both. This runs outside the per-callable isolation, so anything it
+        # raised would abort the whole suite against the module's promise.
+        return False
+    return param is not None and param.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+
+
 async def _run_callable(
     record: CategoryRecord,
     deadline: float | None,
+    runtime: HealthRuntime,
 ) -> tuple[list[CheckResult], bool]:
     """Execute a callable-backed category (core/plugin), off-loading sync funcs.
 
@@ -232,6 +269,17 @@ async def _run_callable(
     time left before the cost-class deadline. A budget expiry synthesizes one
     ``error`` row named after the category and flags a deadline hit; a raise
     synthesizes one ``error`` row without flagging a deadline (isolation).
+
+    A callable that names a ``runtime`` parameter (see :func:`_accepts_runtime`)
+    receives the suite's shared :class:`~osprey.health.runtime.HealthRuntime` by
+    keyword, so a facility plugin reuses the one lazily-built connector instead
+    of standing up a second one. Only coroutine functions are eligible: a sync
+    category runs on a bare thread with no event loop, whose only route into the
+    async connector would be :func:`asyncio.run` — a connector built on a loop
+    that then dies, violating the single-ownership invariant
+    :mod:`osprey.health.runtime` exists to protect. A sync callable that asks for
+    the runtime is therefore refused loudly with one ``error`` row rather than
+    served a cross-loop connector.
     """
     func = record.func
     if deadline is None:
@@ -239,9 +287,29 @@ async def _run_callable(
     else:
         effective = min(record.timeout_s, max(deadline - perf_counter(), 0.0))
 
+    wants_runtime = _accepts_runtime(func)
+    if wants_runtime and not asyncio.iscoroutinefunction(func):
+        return (
+            [
+                CheckResult(
+                    record.name,
+                    record.name,
+                    Status.ERROR,
+                    f"{record.name} must be `async def` to receive `runtime`",
+                    details=(
+                        "A sync category callable runs on a worker thread with no event "
+                        "loop and cannot use the shared HealthRuntime; declare the "
+                        "category `async def` or drop its `runtime` parameter."
+                    ),
+                )
+            ],
+            False,
+        )
+
     try:
         if asyncio.iscoroutinefunction(func):
-            result = await asyncio.wait_for(func(), timeout=effective)
+            call = func(runtime=runtime) if wants_runtime else func()
+            result = await asyncio.wait_for(call, timeout=effective)
         else:
             result = await run_sync(func, timeout_s=effective)
         return list(result), False
@@ -288,7 +356,9 @@ async def run_health_suite(
         records: The merged category set (core + YAML + plugin), already
             resolved to :class:`~osprey.health.config.CategoryRecord`\\ s.
         runtime: The suite's :class:`~osprey.health.runtime.HealthRuntime`,
-            passed to every probe via :class:`~osprey.health.probes.ProbeContext`.
+            passed to every probe via :class:`~osprey.health.probes.ProbeContext`
+            and, for an ``async def`` category callable that names a ``runtime``
+            parameter, injected into the call by keyword.
         config: Optional per-run configuration mapping forwarded to every probe
             via :class:`~osprey.health.probes.ProbeContext`. When ``None`` (the
             CLI/standalone default) probes fall back to the global config
@@ -330,11 +400,22 @@ async def run_health_suite(
             return _skip_on_demand(record), False
         deadline = on_demand_deadline if record.cost is Cost.ON_DEMAND else suite_deadline
         if record.func is not None:
-            return await _run_callable(record, deadline)
+            return await _run_callable(record, deadline, runtime)
         return await _run_declarative(record, ctx, deadline)
 
     grouped = await asyncio.gather(*(_run_category(r) for r in selected))
     results = [result for rows, _ in grouped for result in rows]
+
+    # The banner leads the report while the session is switched away from the
+    # deployment baseline: every row below it describes the baseline target, and
+    # a reader has to know that before reading the first one. It is emitted
+    # regardless of ``categories`` selection — which slice was run does not
+    # change which target the suite reported on — and is absent entirely on the
+    # baseline, so an unswitched report is unchanged.
+    banner = runtime.baseline_pinned_row()
+    if banner is not None:
+        results.insert(0, banner)
+
     deadline_hit = any(hit for _, hit in grouped)
     elapsed_ms = (perf_counter() - t0) * 1000.0
     return CheckReport(results=results, elapsed_ms=elapsed_ms, deadline_hit=deadline_hit)

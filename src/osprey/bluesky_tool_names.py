@@ -28,6 +28,7 @@ LIST_DEVICES = "list_devices"
 LIST_RUNS = "list_runs"
 GET_RUN_DATA = "get_run_data"
 GET_RUN_FIGURE = "get_run_figure"
+GET_PLAN_SOURCE = "get_plan_source"
 
 # --- Draft tools ----------------------------------------------------------
 # Edit the shared plan draft only; touch no hardware (registry
@@ -48,13 +49,17 @@ VALIDATE_PLAN = "validate_plan"
 # approval). ``queue_stop`` carries approval only — a plain stop is the safe
 # direction and must never be kill-switch-blocked, and its one arming case
 # (withdrawing a pending stop) is gated in-tool and at the bridge instead, so
-# that halting keeps working when the kill switch is on. ``queue_list`` and
+# that halting keeps working when the kill switch is on. ``queue_remove``
+# drops one PENDING item (never the running one) — removing queued work arms
+# nothing, so like ``queue_stop`` it carries approval only: the kill switch
+# must not trap a queue wedged on an interrupted item. ``queue_list`` and
 # ``queue_status`` are reads (registry ``permissions_allow``).
 QUEUE_LIST = "queue_list"
 QUEUE_STATUS = "queue_status"
 QUEUE_ADD = "queue_add"
 QUEUE_START = "queue_start"
 QUEUE_STOP = "queue_stop"
+QUEUE_REMOVE = "queue_remove"
 
 # --- Run-control tools ----------------------------------------------------
 # ``stop_run`` is the emergency abort: it stops the plan already in motion
@@ -72,6 +77,7 @@ READ_TOOLS: tuple[str, ...] = (
     LIST_RUNS,
     GET_RUN_DATA,
     GET_RUN_FIGURE,
+    GET_PLAN_SOURCE,
 )
 DRAFT_TOOLS: tuple[str, ...] = (
     GET_DRAFT,
@@ -90,6 +96,7 @@ QUEUE_CONTROL_TOOLS: tuple[str, ...] = (
     QUEUE_ADD,
     QUEUE_START,
     QUEUE_STOP,
+    QUEUE_REMOVE,
 )
 QUEUE_TOOLS: tuple[str, ...] = (
     *QUEUE_READ_TOOLS,

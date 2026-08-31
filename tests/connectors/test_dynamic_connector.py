@@ -4,6 +4,7 @@ import logging
 
 import pytest
 
+from osprey.connectors.control_system.base import WriteOutcome
 from osprey.connectors.factory import ConnectorFactory, isolated_connector_registries
 
 
@@ -115,3 +116,73 @@ class TestControlSystemContextValidation:
             registry._validate()
         assert "Unknown control_system.type: tango" in caplog.text
         assert "Unknown archiver.type: custom_archiver" in caplog.text
+
+
+class TestCustomConnectorConfirmDefault:
+    """A custom connector keeps its own ``confirm`` default.
+
+    ``MockDynamicConnector`` declares ``confirm=False`` outright rather than
+    taking the omission sentinel. The batch path must leave the keyword off
+    rather than forward ``None``, or that default would be lost.
+    """
+
+    @pytest.fixture
+    def writes_enabled(self, monkeypatch):
+        # A custom connector is stamped with its dotted type and resolves its
+        # posture from the ``control_system`` section, which carries no block for
+        # that type and so inherits the deployment-wide key.
+        section = {"writes_enabled": True}
+        monkeypatch.setattr(
+            "osprey.utils.config.get_config_value",
+            lambda key, default=None: section if key == "control_system" else default,
+        )
+
+    async def _connector(self):
+        config = {
+            "type": "tests.connectors._mock_dynamic_connector.MockDynamicConnector",
+            "connector": {},
+        }
+        return await ConnectorFactory.create_control_system_connector(config)
+
+    @pytest.mark.asyncio
+    async def test_omitted_confirm_leaves_connector_default_in_place(self, writes_enabled):
+        """Single write with the keyword omitted: the connector's default applies."""
+        connector = await self._connector()
+
+        result = await connector.write_channel("TEST:CH", 1.0)
+
+        assert result.outcome is WriteOutcome.UNREQUESTED
+
+    @pytest.mark.asyncio
+    async def test_batch_omits_keyword_for_custom_connector(self, writes_enabled):
+        """Batch write with ``confirm`` omitted: no ``None`` reaches write_channel."""
+        connector = await self._connector()
+
+        seen_kwargs = []
+        original = connector.write_channel
+
+        async def spy(channel_address, value, **kwargs):
+            seen_kwargs.append(kwargs)
+            return await original(channel_address, value, **kwargs)
+
+        connector.write_channel = spy
+
+        results = await connector.write_multiple_channels([("TEST:CH1", 1.0), ("TEST:CH2", 2.0)])
+
+        assert [r.channel_address for r in results] == ["TEST:CH1", "TEST:CH2"]
+        for result in results:
+            assert result.outcome is WriteOutcome.UNREQUESTED
+        # The keyword is absent, not None — forwarding None would override the default.
+        assert seen_kwargs and all("confirm" not in kw for kw in seen_kwargs)
+
+    @pytest.mark.asyncio
+    async def test_batch_forwards_an_explicit_confirm(self, writes_enabled):
+        """An explicit answer still reaches a custom connector unchanged."""
+        connector = await self._connector()
+
+        results = await connector.write_multiple_channels(
+            [("TEST:CH1", 1.0), ("TEST:CH2", 2.0)], confirm=True
+        )
+
+        for result in results:
+            assert result.outcome is WriteOutcome.CONFIRMED

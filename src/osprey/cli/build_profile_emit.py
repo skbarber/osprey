@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import copy
 import io
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -35,11 +36,13 @@ from ruamel.yaml.tokens import CommentToken
 
 from osprey import __version__
 from osprey.errors import BuildProfileError
+from osprey.port_layout import CA_DEFAULT_PORT, default_port
 
 from .build_profile_load import _PROFILE_SCHEMA_MIN_OSPREY
 from .build_profile_merge import _deep_merge, _resolve_extends, compute_preset_hash
 from .build_profile_presets import _load_preset_raw
 from .build_profile_resolve import merge_cli_overrides
+from .profile_conventions import BUILD_OUTPUT_DIR
 
 # YAML-surface spellings that differ from the canonical resolved-content field
 # name (D2: the rename is confined to the profile-YAML surface, so the
@@ -166,6 +169,41 @@ _SYNTHESIS_RATIONALE: dict[str, str] = {
     "web_panels": "Panels offered by the web terminal.",
 }
 
+# Two keys need more than a one-line rationale: their shape is not obvious from
+# the empty default the emitter writes, and guessing it wrong is a build error
+# rather than a quiet no-op. Each entry replaces that key's rationale line with
+# a block written above the key. Every line is already '#'-prefixed (like
+# _PROVENANCE_COMMENT below), so an annotated key's value is left exactly as the
+# profile resolved it.
+_ANNOTATIONS: dict[str, tuple[str, ...]] = {
+    "web_panels": (
+        "# Tabs the web workspace offers beside the terminal. To turn on a panel",
+        "# the framework already ships, uncomment one listed under this key.",
+        "# A panel of your own is a list entry plus its address under `config:`:",
+        "#",
+        "#   web_panels:",
+        "#     - elog",
+        "#",
+        "# and, under `config:`, web.panels.elog.url alongside web.panels.elog.label,",
+        "# web.panels.elog.path and — optional — web.panels.elog.health_endpoint.",
+    ),
+    "env": (
+        "# Environment variables the deployment needs. Replace `env: {}` with any",
+        "# of `required` (the variable must be set somewhere), `pinned` (this",
+        "# repo's own env chain owns it outright, and nowhere else), `defaults`",
+        "# (name to value) and `file` (a profile-relative path copied in as .env):",
+        "#",
+        "#   env:",
+        "#     required: [EPICS_CA_ADDR_LIST]",
+        "#     pinned: [ARIEL_DB_PASSWORD]",
+        "#     defaults:",
+        "#       EPICS_CA_ADDR_LIST: 127.0.0.1",
+        "#     file: env/facility.env",
+        "#",
+        "# If `env:` already has children, add yours under it.",
+    ),
+}
+
 # The stamp is always written, so it carries its explanation rather than a
 # synthesis rationale: it is a floor for readers, not a preset choice.
 _REQUIRES_VERSION_COMMENT = (
@@ -200,8 +238,18 @@ _MCP_SERVERS_APPENDIX = """
 # "http"; "sse" is the legacy event-stream wire and needs an explicit url.
 # Tool names under permissions are bare — `allow` runs them unprompted, `ask`
 # prompts the operator on every call.
+# A Python server's package lives at mcp_servers/<package>/ beside this file;
+# the build copies it to __BUILD__/_mcp_servers/<package>/ for `-m <package>`.
 #
 # mcp_servers:
+#   my_server:
+#     command: "{current_python_env}"
+#     args: [-m, my_server]
+#     env:
+#       OSPREY_CONFIG: "{project_root}/__BUILD__/config.yml"
+#       PYTHONPATH: "{project_root}/__BUILD__/_mcp_servers"
+#     permissions:
+#       allow: [my_tool]
 #   matlab:
 #     command: /opt/matlab/bin/mcp-matlab
 #     args: [--workspace, /opt/matlab/scripts]
@@ -215,7 +263,7 @@ _MCP_SERVERS_APPENDIX = """
 #     transport: http
 #     permissions:
 #       allow: [get_twiss]
-"""
+""".replace("__BUILD__", BUILD_OUTPUT_DIR)
 
 # Appended when the resolved profile has no ``artifact_server:`` block.
 _CATEGORIES_APPENDIX = """
@@ -249,22 +297,40 @@ _COMMENTED_TEMPLATES: dict[str, str] = {
 """,
     "provider": """
 # --- LLM provider ------------------------------------------------------------
-# Provider the deployment's agents talk to. Must be configured in the project's
-# config.yml api.providers block.
+# Provider the deployment's agents talk to: a built-in name (anthropic, cborg,
+# als-apg, ...) or any custom gateway described under `config:` api.providers.
+# A custom gateway's key goes in this repo's .env — the variable name derives
+# from the provider name, <NAME>_API_KEY. Worked example:
+#
+# provider: my-gateway
+# config:
+#   api.providers.my-gateway.api_key: ${MY_GATEWAY_API_KEY}
+#   api.providers.my-gateway.base_url: https://my-gateway.example.com/v1
+#   # Optional — the gateway speaks Anthropic natively (e.g. a LiteLLM proxy
+#   # in Anthropic mode), so the local translation proxy is skipped:
+#   api.providers.my-gateway.api_protocol: anthropic
+#   # Optional tier map, model IDs as the gateway names them. Unmapped tiers
+#   # fall back to `model:`, with a build-time warning:
+#   api.providers.my-gateway.models:
+#     haiku: claude-haiku-4-5
+#     sonnet: claude-sonnet-4-6
+#     opus: claude-opus-4-6
 #
 # provider: anthropic
 """,
     "model": """
 # --- Default model -----------------------------------------------------------
-# A tier (haiku/sonnet/opus) or a model ID the provider serves.
+# A tier (haiku/sonnet/opus) or any model ID the provider serves.
 #
 # model: sonnet
 """,
     "channel_finder_mode": """
 # --- Channel-finder paradigm -------------------------------------------------
 # How the agent looks up channels: in_context (whole DB in the prompt),
-# hierarchical (system/device drill-down), or middle_layer. Drives which
-# channel database the build materializes.
+# hierarchical (system/device drill-down), middle_layer, or graph (read-only
+# Cypher over the facility knowledge graph). The first three pick which channel
+# database the build writes; graph reads the store named by services.graphdb
+# and writes no database.
 #
 # channel_finder_mode: hierarchical
 """,
@@ -297,25 +363,34 @@ _COMMENTED_TEMPLATES: dict[str, str] = {
 #   workspace_mode: isolated
 #   facility_name: ALS
 """,
-    "bluesky": """
+    "bluesky": f"""
 # --- Bluesky bridge -----------------------------------------------------
 # Exposes Bluesky plans to the agent. tiled_enabled adds the data-access
-# service; excluded_plans removes shipped plans from the catalog.
+# service; excluded_plans removes shipped plans from the catalog. The bridge
+# and the Tiled catalog publish inside this deployment's port block, so the
+# port below is an override rather than a number you have to write.
 #
 # bluesky:
-#   port: 8090
+#   port: {default_port("bluesky")}
 #   tiled_enabled: false
 #   excluded_plans: []
 """,
-    "virtual_accelerator": """
+    "virtual_accelerator": f"""
 # --- Virtual accelerator -----------------------------------------------------
 # Containerized soft-IOC serving simulated channels, so the deployment can be
-# exercised without touching the machine.
+# exercised without touching the machine. live_standin runs a second copy of it
+# as the deployment's live target, so operators rehearse switching lanes before
+# any of it reaches the machine; delete the key to go live for real, or to save
+# the second container. Write `true` and the stand-in takes this deployment's
+# own stand-in port, so two deployments on one host never collide over it; a
+# number pins it somewhere specific instead. The first instance stays on the
+# Channel Access port below, the one port the port block cannot move.
 #
 # virtual_accelerator:
-#   port: 5064
+#   port: {CA_DEFAULT_PORT}
+#   live_standin: true
 """,
-    "va_archiver": """
+    "va_archiver": f"""
 # --- Stored archive ----------------------------------------------------------
 # Where a simulated deployment keeps its history: a MongoDB store the build
 # seeds with a deterministic base series, a recorder samples the running
@@ -343,7 +418,7 @@ _COMMENTED_TEMPLATES: dict[str, str] = {
 #   recorder_cadence_sec: 10    # how often the live machine is sampled
 #   recorder_tail_cadence_sec: 60
 #   recorder_poll_sec: 30       # how often the recorder re-reads config.yml
-#   port_host: 27017
+#   port_host: {default_port("mongo")}
 #   database: osprey_archiver
 #   collection: pv_history
 #   compression: zstd           # zstd | snappy | zlib | none
@@ -353,12 +428,14 @@ _COMMENTED_TEMPLATES: dict[str, str] = {
 #   timeout_sec: 5
 #   host: archive.example.org   # only for an attached project
 """,
-    "bluesky_web": """
+    "bluesky_web": f"""
 # --- Bluesky web panels ------------------------------------------------------
-# Scan-monitoring panels for the web terminal (requires the bluesky block).
+# Scan-monitoring panels for the web terminal (requires the bluesky block). The
+# sidecar publishes inside this deployment's port block; the port below is an
+# override.
 #
 # bluesky_web:
-#   port: 8095
+#   port: {default_port("bluesky_web")}
 """,
     "nextcloud_bridge": """
 # --- Nextcloud bridge --------------------------------------------------------
@@ -426,6 +503,93 @@ _COMMENTED_TEMPLATE_ORDER: tuple[str, ...] = (
     "nextcloud_bridge",
     "gchat_bridge",
 )
+
+# The six artifact-selection lists, in profile spelling. Each gets a generated
+# "available but not selected" menu of commented entries at emit time, so the
+# emitted file shows the whole opt-in surface the same way the commented
+# templates above show the whole opt-in block surface.
+_ARTIFACT_LIST_KEYS: tuple[str, ...] = (
+    "hooks",
+    "rules",
+    "skills",
+    "agents",
+    "output_styles",
+    "web_panels",
+)
+_MENU_HEADER = "# Available — uncomment to enable:"
+
+
+def _first_sentence(text: str) -> str:
+    """First sentence of a catalog description, for a one-line menu comment."""
+    head, sep, _rest = text.partition(". ")
+    return f"{head}." if sep else head
+
+
+def artifact_menu_catalog() -> dict[str, list[tuple[str, str]]]:
+    """Selectable artifact names with one-line descriptions, per profile list key.
+
+    Names come from the same sources the profile validator trusts — the
+    artifact library for the five .claude kinds, the web-panel registry for
+    panels — so this menu can never disagree with what a profile may name.
+    Universal panels (always served) are excluded: they are not opt-ins.
+    """
+    from osprey.cli.templates.artifact_library import _TYPE_TO_SUBDIR, list_artifacts
+    from osprey.profiles.web_panels import BUILTIN_PANELS, UNIVERSAL_PANELS
+    from osprey.registry.web import FRAMEWORK_WEB_SERVERS
+    from osprey.services.build_artifacts import BuildArtifactCatalog
+
+    catalog = BuildArtifactCatalog.default()
+    menu: dict[str, list[tuple[str, str]]] = {}
+    for artifact_type, subdir in _TYPE_TO_SUBDIR.items():
+        entries: list[tuple[str, str]] = []
+        for name in list_artifacts(artifact_type):
+            artifact = catalog.get(f"{subdir}/{name}")
+            entries.append((name, _first_sentence(artifact.description) if artifact else ""))
+        menu[artifact_type] = entries
+    labels = {d.panel_id: d.name for d in FRAMEWORK_WEB_SERVERS.values()}
+    menu["web_panels"] = [
+        (panel, labels.get(panel, "")) for panel in sorted(BUILTIN_PANELS - UNIVERSAL_PANELS)
+    ]
+    return menu
+
+
+def _insert_artifact_menus(text: str) -> str:
+    """Append "available but not selected" commented entries to each artifact list.
+
+    Text-level like the commented-template append: the dumped document is
+    scanned for the six top-level list keys, each block runs until the first
+    non-indented line, and unselected artifacts are offered as comments at the
+    block's end. A name already present in the block — active or mentioned in
+    a hand-written comment — is skipped, so curated preset commentary wins.
+    """
+    menu = artifact_menu_catalog()
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        out.append(line)
+        index += 1
+        key = next((k for k in _ARTIFACT_LIST_KEYS if line.startswith(f"{k}:")), None)
+        if key is None:
+            continue
+        block: list[str] = [line]
+        while index < len(lines) and lines[index][:1] in (" ", "\t"):
+            block.append(lines[index])
+            out.append(lines[index])
+            index += 1
+        block_text = "".join(block)
+        offers = [
+            (name, description)
+            for name, description in menu.get(key, [])
+            if not re.search(rf"\b{re.escape(name)}\b", block_text)
+        ]
+        if offers:
+            out.append(f"  {_MENU_HEADER}\n")
+            for name, description in offers:
+                suffix = f"  # {description}" if description else ""
+                out.append(f"  # - {name}{suffix}\n")
+    return "".join(out)
 
 
 def _config_segments(config: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
@@ -519,16 +683,16 @@ def _merge_subtree(into: dict[str, Any], value: Mapping[str, Any]) -> None:
             into[key] = copy.deepcopy(item)
 
 
-def effective_web_terminals(config: Mapping[str, Any]) -> dict[str, Any]:
-    """The single ``modules.web_terminals`` subtree a ``config:`` block sets.
+def effective_config_subtree(
+    config: Mapping[str, Any], subtree_path: tuple[str, ...]
+) -> dict[str, Any]:
+    """The single subtree a ``config:`` block sets at ``subtree_path``.
 
     ORDER IS THE WHOLE POINT, and it is fixed here so no caller can get it
     wrong. A ``config:`` block is a flat bag of dotted keys applied verbatim in
-    iteration order, and the bundled persona presets inherit their parent's
-    whole ``modules.web_terminals:`` subtree (``enabled: true``, catalog and
-    all) while switching the module off with a separate
-    ``modules.web_terminals.enabled: false``. Reading either key alone answers
-    "enabled". So:
+    iteration order, and two keys may address the same path at different
+    depths — a whole subtree beside a single leaf under it — where reading
+    either key alone answers wrong. So:
 
     1. :func:`_collapse_config_prefixes` runs FIRST, folding every
        prefix-related pair deeper-key-wins;
@@ -541,15 +705,15 @@ def effective_web_terminals(config: Mapping[str, Any]) -> dict[str, Any]:
     """
     collapsed = _collapse_config_prefixes(dict(config))
     segments = _config_segments(collapsed)
-    depth = len(_WEB_TERMINALS_PATH)
+    depth = len(subtree_path)
     subtree: dict[str, Any] = {}
     for key in sorted(segments, key=lambda k: len(segments[k])):
         path = segments[key]
         value = collapsed[key]
-        if path == _WEB_TERMINALS_PATH:
+        if path == subtree_path:
             if isinstance(value, Mapping):
                 _merge_subtree(subtree, value)
-        elif path[:depth] == _WEB_TERMINALS_PATH:
+        elif path[:depth] == subtree_path:
             # A key addressing INSIDE the subtree, e.g.
             # `modules.web_terminals.personas.ops.build_profile`.
             node = subtree
@@ -560,18 +724,30 @@ def effective_web_terminals(config: Mapping[str, Any]) -> dict[str, Any]:
                     node[part] = child
                 node = child
             node[path[-1]] = copy.deepcopy(value)
-        elif _WEB_TERMINALS_PATH[: len(path)] == path:
+        elif subtree_path[: len(path)] == path:
             # An ancestor key (`modules:`) carrying the subtree nested inside
             # its own value. Bundled presets never spell it this way — they
             # warn against it, since a nested `modules:` wholesale-replaces the
             # rendered subtree — but a facility's own profile may, and a
-            # predicate that missed it would silently emit no personas.
+            # predicate that missed it would silently read no subtree.
             probe: Any = value
-            for part in _WEB_TERMINALS_PATH[len(path) :]:
+            for part in subtree_path[len(path) :]:
                 probe = probe.get(part) if isinstance(probe, Mapping) else None
             if isinstance(probe, Mapping):
                 _merge_subtree(subtree, probe)
     return subtree
+
+
+def effective_web_terminals(config: Mapping[str, Any]) -> dict[str, Any]:
+    """The single ``modules.web_terminals`` subtree a ``config:`` block sets.
+
+    The bundled persona presets inherit their parent's whole
+    ``modules.web_terminals:`` subtree (``enabled: true``, catalog and all)
+    while switching the module off with a separate
+    ``modules.web_terminals.enabled: false`` — the pair whose folding order
+    :func:`effective_config_subtree` exists to fix.
+    """
+    return effective_config_subtree(config, _WEB_TERMINALS_PATH)
 
 
 def emits_persona_profiles(config: Mapping[str, Any]) -> bool:
@@ -1070,8 +1246,19 @@ def emit_standalone_profile_yaml(
     for field in synthesized:
         rationale = _SYNTHESIS_RATIONALE.get(field)
         key = _FIELD_TO_YAML.get(field, field)
-        if rationale and key in doc:
+        if rationale and key in doc and field not in _ANNOTATIONS:
             _set_pre_comment(doc, key, [f"# {rationale}"], 0)
+
+    # Annotated keys carry a worked example instead of a rationale line, and get
+    # it whether or not the preset left them unset: the shape of a custom panel
+    # or an env block is what a facility has to be told, not the fact that the
+    # key is present. Appending keeps any preset's own header above the key
+    # first, and column 0 keeps the block out of the artifact menus, which are
+    # inserted into the dumped text further down.
+    for field, annotation in _ANNOTATIONS.items():
+        key = _FIELD_TO_YAML.get(field, field)
+        if key in doc:
+            _set_pre_comment(doc, key, list(annotation), 0)
     if "requires_osprey_version" in doc:
         _set_pre_comment(doc, "requires_osprey_version", [_REQUIRES_VERSION_COMMENT], 0)
     if "provenance" in doc:
@@ -1093,6 +1280,10 @@ def emit_standalone_profile_yaml(
         f"#   preset content hash: {preset_hash}"
     )
     text = _replace_header(text, header)
+
+    # Unselected artifacts appear as commented menu entries inside their list,
+    # so the opt-in surface of the six selection lists is visible in place.
+    text = _insert_artifact_menus(text)
 
     # Opt-in knobs the resolved profile does not carry appear as documented
     # commented templates, so no configurable surface is invisible. Look the key

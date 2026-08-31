@@ -186,15 +186,28 @@ class TestPyatSpecialistAgentTemplate:
         assert "name: pyat-specialist" in rendered
 
     def test_frontmatter_tools_exact(self, template_manager):
-        """The tools: line pins exactly the six allowed tools, in order."""
+        """The tools: line pins exactly the four allowed tools, in order."""
         ctx = self._full_ctx(enabled=True)
         rendered = self._render(template_manager, ctx)
         expected = (
             "tools: mcp__python__execute, mcp__osprey_workspace__submit_response, "
-            "mcp__osprey_workspace__artifact_save, mcp__osprey_workspace__artifact_list, "
             "mcp__osprey_workspace__artifact_read, Read"
         )
         assert expected in rendered
+
+    def test_frontmatter_declares_no_results_contract(self, template_manager):
+        """The agent's answer is its prose — there is no second data hand-in.
+
+        ``results_category`` was a frontmatter declaration that made
+        ``submit_response`` refuse a hand-in without a JSON copy of the numbers.
+        The copy was re-typed by the model out of its own stdout, so it was no
+        more authoritative than the prose; the run itself is preserved by the
+        automatic notebook artifact.
+        """
+        ctx = self._full_ctx(enabled=True)
+        rendered = self._render(template_manager, ctx)
+        assert "results_category" not in rendered
+        assert "data={" not in rendered
 
     def test_frontmatter_disallowed_tools_exact(self, template_manager):
         """The disallowedTools: line pins exactly the eleven blocked tools, in order."""
@@ -264,13 +277,27 @@ class TestPyatSpecialistAgentTemplate:
         rendered = self._render(template_manager, ctx)
         assert "Flag heavy runs before launching them" in rendered
 
-    def test_body_native_type_conversion_instruction(self, template_manager):
-        """Native-type coercion before save (json.dumps default=str lossily stringifies)."""
+    def test_body_hands_in_its_answer_as_prose(self, template_manager):
+        """One submit_response call carrying the answer, filed under its category.
+
+        The agent is told to report every quantity it was asked for in that
+        prose (a table once there are several), and that a large array goes
+        through save_artifact in the computing call instead of being retyped —
+        the one case where a second artifact earns its place.
+        """
         ctx = self._full_ctx(enabled=True)
         rendered = self._render(template_manager, ctx)
         normalized = " ".join(rendered.split())
-        assert "convert every computed quantity to a NATIVE Python type" in normalized
-        assert "lossily stringifies" in rendered
+
+        assert '`source_agent`: "pyat-specialist"' in rendered
+        assert '`data_type`: "lattice_analysis"' in rendered
+        assert "Report every quantity you were asked for" in normalized
+        assert "markdown table" in normalized
+        # The large-array escape hatch names the injected helper and the category.
+        assert 'category="lattice_analysis"' in rendered
+        assert "np.asarray(x).tolist()" in rendered
+        # No self-verification step: the agent does not re-read its own filing.
+        assert "artifact_list" not in rendered
 
 
 # ---------------------------------------------------------------------------

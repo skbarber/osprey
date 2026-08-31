@@ -1,3 +1,9 @@
+{#- The env passthrough axis — the host variables a service's `env:` key
+    names — is rendered by the shared macro rather than hand-written per
+    template, so every service hands a variable to its container the same
+    way. With none declared it emits nothing and this file renders exactly
+    as it did before the axis existed. -#}
+{%- import "services/_env_axis.j2" as hostenv -%}
 # The mongodb service owns the archiver store: one collection of
 # `{date: ISODate, <PV>: value}` documents, written by the base seeder (host
 # CLI, over the published port below), by `osprey sim apply` when a scenario
@@ -64,7 +70,11 @@ services:
       # rewrite all reach the store this way (bind_address defaults to
       # loopback, so it is not exposed off-box). In-network consumers use the
       # `archiver-mongodb` alias below instead and never this port mapping.
-      - "{{ deployment.bind_address | default('127.0.0.1') }}:{{ (services.mongodb | default({})).port_host | default(27017, true) }}:27017"
+      #
+      # The container half stays 27017 — mongod's own port inside its
+      # namespace, which does not move with the deployment's block. Only the
+      # host half is layout-derived.
+      - "{{ deployment.bind_address | default('127.0.0.1') }}:{{ (services.mongodb | default({})).port_host | default(osprey_ports.mongo, true) }}:27017"
     environment:
       MONGO_INITDB_ROOT_USERNAME: {{ (services.mongodb | default({})).username | default('osprey', true) }}
       # Sourced from the project .env: `osprey up` mints a strong
@@ -86,6 +96,7 @@ services:
       # that rather than leaving the store silently unauthenticatable.
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-osprey}
       TZ: {{ system.timezone }}
+{{- hostenv.passthrough(services.mongodb) }}
     volumes:
       # The store itself. Named (not a bind mount) so it is namespaced per
       # compose project and survives `osprey down`: a base seed costs minutes,

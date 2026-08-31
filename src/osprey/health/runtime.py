@@ -32,16 +32,30 @@ this class without API changes.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
 from osprey.connectors.control_system.base import ControlSystemConnector
+from osprey.health.models import CheckResult, Status
+from osprey_connectors.types import baseline_target
 
 if TYPE_CHECKING:
     from osprey.connectors.archiver.base import ArchiverConnector
 
 logger = logging.getLogger("osprey.health.runtime")
+
+#: The subject the health runtime speaks under in the shared baseline-pinned
+#: wording. Spelled once here so the row and any future health refusal cannot
+#: drift apart.
+HEALTH_SUBJECT = "HealthRuntime"
+
+#: Name and category of the informational row. ``control_system`` is not a
+#: health *category* anyone can run — no probe lives there — which is the point:
+#: the row is a banner about the whole report, not a check that passed or failed.
+BASELINE_ROW_NAME = "control_system.target"
+BASELINE_ROW_CATEGORY = "control_system"
 
 
 class HealthRuntime:
@@ -53,6 +67,19 @@ class HealthRuntime:
     only if one was actually constructed. Teardown is best-effort: a
     ``disconnect()`` that raises is swallowed so a failing connector can never
     mask the suite's own result.
+
+    Construction is serialized. Health checks run concurrently — probes within
+    a category are awaited together, and the categories themselves run under a
+    single ``gather`` — so several probes can reach an accessor while the
+    connector is still ``None``. Without a guard each of them would see the
+    empty slot, each would build a connector, and every assignment but the last
+    would orphan one: an unreferenced Channel Access client that :meth:`shutdown`
+    never disconnects, because it only ever knew about the instance that won the
+    race. Both accessors therefore take a single :class:`asyncio.Lock` and
+    re-test the cache inside it, so exactly one caller constructs and every
+    other waiter returns that same instance. The ``closed`` refusal stays
+    outside the lock: a runtime that has already torn its connectors down must
+    say so immediately rather than queue behind an in-flight construction.
 
     Args:
         control_system_config: The ``control_system`` config section passed
@@ -67,6 +94,9 @@ class HealthRuntime:
         self._archiver: ArchiverConnector | None = None
         self._archiver_ever_constructed = False
         self._closed = False
+        #: Guards lazy construction in both accessors (see the class docstring).
+        #: Held only across construction, never across teardown.
+        self._lock = asyncio.Lock()
 
     @property
     def ever_constructed(self) -> bool:
@@ -118,26 +148,44 @@ class HealthRuntime:
         calls return the same cached instance. After :meth:`shutdown` the
         runtime is closed and this refuses with :class:`RuntimeError` rather
         than reconstructing a connector the suite already tore down.
+
+        Concurrent callers are serialized, so two probes that both find the slot
+        empty still produce one connector between them; the closed check runs
+        before the lock, so a closed runtime refuses at once.
         """
         if self._closed:
             raise RuntimeError(
                 "HealthRuntime is closed; get_connector() cannot reconstruct "
                 "a connector after shutdown()"
             )
-        if self._connector is None:
-            from osprey.connectors.factory import (
-                ConnectorFactory,
-                register_builtin_connectors,
-            )
+        async with self._lock:
+            if self._connector is None:
+                from osprey.connectors.factory import (
+                    ConnectorFactory,
+                    register_builtin_connectors,
+                )
 
-            register_builtin_connectors()  # idempotent; must run before create
-            self._connector = await ConnectorFactory.create_control_system_connector(self._config)
-            self._ever_constructed = True
-            logger.info(
-                "HealthRuntime: constructed control-system connector (%s)",
-                type(self._connector).__name__,
-            )
-        return self._connector
+                register_builtin_connectors()  # idempotent; must run before create
+                # A health run is not a session and never switches: the target
+                # it probes is the one its own configured section describes.
+                connector = await ConnectorFactory.create_control_system_connector(
+                    self._config, control_target=baseline_target(self._config)
+                )
+                if self._closed:
+                    # shutdown() ran during construction: it found the slot
+                    # empty and disconnected nothing, so this one is ours to
+                    # close — installing it would orphan it.
+                    await self._disconnect_one("connector", connector)
+                    raise RuntimeError(
+                        "HealthRuntime was closed while its connector was being constructed"
+                    )
+                self._connector = connector
+                self._ever_constructed = True
+                logger.info(
+                    "HealthRuntime: constructed control-system connector (%s)",
+                    type(self._connector).__name__,
+                )
+            return self._connector
 
     async def get_archiver(self, archiver_config: dict[str, Any]) -> ArchiverConnector:
         """Return the cached archiver connector, constructing it on first call.
@@ -155,6 +203,10 @@ class HealthRuntime:
         :class:`RuntimeError` rather than reconstructing a connector the suite
         already tore down.
 
+        Construction is serialized on the same lock as :meth:`get_connector`, so
+        concurrent archiver probes build one connector between them rather than
+        one apiece.
+
         Args:
             archiver_config: The ``archiver`` config block passed straight to
                 :meth:`ConnectorFactory.create_archiver_connector`.
@@ -164,20 +216,66 @@ class HealthRuntime:
                 "HealthRuntime is closed; get_archiver() cannot reconstruct "
                 "an archiver connector after shutdown()"
             )
-        if self._archiver is None:
-            from osprey.connectors.factory import (
-                ConnectorFactory,
-                register_builtin_connectors,
-            )
+        async with self._lock:
+            if self._archiver is None:
+                from osprey.connectors.factory import (
+                    ConnectorFactory,
+                    register_builtin_connectors,
+                )
 
-            register_builtin_connectors()  # idempotent; must run before create
-            self._archiver = await ConnectorFactory.create_archiver_connector(archiver_config)
-            self._archiver_ever_constructed = True
-            logger.info(
-                "HealthRuntime: constructed archiver connector (%s)",
-                type(self._archiver).__name__,
-            )
-        return self._archiver
+                register_builtin_connectors()  # idempotent; must run before create
+                archiver = await ConnectorFactory.create_archiver_connector(archiver_config)
+                if self._closed:
+                    # Same window as get_connector: closed mid-construction.
+                    await self._disconnect_one("archiver connector", archiver)
+                    raise RuntimeError(
+                        "HealthRuntime was closed while its archiver connector was being constructed"
+                    )
+                self._archiver = archiver
+                self._archiver_ever_constructed = True
+                logger.info(
+                    "HealthRuntime: constructed archiver connector (%s)",
+                    type(self._archiver).__name__,
+                )
+            return self._archiver
+
+    @staticmethod
+    def baseline_pinned_row() -> CheckResult | None:
+        """The informational row naming both targets, or ``None`` on the baseline.
+
+        The health suite reports on the deployment *as configured*: its
+        connectors are built from the config section fixed at construction, and
+        a session-level control-system target switch does not move them. That is
+        the never-swap ruling, and this row does not change it — it makes it
+        visible. While a session is switched away, a reader would otherwise take
+        an ``ok`` row about the baseline target as an ``ok`` row about the target
+        they are working on.
+
+        The sentence comes from
+        :func:`osprey.mcp_server.control_system.target_banner.baseline_pinned_line`,
+        the same helper the Phoebus tools render their label from, so the two
+        pinned holders cannot word the same fact two ways. ``None`` on the
+        baseline keeps an unswitched report byte-identical to what it was before
+        this row existed.
+
+        Emitted as :data:`~osprey.health.models.Status.SKIP`: it is not a check,
+        so it must not count as one that passed, and skip is the one status that
+        leaves :attr:`~osprey.health.models.CheckReport.exit_code` alone.
+
+        Returns:
+            The row while the session is switched, otherwise ``None``. Never
+            raises — a banner that failed to render must not fail a health run.
+        """
+        try:
+            from osprey.mcp_server.control_system.target_banner import baseline_pinned_line
+
+            line = baseline_pinned_line(HEALTH_SUBJECT)
+        except Exception:  # noqa: BLE001 - a label can never cost a health run
+            logger.debug("Could not resolve the baseline-pinned row (ignored)", exc_info=True)
+            return None
+        if line is None:
+            return None
+        return CheckResult(BASELINE_ROW_NAME, BASELINE_ROW_CATEGORY, Status.SKIP, line)
 
     async def shutdown(self) -> None:
         """Disconnect both connectors exactly once, iff each was constructed.

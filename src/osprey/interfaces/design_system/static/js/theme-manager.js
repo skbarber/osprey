@@ -7,7 +7,8 @@
  *
  * Two roles, chosen by the page at init time via initTheme({role}):
  *   'hub'      — web-terminal only. Persists the user's preference to
- *                localStorage['osprey-theme'], live-follows the OS
+ *                localStorage['osprey-theme'] (per-persona scoped on a
+ *                multi-user mount — see storage-scope.js), live-follows the OS
  *                color-scheme preference while that preference is 'auto',
  *                and broadcasts every resolved change to every same-origin
  *                <iframe> panel via postMessage.
@@ -67,6 +68,8 @@
  * silently returning colors it can't vouch for.
  */
 
+import { scopedStorageKey } from '/design-system/js/storage-scope.js';
+
 import {
   DEFAULT_FAMILY as _EMITTED_DEFAULT_FAMILY,
   DEFAULTS,
@@ -78,6 +81,12 @@ import {
 /** @typedef {'auto'|'dark'|'light'} ModePreference */
 /** @typedef {{family: string, mode: ModePreference}} Preference */
 
+// The BASE localStorage key, never used bare: every read and write resolves it
+// through scopedStorageKey() so a multi-user mount gets a per-persona slot (see
+// storage-scope.js). Deliberately duplicated in generator/emit_js.py's
+// STORAGE_KEY, which bakes the same literal — and the same scoping rule — into
+// the generated theme-boot.js that reads this slot pre-paint. Neither side can
+// import the other, so the two must be changed together.
 const STORAGE_KEY = 'osprey-theme';
 const MESSAGE_TYPE = 'osprey-theme-change';
 
@@ -193,10 +202,11 @@ function _familyOf(id) {
  * ('high-contrast' -> 'High Contrast'). The declared label exists for families
  * whose id does not title-case correctly -- 'desy' -> 'DESY', not 'Desy'.
  *
- * The single implementation for every family picker in the fleet: both
- * web-terminal's display menu and <osprey-theme-switcher> import this rather
- * than deriving a label of their own, so a newly-labelled family can never
- * render one way in one picker and another way in the other.
+ * The single implementation for every family picker in the fleet: no picker
+ * derives a label of its own -- <osprey-display-menu> and
+ * <osprey-theme-switcher> both get it through `themeFamilies()` below -- so a
+ * newly-labelled family can never render one way in one picker and another
+ * way in the other.
  *
  * @param {string} family
  * @returns {string}
@@ -208,6 +218,49 @@ export function familyLabel(family) {
     .split('-')
     .map((word) => (word.length ? word[0].toUpperCase() + word.slice(1) : word))
     .join(' ');
+}
+
+/**
+ * The available families, deduped, in `THEMES` declaration order. As long as
+ * the generator emits the `DEFAULT_FAMILY` themes first (true of every
+ * catalog emitted so far), that fallback family is also the first entry --
+ * but that is a property of the declaration order, not a guarantee this
+ * function enforces.
+ *
+ * The single implementation for every family picker in the fleet, for the same
+ * reason `familyLabel` is: both <osprey-display-menu> and
+ * <osprey-theme-switcher> import this rather than deduping `THEMES`
+ * themselves, so the two pickers can never offer a different set of families
+ * (or a different order) after a token regeneration.
+ *
+ * @returns {{id: string, label: string}[]}
+ */
+export function themeFamilies() {
+  /** @type {Map<string, string>} */
+  const seen = new Map();
+  for (const theme of _themes) {
+    if (!seen.has(theme.family)) seen.set(theme.family, familyLabel(theme.family));
+  }
+  return Array.from(seen, ([id, label]) => ({ id, label }));
+}
+
+/**
+ * The `mode` ('dark'|'light') of a concrete theme id, or null when `id` is
+ * not a recognized theme -- including `null` itself, e.g. `getTheme()` before
+ * `initTheme()` has resolved one.
+ *
+ * The single implementation for every theme control in the fleet, like
+ * `familyLabel` and `themeFamilies` above: `<osprey-theme-switcher>` and
+ * `<osprey-display-menu>` both reflect the active light/dark side off this
+ * rather than each reading `THEMES` for itself.
+ *
+ * @param {string|null} id
+ * @returns {string|null}
+ */
+export function modeOf(id) {
+  if (id === null) return null;
+  const theme = _themesById.get(id);
+  return theme ? theme.mode : null;
 }
 
 function _prefersDarkOS() {
@@ -321,13 +374,18 @@ function _parsePreferenceToken(token) {
  * ('auto' or a concrete id like 'dark') forward via _parsePreferenceToken.
  * Never throws -- storage errors, malformed JSON, and unrecognized values
  * all resolve to null (caller falls back to auto within DEFAULT_FAMILY).
+ *
+ * Reads the per-persona key on a scoped page, resolved here rather than at
+ * module load so the writer below and this reader always agree. A scoped page
+ * whose own key is empty has NO stored preference: it must not fall back to
+ * the bare key, which on a multi-user mount holds whichever persona wrote last.
  * @returns {Preference|null}
  */
 function _readStoredPreference() {
   /** @type {string|null} */
   let raw;
   try {
-    raw = window.localStorage.getItem(STORAGE_KEY);
+    raw = window.localStorage.getItem(scopedStorageKey(STORAGE_KEY));
   } catch {
     return null;
   }
@@ -352,13 +410,18 @@ function _readStoredPreference() {
 
 /**
  * Persist the (family, mode) preference as `{"family":..., "mode":...}`
- * JSON under STORAGE_KEY.
+ * JSON under STORAGE_KEY -- scoped per persona, resolved at write time through
+ * the same scopedStorageKey(STORAGE_KEY) the reader above uses. The stored
+ * VALUE shape is unaffected by scoping; only the key changes.
  * @param {string} family
  * @param {ModePreference} mode
  */
 function _persistPreference(family, mode) {
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ family, mode }));
+    window.localStorage.setItem(
+      scopedStorageKey(STORAGE_KEY),
+      JSON.stringify({ family, mode })
+    );
   } catch {
     // Storage unavailable (private browsing, quota) -- non-fatal; the
     // preference just won't survive a reload this session.
@@ -554,8 +617,8 @@ export function initTheme({ role = 'follower' } = {}) {
     // The mode comes from the server too, when the server stated one.
     // `data-theme-mode` is set only when the deployment configured a concrete
     // theme id (`web.theme: desy-light`) rather than a bare family
-    // (`web.theme: desy`) -- see resolve_web_theme_pinned_mode() in the web
-    // terminal's app.py. Without reading it, a configured light default would
+    // (`web.theme: desy`) -- see resolve_pinned_mode() in the design system's
+    // theme_config.py. Without reading it, a configured light default would
     // paint correctly and then be discarded one frame later by 'auto'
     // re-resolving the mode from the OS. A stored preference still outranks
     // it: config sets the DEFAULT, not a lock.
@@ -750,6 +813,93 @@ export function chartTheme() {
     xaxis: { gridcolor },
     yaxis: { gridcolor },
   };
+}
+
+/**
+ * A flat `Plotly.relayout()` update that re-themes an ALREADY-PLOTTED figure
+ * in place from the --chart-* tokens, whatever palette its author baked into
+ * the layout. The one owner of the token -> Plotly layout-key mapping for
+ * live re-theming: the artifact gallery's served plot pages and its own
+ * timeseries charts both apply exactly this.
+ *
+ * Always: paper/plot backgrounds, font color, legend background/border.
+ * Per subplot actually present on the figure (read from Plotly's own
+ * `_fullLayout._subplots`, falling back to the `layout` keys before the
+ * first plot): cartesian axes get grid/line/zeroline colors; every 3D scene
+ * gets its box, axis panes, grids, tick text and spike lines. Keys are only
+ * emitted for subplots the figure has -- relayouting `xaxis.*` onto a
+ * scene-only figure would make Plotly conjure an empty cartesian axis
+ * underneath it. Trace colors are never touched.
+ *
+ * @param {any} gd - the plotted Plotly graph div
+ * @returns {Record<string, string>}
+ */
+export function chartRelayout(gd) {
+  const styles = _computedStyles();
+  _checkSentinel(styles);
+  const paper = _readVar(styles, '--chart-paper-bg');
+  const plot = _readVar(styles, '--chart-plot-bg');
+  const text = _readVar(styles, '--chart-axis-text');
+  const grid = _readVar(styles, '--chart-grid');
+  const line = _readVar(styles, '--chart-axis-line');
+  const pane = _readVar(styles, '--chart-pane-bg');
+
+  /** @type {Record<string, string>} */
+  const update = {
+    paper_bgcolor: paper,
+    plot_bgcolor: plot,
+    'font.color': text,
+    'legend.bgcolor': paper,
+    'legend.bordercolor': line,
+  };
+  for (const axis of _cartesianAxes(gd)) {
+    update[`${axis}.gridcolor`] = grid;
+    update[`${axis}.linecolor`] = line;
+    update[`${axis}.zerolinecolor`] = line;
+  }
+  for (const scene of _scenes(gd)) {
+    update[`${scene}.bgcolor`] = plot;
+    for (const axis of ['xaxis', 'yaxis', 'zaxis']) {
+      update[`${scene}.${axis}.backgroundcolor`] = pane;
+      update[`${scene}.${axis}.gridcolor`] = grid;
+      // plotly.py's default template bakes an explicit white linecolor
+      // into every scene axis, and an explicit linecolor beats the
+      // `.color` cascade below -- so it has to be set by name.
+      update[`${scene}.${axis}.linecolor`] = line;
+      update[`${scene}.${axis}.zerolinecolor`] = line;
+      update[`${scene}.${axis}.color`] = text;
+      update[`${scene}.${axis}.spikecolor`] = text;
+    }
+  }
+  return update;
+}
+
+/**
+ * Layout keys of the cartesian axes a figure has (`xaxis`, `yaxis2`, ...).
+ * Plotly's `_fullLayout._subplots.xaxis`/`.yaxis` list axis ids (`x`,
+ * `y2`); before the first plot only the author's own `layout` keys exist.
+ * @param {any} gd
+ * @returns {string[]}
+ */
+function _cartesianAxes(gd) {
+  const subplots = gd?._fullLayout?._subplots;
+  if (subplots) {
+    return [...(subplots.xaxis || []), ...(subplots.yaxis || [])].map((id) =>
+      id.replace(/^([xy])(\d*)$/, '$1axis$2')
+    );
+  }
+  return Object.keys(gd?.layout || {}).filter((key) => /^[xy]axis\d*$/.test(key));
+}
+
+/**
+ * Layout keys of the 3D scenes a figure has (`scene`, `scene2`, ...).
+ * @param {any} gd
+ * @returns {string[]}
+ */
+function _scenes(gd) {
+  const subplots = gd?._fullLayout?._subplots;
+  if (subplots) return [...(subplots.gl3d || [])];
+  return Object.keys(gd?.layout || {}).filter((key) => /^scene\d*$/.test(key));
 }
 
 /** The categorical chart color palette, built from --chart-series-N. */

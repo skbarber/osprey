@@ -1,7 +1,9 @@
 """Tests for the channel_limits MCP tool.
 
 Covers: summary mode, exact lookup (found/not-found/mixed), regex search,
-property filters, combined search+filter, parameter validation, and limits-disabled.
+property filters, combined search+filter, parameter validation, limits-disabled,
+and the reported limits posture (tri-state allow_unlisted_channels plus the
+config key that answered, resolved for the session's control target).
 """
 
 from dataclasses import dataclass
@@ -21,19 +23,19 @@ from tests.mcp_server.conftest import (
 
 TEST_LIMITS_DB = {
     "_version": "1.0",
-    "defaults": {"writable": True, "verification": {"level": "callback"}},
+    "defaults": {"writable": True, "confirm": True},
     "MAG:HCM01:CURRENT:SP": {
         "min_value": -10.0,
         "max_value": 10.0,
         "max_step": 2.0,
         "writable": True,
-        "verification": {"level": "readback", "tolerance_percent": 0.1},
     },
     "MAG:QF01:CURRENT:SP": {"writable": False},
     "DIAG:TEMP:SP": {
         "min_value": 0.0,
         "max_value": 100.0,
         "writable": True,
+        "confirm": False,
     },
     "Amplifier 2 [J]": {
         "min_value": 0.0,
@@ -58,10 +60,33 @@ class FakeChannelLimitsConfig:
     writable: bool = True
 
 
-def _make_validator(allow_unlisted: bool = True) -> MagicMock:
-    """Build a mock LimitsValidator from TEST_LIMITS_DB."""
+def _resolve_confirm(channel_address: str) -> bool:
+    """Mirror LimitsValidator.resolve_confirm: channel → defaults → True."""
+    cfg = TEST_LIMITS_DB.get(channel_address)
+    if isinstance(cfg, dict) and "confirm" in cfg:
+        return bool(cfg["confirm"])
+    return bool(TEST_LIMITS_DB["defaults"].get("confirm", True))
+
+
+DEPLOYMENT_WIDE_KEY = "control_system.limits_checking.allow_unlisted_channels"
+VA_KEY = "control_system.connector.virtual_accelerator.limits_checking.allow_unlisted_channels"
+
+
+def _make_validator(
+    allow_unlisted: bool | None = True,
+    allow_unlisted_key: str = DEPLOYMENT_WIDE_KEY,
+) -> MagicMock:
+    """Build a mock LimitsValidator from TEST_LIMITS_DB.
+
+    Args:
+        allow_unlisted: The tri-state posture answer — ``None`` is an unset
+            deployment-wide key, which refuses unlisted channels.
+        allow_unlisted_key: The config key that answered, as
+            ``LimitsValidator._from_posture`` puts it into ``policy``.
+    """
     validator = MagicMock()
     validator._raw_db = TEST_LIMITS_DB
+    validator.resolve_confirm.side_effect = _resolve_confirm
 
     limits = {}
     for addr, cfg in TEST_LIMITS_DB.items():
@@ -77,9 +102,24 @@ def _make_validator(allow_unlisted: bool = True) -> MagicMock:
     validator.limits = limits
     validator.policy = {
         "allow_unlisted_channels": allow_unlisted,
+        "allow_unlisted_key": allow_unlisted_key,
         "on_violation": "error",
     }
     return validator
+
+
+def _patch_target(target: str | None = None, raises: bool = False):
+    """Patch the session control target the tool reads before building a validator."""
+    if raises:
+        return patch(
+            "osprey.mcp_server.control_system.tools.channel_limits.target_state.read",
+            side_effect=OSError("no shared data root"),
+        )
+    record = None if target is None else {"target": target, "generation": 3}
+    return patch(
+        "osprey.mcp_server.control_system.tools.channel_limits.target_state.read",
+        return_value=record,
+    )
 
 
 def _get_channel_limits():
@@ -111,7 +151,25 @@ async def test_summary_mode():
     assert data["summary"]["has_step_limit"] == 1
     assert data["summary"]["version"] == "1.0"
     assert data["access_details"]["policy"]["allow_unlisted_channels"] is True
+    assert data["access_details"]["policy"]["allow_unlisted_key"] == DEPLOYMENT_WIDE_KEY
     assert data["access_details"]["defaults"]["writable"] is True
+
+
+@pytest.mark.unit
+async def test_summary_confirm_breakdown():
+    """Summary reports how many channels resolve to confirm true vs false."""
+    with patch(
+        "osprey.connectors.control_system.limits_validator.LimitsValidator.from_config",
+        return_value=_make_validator(),
+    ):
+        fn = _get_channel_limits()
+        result = await fn()
+
+    data = extract_response_dict(result)
+    # Only DIAG:TEMP:SP opts out; the rest inherit defaults.confirm = true.
+    assert data["summary"]["confirm_breakdown"] == {"true": 5, "false": 1}
+    # The retired per-level breakdown is gone: no summary key names it any more.
+    assert not [key for key in data["summary"] if "verification" in key]
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +179,7 @@ async def test_summary_mode():
 
 @pytest.mark.unit
 async def test_lookup_found():
-    """Single known channel → full config with verification."""
+    """Single known channel → full config with the resolved confirm flag."""
     with patch(
         "osprey.connectors.control_system.limits_validator.LimitsValidator.from_config",
         return_value=_make_validator(),
@@ -136,7 +194,23 @@ async def test_lookup_found():
     assert ch["min_value"] == -10.0
     assert ch["max_value"] == 10.0
     assert ch["max_step"] == 2.0
-    assert ch["verification"]["level"] == "readback"
+    assert ch["confirm"] is True
+    assert "verification" not in ch
+
+
+@pytest.mark.unit
+async def test_lookup_confirm_opt_out():
+    """A channel with confirm: false reports it; defaults are not applied over it."""
+    with patch(
+        "osprey.connectors.control_system.limits_validator.LimitsValidator.from_config",
+        return_value=_make_validator(),
+    ):
+        fn = _get_channel_limits()
+        result = await fn(channels=["DIAG:TEMP:SP"])
+
+    data = extract_response_dict(result)
+    ch = data["access_details"]["channels"]["DIAG:TEMP:SP"]
+    assert ch["confirm"] is False
 
 
 @pytest.mark.unit
@@ -170,6 +244,122 @@ async def test_lookup_not_found_allowed():
     ch = data["access_details"]["channels"]["UNKNOWN:PV"]
     assert ch["in_database"] is False
     assert "allowed" in ch["policy_action"]
+
+
+@pytest.mark.unit
+async def test_summary_unset_reports_null_and_deployment_wide_key():
+    """Deployment-wide key unset → the summary reports null, not a permissive default."""
+    with (
+        _patch_target(),
+        patch(
+            "osprey.connectors.control_system.limits_validator.LimitsValidator.from_config",
+            return_value=_make_validator(allow_unlisted=None),
+        ),
+    ):
+        fn = _get_channel_limits()
+        result = await fn()
+
+    data = extract_response_dict(result)
+    policy = data["access_details"]["policy"]
+    assert policy["allow_unlisted_channels"] is None
+    assert policy["allow_unlisted_key"] == DEPLOYMENT_WIDE_KEY
+
+
+@pytest.mark.unit
+async def test_lookup_unset_is_refused_naming_the_deployment_wide_key():
+    """Unset is nobody's permission: the unlisted channel is refused, key named."""
+    with (
+        _patch_target(),
+        patch(
+            "osprey.connectors.control_system.limits_validator.LimitsValidator.from_config",
+            return_value=_make_validator(allow_unlisted=None),
+        ),
+    ):
+        fn = _get_channel_limits()
+        result = await fn(channels=["UNKNOWN:PV"])
+
+    data = extract_response_dict(result)
+    ch = data["access_details"]["channels"]["UNKNOWN:PV"]
+    assert ch["in_database"] is False
+    assert ch["allow_unlisted_channels"] is None
+    assert ch["allow_unlisted_key"] == DEPLOYMENT_WIDE_KEY
+    assert ch["policy_action"].startswith("BLOCKED")
+    assert DEPLOYMENT_WIDE_KEY in ch["policy_action"]
+
+
+@pytest.mark.unit
+async def test_posture_is_resolved_for_the_session_target():
+    """The tool asks for the posture of the target this server is on."""
+    with (
+        _patch_target("va"),
+        patch(
+            "osprey.connectors.control_system.limits_validator.LimitsValidator.from_config",
+            return_value=_make_validator(allow_unlisted=True, allow_unlisted_key=VA_KEY),
+        ) as from_config,
+    ):
+        fn = _get_channel_limits()
+        result = await fn(channels=["UNKNOWN:PV"])
+
+    from_config.assert_called_once_with(target="va")
+    data = extract_response_dict(result)
+    ch = data["access_details"]["channels"]["UNKNOWN:PV"]
+    assert ch["allow_unlisted_channels"] is True
+    assert ch["allow_unlisted_key"] == VA_KEY
+    assert ch["policy_action"] == "allowed (no limits enforced)"
+
+
+@pytest.mark.unit
+async def test_summary_reports_the_per_target_key():
+    """A per-type block answers: the summary names that key, not the deployment-wide one."""
+    with (
+        _patch_target("va"),
+        patch(
+            "osprey.connectors.control_system.limits_validator.LimitsValidator.from_config",
+            return_value=_make_validator(allow_unlisted=True, allow_unlisted_key=VA_KEY),
+        ),
+    ):
+        fn = _get_channel_limits()
+        result = await fn()
+
+    data = extract_response_dict(result)
+    assert data["access_details"]["policy"]["allow_unlisted_key"] == VA_KEY
+
+
+@pytest.mark.unit
+async def test_unreadable_target_state_falls_back_to_the_deployment_wide_block():
+    """An unreadable state directory is not fatal: no target → deployment-wide posture."""
+    with (
+        _patch_target(raises=True),
+        patch(
+            "osprey.connectors.control_system.limits_validator.LimitsValidator.from_config",
+            return_value=_make_validator(),
+        ) as from_config,
+    ):
+        fn = _get_channel_limits()
+        result = await fn()
+
+    from_config.assert_called_once_with(target=None)
+    assert extract_response_dict(result)["status"] == "success"
+
+
+@pytest.mark.unit
+async def test_hand_built_policy_without_a_key_names_the_deployment_wide_one():
+    """A validator built from a bare policy dict carries no key; report the honest default."""
+    validator = _make_validator(allow_unlisted=False)
+    del validator.policy["allow_unlisted_key"]
+    with (
+        _patch_target("live"),
+        patch(
+            "osprey.connectors.control_system.limits_validator.LimitsValidator.from_config",
+            return_value=validator,
+        ),
+    ):
+        fn = _get_channel_limits()
+        result = await fn(channels=["UNKNOWN:PV"])
+
+    ch = extract_response_dict(result)["access_details"]["channels"]["UNKNOWN:PV"]
+    assert ch["allow_unlisted_channels"] is False
+    assert ch["allow_unlisted_key"] == DEPLOYMENT_WIDE_KEY
 
 
 @pytest.mark.unit
@@ -224,6 +414,23 @@ async def test_pattern_match():
     assert data["summary"]["matches"] == 2
     assert "MAG:HCM01:CURRENT:SP" in data["access_details"]["channels"]
     assert "MAG:QF01:CURRENT:SP" in data["access_details"]["channels"]
+
+
+@pytest.mark.unit
+async def test_search_entries_carry_confirm():
+    """Compact search entries report confirm, never verification vocabulary."""
+    with patch(
+        "osprey.connectors.control_system.limits_validator.LimitsValidator.from_config",
+        return_value=_make_validator(),
+    ):
+        fn = _get_channel_limits()
+        result = await fn(pattern=".*")
+
+    data = extract_response_dict(result)
+    channels = data["access_details"]["channels"]
+    assert channels["MAG:HCM01:CURRENT:SP"]["confirm"] is True
+    assert channels["DIAG:TEMP:SP"]["confirm"] is False
+    assert all("verification" not in key for entry in channels.values() for key in entry)
 
 
 @pytest.mark.unit
@@ -343,19 +550,25 @@ async def test_filter_has_step_limit():
 
 
 @pytest.mark.unit
-async def test_filter_readback_verified():
-    """filter_by=readback_verified → channels with readback verification."""
-    with patch(
-        "osprey.connectors.control_system.limits_validator.LimitsValidator.from_config",
-        return_value=_make_validator(),
-    ):
-        fn = _get_channel_limits()
-        result = await fn(filter_by="readback_verified")
+async def test_the_filter_set_carries_no_retired_readback_filter():
+    """Only the four live property filters are accepted; a readback one is not.
 
-    data = extract_response_dict(result)
-    channels = data["access_details"]["channels"]
-    assert len(channels) == 1
-    assert "MAG:HCM01:CURRENT:SP" in channels
+    The tool once offered a filter keyed on the retired per-channel readback
+    setting. Pinning ``VALID_FILTERS`` itself is what keeps it from coming
+    back — the rejection below only proves the guard still names what it
+    refused.
+    """
+    from osprey.mcp_server.control_system.tools.channel_limits import VALID_FILTERS
+
+    assert VALID_FILTERS == {"writable", "read_only", "has_step_limit", "has_range"}
+    assert not [name for name in VALID_FILTERS if "readback" in name or "verif" in name]
+
+    fn = _get_channel_limits()
+    with assert_raises_error(error_type="validation_error") as _exc_ctx:
+        await fn(filter_by="readback")
+
+    data = _exc_ctx["envelope"]
+    assert "readback" in data["error_message"]
 
 
 # ---------------------------------------------------------------------------

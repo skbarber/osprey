@@ -187,7 +187,7 @@ def _normalize(text: str) -> str:
 def _override_yaml() -> str:
     """The ``--override`` content that opts this project into the stored archive.
 
-    Three decisions, each load-bearing:
+    Four decisions, each load-bearing:
 
     ``va_archiver:`` declares the store — which injects the mongodb and
     archiver_recorder services and renders the connector's connection keys.
@@ -210,6 +210,23 @@ def _override_yaml() -> str:
     injectors append leaves precisely ``[virtual_accelerator, mongodb,
     archiver_recorder]`` — verified in the built config, not assumed.
 
+    ``virtual_accelerator.live_standin: null`` switches the preset's live
+    stand-in off — the delete-the-line escape the profile documents, spelled as
+    a null because an override cannot remove a key. The preset ships a second
+    simulator as the ``live`` target, and the recorder follows the machine the
+    deployment calls live: with the stand-in deployed, the setpoints this lane
+    writes to the sandbox VA would never reach the archive it then reads.
+    Nulling the key keeps the recorder on the VA under test, and keeps a second
+    emulated container out of the build.
+
+    Trimming ``deployed_services`` does not switch off the preset's consumers
+    of what it trimmed away, and the build refuses a deploying render whose
+    consumer is on for a service it does not run — the ARIEL database and
+    hybrid search (``ariel:`` nulled, the section being both consumers'
+    switch), the OTLP exporter and the bluesky MCP server are switched off
+    here by the keys that refusal names. Nothing in this lane dials any of
+    them.
+
     That trim is not only about speed. The preset's full stack publishes
     postgres, openobserve, the bluesky bridge, Tiled and the panels on fixed
     host ports, and a developer box running any OSPREY demo stack already holds
@@ -223,9 +240,14 @@ def _override_yaml() -> str:
         "  archiver.type: mongodb_archiver\n"
         "  modules.web_terminals.enabled: false\n"
         "  deployed_services: []\n"
+        "  ariel:\n"
+        "  claude_code.telemetry.enabled: false\n"
+        "  claude_code.servers.bluesky.enabled: false\n"
         "va_archiver:\n"
         f"  port_host: {MONGO_PORT_HOST}\n"
         f"  freshness_channel: {FRESHNESS_CANARY}\n"
+        "virtual_accelerator:\n"
+        "  live_standin: null\n"
         "bluesky: null\n"
         "bluesky_web: null\n"
         "dispatch: null\n"

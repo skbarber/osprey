@@ -64,9 +64,23 @@ _SYSTEM_VARS = (
 # ``config_path`` argument, never inherited.
 _HOOK_VARS = (
     "CLAUDE_PROJECT_DIR",
+    "CLAUDE_CONFIG_DIR",
     "OSPREY_HOOK_CONFIG",
     "OSPREY_HOOK_DEBUG",
     "OSPREY_DISPATCH_RUN",
+    # Session posture. Forwarded so a test can put a hook subprocess in the
+    # sandbox posture with ``monkeypatch.setenv``; without it here the curated
+    # environment drops the variable and a posture test passes for the wrong
+    # reason. Blanked by default in :func:`_no_session_posture` so the value
+    # can only ever arrive from the test that asked for it.
+    "OSPREY_EXECUTION_MODE",
+    # The per-(session, target) posture store's two anchors, always stamped as a
+    # pair by the web server. Forwarded for the same reason and blanked in the
+    # same fixture: a developer running the suite from inside a web-terminal
+    # session would otherwise hand every hook subprocess a session key and an
+    # agent-data root no test asked for.
+    "OSPREY_POSTURE_SESSION",
+    "OSPREY_AGENT_DATA_ROOT",
     "OSPREY_WEB_PORT",
     "OSPREY_WEB_UX",
     "BLUESKY_BRIDGE_URL",
@@ -223,6 +237,28 @@ def _isolated_home(hook_home, monkeypatch):
     """
     monkeypatch.setenv("HOME", str(hook_home))
     monkeypatch.setenv("USERPROFILE", str(hook_home))
+    # The state root Claude Code actually honours. Unset here so the default
+    # ``$HOME/.claude`` path is what the tests exercise; a test that wants the
+    # container layout sets it explicitly.
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_session_posture(session_posture_leak_guard):
+    """Run every hook test outside a session posture unless it asks for one.
+
+    All three anchors are blanked suite-wide by
+    ``tests/conftest.py::session_posture_leak_guard``, and this fixture depends
+    on it rather than restating them. It matters more here than anywhere else:
+    all three are forwarded to hook subprocesses through ``_HOOK_VARS``, so a
+    developer running the suite from inside a narrowed web-terminal session
+    would otherwise put every hook under a posture — deployment-wide or
+    per-target — that no test asked for.
+
+    Tests that want any of the three set it with ``monkeypatch.setenv`` in the
+    test body, which runs after both fixtures.
+    """
     yield
 
 

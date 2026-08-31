@@ -19,6 +19,12 @@ import pytest
 
 from osprey.services.ariel_search.config import ARIELConfig, DatabaseConfig, SearchModuleConfig
 from osprey.services.ariel_search.enhancement.qmd_export.writer import encode_entry_id
+from osprey.services.ariel_search.models import DiagnosticLevel
+from osprey.services.ariel_search.search.base import (
+    ExpansionGroup,
+    ModuleOutput,
+    QueryExpansion,
+)
 from osprey.services.ariel_search.search.qmd import (
     ARIEL_COLLECTION,
     DEFAULT_CANDIDATE_LIMIT,
@@ -165,6 +171,29 @@ class TestDescriptor:
         assert by_name["rerank"].default is DEFAULT_RERANK
         assert by_name["candidate_limit"].default == DEFAULT_CANDIDATE_LIMIT
 
+    def test_parameter_descriptors_report_the_configured_values(self):
+        """The panel opens on what a query would do, not on what ships."""
+        by_name = {
+            p.name: p
+            for p in get_parameter_descriptors(
+                make_config({"rerank": False, "candidate_limit": 12})
+            )
+        }
+        assert by_name["rerank"].default is False
+        assert by_name["candidate_limit"].default == 12
+
+    def test_malformed_config_falls_back_instead_of_raising(self):
+        """Describing the module survives a key the query path would refuse."""
+        by_name = {p.name: p for p in get_parameter_descriptors(make_config({"rerank": "junk"}))}
+        assert by_name["rerank"].default is DEFAULT_RERANK
+        assert by_name["candidate_limit"].default == DEFAULT_CANDIDATE_LIMIT
+
+    def test_rerank_description_describes_the_cost_without_a_multiplier(self):
+        """The panel hint explains the mechanism; perf ratios are not ours to promise."""
+        rerank = {p.name: p for p in get_parameter_descriptors()}["rerank"]
+        assert "4x" not in rerank.description
+        assert "slower" in rerank.description.casefold()
+
     def test_registered_in_builtins(self):
         from osprey.registry.builtins import FrameworkRegistryProvider
 
@@ -186,6 +215,13 @@ class TestDescriptor:
 
 class TestSettings:
     """``search_modules.hybrid.settings`` resolution."""
+
+    def test_shipped_defaults_are_rerank_on_and_forty_candidates(self):
+        """Pinned here because the descriptors no longer pin them by construction."""
+        assert DEFAULT_RERANK is True
+        assert DEFAULT_CANDIDATE_LIMIT == 40
+        assert HybridSearchSettings().rerank is True
+        assert HybridSearchSettings().candidate_limit == 40
 
     def test_defaults_when_unconfigured(self):
         settings = HybridSearchSettings.from_ariel_config(make_config())
@@ -788,6 +824,164 @@ class TestSidecarFaults:
 
 
 # --------------------------------------------------------------------------
+# Reranker fallback
+# --------------------------------------------------------------------------
+
+
+class RerankFaultClient(StubClient):
+    """A client whose reranked queries fail and whose fast queries answer.
+
+    Models the fault this fallback exists for: the sidecar is up — ``/health``
+    answered at resolve time — but the reranker itself cannot serve the query,
+    because its model is still loading after a restart or because the reranked
+    query took the daemon down. The unreranked path still answers.
+    """
+
+    def __init__(
+        self,
+        hits: list[QMDSearchResult] | None = None,
+        *,
+        error: Exception | None = None,
+        retry_error: Exception | None = None,
+    ) -> None:
+        super().__init__(hits)
+        self._rerank_error = error or RuntimeError("reranker model is still loading")
+        self._retry_error = retry_error
+
+    def query(self, collection: str | None, text: str, **kwargs: Any) -> list[QMDSearchResult]:
+        if kwargs.get("rerank"):
+            self.calls.append({"collection": collection, "text": text, **kwargs})
+            raise self._rerank_error
+        if self._retry_error is not None:
+            self.calls.append({"collection": collection, "text": text, **kwargs})
+            raise self._retry_error
+        return super().query(collection, text, **kwargs)
+
+
+class TestRerankFallback:
+    """A reranked-query failure degrades the ranking; it never breaks search."""
+
+    @pytest.mark.asyncio
+    async def test_failed_rerank_retries_without_the_reranker(self):
+        client = RerankFaultClient([make_hit("1")])
+        repo = StubRepository([make_entry("1")])
+
+        result = await hybrid_search("beam", repo, make_config({"rerank": True}), client=client)
+
+        assert isinstance(result, ModuleOutput)
+        assert [call["rerank"] for call in client.calls] == [True, False]
+        ((entry, _, _),) = result.entries
+        assert entry["entry_id"] == "1"
+
+    @pytest.mark.asyncio
+    async def test_the_retry_is_otherwise_the_same_query(self):
+        """Only ``rerank`` changes — a narrower retry would answer differently."""
+        client = RerankFaultClient([])
+
+        await hybrid_search(
+            "beam",
+            StubRepository([]),
+            make_config({"rerank": True}),
+            client=client,
+            max_results=7,
+            candidate_limit=11,
+        )
+
+        first, retry = client.calls
+        assert {key: value for key, value in first.items() if key != "rerank"} == {
+            key: value for key, value in retry.items() if key != "rerank"
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_degraded_ranking_is_reported_as_a_warning(self):
+        client = RerankFaultClient([make_hit("1")])
+        repo = StubRepository([make_entry("1")])
+
+        result = await hybrid_search("beam", repo, make_config({"rerank": True}), client=client)
+
+        (diagnostic,) = result.diagnostics
+        assert diagnostic.level is DiagnosticLevel.WARNING
+        assert diagnostic.source == "hybrid"
+        assert "rerank" in diagnostic.message.lower()
+
+    @pytest.mark.asyncio
+    async def test_any_exception_triggers_the_retry(self):
+        """The client raises whatever its transport raised; all of it falls back."""
+        client = RerankFaultClient([make_hit("1")], error=TimeoutError("read timed out"))
+        repo = StubRepository([make_entry("1")])
+
+        result = await hybrid_search("beam", repo, make_config({"rerank": True}), client=client)
+
+        assert isinstance(result, ModuleOutput)
+        assert [call["rerank"] for call in client.calls] == [True, False]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_retry_raises_the_retrys_error(self):
+        """One retry, not a loop: if the fast path is down too, search is down."""
+        client = RerankFaultClient(
+            error=TimeoutError("read timed out"),
+            retry_error=RuntimeError("qmd daemon is gone"),
+        )
+
+        with pytest.raises(RuntimeError, match="qmd daemon is gone"):
+            await hybrid_search(
+                "beam", StubRepository([]), make_config({"rerank": True}), client=client
+            )
+        assert [call["rerank"] for call in client.calls] == [True, False]
+
+    @pytest.mark.asyncio
+    async def test_a_working_reranker_queries_once_and_returns_a_bare_list(self):
+        client = StubClient([make_hit("1")])
+        repo = StubRepository([make_entry("1")])
+
+        results = await hybrid_search("beam", repo, make_config({"rerank": True}), client=client)
+
+        assert isinstance(results, list)
+        assert len(client.calls) == 1
+        assert client.calls[0]["rerank"] is True
+
+    @pytest.mark.asyncio
+    async def test_an_unreranked_query_is_never_retried(self):
+        """With the reranker off there is nothing to fall back to."""
+        client = StubClient([make_hit("1")], error=RuntimeError("index missing"))
+
+        with pytest.raises(RuntimeError, match="index missing"):
+            await hybrid_search(
+                "beam", StubRepository([]), make_config({"rerank": False}), client=client
+            )
+        assert len(client.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_zero_hit_fallback_still_reports_the_warning(self):
+        """The degraded ranking is news even when it ranked nothing."""
+        client = RerankFaultClient([])
+
+        result = await hybrid_search(
+            "beam", StubRepository([]), make_config({"rerank": True}), client=client
+        )
+
+        assert isinstance(result, ModuleOutput)
+        assert result.entries == []
+        assert len(result.diagnostics) == 1
+
+    @pytest.mark.asyncio
+    async def test_one_output_carries_both_the_warning_and_the_expansion(self):
+        client = RerankFaultClient([make_hit("1")])
+        repo = StubRepository([make_entry("1")])
+
+        result = await hybrid_search(
+            "ts fault",
+            repo,
+            make_config({"rerank": True}),
+            client=client,
+            query_expansion=AMBIGUOUS_EXPANSION,
+        )
+
+        assert result.expansion == AMBIGUOUS_GROUPS
+        assert len(result.diagnostics) == 1
+
+
+# --------------------------------------------------------------------------
 # Service integration
 # --------------------------------------------------------------------------
 
@@ -822,3 +1016,130 @@ class TestServiceDispatch:
         )
 
         assert client.calls
+
+
+# --------------------------------------------------------------------------
+# Vocabulary expansion
+# --------------------------------------------------------------------------
+
+
+AMBIGUOUS_GROUPS = (ExpansionGroup(original="ts", alternatives=("troubleshoot", "timing system")),)
+AMBIGUOUS_EXPANSION = QueryExpansion(
+    groups=AMBIGUOUS_GROUPS,
+    flattened_text="ts fault troubleshoot timing system",
+)
+
+
+class TestVocabularyExpansion:
+    """What the sidecar is sent, and what comes back, when expansion is active.
+
+    Hybrid search matches on the whole query, so expansion is one substitution:
+    the sidecar — and therefore its reranker — sees the flattened text instead
+    of the raw query. Nothing is truncated on the way.
+    """
+
+    @pytest.mark.asyncio
+    async def test_flattened_text_reaches_the_sidecar(self):
+        client = StubClient([])
+
+        await hybrid_search(
+            "ts fault",
+            StubRepository([]),
+            make_config(),
+            client=client,
+            query_expansion=AMBIGUOUS_EXPANSION,
+        )
+
+        assert client.calls[0]["text"] == "ts fault troubleshoot timing system"
+
+    @pytest.mark.asyncio
+    async def test_raw_query_reaches_the_sidecar_without_expansion(self):
+        """Without an expansion the call is byte-identical to today's."""
+        client = StubClient([])
+
+        await hybrid_search("ts fault", StubRepository([]), make_config(), client=client)
+
+        assert client.calls[0]["text"] == "ts fault"
+
+    @pytest.mark.asyncio
+    async def test_long_query_is_not_truncated(self):
+        """The 1000-char cap is keyword-only; hybrid queries go whole."""
+        client = StubClient([])
+        query = "beam loss " * 120  # 1200 characters
+
+        await hybrid_search(query, StubRepository([]), make_config(), client=client)
+
+        assert client.calls[0]["text"] == query
+
+    @pytest.mark.asyncio
+    async def test_without_expansion_a_bare_list_is_returned(self):
+        """Direct callers keep the list they have always received."""
+        client = StubClient([make_hit("1")])
+        repo = StubRepository([make_entry("1")])
+
+        results = await hybrid_search("beam", repo, make_config(), client=client)
+
+        assert isinstance(results, list)
+        assert len(results) == 1
+
+    @pytest.mark.asyncio
+    async def test_with_expansion_a_module_output_carries_the_groups(self):
+        client = StubClient([make_hit("1")])
+        repo = StubRepository([make_entry("1")])
+
+        result = await hybrid_search(
+            "ts fault",
+            repo,
+            make_config(),
+            client=client,
+            query_expansion=AMBIGUOUS_EXPANSION,
+        )
+
+        assert isinstance(result, ModuleOutput)
+        assert result.expansion == AMBIGUOUS_GROUPS
+        assert result.diagnostics == ()
+        ((entry, score, snippets),) = result.entries
+        assert entry["entry_id"] == "1"
+        assert isinstance(score, float)
+        assert isinstance(snippets, list)
+
+    @pytest.mark.asyncio
+    async def test_zero_hit_path_keeps_the_shape(self):
+        """A query the sidecar answers with nothing still answers in shape."""
+        client = StubClient([])
+
+        result = await hybrid_search(
+            "ts fault",
+            StubRepository([]),
+            make_config(),
+            client=client,
+            query_expansion=AMBIGUOUS_EXPANSION,
+        )
+
+        assert isinstance(result, ModuleOutput)
+        assert result.entries == []
+
+    @pytest.mark.asyncio
+    async def test_blank_query_keeps_the_shape_without_reaching_the_sidecar(self):
+        client = StubClient([])
+
+        result = await hybrid_search(
+            "   ",
+            StubRepository([]),
+            make_config(),
+            client=client,
+            query_expansion=AMBIGUOUS_EXPANSION,
+        )
+
+        assert isinstance(result, ModuleOutput)
+        assert result.entries == []
+        assert client.calls == []
+
+    def test_descriptor_opts_into_expansion(self):
+        descriptor = get_tool_descriptor()
+
+        assert descriptor.accepts_expansion is True
+
+    def test_descriptor_declares_no_query_parser(self):
+        """Hybrid search matches whole text — there is nothing to parse."""
+        assert get_tool_descriptor().query_parser is None

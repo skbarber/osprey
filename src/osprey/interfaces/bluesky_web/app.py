@@ -4,8 +4,10 @@ shared HTTP client onto the Bluesky bridge.
 What the app owns is serving and plumbing: its container healthcheck, a default
 no-cache header on everything that does not set one itself, one
 ``httpx.AsyncClient`` and resolved
-bridge URL published on ``app.state`` for every router to use, and the static
-mounts for the panel bundles plus the shared design-system assets.
+bridge URL published on ``app.state`` for every router to use, and the mounts
+for the panel bundles plus the shared design-system assets. Each bundle is
+served verbatim except its ``index.html``, which is rendered so ``vendor_url()``
+can resolve highlight.js to the CDN or to a locally fetched copy.
 
 What it does NOT own is policy. The bridge-facing routers it composes — the read
 proxy, the plan-draft relay and the plan-queue relay — relay to the bridge
@@ -25,17 +27,25 @@ Stays import-clean of ``bluesky``/``ophyd``/``tiled`` at module scope, mirroring
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.templating import Jinja2Templates
+from starlette.responses import Response
 from starlette.staticfiles import StaticFiles
 
-from osprey.bluesky_bridge_connection import resolve_bridge_url
+from osprey.bluesky_bridge_connection import (
+    LANE_ONE,
+    lane_declared_target,
+    resolve_bridge_url,
+    resolve_lane_bridge_urls,
+)
 from osprey.interfaces._app_setup import configure_interface_app
 from osprey.interfaces.bluesky_web import channels, draft_relay, queue_relay, read_proxy
+from osprey.interfaces.vendor import vendor_url
 
 # Panel bundle directories (relative to this module's directory) and the mount
 # path each is served under. Directories are created on startup if absent, so
@@ -48,6 +58,29 @@ _BLUESKY_PANEL_DIR = "bluesky"
 
 # (mount path, bundle directory).
 _PANEL_MOUNTS: tuple[tuple[str, str], ...] = (("/bluesky", _BLUESKY_PANEL_DIR),)
+
+#: The roster ``GET /lanes`` answers before the lifespan has resolved one —
+#: and the roster every single-lane deployment keeps: the one lane every
+#: deployment has had since the bridge shipped, declaring no target because
+#: its config block has never carried one (the panel labels it by the
+#: capability record its bridge publishes instead).
+_SINGLE_LANE_ROSTER: tuple[dict, ...] = ({"lane": LANE_ONE, "lane_target": None},)
+
+
+def _lane_roster(lane_urls: dict[str, str]) -> tuple[dict, ...]:
+    """The plan lanes this sidecar can address, as ``GET /lanes`` reports them.
+
+    One entry per lane the sidecar holds a bridge URL for — the same mapping
+    the read proxy and both relays route ``?lane=`` by, so the roster can
+    never claim a lane a request would then 404 on. ``lane_target`` is the
+    control target the lane's own ``services.<lane>`` block declares
+    (:func:`~osprey.bluesky_bridge_connection.lane_declared_target`), which a
+    two-lane render writes on every lane; ``None`` is the single-lane
+    deployment, whose block has never carried one.
+    """
+    if not lane_urls:
+        return _SINGLE_LANE_ROSTER
+    return tuple({"lane": key, "lane_target": lane_declared_target(key)} for key in lane_urls)
 
 
 @asynccontextmanager
@@ -65,6 +98,19 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # sidecar and the Bluesky MCP server agree on which bridge instance to talk
     # to.
     _app.state.bridge_url = resolve_bridge_url()
+    # A deployment that renders two PLAN LANES has two bridges, and the read
+    # proxy addresses them by lane (`?lane=`). Publishing the mapping here is
+    # what makes that addressing resolvable at request time. It is set ONLY on
+    # a multi-lane deployment: a single-lane sidecar publishes the one
+    # `bridge_url` it always has, and `resolve_lane_bridge_url` falls back to
+    # exactly that, so nothing about those deployments changes.
+    lane_urls = resolve_lane_bridge_urls()
+    if lane_urls:
+        _app.state.bridge_urls = lane_urls
+    # The roster the panel builds its lane picker from — computed once here,
+    # beside the URL map it mirrors, so the two cannot disagree at request
+    # time about which lanes exist.
+    _app.state.lanes = _lane_roster(lane_urls)
     try:
         yield
     finally:
@@ -102,6 +148,21 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/lanes")
+def lanes(request: Request) -> dict:
+    """The plan lanes this sidecar can address, in render order.
+
+    The panel builds its lane picker from this roster — lane keys plus the
+    control target each lane's own config block declares — and shows the
+    picker only when there is more than one entry, so a single-lane deployment
+    (every deployment until a second lane is opted in) renders exactly the
+    panel it always has. Whether a lane can *execute* is deliberately not
+    answered here: that is the bridge's own capability record, read per lane
+    through ``GET /bridge/health?lane=``.
+    """
+    return {"lanes": list(getattr(request.app.state, "lanes", _SINGLE_LANE_ROSTER))}
+
+
 # Wire the bridge read-proxy, the plan-draft relay, and the plan-queue relay
 # onto the app. Each router reads the shared httpx client + bridge URL from
 # ``app.state`` at request time (set in _lifespan). The queue relay carries the
@@ -114,11 +175,38 @@ app.include_router(queue_relay.router)
 app.include_router(channels.router)
 
 
+def _panel_index_route(templates: Jinja2Templates) -> Callable:
+    """Build the GET handler that renders one bundle's ``index.html``.
+
+    The index is the single bundle file rendered rather than served verbatim,
+    because it is the only one that has to name highlight.js: ``vendor_url()``
+    resolves to the CDN by default and to the locally fetched ``vendor/`` dir
+    under ``OSPREY_OFFLINE``, and only a template can make that choice at
+    request time. Bound through a factory so each bundle closes over its own
+    ``templates`` rather than the loop variable.
+    """
+
+    async def _index(request: Request) -> Response:
+        return templates.TemplateResponse(request, "index.html", {})
+
+    return _index
+
+
 for _mount_path, _panel_name in _PANEL_MOUNTS:
     _panel_dir = _PANELS_ROOT / _panel_name
     os.makedirs(_panel_dir, exist_ok=True)
-    # Mount name keys off the mount PATH, not the bundle directory: the two
-    # mounts sharing one bundle would otherwise collide on a single name.
+    _templates = Jinja2Templates(directory=str(_panel_dir))
+    _templates.env.globals["vendor_url"] = vendor_url
+    # Registered BEFORE the mount: Starlette matches in declaration order, so
+    # these three spellings of "the bundle root" reach the renderer while the
+    # StaticFiles mount below still serves every other file verbatim. Without
+    # them, `html=True` would answer the bare directory with the raw,
+    # unrendered index.
+    _index_route = _panel_index_route(_templates)
+    for _index_path in (_mount_path, f"{_mount_path}/", f"{_mount_path}/index.html"):
+        app.get(_index_path, include_in_schema=False)(_index_route)
+    # Mount name keys off the mount PATH, not the bundle directory: two mounts
+    # sharing one bundle would otherwise collide on a single name.
     app.mount(
         _mount_path,
         StaticFiles(directory=_panel_dir, html=True),

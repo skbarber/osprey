@@ -6,7 +6,17 @@ import logging
 import pytest
 
 from osprey.deployment.web_terminals.render import render_web_terminals
-from osprey.registry.mcp import HOOK_PRESETS, resolve_agents, resolve_servers
+from osprey.registry.mcp import (
+    _WRITES_CHECK,
+    FRAMEWORK_SERVERS,
+    HOOK_PRESETS,
+    MIXED_READ_WRITE_TEMPLATES,
+    framework_mixed_read_write_tools,
+    mixed_read_write_tools,
+    resolve_agents,
+    resolve_servers,
+    writes_check_matchers,
+)
 from osprey.utils.workspace import DEFAULT_AGENT_DATA_BASE_DIR
 
 # ---------------------------------------------------------------------------
@@ -49,7 +59,7 @@ class TestResolveServers:
         # Core servers always on
         assert {"controls", "osprey_workspace", "ariel"} <= enabled
         # Conditional servers off (conditions not in ctx); opt-in servers off by default
-        assert {"channel-finder", "health"} <= disabled
+        assert {"channel-finder", "health", "graph"} <= disabled
 
     def test_resolve_disable_framework_server(self):
         """New format: servers: {ariel: {enabled: false}}."""
@@ -80,10 +90,35 @@ class TestResolveServers:
         assert s["enabled"] is True
         assert s["command"] == "node"
         assert s["args"] == ["server.js"]
-        assert s["env"] == {"MY_KEY": "val"}
+        # Spec env, plus the framework-owned tool-prefix identity every server
+        # gets post-merge (see tests/registry/test_tool_prefix.py).
+        assert s["env"] == {"MY_KEY": "val", "OSPREY_MCP_TOOL_PREFIX": "my-server"}
         assert s["permissions_allow"] == ["read_data"]
         assert s["permissions_ask"] == ["write_data"]
         assert s["is_custom"] is True
+
+    def test_resolve_external_command_resolves_current_python_env(self):
+        """An external server's ``command`` resolves {current_python_env}
+        the same way ``args`` and ``env`` already do."""
+        ctx = _base_ctx()
+        cfg = {"servers": {"my-server": {"command": "{current_python_env}"}}}
+        s = _resolve_one(cfg, "my-server", ctx)
+        assert s["command"] == "/usr/bin/python3"
+
+    def test_resolve_external_command_resolves_project_root(self):
+        """An external server's ``command`` resolves {project_root}."""
+        ctx = _base_ctx()
+        cfg = {"servers": {"my-server": {"command": "{project_root}/bin/x"}}}
+        s = _resolve_one(cfg, "my-server", ctx)
+        assert s["command"] == "/tmp/test-project/bin/x"
+
+    def test_resolve_external_command_leaves_dollar_var_untouched(self):
+        """``${VAR}`` in an external server's ``command`` survives verbatim,
+        matching the existing behavior for ``args`` and ``env``."""
+        ctx = _base_ctx()
+        cfg = {"servers": {"my-server": {"command": "${TOOL_HOME}/bin/x"}}}
+        s = _resolve_one(cfg, "my-server", ctx)
+        assert s["command"] == "${TOOL_HOME}/bin/x"
 
     def test_resolve_custom_server_url_defaults_to_http_transport(self):
         """A URL server without a transport key resolves as streamable-HTTP."""
@@ -138,6 +173,30 @@ class TestResolveServers:
             servers = resolve_servers(cfg, ctx)
         assert not [s for s in servers if s["name"] == "typo-api"]
         assert "invalid transport" in caplog.text
+
+    def test_resolve_custom_server_double_underscore_name_rejected(self, caplog):
+        """A ``__`` in a custom server name is rejected loudly, like extends clones.
+
+        Tool names are ``mcp__<server>__<tool>``, so a server named
+        ``my__server`` would make every consumer that splits on the first
+        ``__`` (transcript reader, display formatting) silently mis-attribute
+        its calls to a server named ``my``.
+        """
+        ctx = _base_ctx()
+        cfg = {"servers": {"my__server": {"command": "node", "args": ["s.js"]}}}
+        with caplog.at_level("WARNING"):
+            servers = resolve_servers(cfg, ctx)
+        assert not [s for s in servers if s["name"] == "my__server"]
+        assert "my__server" in caplog.text
+
+    def test_resolve_custom_server_trailing_underscore_rejected(self, caplog):
+        """A trailing ``_`` makes ``mcp__<server>__`` ambiguous — rejected."""
+        ctx = _base_ctx()
+        cfg = {"servers": {"srv_": {"command": "node", "args": ["s.js"]}}}
+        with caplog.at_level("WARNING"):
+            servers = resolve_servers(cfg, ctx)
+        assert not [s for s in servers if s["name"] == "srv_"]
+        assert "srv_" in caplog.text
 
     def test_resolve_custom_server_transport_on_stdio_ignored(self, caplog):
         """A command server declaring transport keeps working; the key is ignored loudly."""
@@ -197,10 +256,18 @@ class TestResolveServers:
         makes config resolution fall back to CWD/config.yml and fail. Regression
         guard: osprey_workspace / ariel / channel-finder used to omit it.
         """
-        ctx = _base_ctx(channel_finder_pipeline="hierarchical")
+        ctx = _base_ctx(channel_finder_pipeline="hierarchical", graphdb_configured=True)
         servers = resolve_servers({}, ctx)
         expected = "/tmp/test-project/build/config.yml"
-        for name in ("controls", "python", "osprey_workspace", "ariel", "health", "channel-finder"):
+        for name in (
+            "controls",
+            "python",
+            "osprey_workspace",
+            "ariel",
+            "health",
+            "channel-finder",
+            "graph",
+        ):
             srv = [s for s in servers if s["name"] == name][0]
             assert srv["env"].get("CONFIG_FILE") == expected, (
                 f"{name} must set CONFIG_FILE={expected!r}, got {srv['env'].get('CONFIG_FILE')!r}"
@@ -375,6 +442,25 @@ class TestResolveServers:
         custom = [s for s in servers if s["name"] == "my-server"][0]
         assert custom["hooks_pre"] == []
 
+    @pytest.mark.parametrize(
+        "bad_env", [None, ["A=1"], "A=1", 7], ids=["null", "list", "str", "int"]
+    )
+    def test_custom_server_malformed_env_is_dropped_not_fatal(self, caplog, bad_env):
+        """``env: null`` (or any non-mapping) used to crash the WHOLE resolve at
+        ``_server_to_dict``'s ``.items()`` — every server in the deployment,
+        not just the malformed one. It now fails closed on the spec (no env) and
+        says so, so the operator hears about the typo instead of losing the
+        render.
+        """
+        ctx = _base_ctx()
+        cfg = {"servers": {"my-server": {"command": "node", "args": ["s.js"], "env": bad_env}}}
+        with caplog.at_level("WARNING"):
+            servers = resolve_servers(cfg, ctx)
+        custom = [s for s in servers if s["name"] == "my-server"][0]
+        assert set(custom["env"]) == {"OSPREY_MCP_TOOL_PREFIX"}
+        if bad_env is not None:
+            assert "malformed env" in caplog.text and "my-server" in caplog.text
+
     def test_hook_presets_dict_contains_expected_keys(self):
         """HOOK_PRESETS has the three expected preset names."""
         assert set(HOOK_PRESETS.keys()) == {"approval", "writes_check", "limits"}
@@ -426,11 +512,16 @@ class TestExtendsServers:
         # OSPREY_SERVER_NAME is a deliberate post-golden addition (instance
         # identity for UI signals, e.g. open_panel → panel_focus) — auto-set
         # to the clone's own name, not inherited from the template.
+        # OSPREY_MCP_TOOL_PREFIX is the second such addition: the process-side
+        # mcp__<name>__ tool-prefix identity, assigned unconditionally after
+        # the env merge on every launch path, so a spec cannot pin it (see
+        # tests/registry/test_tool_prefix.py).
         assert p2["env"] == {
             "OSPREY_CONFIG": "/tmp/test-project/build/config.yml",
             "CONFIG_FILE": "/tmp/test-project/build/config.yml",
             "PHOEBUS_BRIDGE_URL": "${PHOEBUS2_BRIDGE_URL:-http://127.0.0.1:7980}",
             "OSPREY_SERVER_NAME": "phoebus2",
+            "OSPREY_MCP_TOOL_PREFIX": "phoebus2",
         }
         # Permissions inherited as bare names (unrewritten).
         assert p2["permissions_allow"] == _PHOEBUS_ALLOW
@@ -587,6 +678,29 @@ class TestExtendsServers:
             )
         assert "phoebus2" not in {s["name"] for s in servers}
         assert any("Unknown extends target" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "bad_env", [None, ["A=1"], "A=1", 7], ids=["null", "list", "str", "int"]
+    )
+    def test_extends_clone_malformed_env_is_dropped_not_fatal(self, caplog, bad_env):
+        """The extends mirror of the custom-server case: a non-mapping ``env:``
+        on a clone used to reach ``merged_env.update()`` and crash the WHOLE
+        resolve (``ValueError`` for a list/str, ``TypeError`` for an int). The
+        clone now renders with the template's env alone and the warning names
+        the spec, exactly as a custom server does. ``env: null`` stays valid
+        and warning-free on both paths: absent, not malformed."""
+        cfg = {"servers": {"phoebus2": {"extends": "phoebus", "env": bad_env}}}
+        with caplog.at_level(logging.WARNING):
+            p2 = _resolve_one(cfg, "phoebus2")
+        template = _resolve_one({"servers": {"phoebus": {"enabled": True}}}, "phoebus")
+        expected = dict(template["env"])
+        expected["OSPREY_SERVER_NAME"] = "phoebus2"
+        expected["OSPREY_MCP_TOOL_PREFIX"] = "phoebus2"
+        assert p2["env"] == expected
+        if bad_env is None:
+            assert "malformed env" not in caplog.text
+        else:
+            assert "malformed env" in caplog.text and "phoebus2" in caplog.text
 
     def test_duplicate_allow_override_cannot_defeat_ask_union(self, caplog):
         """Duplicated entries in an override's permissions.allow must not defeat
@@ -974,11 +1088,6 @@ class TestTemplateRendering:
             "modules": {
                 "web_terminals": {
                     "enabled": True,
-                    "nginx_port": 9080,
-                    "web_base_port": 9091,
-                    "artifact_base_port": 9291,
-                    "ariel_base_port": 9391,
-                    "lattice_base_port": 9491,
                     "users": ["alice"],
                 }
             },
@@ -1025,7 +1134,9 @@ class TestTemplateRendering:
         rendered = self._render(template_manager, "claude_code/claude/settings.json.j2", ctx)
         data = json.loads(rendered)
         pre_matchers = [r["matcher"] for r in data["hooks"]["PreToolUse"]]
-        assert "Write" in pre_matchers  # Framework standalone hook (memory-guard)
+        # One matcher covering every write tool: the memory guard's frontmatter
+        # is copied verbatim into the rule, so this string is the guard's reach.
+        assert "Write|MultiEdit|NotebookEdit" in pre_matchers
         assert "mcp__controls__channel_write" in pre_matchers
         post_matchers = [r["matcher"] for r in data["hooks"]["PostToolUse"]]
         assert "NotebookEdit" in post_matchers  # Framework standalone hook (notebook-update)
@@ -1147,3 +1258,123 @@ class TestTemplateRendering:
         assert "mcp__phoebus__phoebus_drive" in data["permissions"]["ask"]
         pre_matchers = [r["matcher"] for r in data["hooks"]["PreToolUse"]]
         assert "mcp__phoebus2__phoebus_drive" in pre_matchers
+
+
+# ---------------------------------------------------------------------------
+# Mixed read/write templates (the kill switch's documented exception)
+# ---------------------------------------------------------------------------
+
+
+class TestMixedReadWriteTools:
+    """The registry owns which templates are read/write-mixed, and the
+    fully-qualified tool list derived from them.
+
+    The classification used to live in the Claude Code renderer as a bare set
+    of template names, which left every consumer (renderer, hook config,
+    audit middleware) to re-derive the fully-qualified tool names — and to
+    re-derive the ``extends`` clone rewrite that goes with them. One spelling
+    here, so a second consumer cannot fork from the first.
+    """
+
+    def test_mixed_templates_name_real_framework_servers(self):
+        """A typo'd or removed template name would silently classify nothing:
+        the renderer's membership test just stops matching, and a mixed tool
+        gets hard-denied instead of pulled from ask.
+        """
+        assert MIXED_READ_WRITE_TEMPLATES
+        for name in MIXED_READ_WRITE_TEMPLATES:
+            assert name in FRAMEWORK_SERVERS, f"{name!r} names no framework server"
+
+    def test_every_mixed_template_actually_carries_a_writes_check(self):
+        """A template with no ``_WRITES_CHECK`` rule contributes no tool at
+        all — it would sit in the set looking like coverage while the derived
+        list stayed empty."""
+        for name in MIXED_READ_WRITE_TEMPLATES:
+            assert writes_check_matchers(name), (
+                f"{name!r} is listed as read/write-mixed but carries no "
+                f"_WRITES_CHECK-gated hooks_pre rule"
+            )
+
+    def test_writes_check_matchers_are_the_hook_gated_rules(self):
+        """Canonical construction: walk hooks_pre, keep rules whose hooks
+        include the _WRITES_CHECK singleton."""
+        expected = [
+            rule.matcher
+            for rule in FRAMEWORK_SERVERS["python"].hooks_pre
+            if _WRITES_CHECK in rule.hooks
+        ]
+        assert (
+            writes_check_matchers("python")
+            == expected
+            == ["mcp__python__execute", "mcp__python__execute_file"]
+        )
+
+    def test_writes_check_matchers_rewrite_the_clone_prefix(self):
+        """An ``extends`` clone's tools are named for the clone, not the
+        template — the same anchored splice build_extended_server applies."""
+        assert writes_check_matchers("python", "python2") == [
+            "mcp__python2__execute",
+            "mcp__python2__execute_file",
+        ]
+
+    def test_writes_check_matchers_unknown_template_is_empty(self):
+        """A custom (non-framework) server has no template to read rules from."""
+        assert writes_check_matchers("not-a-framework-server") == []
+
+    def test_framework_floor_is_the_fully_qualified_mixed_set(self):
+        """The floor the hook/middleware fall back to when a render is
+        degraded: every mixed template's write-gated tools, fully qualified."""
+        assert framework_mixed_read_write_tools() == [
+            "mcp__python__execute",
+            "mcp__python__execute_file",
+        ]
+        for tool in framework_mixed_read_write_tools():
+            assert tool.startswith("mcp__")
+
+    def test_render_list_covers_enabled_servers_only(self):
+        """python ships enabled by default; a disabled mixed server
+        contributes nothing to the render's list."""
+        servers = resolve_servers({}, _base_ctx())
+        assert mixed_read_write_tools(servers) == [
+            "mcp__python__execute",
+            "mcp__python__execute_file",
+        ]
+
+        off = resolve_servers({"servers": {"python": {"enabled": False}}}, _base_ctx())
+        assert mixed_read_write_tools(off) == []
+
+    def test_render_list_excludes_pure_write_tools(self):
+        """Only the documented mixed templates are in it — controls' hardware
+        writes are write-gated too and must NOT appear."""
+        servers = resolve_servers({}, _base_ctx())
+        tools = mixed_read_write_tools(servers)
+        controls_write_gated = writes_check_matchers("controls")
+        assert controls_write_gated, "controls carries no write-gated rule — test is vacuous"
+        for tool in controls_write_gated:
+            assert tool not in tools
+
+    def test_render_list_covers_extends_clones(self):
+        """The clone is the whole reason this is computed Python-side: its
+        tool names are only knowable after resolve_servers has rewritten the
+        matcher prefixes."""
+        servers = resolve_servers(
+            {"servers": {"python2": {"extends": "python", "enabled": True}}}, _base_ctx()
+        )
+        tools = mixed_read_write_tools(servers)
+        assert "mcp__python__execute" in tools
+        assert "mcp__python2__execute" in tools
+
+    def test_render_list_is_deduplicated_and_ordered(self):
+        """Rendered into a JSON safety file, so a stable order keeps every
+        built project's diff quiet, and duplicates would double-count."""
+        servers = resolve_servers(
+            {"servers": {"python2": {"extends": "python", "enabled": True}}}, _base_ctx()
+        )
+        tools = mixed_read_write_tools(servers)
+        assert tools == list(dict.fromkeys(tools))
+        assert tools == [
+            "mcp__python__execute",
+            "mcp__python__execute_file",
+            "mcp__python2__execute",
+            "mcp__python2__execute_file",
+        ]

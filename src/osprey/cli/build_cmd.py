@@ -34,19 +34,23 @@ persistence (config overrides, convention artifacts, MCP servers, git init) in
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shlex
 import shutil
 import sys
-from collections.abc import Sequence
+import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
+from uuid import uuid4
 
 import click
 
 from osprey.deployment.compose_merge import MERGED_COMPOSE_FILENAME
 from osprey.errors import BuildProfileError
+from osprey.port_layout import resolve_port_base
 from osprey.utils.logger import get_logger
 from osprey.utils.workspace import (
     BUILD_DIR_NAME,
@@ -86,6 +90,7 @@ from .build_persistence import (
     _register_convention_artifacts,
     _resolve_context_roster,
 )
+from .build_profile_emit import effective_config_subtree
 from .repo_resolver import PROFILE_FILENAME, find_repo_root, repo_option
 from .templates.manager import TemplateManager
 
@@ -178,6 +183,28 @@ _CONTAINER_INTERPRETER = "/usr/local/bin/python"
 _INCOMING_DIRNAME = ".osprey-build-incoming"
 _OUTGOING_DIRNAME = ".osprey-build-outgoing"
 
+#: The errnos that mean "the filesystem will not let go of this yet", as opposed
+#: to "this code is wrong about the path". ENOTEMPTY is what a directory reports
+#: once a sweep has taken everything it could and an NFS ``.nfs*`` sillyrename
+#: is all that is left; EBUSY is the same story for a mount or an open file;
+#: EACCES/EPERM is a subtree written by another user, which for a deployment
+#: repo is usually a container that ran as root. Every one of them can clear on
+#: its own — the client drops its reference, the mount goes — so they are worth
+#: one retry. Anything else is re-raised.
+_LEFTOVER_ERRNOS: frozenset[int] = frozenset(
+    {errno.ENOTEMPTY, errno.EBUSY, errno.EACCES, errno.EPERM}
+)
+
+#: How long to wait before the single retry. Long enough for an NFS client to
+#: release a sillyrenamed file, short enough that a build nobody can fix anyway
+#: still fails promptly.
+_LEFTOVER_RETRY_SECONDS = 1.0
+
+#: Marks a leftover that could not be deleted and was renamed out of the way
+#: instead. Carries a unique suffix, because a second stuck build must not
+#: collide with the first one's rescue.
+_HELD_ASIDE_SUFFIX = ".undeletable"
+
 #: The STATE zone a build guarantees exists — created empty, and otherwise the
 #: agent's to write, not the build's. Imported from the conventions module that
 #: owns the zone layout rather than spelled again: ``osprey init`` emits the
@@ -259,6 +286,87 @@ def _ensure_state_zone(repo_root: Path) -> None:
         (repo_root / relative).mkdir(parents=True, exist_ok=True)
 
 
+def _is_leftover_stuck(error: OSError) -> bool:
+    """Whether *error* is the filesystem holding on, rather than a wrong path.
+
+    NFS reports its sillyrenamed files by name rather than by errno on some
+    clients, so the message is checked too.
+    """
+    return error.errno in _LEFTOVER_ERRNOS or "nfs" in str(error).lower()
+
+
+def _clear_leftover(path: Path, *, aside_root: Path) -> None:
+    """Free the name *path* occupies — by deleting it, or by moving it aside.
+
+    Every caller is about to ``rename`` something onto this path, and
+    ``rename(2)`` onto a non-empty directory fails. So the name has to end up
+    free, and "we tried to delete it" is not the same thing: the failure mode
+    this replaces was a swallowed ``rmtree`` whose leftover surfaced as a bare
+    ENOTEMPTY from a rename several hundred lines away, on this build and on
+    every build after it, with nothing in the message about which path or why.
+
+    Three attempts at freeing the name, in order:
+
+    1. Delete it. The overwhelmingly common case, and the only one with no
+       trace left behind.
+    2. Delete it again, after :data:`_LEFTOVER_RETRY_SECONDS`, if it is still
+       standing — for one of the reasons in :data:`_LEFTOVER_ERRNOS`, which are
+       the ones that clear on their own, or for no stated reason at all. Any
+       other ``OSError`` is this code being wrong about the path, and is
+       re-raised untouched.
+    3. Rename it aside, under *aside_root*, with a unique suffix. The tree is
+       still on disk and still undeletable, but it is no longer in the way, so
+       the build proceeds and the operator is told where it went.
+
+    Only if the rename aside fails too does the caller fail — and then with the
+    path, the reason it could not be deleted, and the reason it could not be
+    moved, all named.
+
+    :param path: The file or directory to clear. Absent is success.
+    :param aside_root: Where an undeletable tree is parked. Must be on the same
+        filesystem as *path*, since step 3 is a rename; both callers pass a
+        directory inside the same repo.
+    :raises click.ClickException: When the name could not be freed at all.
+    """
+    reason: OSError | None = None
+    for attempt in (1, 2):
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            elif path.exists() or path.is_symlink():
+                path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            if not _is_leftover_stuck(error):
+                raise
+            reason = error
+        # The gone-ness is checked rather than inferred from a call that
+        # returned: what the name looks like now is the whole question, and a
+        # removal that reports success over a tree that is still standing is
+        # exactly the silence this function replaces.
+        if not path.exists() and not path.is_symlink():
+            return
+        if attempt == 1:
+            time.sleep(_LEFTOVER_RETRY_SECONDS)
+
+    detail = reason if reason is not None else "it is still there afterwards"
+    aside = aside_root / f"{path.name}{_HELD_ASIDE_SUFFIX}.{uuid4().hex[:8]}"
+    try:
+        aside_root.mkdir(parents=True, exist_ok=True)
+        os.replace(path, aside)
+    except OSError as error:
+        raise click.ClickException(
+            f"Could not clear {path}: {detail}\n"
+            f"Nor move it aside to {aside}: {error}\n"
+            "Remove that path yourself — as its owner, or once whatever holds "
+            "it open has stopped — and run the command again."
+        ) from error
+
+    logger.warning("  Could not delete %s (%s)", path, detail)
+    logger.warning("  Moved it aside to %s — delete it when you can", aside)
+
+
 def _repair_interrupted_swap(zones: _RenderZones) -> None:
     """Restore a ``build/`` left missing by an interrupted swap, then clean up.
 
@@ -273,6 +381,13 @@ def _repair_interrupted_swap(zones: _RenderZones) -> None:
     success never happened, so an incoming render found *beside* a present
     ``build/`` is discarded rather than adopted — the last render an operator
     was told about is the one they keep.
+
+    The sweep afterwards is what makes the repair self-healing rather than
+    self-defeating. Each of the three names it clears is a name the NEXT
+    :func:`_swap_in_render` renames onto, so a leftover left standing does not
+    stay quiet — it fails that rename with a bare ENOTEMPTY, and keeps failing
+    it forever. :func:`_clear_leftover` therefore frees each name or says why
+    it could not.
     """
     if not zones.build_dir.exists():
         for candidate in (zones.incoming, zones.outgoing):
@@ -281,9 +396,14 @@ def _repair_interrupted_swap(zones: _RenderZones) -> None:
                 os.replace(candidate, zones.build_dir)
                 break
 
+    # Parked in the STATE zone rather than beside each leftover: `var/` is
+    # git-ignored, is on the same filesystem as all three, and is the one of
+    # the four zones a build never rewrites — so a tree parked there survives
+    # the swap that is about to replace `build/` instead of riding along inside
+    # it and coming back as the next build's leftover.
+    aside_root = zones.repo_root / STATE_DIR_NAME
     for leftover in (zones.incoming, zones.outgoing, zones.stage_root):
-        if leftover.exists():
-            shutil.rmtree(leftover, ignore_errors=True)
+        _clear_leftover(leftover, aside_root=aside_root)
 
 
 def _swap_in_render(zones: _RenderZones) -> None:
@@ -440,9 +560,13 @@ def _stamp_repo_manifest(
     The drift fingerprint's per-key digests are added to the DEPLOYMENT's
     manifest only. The fingerprint itself — ``creation.preset_hash``, a
     :func:`~osprey.cli.build_profile.compute_profile_hash` of the resolved
-    profile and the file material it names — is stamped by the manifest
-    generator on every render, and on ``build/.osprey-manifest.json`` it is the
-    *only* thing the drift verdict reads. What is added here is commentary on
+    profile, the file material it names, and the host overlay ``.env.variant``
+    selects — is stamped by the manifest generator on every render, and on
+    ``build/.osprey-manifest.json`` it is the *only* thing the drift verdict
+    reads. The variant is read off the profile's own directory by the hash, not
+    passed in from here: this build already resolved a selection, and a second
+    resolution at the stamp could disagree with the one ``osprey up`` makes,
+    which is precisely how a build goes stale without anyone noticing. What is added here is commentary on
     it: the per-top-level-key digests that let
     :func:`osprey.deployment.staleness.check_drift` name which part of
     ``profile.yml`` moved when it refuses to start a stale build. Deliberately
@@ -505,20 +629,6 @@ _HOST_NETWORK = "host"
 #: no longer carries the pair's name, so there is nothing left in the VALUE to
 #: recognize it by.
 _DISPATCH_PAIR_ADDRESS_VARS = ("DISPATCHER_URL", "WORKER_URL")
-
-#: The variable a host-mode service is rendered with to name the telemetry
-#: store, read by :mod:`osprey.build.claude_code_telemetry`. It carries a HOST
-#: and nothing else — see :data:`_OPENOBSERVE_ENDPOINT_PORT`.
-_OTEL_OPENOBSERVE_HOST_VAR = "OSPREY_OTEL_OPENOBSERVE_HOST"
-
-#: The port the OTLP endpoint derived from ``backend: openobserve`` is pinned
-#: at (``osprey/build/claude_code_telemetry.py``'s
-#: ``http://{host}:5080/api/{org}``). The pin is invisible under bridge
-#: networking, where the store is reached by its compose DNS name on the port it
-#: LISTENS on; under host networking the address is the port it PUBLISHES, which
-#: a project is free to move. The test suite binds this constant to the endpoint
-#: the resolver actually derives, so the two cannot drift apart.
-_OPENOBSERVE_ENDPOINT_PORT = 5080
 
 
 class _RenderedService(NamedTuple):
@@ -685,7 +795,7 @@ def _names_service(value: str, dns_name: str) -> bool:
     value or follow something that is not part of a name (never a path
     separator, except the ``//`` that opens a URL authority), and must be
     followed by a port, a path, or the end of the value. So
-    ``http://event-dispatcher:8020``, ``event-dispatcher:8020`` and a bare
+    ``http://event-dispatcher:10010``, ``event-dispatcher:10010`` and a bare
     ``event-dispatcher`` all count, while ``/app/event-dispatcher`` and
     ``event-dispatcher-external`` do not.
     """
@@ -874,68 +984,6 @@ def _cross_network_errors(
     return errors
 
 
-def _openobserve_endpoint_errors(
-    config: dict[str, Any], indexed: Sequence[_RenderedService]
-) -> list[str]:
-    """A host-mode telemetry exporter aimed at a port the store does not publish.
-
-    ``OSPREY_OTEL_OPENOBSERVE_HOST`` carries a host and no port, and the
-    endpoint derived from it pins :data:`_OPENOBSERVE_ENDPOINT_PORT`. On the
-    bridge that is the port the store LISTENS on, which no project changes;
-    on the host namespace it is the port the store PUBLISHES, which
-    ``services.openobserve.port`` moves freely. The two disagreeing costs
-    nothing at boot and drops every metric and log afterwards.
-
-    Fails the build only when the derivation is live — telemetry enabled, the
-    openobserve backend, no explicit endpoint. Otherwise the variable is inert
-    and refusing to build would be an error about nothing; that case gets a
-    warning, because enabling telemetry later would break it silently.
-    """
-    published = _mapping(_mapping(config.get("services")).get("openobserve")).get("port")
-    if published is None or str(published) == str(_OPENOBSERVE_ENDPOINT_PORT):
-        return []
-
-    exporters = [
-        service
-        for service in indexed
-        if service.on_host and _OTEL_OPENOBSERVE_HOST_VAR in service.environment
-    ]
-    if not exporters:
-        return []
-
-    named = ", ".join(sorted({_service_label(service) for service in exporters}))
-    telemetry = _mapping(_mapping(config.get("claude_code")).get("telemetry"))
-    derived = (
-        bool(telemetry.get("enabled"))
-        and telemetry.get("backend") == "openobserve"
-        and not telemetry.get("endpoint")
-    )
-    org = _mapping(telemetry.get("openobserve")).get("org", "default")
-    if not derived:
-        logger.warning(
-            "  services.openobserve.port publishes the store on %s, while %s runs on the "
-            "host network and derives the telemetry endpoint's port from a pinned %s. "
-            "Nothing is broken today, since claude_code.telemetry is not deriving an "
-            "endpoint. Enabling it with backend: openobserve will need "
-            "claude_code.telemetry.endpoint set explicitly.",
-            published,
-            named,
-            _OPENOBSERVE_ENDPOINT_PORT,
-        )
-        return []
-
-    return [
-        f"{named} runs on the host network and reaches the telemetry store over the host's "
-        f"own loopback ({_OTEL_OPENOBSERVE_HOST_VAR}), but claude_code.telemetry derives its "
-        f"OTLP endpoint from backend: openobserve with the store's port pinned at "
-        f"{_OPENOBSERVE_ENDPOINT_PORT}, while services.openobserve.port publishes it on "
-        f"{published}. The exporter would post to "
-        f"http://localhost:{_OPENOBSERVE_ENDPOINT_PORT}/api/{org}, where nothing is "
-        f"listening. Set `claude_code.telemetry.endpoint: http://localhost:{published}"
-        f"/api/{org}` — the variable carries a host only, so it has no port half to correct."
-    ]
-
-
 def _network_check_errors(config: dict[str, Any], compose_files: Sequence[str]) -> list[str]:
     """Everything wrong with the network axis of the render that just happened.
 
@@ -949,7 +997,6 @@ def _network_check_errors(config: dict[str, Any], compose_files: Sequence[str]) 
         *_inert_axis_errors(config, indexed),
         *parity_errors,
         *_cross_network_errors(indexed, dispatch_consumers),
-        *_openobserve_endpoint_errors(config, indexed),
     ]
 
 
@@ -960,7 +1007,11 @@ def _render_compose_files(
 
     Compose files are rendered in the same pass as everything else, because they
     are derived from the same ``config.yml``: emitting them a verb later would
-    leave ``build/`` an incomplete description of the deployment.
+    leave ``build/`` an incomplete description of the deployment. After the
+    persona renders, because they read them: the bluesky_web sidecar's compose
+    lists the secret of every user whose persona's rendered ``config.yml``
+    shows the BLUESKY tab, and what this pass writes is what ``osprey up``
+    starts.
 
     The generator resolves its inputs relative to the working directory, which
     is what makes it stageable at all: run from the staged render, every service
@@ -1010,8 +1061,22 @@ def _render_compose_files(
     previous = Path.cwd()
     os.chdir(zones.stage)
     try:
+        # ``deployed_config_dir`` is passed explicitly for the same reason
+        # ``output_root`` is, and is its mirror image: this render reads its
+        # config from the staging ROOT, but the config it produces will be read
+        # from ``build/`` once the swap lands. Derived from the config path it
+        # would come out empty, and every path spelled against it would resolve
+        # one directory too high at deploy time.
+        # ``persona_root`` for the same reason again: the persona renders this
+        # build has already written sit in the staged tree, and the catalog's
+        # ``project_path`` (``build/<repo>-<persona>``) names where they will
+        # be once the swap lands — the previous build's personas until then.
         config, compose_files = prepare_compose_files(
-            str(zones.stage / "config.yml"), dev_mode=dev_mode, output_root="."
+            str(zones.stage / "config.yml"),
+            dev_mode=dev_mode,
+            output_root=".",
+            deployed_config_dir=BUILD_DIR_NAME,
+            persona_root=str(zones.stage),
         )
         # Read back inside the chdir: every path involved — the rendered files,
         # the service directories the config names — is spelled relative to the
@@ -1112,6 +1177,18 @@ class _SharedRenderInputs(NamedTuple):
     inputs that decide it, so a delta that *does* move either still gets its own.
     """
 
+    profile_overlays: tuple[Path, ...] = ()
+    """Profile layers merged over EVERY profile this build resolves.
+
+    The host-variant overlay (:mod:`~osprey.cli.variant_selection`), or empty
+    when this host builds the tracked profile. It belongs here for the same
+    reason ``--runtime-root`` does: it is a property of the build, not of a
+    profile, so the deployment's render and each persona's must see the same
+    one. A variant that reached only the deployment would leave every persona
+    project — and every persona image — rendered for a different host than the
+    stack they ship in.
+    """
+
     runtime_interpreter: str | None = None
     """The interpreter this render's artifacts launch with, when it is KNOWN
     rather than derivable.
@@ -1124,6 +1201,147 @@ class _SharedRenderInputs(NamedTuple):
     machine's ``.venv`` into every MCP server command and every framework hook.
     See :data:`_CONTAINER_INTERPRETER`.
     """
+
+    host_config: Mapping[str, Any] | None = None
+    """The deployment's own rendered ``config.yml``, once it has been rendered.
+
+    What every attached render in this repo is told about the services the
+    deployment runs (:func:`osprey.deployment.reach.project_attached_overrides`):
+    the ports it publishes, the panel URLs its injectors derived. ``None``
+    until the deployment's render is done — it is the first render of every
+    build — and ``None`` throughout a build whose profile is itself attached,
+    which has no host in this repo and is told the app template's defaults
+    instead (:func:`_template_host_config`).
+    """
+
+
+def _rendered_config(render_dir: Path) -> dict[str, Any]:
+    """The ``config.yml`` a render wrote, as a plain mapping."""
+    import yaml
+
+    with (render_dir / "config.yml").open("r", encoding="utf-8") as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def _resolve_rendered_execution_method(render_dir: Path) -> list[str]:
+    """Run the execution-backend resolver on a render, writing back what runs.
+
+    ``execution.execution_method`` is read by every container's python
+    executor through :func:`osprey_connectors.config.resolve_execution_method`
+    — at its first ``execute`` call. A profile's ``config:`` overlay writes
+    whatever it says into the render and nothing else reads it back, so a
+    typo used to survive build, deploy and MCP startup. The same resolver
+    runs here instead: an unknown backend is a refusal carrying the
+    resolver's own message, and a legacy spelling (``local``, ``container``)
+    is rewritten into the render as the backend that runs — ``container``'s
+    one-time deprecation warning fires here, where the operator is, rather
+    than once per container.
+
+    Returns:
+        The refusal, as one message, or nothing.
+    """
+    from osprey_connectors.config import resolve_execution_method
+
+    config_path = render_dir / "config.yml"
+    config = _rendered_config(render_dir)
+    try:
+        method = resolve_execution_method(config, source=str(config_path))
+    except ValueError as e:
+        return [str(e)]
+
+    execution = config.get("execution")
+    written = execution.get("execution_method") if isinstance(execution, dict) else None
+    if written == method:
+        return []
+
+    from ruamel.yaml import YAML
+
+    yaml = YAML()
+    with config_path.open("r", encoding="utf-8") as fh:
+        document = yaml.load(fh)
+    if not isinstance(document.get("execution"), Mapping):
+        document["execution"] = {}
+    document["execution"]["execution_method"] = method
+    with config_path.open("w", encoding="utf-8") as fh:
+        yaml.dump(document, fh)
+    return []
+
+
+def _incomplete_limits_errors(render_dir: Path) -> list[str]:
+    """Every ``limits_checking`` block in a render that fails to state a leaf, named.
+
+    Both scopes are read: the deployment-wide block and every per-type block.
+    A per-type block overrides the deployment-wide pair whole, so a block that
+    states one leaf answers no posture at all; a leaf that is present but not
+    a literal ``true``/``false`` (``"true"``, ``1``, an unexpanded ``${VAR}``)
+    answers nothing either, in either scope; and a ``limits_checking`` value
+    that is not a mapping at all answers neither leaf. Each of those makes
+    every write path fall back to refusing unlisted channels — a deployment
+    whose limits posture quietly stopped doing what its author wrote.
+    ``osprey validate`` catches the ones a ``config:`` block spelled; this
+    reads the config a deployment actually runs, so a block an injector or an
+    app template assembled is caught too.
+
+    Args:
+        render_dir: The rendered project directory, read after the injectors.
+
+    Returns:
+        One line per missing or unreadable leaf, naming the key an operator
+        has to add or rewrite as a literal boolean; one line naming the block
+        and its value when ``limits_checking`` is not a mapping; nothing for a
+        render whose blocks are complete or absent.
+    """
+    from osprey_connectors.types import incomplete_limits_blocks
+
+    errors: list[str] = incomplete_limits_blocks(
+        _rendered_config(render_dir).get("control_system") or {}
+    )
+    return errors
+
+
+def _template_host_config(
+    shared: _SharedRenderInputs,
+    build_profile: Any,
+    *,
+    project_name: str,
+    render_dir: Path,
+    profile_dir: Path,
+    context: Mapping[str, Any],
+    artifacts: dict[str, list[str]] | None,
+) -> dict[str, Any]:
+    """What the app template deploys at its defaults — the host an attached
+    profile built with no deployment in its repo is told about.
+
+    The template rendered AS a deployment (``deploy_services: true``) with
+    this render's own context, the profile's ``config:`` laid over it (the
+    same overlay the render itself gets, because a host that differs from
+    the template's defaults is named there), and then the service injectors
+    run over it exactly as for a deploying profile: an attached profile
+    inherits the blocks they read (``dispatch:``, ``bluesky_web:``, …) from
+    the deployment profile it extends, and what they derive — the EVENTS and
+    BLUESKY tab entries above all — is what a persona beside a real host is
+    told from that host's render. Rendered into a scratch directory the build
+    zone never sees — it is a reading, not a render.
+    """
+    import tempfile
+    from dataclasses import replace
+
+    with tempfile.TemporaryDirectory() as scratch:
+        scratch_dir = Path(scratch)
+        shared.manager.render_config(
+            project_name,
+            render_dir,
+            scratch_dir / "config.yml",
+            data_bundle=build_profile.data_bundle,
+            context={**context, "deploy_services": True},
+            artifacts=artifacts,
+        )
+        if build_profile.config:
+            _apply_config_overrides(scratch_dir, build_profile.config)
+        # A view of the profile as the deployment it extends: the injectors
+        # skip an attached profile wholesale, and this reading is of the host.
+        _inject_services(replace(build_profile, deploy_services=True), profile_dir, scratch_dir)
+        return _rendered_config(scratch_dir)
 
 
 def _render_project(
@@ -1191,7 +1409,9 @@ def _render_project(
     Returns:
         The rendered project directory.
     """
+    from osprey.build.build_tiers import tier_mode_conflict
     from osprey.build.claude_code_resolver import load_provider_spec
+    from osprey.deployment.reach import reach_errors
     from osprey.services.virtual_accelerator.manifest.build import (
         prepare_project_manifest,
         write_project_manifest,
@@ -1199,6 +1419,16 @@ def _render_project(
 
     from .build_profile_archiver import va_archiver_config_overrides
     from .build_profile_deploy import deploy_config_overrides
+    from .build_profile_reach import (
+        attached_render_overrides,
+        orphan_panel_fragments,
+        reach_override_errors,
+        selected_panel_errors,
+    )
+    from .build_profile_standin import (
+        live_standin_config_overrides,
+        live_standin_duplicate_key_errors,
+    )
     from .validate_claude_artifacts import validate_agent_tools_against_permissions
 
     build_profile = resolved.profile
@@ -1231,6 +1461,21 @@ def _render_project(
         shared.va_manifests[va_key] = prepare_project_manifest(va_data_root, va_key[1])
     prepared_va_manifest = shared.va_manifests[va_key]
 
+    # ``create_project``'s ``tier`` argument means "the tier the profile PINNED",
+    # not "the tier to use": given ``None`` it applies the same paradigm-aware
+    # derivation ``resolved_tier()`` does, and given a value it enforces
+    # ``tier_mode_conflict`` against it. So a paradigm that refuses an explicit
+    # tier — one whose store is a service rather than tiered database files —
+    # must be handed ``None`` here, or its own derived default comes back as a
+    # pin and the build refuses to render at all. Ask the rule rather than
+    # naming the paradigm, so this stays true as paradigms are added.
+    derived_tier = build_profile.resolved_tier()
+    pinned_tier = (
+        None
+        if tier_mode_conflict(derived_tier, build_profile.channel_finder_mode)
+        else derived_tier
+    )
+
     # The render. No `.env` is carried in from anywhere: the repo's own `.env`
     # is the deployment's whole secret store, it is mounted from the repo root,
     # and a build neither reads nor rewrites it — copying it into the disposable
@@ -1245,18 +1490,35 @@ def _render_project(
         context=context,
         force=True,
         artifacts=artifacts or None,
-        tier=build_profile.resolved_tier(),
+        tier=pinned_tier,
         data_root=build_profile.resolved_data_root(repo_root),
     )
     progress("  ✓ Base template rendered")
 
-    # What the deploy and va_archiver blocks contribute to the rendered config,
-    # applied with the profile's own `config:` entries in one pass. Derived
-    # keys the profile also spells are rejected at validation, so winning here
-    # can never silently overwrite a facility's own value.
+    # One fact, two homes: a profile that also spells a key the live stand-in
+    # derives is refused rather than silently overwritten below — the same rule
+    # the va_archiver block applies to the archive's coordinates, and here the
+    # duplicate is a real gateway address sitting in the profile while every
+    # session is on the stand-in.
+    standin_duplicates = live_standin_duplicate_key_errors(
+        build_profile.virtual_accelerator, build_profile.config
+    )
+    if standin_duplicates:
+        raise BuildProfileError("Profile validation failed:\n  " + "\n  ".join(standin_duplicates))
+
+    # What the deploy, va_archiver and virtual_accelerator blocks contribute to
+    # the rendered config, applied with the profile's own `config:` entries in
+    # one pass. Derived keys the profile also spells are rejected at validation,
+    # so winning here can never silently overwrite a facility's own value.
     derived_by_block = {
         "deploy": deploy_config_overrides(build_profile.deploy, build_profile.config),
         "va_archiver": va_archiver_config_overrides(build_profile.va_archiver),
+        # Reads the render because the stand-in's probe channel is the sandbox
+        # VA's: whatever the template put there is the fallback for a profile
+        # that named none of its own.
+        "virtual_accelerator": live_standin_config_overrides(
+            build_profile.virtual_accelerator, build_profile.config, _rendered_config(render_dir)
+        ),
     }
     derived = {key: value for block in derived_by_block.values() for key, value in block.items()}
     config_overrides = {**build_profile.config, **derived}
@@ -1267,9 +1529,95 @@ def _render_project(
             for key, value in entries.items():
                 progress("      %s: %s (from the profile's %s block)", key, value, block)
 
+    # What an attached render is told about the services its host deploys —
+    # the ports it publishes, the panel URLs its injectors derived — copied
+    # from the deployment's own render (the Reach Contract,
+    # osprey.deployment.reach). After the profile's overlay, because the
+    # projection is gated on what THIS render switches on; before the
+    # service injection and the Claude Code re-render, because a projected
+    # block is what makes a server render at all (`graphdb_configured`).
+    # A deploying project projects nothing: its injectors write the blocks.
+    if not build_profile.deploy_services:
+        if shared.host_config is not None:
+            host_config, told_by = shared.host_config, "the hosting deployment's render"
+        else:
+            # Built alone, with no deployment in this repo: the profile extends
+            # a deployment of the same app template, so that template rendered
+            # AS a deployment is what the host says at the shipped defaults —
+            # and the profile's own `config:` is where a host that differs is
+            # named, so it is laid over those defaults first.
+            host_config = _template_host_config(
+                shared,
+                build_profile,
+                project_name=project_name,
+                render_dir=render_dir,
+                profile_dir=repo_root,
+                context=context,
+                artifacts=artifacts or None,
+            )
+            told_by = "the app template's defaults"
+        projected = attached_render_overrides(
+            host_config,
+            _rendered_config(render_dir),
+            selected_panels=build_profile.web_panels or (),
+        )
+        # A `config:` spelling that contradicts the projection is refused;
+        # one that agrees (inherited from the hosting profile, or laid over
+        # the template's defaults when built alone) is the same fact.
+        duplicate_errors = reach_override_errors(build_profile.config, projected)
+        if duplicate_errors:
+            raise BuildProfileError(
+                "Profile validation failed:\n  " + "\n  ".join(duplicate_errors)
+            )
+        if projected:
+            _apply_config_overrides(render_dir, projected)
+            progress(
+                "  ✓ Told this attached render %d fact(s) about the host's services", len(projected)
+            )
+            for key, value in projected.items():
+                progress("      %s: %s (from %s)", key, value, told_by)
+        # The reverse: a tab this profile does NOT select, inherited from the
+        # hosting profile's `config:` as a url-less fragment (a pinned route),
+        # would render as an empty-url panel. Dropped — the selection is what
+        # puts a projected tab in an attached render.
+        from osprey.utils.config_writer import config_delete_field
+
+        for key in orphan_panel_fragments(
+            build_profile.web_panels or (), _rendered_config(render_dir)
+        ):
+            config_delete_field(render_dir / "config.yml", key)
+            progress(
+                "  ✓ Dropped %s: a tab this profile does not select, inherited with no url", key
+            )
+        # A tab this profile selects (`web_panels:`) that the projection gave
+        # no address — the host it was told about runs no such sidecar — would
+        # otherwise vanish from the render without a word.
+        tabless = selected_panel_errors(
+            build_profile.web_panels or (), _rendered_config(render_dir), told_by=told_by
+        )
+        if tabless:
+            raise BuildProfileError("Profile validation failed:\n  " + "\n  ".join(tabless))
+
     injected = _inject_services(build_profile, repo_root, render_dir)
     if injected_out is not None:
         injected_out.extend(injected)
+
+    # The ground truth every client loads is the rendered config, so this is
+    # where a consumer switched on with nothing to dial is refused — for a
+    # deployment that dropped a block its modules still use, and for an
+    # attached render that was told nothing (a host, or an app template, that
+    # deploys no such service) alike. AFTER the injectors: a deploying profile
+    # that pins only `web.panels.events.path` has its `url` written by the
+    # dispatch injector, and refusing before that would name a key the build
+    # was about to write. The execution backend is read here for the same
+    # reason: it is the render, not the profile, that a container loads.
+    unrunnable = [
+        *_resolve_rendered_execution_method(render_dir),
+        *reach_errors(_rendered_config(render_dir), repo_root=repo_root),
+        *_incomplete_limits_errors(render_dir),
+    ]
+    if unrunnable:
+        raise BuildProfileError("Profile validation failed:\n  " + "\n  ".join(unrunnable))
 
     applied = _apply_conventions(
         repo_root,
@@ -1480,7 +1828,7 @@ def _render_persona_projects(shared: _SharedRenderInputs, zones: _RenderZones) -
         rendered.append(
             _render_project(
                 shared,
-                resolve_build_document(delta, None),
+                resolve_build_document(delta, None, shared.profile_overlays),
                 profile_path=delta,
                 project_name=project_name,
                 output_dir=zones.stage,
@@ -1924,7 +2272,7 @@ def _render_container_projects(
         contexts.append(
             _render_container_project(
                 shared,
-                resolve_build_document(delta, None),
+                resolve_build_document(delta, None, shared.profile_overlays),
                 zones,
                 profile_path=delta,
                 project_name=f"{shared.repo_root.name}-{delta.stem}",
@@ -1978,6 +2326,8 @@ def _wire_build_derived_env(repo_root: Path, build_dir: Path) -> None:
     from osprey.utils.dotenv import (
         BUILD_DERIVED_BANNER,
         BUILD_DERIVED_KEYS,
+        VA_LATTICE_DEFAULT,
+        VA_LATTICE_KEY,
         append_profile_env,
         parse_dotenv_file,
     )
@@ -2010,7 +2360,13 @@ def _wire_build_derived_env(repo_root: Path, build_dir: Path) -> None:
     # from a tree carrying the paradigm channel databases, whose machine is the
     # lattice-backed one, so defaulting here would drop the physics bridge on
     # exactly the projects that have a lattice to run.
-    entries = {"VA_CHANNELS_FILE": MANIFEST_FILENAME, "VA_LATTICE": "builtin"}
+    #
+    # Written from `VA_LATTICE_DEFAULT` rather than a literal: that constant is
+    # DEFINED as the value an unpinned chain resolves to, and this line is the
+    # only thing that makes it so. `resolved_va_lattice` answers every reader
+    # from it — the stand-in's lattice refusal, the render, the archive seed —
+    # so a literal here is the one place their shared answer could be wrong.
+    entries = {"VA_CHANNELS_FILE": MANIFEST_FILENAME, VA_LATTICE_KEY: VA_LATTICE_DEFAULT}
     result = append_profile_env(env_path, entries, BUILD_DERIVED_BANNER)
 
     if result.added:
@@ -2055,6 +2411,13 @@ def _build_repo(
     ``build/.tmp`` and replaces ``build/`` only once every step below has
     succeeded; see :func:`_swap_in_render`.
 
+    *Which* profile it renders is the one thing the host gets a say in. A
+    ``.env.variant`` at the repo root may name an overlay under ``profiles/``
+    (:func:`~osprey.cli.variant_selection.resolve_variant_selection`); when it
+    does, that overlay is merged over ``profile.yml`` as a profile layer before
+    resolution, for the deployment and for every persona alike. One repo, one
+    tracked profile, and as many host renders as the repo has variants.
+
     Args:
         repo: ``--repo``, or ``None`` to walk up from the working directory.
         stream: Stream lifecycle-phase output as it is produced.
@@ -2074,10 +2437,17 @@ def _build_repo(
         click.UsageError: When no deployment repo encloses the search path.
     """
     from osprey.deployment.errors import CapturedProcessError
+    from osprey.deployment.subprocess_capture import diagnose_captured_failure
 
     from .build_profile import resolve_build_document
-    from .build_profile_deploy import deploy_aware_config_errors
+    from .build_profile_deploy import (
+        deploy_aware_config_errors,
+        deploy_aware_config_warnings,
+        limits_block_errors,
+    )
+    from .build_profile_va_faults import live_standin_lattice_errors
     from .phase_reporter import current_reporter
+    from .variant_selection import VARIANT_DIRNAME, resolve_variant_selection
 
     # Whatever the verb at the top of this run installed — this build's own
     # reporter under `osprey build`, and the one `init --up` or `up --build`
@@ -2107,19 +2477,45 @@ def _build_repo(
     config: dict[str, Any] | None = None
 
     try:
-        resolved = resolve_build_document(profile_path, None)
+        # Which profile this HOST builds, decided before anything is resolved.
+        # The overlay is a profile layer like a `-O` file: it merges over
+        # `profile.yml` by the same deep merge, ahead of `extends:` resolution,
+        # and anchors at the repo root — so the render reads the merged result
+        # and every profile-relative path still points at this repo. A future
+        # `osprey build --variant` would win over the file; nothing in the
+        # command line names a variant today.
+        variant = resolve_variant_selection(repo_root)
+        profile_overlays: tuple[Path, ...] = (variant.path,) if variant.path is not None else ()
+
+        resolved = resolve_build_document(profile_path, None, profile_overlays)
         build_profile = resolved.profile
 
         # The profile's own checks first, then the ones that need the config
         # this build is about to render (the `config:` block plus what the
         # `deploy:` block contributes to it).
-        web_errors = deploy_aware_config_errors(build_profile.deploy, build_profile.config)
+        # `repo_root`, not the working directory: a catalog entry's
+        # `build_profile: personas/<name>.yml` is named relative to the profile.
+        # Without it, `osprey build` from a subdirectory or through `--repo`
+        # read no persona delta at all and passed a roster the gate exists to
+        # refuse.
+        web_errors = deploy_aware_config_errors(
+            build_profile.deploy, build_profile.config, profile_root=repo_root
+        )
+        # A sibling call, exactly as `osprey validate` makes it — see the note
+        # beside the same line in `validate_cmd.py`. Raising here, profile-side,
+        # is what keeps the render-side `_incomplete_limits_errors` from
+        # reporting the same half-written block a second time.
+        web_errors = [*web_errors, *limits_block_errors(build_profile.config)]
         if web_errors:
             raise click.UsageError("Profile validation failed:\n  - " + "\n  - ".join(web_errors))
+        web_warnings = deploy_aware_config_warnings(
+            build_profile.deploy, build_profile.config, profile_root=repo_root
+        )
         if not build_profile.provider:
             raise click.UsageError(
                 f"{PROFILE_FILENAME} names no provider. Add `provider: "
-                "<als-apg|cborg|anthropic|amsc-i2|argo>`, or run "
+                "<als-apg|cborg|anthropic|amsc-i2|argo>` — or any custom "
+                "provider you declare under `config:` api.providers — or run "
                 "`osprey set provider=<...>`."
             )
         _check_osprey_version_requirement(build_profile)
@@ -2136,6 +2532,23 @@ def _build_repo(
             f"profile {build_profile.name} (bundle {build_profile.data_bundle}, "
             f"tier {build_profile.resolved_tier()})"
         )
+        # Said out loud whenever a variant is in force: the same repo builds
+        # differently on this host than on the next one, and an operator
+        # reading a render has to be told which of the two they are looking at.
+        if variant.selected:
+            output.note(
+                f"host variant {variant.name} "
+                f"({VARIANT_DIRNAME}/{variant.name}.yml over {PROFILE_FILENAME})"
+            )
+
+        # Advisory lint findings — real exposures that are deliberately not
+        # build-failing (a privileged terminal with no login wall — `auth.method:
+        # token` or `none` — is the shipped loopback posture, not a mistake).
+        # Printed here, beside
+        # the profile identity, because a finding nobody prints is a finding
+        # nobody has: every surface that gates on the errors discards these.
+        for web_warning in web_warnings:
+            output.note(f"⚠ {web_warning}")
 
         # A fresh staging tree, and the output zone it will replace. Both are
         # created now: the venv below is written into `build/` directly, at the
@@ -2179,6 +2592,7 @@ def _build_repo(
             skip_deps=skip_deps,
             manager=TemplateManager(),
             va_manifests={},
+            profile_overlays=profile_overlays,
         )
 
         # One reported phase over every render pass this build makes — the
@@ -2190,7 +2604,7 @@ def _build_repo(
             # Only this pass records what it injected: all six inject the same
             # set, and the operator wants the components named once.
             injected: list[str] = []
-            _render_project(
+            host_render = _render_project(
                 shared,
                 resolved,
                 profile_path=profile_path,
@@ -2203,16 +2617,26 @@ def _build_repo(
                 progress=logger.debug,
                 injected_out=injected,
             )
+            # Every render after this one — each persona's, and each image
+            # copy's — is told about the deployment's services from the render
+            # just written (see _SharedRenderInputs.host_config). A profile
+            # that is itself attached hosts nothing and projects nothing.
+            if build_profile.deploy_services:
+                shared = shared._replace(host_config=_rendered_config(host_render))
             phase.step("project files, agent artifacts and services")
             if injected:
                 phase.step(f"services injected: {', '.join(injected)}")
 
-            config = _render_compose_files(zones, runtime_root, dev_mode=dev)
-            phase.step("compose files")
-
+            # Personas BEFORE the compose files: the services render reads the
+            # personas' rendered config.yml files for its per-persona grants
+            # (the bluesky_web sidecar's roster secrets), and the start verbs
+            # are as-built — a grant this pass misses reaches no container.
             persona_renders = _render_persona_projects(shared, zones)
             if persona_renders:
                 phase.step(f"{len(persona_renders)} persona render(s)")
+
+            config = _render_compose_files(zones, runtime_root, dev_mode=dev)
+            phase.step("compose files")
 
             # The copies the images are built from — the deployment's and one per
             # persona — each rendered against the path its container sees itself at
@@ -2271,6 +2695,21 @@ def _build_repo(
         # file in the tree the line above just published.
         _wire_build_derived_env(repo_root, zones.build_dir)
 
+        # The build-time half of the stand-in's lattice gate. Validation asks
+        # the same question of the env chain alone; only here is the other half
+        # knowable — whether this render produced a channel manifest, which is
+        # the precondition the line above gates its `VA_LATTICE=builtin` write
+        # on. A stand-in with no lattice behind the readout perturbation it
+        # ships exits at container start, so it is refused now rather than
+        # discovered at `osprey up`.
+        va = build_profile.virtual_accelerator
+        if va is not None and va.live_standin is not None:
+            standin_errors = live_standin_lattice_errors(repo_root, zones.build_dir)
+            if standin_errors:
+                raise BuildProfileError(
+                    "Profile validation failed:\n  " + "\n  ".join(standin_errors)
+                )
+
     except click.Abort:
         raise
     except click.UsageError as e:
@@ -2288,6 +2727,13 @@ def _build_repo(
         # under, so the message names the spool rather than repeating it — and
         # carries no ✗ of its own, because that phase's failure line has one.
         logger.error("Build failed: %s", e)
+        # Some of those failures say nothing an operator can act on — a registry
+        # 401 naming a password that was never sent is the standing example. The
+        # same seam `osprey up` uses answers them here, and stays silent on
+        # every failure it cannot name.
+        remedy = diagnose_captured_failure(e)
+        if remedy is not None:
+            logger.error("→ %s", remedy)
         raise click.Abort() from e
     except Exception as e:
         logger.error("✗ Unexpected error: %s", e)
@@ -2369,6 +2815,86 @@ def _collect_profile_artifacts(
     return artifacts
 
 
+def _profile_setup_patch_capable(build_profile: Any) -> bool:
+    """Whether *build_profile*'s render leaves the setup capability in place.
+
+    :func:`~osprey.cli.profile_conventions.is_setup_patch_capable` answers this
+    for a rendered persona config; this reaches the same answer one step
+    earlier, from the ``config:`` overrides that config is about to be written
+    from. The composition — deny minus ``remove_deny``, because a persona tier
+    that lifts an inherited deny is capable — is NOT repeated here: the
+    overrides are assembled into the ``config.yml``-shaped document the
+    predicate reads and it does the subtraction, so there is one composition
+    for both callers to be wrong or right together.
+
+    The SPELLING is not owned here either, and deliberately no longer is.
+    ``claude_code.permissions.deny`` can be written as one dotted key, as a
+    ``claude_code.permissions:`` mapping holding ``deny``, or as a fully nested
+    ``claude_code:`` block, and all three reach the same leaf in the rendered
+    ``config.yml`` — ``config_update_fields`` takes any of them. This function
+    used to read the first and the third; the middle one renders and was read as
+    nothing, so a profile that denied the setup tool through
+    ``claude_code.permissions: {deny: [...]}`` was reported capable and the
+    Dockerfile chowned ``build/config.yml`` to a persona whose ``settings.json``
+    denies the tool. Rather than adding the third reader,
+    :func:`~osprey.deployment.web_terminals.personas.persona_capability_document`
+    — the guard belt's reader, which already tries every split point — assembles
+    the document, so exactly one spelling reader exists in the codebase and the
+    container's verdict cannot disagree with the guard's about what a profile
+    says.
+
+    Reading every spelling and unioning them is exact rather than merely broad
+    because a profile cannot carry two of them at once:
+    :func:`~osprey.cli.build_profile_load._reject_mixed_claude_code_spellings`
+    refuses a ``config:`` block that spells any ``claude_code`` path two ways,
+    since ``config_update_fields`` would silently apply one and discard the
+    other. Absent that refusal the union would be wrong in the direction that
+    matters: ``remove_deny`` GRANTS the capability, so unioning a dotted lift
+    with a nested deny would report ``True`` for a render whose
+    ``settings.json`` denies the tool.
+
+    Args:
+        build_profile: The resolved profile for the render being built.
+
+    Returns:
+        ``True`` when nothing the profile denies takes the setup tool away.
+    """
+    from osprey.deployment.web_terminals.personas import persona_capability_document
+
+    from .profile_conventions import is_setup_patch_capable
+
+    overrides = build_profile.config if isinstance(build_profile.config, dict) else {}
+    return is_setup_patch_capable(persona_capability_document(overrides))
+
+
+def _profile_port_base(build_profile: Any) -> int:
+    """The first port of the block this profile's deployment publishes into.
+
+    The profile's ``config:`` is a flat bag of dotted keys, so the deployment
+    block is read through :func:`effective_config_subtree` — which folds
+    ``deployment:``, ``deployment.port_base`` and any nesting of the two into
+    one subtree in the right order — and then re-wrapped as
+    ``{"deployment": ...}`` for :func:`resolve_port_base`. The re-wrap is what
+    keeps the resolver on its single rendered-config-shaped input, so a base
+    that arrives through a profile is range-checked by exactly the same code
+    that checks one read from a rendered ``config.yml``.
+
+    Args:
+        build_profile: The resolved profile being rendered.
+
+    Returns:
+        The configured base, or the layout default when the profile names none.
+
+    Raises:
+        ValueError: If the profile's base is below 1024 or its block would run
+            past port 65535. The build stops here rather than rendering the
+            deployment at the default base, which would silently publish
+            somewhere the author did not ask for.
+    """
+    deployment = effective_config_subtree(build_profile.config, ("deployment",))
+    return resolve_port_base({"deployment": deployment})
+
+
 def _repo_render_context(
     build_profile: Any,
     *,
@@ -2400,6 +2926,15 @@ def _repo_render_context(
     whole derivation for a render whose processes start on another machine
     (:data:`_CONTAINER_INTERPRETER`), where none of this filesystem's answers
     exist.
+
+    ``port_base`` is the third, and it is resolved here because this is the
+    one place that holds both the profile and every render made from it: the
+    project render, the persona renders and the reading of what the app
+    template deploys at its defaults all take their ports from this value.
+
+    Raises:
+        ValueError: If the profile's ``deployment.port_base`` is out of range;
+            see :func:`_profile_port_base`.
     """
     context: dict[str, Any] = {
         # Gates the rendered config's `services:`/`deployed_services:` blocks.
@@ -2407,6 +2942,19 @@ def _repo_render_context(
         "project_root": str(runtime_root or repo_root),
         "dependencies": project_deps,
         "pip_dependency_args": " ".join(shlex.quote(d) for d in project_deps),
+        # Gates the ONE line of Dockerfile.j2 that hands `build/config.yml` to
+        # the agent's user: a persona that can still reach the setup tool needs
+        # the file that tool edits to be writable, and every other tier must
+        # leave it root-owned. Composed here the way settings.json renders it —
+        # the profile's own deny minus its `remove_deny`, which is how a tier
+        # lifts the base floor — because the rendered config those keys land in
+        # does not exist yet when this context is built.
+        "is_setup_patch_capable": _profile_setup_patch_capable(build_profile),
+        # The base this deployment's whole port block hangs off, resolved from
+        # the profile ONCE and handed down: every framework port the render
+        # writes is derived from this value by the template manager, so no
+        # consumer downstream falls back to the layout's own default.
+        "port_base": _profile_port_base(build_profile),
     }
     if build_profile.provider:
         context["default_provider"] = build_profile.provider
@@ -2499,7 +3047,18 @@ def _inject_services(build_profile: Any, profile_dir: Path, project_path: Path) 
         _inject_gchat_bridge(build_profile.gchat_bridge, project_path)
         injected.append("Google Chat bridge")
     if build_profile.bluesky is not None:
-        _inject_bluesky(build_profile.bluesky, project_path)
+        # The VA block is handed over because a two-lane deploy on a live
+        # baseline puts its second lane on the virtual accelerator, and
+        # _inject_va has not written that service to config.yml yet.
+        # The base travels with the call: lane 2's port is re-checked against
+        # the layout at the base this deployment resolved, and the injector has
+        # no config of its own to read one from.
+        _inject_bluesky(
+            build_profile.bluesky,
+            project_path,
+            build_profile.virtual_accelerator,
+            base=_profile_port_base(build_profile),
+        )
         injected.append("bluesky bridge")
     if build_profile.bluesky_web is not None:
         _inject_bluesky_web(build_profile.bluesky_web, project_path)

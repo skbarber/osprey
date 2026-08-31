@@ -1,0 +1,572 @@
+"""The composition card ``osprey init`` prints under its report.
+
+One glance at what the deployment that was just materialized consists of,
+before anything is built or started: who can sign in and with what rights,
+what the agent runs on, what machine it talks to, and what else runs beside
+it. Everything on the card is read off the resolved
+:class:`~osprey.cli.build_profile_model.BuildProfile` (plus the emitted
+persona deltas), so the card is a pure function of the profile — a build with
+no web tier simply has no ``web terminal`` group, and a profile that declares
+no extra services has no ``services`` group. Nothing here probes the host or
+the container runtime.
+
+The card is echo-class: it is part of what ``init`` owes its operator, so it
+prints under every reporter, through
+:meth:`~osprey.cli.phase_reporter.PhaseReporter.echo_segments` — styled on a
+terminal, byte-identical to its plain rendering through a pipe. The one
+derivation feeds both the printer and :func:`format_profile_card`, the
+plain-text twin the tests pin, so the card an operator reads cannot differ
+from the card a test reads (:mod:`osprey.cli.summary_card`'s precedent).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+from osprey.utils.logger import get_logger
+
+from .styles import Styles
+
+if TYPE_CHECKING:
+    from .build_profile_model import BuildProfile
+
+logger = get_logger("cli.profile_card")
+
+#: One styled run of text: ``(text, style token or None)``.
+Segment = tuple[str, str | None]
+
+#: One cell of a row — a list of segments, so a single cell can carry a plain
+#: value with a dim separator or an accent port inside it.
+Cell = list[Segment]
+
+#: The list separator, always dim: lists should read as items, not dot soup.
+_SEP: Segment = (" · ", Styles.DIM)
+
+_INDENT = "  "
+_GUTTER = "   "
+
+
+@dataclass
+class CardGroup:
+    """One titled block of the card."""
+
+    title: str
+    """The group anchor, rendered in the header token."""
+
+    suffix: str = ""
+    """Text after the title (the web tier's entry port), rendered accent."""
+
+    rows: list[list[Cell]] = field(default_factory=list)
+    """Rows of cells. The first cell is the row's label; within a group every
+    column is padded to a common width, except each row's last non-empty cell,
+    which flows free (so a long panels list never pushes the user columns)."""
+
+
+# ---------------------------------------------------------------------------
+# Derivation — profile in, groups out
+# ---------------------------------------------------------------------------
+
+
+def _dotted_lookup(config: Mapping[str, Any], wanted: tuple[str, ...]) -> Any:
+    """What a flat dotted ``config:`` bag sets at ``wanted``, or ``None``.
+
+    Reads every spelling — the dotted key itself or an ancestor carrying the
+    path nested inside its value — and later keys win, matching the order the
+    build applies them in.
+    """
+    from .profile_cmd import _config_node
+
+    found: Any = None
+    for key, value in config.items():
+        if not isinstance(key, str):
+            continue
+        node = _config_node(tuple(key.split(".")), value, wanted)
+        if node is not None:
+            found = node
+    return found
+
+
+def _persona_control_section(
+    profile: BuildProfile, persona_deltas: Mapping[str, Mapping[str, Any]], persona: str
+) -> dict[str, Any]:
+    """The ``control_system:`` section ``persona``'s render resolves to.
+
+    The persona delta's own ``config:`` folded over the host profile's, deeper
+    key winning, exactly as the build applies the two flat dotted bags in turn
+    — the bundled tiers pin posture on both sides of the boundary, and a
+    facility persona that says nothing inherits the host's.
+    """
+    from .build_profile_emit import _merge_subtree, effective_config_subtree
+
+    wanted = ("control_system",)
+    section = effective_config_subtree(profile.config, wanted)
+    config = persona_deltas.get(persona, {}).get("config")
+    if isinstance(config, Mapping):
+        _merge_subtree(section, effective_config_subtree(config, wanted))
+    return section
+
+
+def _write_rights(
+    profile: BuildProfile, persona_deltas: Mapping[str, Mapping[str, Any]], persona: str
+) -> list[str]:
+    """``persona``'s write posture, one item per target its render reaches.
+
+    Posture is per connector type — ``control_system.connector.<type>.
+    writes_enabled``, and only for a type whose own block says nothing the
+    deployment-wide ``control_system.writes_enabled`` — so one deployment can
+    be armed on its simulator and read-only on the machine beside it. There is
+    no deployment-wide answer to print, and no single answer per persona
+    either: the card says it per target, and per login.
+
+    Which targets are named is
+    :func:`~osprey_connectors.types.session_posture`'s answer, never a loop
+    over both — a render that cannot switch reaches the one connector it
+    builds, and speaking about the other would describe a machine no session
+    here can be pointed at. So the ordinary single-target render reads as it
+    always has, one unqualified item or nothing at all, and only a
+    switch-capable render spells the targets out — both of them, armed and
+    not, since which half of a mixed posture carries the write path is the
+    whole reason to say it.
+    """
+    from osprey_connectors.types import session_posture
+
+    posture = session_posture(_persona_control_section(profile, persona_deltas, persona))
+    if len(posture) == 1:
+        return ["rights approval-gated"] if any(posture.values()) else []
+    return [
+        f"{target} rights approval-gated" if armed else f"{target} read-only"
+        for target, armed in posture.items()
+    ]
+
+
+def _panel_labels(
+    profile: BuildProfile, persona_deltas: Mapping[str, Mapping[str, Any]]
+) -> list[str]:
+    """Display labels for every panel any login of this deployment gets.
+
+    The union across the host profile and the persona deltas, in declaration
+    order — panel sets are per-persona (the write tier adds its own), and the
+    card summarizes the deployment. Labels come from the same sources the web
+    terminal reads: :data:`~osprey.profiles.web_panels.BUILTIN_PANEL_LABELS`
+    for built-ins, ``web.panels.<id>.label`` for URL-backed custom panels, and
+    the id itself, uppercased, when neither says.
+    """
+    from osprey.profiles.web_panels import BUILTIN_PANEL_LABELS
+
+    ids: list[str] = list(dict.fromkeys(profile.web_panels))
+    for delta in persona_deltas.values():
+        extra = delta.get("web_panels")
+        if not isinstance(extra, list):
+            continue
+        for panel_id in extra:
+            if isinstance(panel_id, str) and panel_id not in ids:
+                ids.append(panel_id)
+
+    return [
+        BUILTIN_PANEL_LABELS.get(panel_id)
+        or _custom_panel_label(profile, persona_deltas, panel_id)
+        or panel_id.upper()
+        for panel_id in ids
+    ]
+
+
+def _custom_panel_label(
+    profile: BuildProfile, persona_deltas: Mapping[str, Mapping[str, Any]], panel_id: str
+) -> str | None:
+    """The ``web.panels.<id>.label`` any layer of this deployment declares."""
+    wanted = ("web", "panels", panel_id, "label")
+    value = _dotted_lookup(profile.config, wanted)
+    for delta in persona_deltas.values():
+        config = delta.get("config")
+        if isinstance(config, Mapping):
+            value = _dotted_lookup(config, wanted) or value
+    return str(value) if value else None
+
+
+def _joined(parts: Sequence[Cell]) -> Cell:
+    """One cell from several, separated by the dim list separator."""
+    cell: Cell = []
+    for part in parts:
+        if cell:
+            cell.append(_SEP)
+        cell.extend(part)
+    return cell
+
+
+def _dotted_list(items: Sequence[str]) -> Cell:
+    """Plain items joined by the dim separator."""
+    return _joined([[(item, None)] for item in items])
+
+
+def _allocated(base_ports: Mapping[str, int], index: Any) -> dict[str, int]:
+    """The host ports web-terminal user ``index`` gets, or ``{}``.
+
+    The render's own allocator, so the card cannot describe a user as reachable
+    somewhere the deployment does not put them.
+
+    Args:
+        base_ports: Each family's effective base port, from
+            :func:`~osprey.deployment.web_terminals.ports.base_ports_from_config`.
+            Empty when the profile's ports could not be resolved at all.
+        index: The user's roster index, as the profile spells it — anything that
+            is not a usable index costs this user's port cell, which is lint's
+            finding to raise rather than the card's.
+
+    Returns:
+        ``{family: port}``, or an empty mapping when nothing can be allocated.
+    """
+    from osprey.deployment.web_terminals.ports import allocate_ports
+
+    try:
+        return allocate_ports(dict(base_ports), index)
+    except (TypeError, ValueError):
+        return {}
+
+
+def _family_ports(base_ports: Mapping[str, int]) -> Cell:
+    """Every port family's first port, as one cell.
+
+    Args:
+        base_ports: Each family's effective base port.
+
+    Returns:
+        ``web :10100 · artifact :10200 · …`` as styled segments, or an empty
+        cell when the ports could not be resolved. Ascending, so the row reads
+        as the stretch of the block it is — the registry's own order is by
+        family name, which would print a higher band before a lower one. Family
+        names are shown as words, since the underscore in ``channel_finder`` is
+        a config spelling and this row is prose.
+    """
+    allocated = sorted(_allocated(base_ports, 0).items(), key=lambda item: item[1])
+    return _joined(
+        [
+            [(family.replace("_", " "), None), (f" :{port}", Styles.ACCENT)]
+            for family, port in allocated
+        ]
+    )
+
+
+def _web_terminal_group(
+    profile: BuildProfile, persona_deltas: Mapping[str, Mapping[str, Any]]
+) -> CardGroup | None:
+    """Who gets in, with what rights, how, and where — plus what they see."""
+    from osprey.deployment.web_terminals.personas import (
+        effective_persona,
+        resolve_authorization_roles,
+    )
+    from osprey.deployment.web_terminals.ports import base_ports_from_config, resolve_nginx_port
+    from osprey.port_layout import resolve_port_base
+
+    from .build_profile_emit import effective_config_subtree, effective_web_terminals
+
+    web_tier = effective_web_terminals(profile.config)
+    if not web_tier.get("enabled"):
+        return None
+
+    # The shape the port resolvers take: they read `deployment.port_base` and
+    # `modules.web_terminals` out of ONE document, because a family's port is
+    # the base plus its band and reading either half alone describes a
+    # deployment that lives somewhere else. A profile carries the two in
+    # separate places, so they are re-wrapped here once for every port on this
+    # group. Report, not gate (see `roles` below): a base or a port key that is
+    # not a number is lint's finding to raise, and costs a cell rather than the
+    # card.
+    rendered_shape = {
+        "deployment": effective_config_subtree(profile.config, ("deployment",)),
+        "modules": {"web_terminals": web_tier},
+    }
+    try:
+        base_ports = base_ports_from_config(web_tier, base=resolve_port_base(rendered_shape))
+    except ValueError:
+        base_ports = {}
+
+    # The card is a REPORT of a profile, not a gate on one: an `authorization`
+    # stanza that does not parse, or an entry whose binding does not resolve,
+    # is lint's finding to raise (the same lint belt runs at profile altitude).
+    # Both degrade here to the persona the entry would have shown before roles
+    # existed, so a bad binding costs one wrong cell rather than the whole card.
+    try:
+        roles = resolve_authorization_roles(web_tier)
+    except ValueError:
+        roles = {}
+
+    rows: list[list[Cell]] = []
+    auth = web_tier.get("auth")
+    auth_method = auth.get("method") if isinstance(auth, Mapping) else None
+    default_persona = web_tier.get("default_persona")
+    users = web_tier.get("users")
+    for position, user in enumerate(users if isinstance(users, list) else []):
+        if not isinstance(user, Mapping):
+            continue
+        name = str(user.get("name") or "")
+        if not name:
+            continue
+        persona = effective_persona(user, roles, default_persona, strict=False) or ""
+        rights: list[str] = []
+        if persona:
+            rights.append(persona)
+            rights.extend(_write_rights(profile, persona_deltas, persona))
+        if user.get("login") is False:
+            # The one warning tone on the card: an open surface must not be
+            # skimmed past, so `password` stays dim precisely to keep it alone.
+            auth_cell: Cell = [("no login", Styles.WARNING)]
+        elif auth_method:
+            auth_cell = [(str(auth_method), Styles.DIM)]
+        else:
+            auth_cell = []
+        index = user.get("index", position)
+        # The allocator the render itself uses, rather than `base + index` spelled
+        # again: it is what falls a family back to its layout band when the
+        # profile sets no base port, and what refuses an index past the end of
+        # the band instead of quietly placing a user in the next family's ports.
+        web_port = _allocated(base_ports, index).get("web")
+        port_cell: Cell = [(f":{web_port}", Styles.ACCENT)] if web_port else []
+        rows.append([[(name, Styles.BOLD)], _dotted_list(rights), auth_cell, port_cell])
+
+    panels = _panel_labels(profile, persona_deltas)
+    if panels:
+        rows.append([[("panels", Styles.DIM)], _dotted_list(panels)])
+
+    if not rows:
+        return None
+
+    # Every family, at the first index of the block. The rows above give each
+    # user the one port they open — their terminal — but a deployment publishes
+    # a whole band per family, and the panels row directly above says what those
+    # bands serve without saying where any of them answers. One row settles both
+    # halves, and states the index it is showing rather than leaving a reader to
+    # infer whose ports these are.
+    #
+    # Below the guard on purpose: this row is derivable for any enabled web tier,
+    # including one with no roster and no panels, and a group that consisted of
+    # nothing but a port table would say a deployment has terminals when nobody
+    # can sign into one.
+    families = _family_ports(base_ports)
+    if families:
+        rows.append([[("ports (user 0)", Styles.DIM)], families])
+
+    # The address the card puts beside the group title, resolved rather than
+    # read: a profile that sets no `nginx_port` still lands on the gateway slot
+    # of its own block, and a card that dropped the suffix there would report a
+    # deployment with no front door.
+    try:
+        suffix = f":{resolve_nginx_port(rendered_shape)}"
+    except ValueError:
+        suffix = ""
+    return CardGroup("web terminal", suffix, rows)
+
+
+def _enabled_mcp_servers(profile: BuildProfile) -> list[str]:
+    """The MCP servers the agent gets, resolved as the render resolves them.
+
+    :func:`~osprey.registry.mcp.resolve_servers` over the profile's effective
+    ``claude_code`` subtree — the registry's own defaults plus the profile's
+    ``claude_code.servers.<name>.enabled`` overrides — with the channel-finder
+    condition keyed the way the render keys it, plus the profile's own
+    ``mcp_servers:`` declarations.
+    """
+    from osprey.registry.mcp import resolve_servers
+
+    from .build_profile_emit import effective_config_subtree
+
+    claude_code = effective_config_subtree(profile.config, ("claude_code",))
+    ctx: dict[str, Any] = {}
+    if profile.channel_finder_mode and "channel-finder" in profile.agents:
+        ctx["channel_finder_pipeline"] = profile.channel_finder_mode
+    names = [server["name"] for server in resolve_servers(claude_code, ctx) if server["enabled"]]
+    for name in profile.mcp_servers:
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def _agent_group(profile: BuildProfile) -> CardGroup | None:
+    """What thinks: the model, its tool surface, and its bundled toolkit."""
+    rows: list[list[Cell]] = []
+    model_bits = [bit for bit in (profile.provider, profile.model) if bit]
+    if model_bits:
+        rows.append([[("model", Styles.DIM)], _dotted_list(model_bits)])
+    servers = _enabled_mcp_servers(profile)
+    if servers:
+        rows.append([[("mcp", Styles.DIM)], _dotted_list(servers)])
+    toolkit = [
+        f"{len(entries)} {noun}"
+        for entries, noun in (
+            (profile.hooks, "hooks"),
+            (profile.rules, "rules"),
+            (profile.skills, "skills"),
+            (profile.agents, "agents"),
+        )
+        if entries
+    ]
+    if toolkit:
+        rows.append([[("toolkit", Styles.DIM)], _dotted_list(toolkit)])
+    return CardGroup("agent", rows=rows) if rows else None
+
+
+def _machine_group(profile: BuildProfile) -> CardGroup | None:
+    """What the agent talks to: connector, archive, channel database."""
+    rows: list[list[Cell]] = []
+
+    control: list[Cell] = []
+    connector = _dotted_lookup(profile.config, ("control_system", "type"))
+    if isinstance(connector, str) and connector:
+        control.append([(connector.replace("_", " "), None)])
+    if profile.virtual_accelerator is not None:
+        port = profile.virtual_accelerator.port
+        control.append([("EPICS ", None), (f":{port}", Styles.ACCENT)])
+        standin_port = profile.virtual_accelerator.live_standin
+        if standin_port is not None:
+            control.append([("live stand-in ", None), (f":{standin_port}", Styles.ACCENT)])
+    if control:
+        rows.append([[("control", Styles.DIM)], _joined(control)])
+
+    archiver: list[str] = []
+    archiver_type = _dotted_lookup(profile.config, ("archiver", "type"))
+    if isinstance(archiver_type, str) and archiver_type:
+        archiver.append(archiver_type.removesuffix("_archiver").replace("_", " "))
+    if profile.va_archiver is not None:
+        archiver.append(f"{profile.va_archiver.retention_days} d retention")
+    if archiver:
+        rows.append([[("archiver", Styles.DIM)], _dotted_list(archiver)])
+
+    if profile.channel_finder_mode:
+        finder = f"{profile.channel_finder_mode.replace('_', ' ')} finder"
+        tier = f"tier {profile.resolved_tier()}"
+        rows.append([[("channels", Styles.DIM)], _dotted_list([finder, tier])])
+
+    return CardGroup("machine", rows=rows) if rows else None
+
+
+def _services_group(profile: BuildProfile) -> CardGroup | None:
+    """What else runs beside the terminals, named as the build names it."""
+    rows: list[list[Cell]] = []
+
+    if profile.bluesky is not None:
+        parts: list[Cell] = [[(f":{profile.bluesky.port}", Styles.ACCENT)]]
+        if profile.bluesky.tiled_enabled:
+            parts.append([("tiled ", None), (f":{profile.bluesky.tiled_port}", Styles.ACCENT)])
+        if profile.bluesky_web is not None:
+            parts.append([("web ", None), (f":{profile.bluesky_web.port}", Styles.ACCENT)])
+        rows.append([[("bluesky", Styles.DIM)], _joined(parts)])
+    elif profile.bluesky_web is not None:
+        rows.append(
+            [[("bluesky web", Styles.DIM)], [(f":{profile.bluesky_web.port}", Styles.ACCENT)]]
+        )
+
+    if profile.dispatch is not None:
+        dispatch = profile.dispatch
+        noun = "worker" if dispatch.worker_count == 1 else "workers"
+        workers: Cell = [(f"{dispatch.worker_count} {noun}", None)]
+        triggers: Cell = [("triggers ", None), (dispatch.triggers, Styles.PATH)]
+        rows.append([[("dispatch", Styles.DIM)], _joined([workers, triggers])])
+
+    if profile.nextcloud_bridge is not None:
+        rows.append([[("bridge", Styles.DIM)], [("Nextcloud Talk", None)]])
+    if profile.gchat_bridge is not None:
+        rows.append([[("bridge", Styles.DIM)], [("Google Chat", None)]])
+    for name in profile.services:
+        rows.append([[(name, Styles.DIM)], [("profile service", None)]])
+
+    return CardGroup("services", rows=rows) if rows else None
+
+
+def _card_groups(
+    profile: BuildProfile, persona_deltas: Mapping[str, Mapping[str, Any]]
+) -> list[CardGroup]:
+    """The card's groups, in the fixed order the reader learns once."""
+    candidates = (
+        _web_terminal_group(profile, persona_deltas),
+        _agent_group(profile),
+        _machine_group(profile),
+        _services_group(profile),
+    )
+    return [group for group in candidates if group is not None]
+
+
+# ---------------------------------------------------------------------------
+# Layout — groups in, lines out
+# ---------------------------------------------------------------------------
+
+
+def _plain_text(segments: Sequence[Segment]) -> str:
+    """The text of a run of segments, with the styles dropped."""
+    return "".join(part for part, _ in segments)
+
+
+def _last_filled(row: list[Cell]) -> int:
+    """The index of ``row``'s last non-empty cell, or 0 for an empty row."""
+    return max((column for column, cell in enumerate(row) if cell), default=0)
+
+
+def _group_lines(group: CardGroup) -> list[list[Segment]]:
+    """Lay one group out as segment lines: title, then padded rows."""
+    title: list[Segment] = [(_INDENT, None), (group.title, Styles.HEADER)]
+    if group.suffix:
+        title += [("  ", None), (group.suffix, Styles.ACCENT)]
+    lines = [title]
+
+    # Each row is cut at its last non-empty cell, so that cell flows free and
+    # only the columns before it are padded to the group's common width.
+    rows = [row[: _last_filled(row) + 1] for row in group.rows]
+    widths: dict[int, int] = {}
+    for row in rows:
+        for column, cell in enumerate(row[:-1]):
+            widths[column] = max(widths.get(column, 0), len(_plain_text(cell)))
+
+    for row in rows:
+        line: list[Segment] = [(_INDENT * 2, None)]
+        for column, cell in enumerate(row):
+            line.extend(cell)
+            if column < len(row) - 1:
+                line.append((" " * (widths[column] - len(_plain_text(cell))) + _GUTTER, None))
+        lines.append(line)
+    return lines
+
+
+def _card_segment_lines(
+    profile: BuildProfile, persona_deltas: Mapping[str, Mapping[str, Any]]
+) -> list[list[Segment]]:
+    """The whole card as segment lines; an empty line separates the groups.
+
+    Starts with its own separator line when there is anything to say, so the
+    card always stands one blank line off whatever printed above it.
+    """
+    lines: list[list[Segment]] = []
+    for group in _card_groups(profile, persona_deltas):
+        lines.append([])
+        lines.extend(_group_lines(group))
+    return lines
+
+
+def format_profile_card(
+    profile: BuildProfile, persona_deltas: Mapping[str, Mapping[str, Any]]
+) -> list[str]:
+    """The card as plain lines — what a pipe reads, and what the tests pin."""
+    return [_plain_text(line) for line in _card_segment_lines(profile, persona_deltas)]
+
+
+def print_profile_card(
+    profile: BuildProfile, persona_deltas: Mapping[str, Mapping[str, Any]]
+) -> None:
+    """Print the card through the reporter; advisory, never raises.
+
+    ``init`` has created the repo by the time this runs, and a card that
+    cannot be derived — a config shape this reader never met — must not turn
+    that into a failure.
+    """
+    from .phase_reporter import current_reporter
+
+    try:
+        lines = _card_segment_lines(profile, persona_deltas)
+    except Exception as exc:  # noqa: BLE001 — see docstring: the card is advisory
+        logger.debug("Profile card skipped: %s", exc)
+        return
+    reporter = current_reporter()
+    for line in lines:
+        if line:
+            reporter.echo_segments(line)
+        else:
+            reporter.echo("")

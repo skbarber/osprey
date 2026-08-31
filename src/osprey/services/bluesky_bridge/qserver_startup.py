@@ -11,10 +11,9 @@ here, in this process — the bridge is a client of the manager, not its parent.
 Three things are assembled, in this order:
 
 1. **Devices** — connector-mediated ``ConnectorSettable``/``ConnectorReadable``
-   instances built from the substrate env (``BLUESKY_EPICS_SUBSTRATE`` +
-   ``BLUESKY_EPICS_SETPOINTS``/``BLUESKY_EPICS_READBACKS``), exactly as the
-   bridge's in-process wiring built them: every plan read goes through
-   ``connector.read_channel`` and every plan write through
+   instances built from the device file named by ``BLUESKY_DEVICES_FILE``,
+   exactly as the bridge's in-process wiring built them: every plan read goes
+   through ``connector.read_channel`` and every plan write through
    ``connector.write_channel_checked``. Moving execution out of the bridge
    moves the reference monitor here with it — there is no raw Channel Access
    in this process either.
@@ -32,7 +31,7 @@ Three things are assembled, in this order:
    fault-isolated: a Tiled outage or a dead proxy degrades telemetry, it never
    aborts a plan.
 
-**Browse-only is the failure mode.** With no substrate env — the mock
+**Browse-only is the failure mode.** With no readable device file — the mock
 connector case — no devices are built, no plans are registered, and the
 namespace ends up holding only ``RE``. The script does not raise: the manager
 comes up healthy with an empty allowed-plan list, so the queue surface is
@@ -42,7 +41,11 @@ execution time against devices that were never built.
 Self-contained on purpose: this module reads its own env and builds its own
 connector rather than importing the bridge's in-process runner wiring, which
 the queue backend replaces. It runs in a different container from ``app.py``
-and must keep working when that wiring is gone.
+and must keep working when that wiring is gone. The one thing it does import
+from the bridge's side is ``queue_backend``'s lane resolver — which machine
+this worker binds to is the same question the bridge answers on its capability
+record, and one ladder is what keeps the two containers from describing the
+lane differently.
 
 **NEVER use a relative import in this file — not even inside a function.** In
 production this module is not imported at all: it is the manager's
@@ -63,19 +66,19 @@ import inspect
 import logging
 import os
 from collections.abc import Callable, Iterator, Mapping
+from pathlib import Path
 from typing import Any
-
-# Absolute, never relative -- see the module docstring. Safe at module level:
-# `devices/__init__.py` imports neither submodule and `specs.py` is dataclasses
-# only, so this pulls in no part of the ophyd-async device stack.
-from osprey.services.bluesky_bridge.devices._specs_from_env import SUBSTRATE_ENV
 
 logger = logging.getLogger("osprey.services.bluesky_bridge.qserver_startup")
 
-__all__ = ["SUBSTRATE_ENV"]
-"""``SUBSTRATE_ENV`` is re-exported: it is the opt-in flag for building real
-connector-mediated devices (absent/false means browse-only), and it lives in
-``devices._specs_from_env`` beside the two PV-list vars it gates."""
+DEVICES_FILE_ENV = "BLUESKY_DEVICES_FILE"
+"""Path to the worker's device file, as mounted into this container.
+
+Its presence *is* the substrate switch. The file lists every channel this
+worker exposes as a scan device, so a deploy that mounts one gets real
+connector-mediated devices and a deploy that does not is browse-only — there is
+no separate on/off flag to keep in step with it. Unset, or naming something
+this process cannot read as a file, means no devices are built."""
 
 TILED_URI_ENV = "BLUESKY_TILED_URI"
 """Tiled server URI. Absent means no ``TiledWriter`` subscription at all."""
@@ -97,14 +100,6 @@ ZMQ_CURVE_SERVER_PUBLIC_KEY_ENV = "BLUESKY_ZMQ_CURVE_SERVER_PUBLIC_KEY"
 :data:`ZMQ_CURVE_SECRET_KEY_ENV`; setting exactly one of the two is a
 misconfiguration and is refused rather than silently publishing unencrypted."""
 
-_TRUTHY_VALUES = {"1", "true", "yes", "on"}
-
-_EPICS_LIKE_CONNECTOR_TYPES = ("virtual_accelerator", "epics")
-"""Connector types that get a gateway-less ``type_config`` — real Channel
-Access, whether a virtual-accelerator soft-IOC or live hardware. A gateway-less
-config makes ``connect()`` skip the block that sets process-wide ``EPICS_CA_*``
-env, so the compose-inherited ``EPICS_CA_NAME_SERVERS`` survives untouched."""
-
 CONNECT_TIMEOUT = 30.0
 """Seconds :func:`build_namespace` waits for the async device build to finish
 on the RunEngine's loop. Generous enough for real Channel Access connects
@@ -112,49 +107,83 @@ on the RunEngine's loop. Generous enough for real Channel Access connects
 open instead of hanging the manager forever."""
 
 
-def is_substrate_enabled(env: Mapping[str, str] | None = None) -> bool:
-    """True if ``BLUESKY_EPICS_SUBSTRATE`` is set to any of ``1/true/yes/on``.
-
-    Absent, empty, or any other value (e.g. ``"false"``) is off. Deliberately
-    liberal on the "on" spellings, but never guesses at "on" from an
-    unrecognized value — matching how the bridge parses the same flag.
-    """
-    env = os.environ if env is None else env
-    return env.get(SUBSTRATE_ENV, "").strip().lower() in _TRUTHY_VALUES
-
-
 def resolve_control_system_type() -> str:
-    """Read ``control_system.type`` from the mounted project config.
+    """The connector type this worker builds, by the lane resolution ladder.
 
-    Single source of truth: one config line flips the whole Bluesky stack
-    between the mock connector and real Channel Access. Fail-SAFE default of
-    ``"mock"`` whenever the config cannot be read at all (no project config
-    context, or a transient lookup failure) — the mock connector never touches
-    Channel Access, so an unreadable config can never silently connect this
-    worker to real hardware.
+    A single-lane deployment — every project rendered before the lane axis
+    existed — declares no target, and the ladder's first rung is then exactly
+    what this function has always answered: ``control_system.type``, fail-SAFE
+    to ``"mock"`` when the config cannot be read at all, because the mock
+    connector never touches Channel Access. A lane that DOES declare a target
+    resolves through it instead, which is how two lanes over one mounted
+    config.yml build two different connectors.
+
+    Delegated to ``queue_backend`` rather than restated here even though this
+    module is otherwise self-contained: the ladder decides which machine this
+    worker's devices bind to, and the bridge beside it publishes the same
+    answer on its capability record. Two spellings of that is one of them
+    being wrong about a machine somebody can move.
     """
+    from osprey.services.bluesky_bridge.queue_backend import resolve_lane_connector_type
+
+    return resolve_lane_connector_type()[0]
+
+
+def worker_writes_enabled() -> bool:
+    """Whether this worker is armed to drive the machine its lane addresses.
+
+    The same answer the reference monitor inside the connector reaches, from
+    the same inputs — stated here because the type the ladder lands on is the
+    whole point of the lane axis (a VA lane beside a live baseline is armed by
+    the VA block alone), and a worker that comes up unarmed should say so at
+    startup rather than leave an operator to discover it on a refused write.
+
+    Which posture applies follows the rung the ladder stopped on:
+
+    * a lane whose target resolved is armed by its own type's block,
+      ``control_system.connector.<type>.writes_enabled``, inheriting the
+      deployment-wide key when that block says nothing;
+    * a DEGRADED lane (rung 3) is armed by ``control_system.writes_enabled``
+      and nothing else. It was built as the deployment baseline while
+      addressing a different machine, so the baseline type's block describes a
+      machine this lane does not talk to — arming a facility gateway on the
+      strength of "you may write to the simulator" is exactly the confusion the
+      per-type posture exists to prevent. The deployment-wide key is the only
+      thing such a config has ever said about this lane.
+
+    False whenever the config cannot be read, and False in a readonly run
+    whatever the deployment says.
+    """
+    from osprey.services.bluesky_bridge.queue_backend import resolve_lane_connector_type
     from osprey.utils.config import get_config_value
+    from osprey_connectors.control_system.base import is_readonly_run
+    from osprey_connectors.types import WRITES_ENABLED_KEY, type_writes_enabled
 
+    connector_type, lane_degraded = resolve_lane_connector_type()
     try:
-        control_system_type = get_config_value("control_system.type", "mock")
+        if lane_degraded:
+            armed = get_config_value(WRITES_ENABLED_KEY, False) is True
+        else:
+            armed = type_writes_enabled(get_config_value("control_system", {}), connector_type)
     except (FileNotFoundError, KeyError, RuntimeError):
-        return "mock"
-
-    if not control_system_type or not isinstance(control_system_type, str):
-        return "mock"
-    return control_system_type
+        return False
+    return armed and not is_readonly_run()
 
 
 def build_connector_config(control_system_type: str) -> dict[str, Any]:
     """The ``type_config`` mapping ``ConnectorFactory`` consumes for ``control_system_type``.
 
-    EPICS-like types get a gateway-less config (see
-    :data:`_EPICS_LIKE_CONNECTOR_TYPES`) with a connect timeout; anything else
-    is forwarded through with no type-specific config, so an unrecognized value
-    surfaces as ``ConnectorFactory``'s own "Unknown control system type" error
-    rather than being silently mis-wired to a connector nobody asked for.
+    Channel Access types (:data:`osprey_connectors.types.CHANNEL_ACCESS_TYPES`)
+    get a gateway-less config with a connect timeout: a gateway-less config makes
+    ``connect()`` skip the block that sets process-wide ``EPICS_CA_*`` env, so
+    the compose-inherited ``EPICS_CA_NAME_SERVERS`` survives untouched. Anything
+    else is forwarded through with no type-specific config, so an unrecognized
+    value surfaces as ``ConnectorFactory``'s own "Unknown control system type"
+    error rather than being silently mis-wired to a connector nobody asked for.
     """
-    if control_system_type in _EPICS_LIKE_CONNECTOR_TYPES:
+    from osprey_connectors.types import CHANNEL_ACCESS_TYPES
+
+    if control_system_type in CHANNEL_ACCESS_TYPES:
         return {
             "type": control_system_type,
             "connector": {control_system_type: {"timeout": 5.0}},
@@ -170,16 +199,53 @@ async def create_connector() -> Any:
     when it executed plans in-process.
     """
     from osprey.connectors.factory import ConnectorFactory, register_builtin_connectors
-
-    control_system_type = resolve_control_system_type()
-    register_builtin_connectors()  # idempotent; must run before create
-    connector = await ConnectorFactory.create_control_system_connector(
-        build_connector_config(control_system_type)
+    from osprey.services.bluesky_bridge.queue_backend import (
+        resolve_lane_connector_type,
+        resolve_lane_identity,
     )
+
+    control_system_type, lane_degraded = resolve_lane_connector_type()
+    if lane_degraded:
+        logger.warning("qserver_startup: %s", lane_degraded)
+    register_builtin_connectors()  # idempotent; must run before create
+    # Built in two steps rather than through `create_control_system_connector`
+    # so the TYPE stamp can be cleared BEFORE `connect()`: a connector loads its
+    # limits validator inside connect(), keyed on the stamp, so a clear that
+    # came afterwards would leave the validator built against the wrong block.
+    connector, type_config = ConnectorFactory.build_control_system_connector(
+        build_connector_config(control_system_type),
+        # This lane's OWN target, not the deployment baseline: a two-lane
+        # deployment is exactly where the two differ, and the machine this
+        # worker drives is the one its lane declares.
+        control_target=resolve_lane_identity()[1],
+    )
+    if lane_degraded:
+        # The factory stamps the type it built, and the reference monitor keys
+        # this deployment's per-type write and limits postures on that stamp. A
+        # degraded lane was built as the baseline type while addressing a
+        # machine this config never tied to that type, so the type's block does
+        # not describe it: clearing the stamp is what makes the monitor read
+        # `control_system.writes_enabled` and the deployment-wide
+        # `limits_checking` block — the only postures the config has ever
+        # stated about this lane — which is also what `worker_writes_enabled`
+        # reports. EPICS gateway selection inside connect() is the stamp's third
+        # reader, so clearing it first moves that to the deployment-wide posture
+        # too; a no-op for this worker, whose type_config is gateway-less by
+        # construction, but it keeps all three readers on one answer.
+        #
+        # The TARGET stamp is left alone. Degradation is a statement about the
+        # config's type table, not about the lane: rung 3 is reached precisely
+        # because the lane declared a target this deployment cannot resolve, so
+        # the declared target is still the honest answer to "which machine does
+        # this worker address", and it indexes the session store rather than any
+        # config block.
+        connector._connector_type = None
+    await connector.connect(type_config)
     logger.info(
-        "qserver_startup: connected the worker's OSPREY connector (control_system.type=%s, %s)",
+        "qserver_startup: connected the worker's OSPREY connector (type=%s, %s, writes %s)",
         control_system_type,
         type(connector).__name__,
+        "enabled" if worker_writes_enabled() else "disabled",
     )
     return connector
 
@@ -187,10 +253,14 @@ async def create_connector() -> Any:
 async def build_devices(
     env: Mapping[str, str] | None = None, *, connector: Any = None
 ) -> dict[str, Any]:
-    """Build the worker's connector-mediated device set from the substrate env.
+    """Build the worker's connector-mediated device set from the device file.
+
+    The substrate is enabled exactly when :data:`DEVICES_FILE_ENV` is set *and*
+    names a file this process can read — file presence is the switch, so there
+    is no second flag that can disagree with it.
 
     Returns an empty mapping — never raises — when the substrate is disabled
-    (browse-only) or when the PV-list env vars name no devices at all. A caller
+    (browse-only) or when the device file names no devices at all. A caller
     treats an empty result as "this worker cannot execute plans", which is
     exactly what :func:`build_namespace` does with it.
 
@@ -204,10 +274,21 @@ async def build_devices(
         Mapping of device name to connected device.
     """
     env = os.environ if env is None else env
-    if not is_substrate_enabled(env):
+    devices_file = (env.get(DEVICES_FILE_ENV) or "").strip()
+    if not devices_file:
         logger.info(
             "qserver_startup: %s is not set — building no devices (browse-only worker)",
-            SUBSTRATE_ENV,
+            DEVICES_FILE_ENV,
+        )
+        return {}
+
+    path = Path(devices_file)
+    if not path.is_file() or not os.access(path, os.R_OK):
+        logger.warning(
+            "qserver_startup: %s names %r, which this worker cannot read as a file — "
+            "building no devices (browse-only worker)",
+            DEVICES_FILE_ENV,
+            devices_file,
         )
         return {}
 
@@ -215,14 +296,13 @@ async def build_devices(
     # a script with no package context, so `from .devices import ...` cannot
     # resolve and takes the whole worker environment down with it.
     from osprey.services.bluesky_bridge.devices import connector as connector_devices
-    from osprey.services.bluesky_bridge.devices._specs_from_env import specs_from_env
+    from osprey.services.bluesky_bridge.devices._specs_from_file import specs_from_file
 
-    setpoints, readbacks = specs_from_env(env)
+    setpoints, readbacks = specs_from_file(path)
     if not setpoints and not readbacks:
         logger.warning(
-            "qserver_startup: %s is enabled but BLUESKY_EPICS_SETPOINTS / "
-            "BLUESKY_EPICS_READBACKS name no devices; this worker will expose no plans",
-            SUBSTRATE_ENV,
+            "qserver_startup: device file %r names no devices; this worker will expose no plans",
+            devices_file,
         )
         return {}
 

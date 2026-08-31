@@ -133,6 +133,12 @@
 // ---- Module state ----
 
 import { initSplitter } from '/design-system/js/splitter.js';
+import {
+  focusableElements,
+  installFocusTrap,
+  removeFocusTrap,
+} from '/design-system/js/focus-trap.js';
+import { scopedStorageKey } from '/design-system/js/storage-scope.js';
 
 const BACKDROP_ID = 'drawer-backdrop';
 
@@ -148,16 +154,6 @@ let _titleIdCounter = 0;
 // closing only ever restores what this component touched.
 /** @type {Set<HTMLElement>} */
 const _inertedByUs = new Set();
-
-const FOCUSABLE_SELECTOR = [
-  'a[href]',
-  'button:not([disabled])',
-  'textarea:not([disabled])',
-  'input:not([disabled])',
-  'select:not([disabled])',
-  '[tabindex]:not([tabindex="-1"])',
-  '[contenteditable="true"]',
-].join(',');
 
 // `resizable` width persistence: key and bounds reused verbatim from old
 // web_terminal/static/js/drawer.js's initDrawerResize()/_doOpenDrawer().
@@ -185,9 +181,6 @@ export class OspreyDrawer extends HTMLElement {
     /** Element to refocus on close, captured when this drawer opened. */
     /** @type {Element|null} */
     this._returnFocusTarget = null;
-    /** The Tab-trap keydown listener while installed, else null. */
-    /** @type {((event: KeyboardEvent) => void)|null} */
-    this._focusTrapHandler = null;
     /** Registered unsaved-changes guards; all must return true to proceed. */
     /** @type {Array<() => boolean>} */
     this._unsavedGuards = [];
@@ -399,56 +392,19 @@ export class OspreyDrawer extends HTMLElement {
   }
 
   // ---- Focus trap ----
-
-  /** Every focusable, actually-rendered descendant, in document order. */
-  _focusableElements() {
-    return Array.from(this.querySelectorAll(FOCUSABLE_SELECTOR)).filter(
-      /** @returns {el is HTMLElement} */
-      (el) => el instanceof HTMLElement && el.offsetParent !== null
-    );
-  }
+  //
+  // The Tab/Shift+Tab wraparound itself lives in the shared focus-trap module,
+  // which every modal surface in the product uses. Only moving focus IN on
+  // open stays here, because the host-element fallback is drawer-specific.
 
   /** Move focus to the first focusable descendant, or the host as a fallback. */
   _moveFocusIn() {
-    const [first] = this._focusableElements();
+    const [first] = focusableElements(this);
     if (first) {
       first.focus();
     } else {
       this.focus();
     }
-  }
-
-  /** Install the Tab/Shift+Tab wraparound. Idempotent — guarded. */
-  _installFocusTrap() {
-    if (this._focusTrapHandler) return;
-    this._focusTrapHandler = (event) => {
-      if (event.key !== 'Tab') return;
-      const focusable = this._focusableElements();
-      if (focusable.length === 0) {
-        event.preventDefault();
-        return;
-      }
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      const current = document.activeElement;
-      const wrapsBackward = event.shiftKey && (current === first || !this.contains(current));
-      const wrapsForward = !event.shiftKey && (current === last || !this.contains(current));
-      if (wrapsBackward) {
-        event.preventDefault();
-        last.focus();
-      } else if (wrapsForward) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    this.addEventListener('keydown', this._focusTrapHandler);
-  }
-
-  /** Remove the Tab/Shift+Tab wraparound. Idempotent — a no-op if absent. */
-  _removeFocusTrap() {
-    if (!this._focusTrapHandler) return;
-    this.removeEventListener('keydown', this._focusTrapHandler);
-    this._focusTrapHandler = null;
   }
 
   // ---- Unsaved-changes guard (opt-in via registerUnsavedGuard) ----
@@ -552,7 +508,9 @@ export class OspreyDrawer extends HTMLElement {
     this._splitter = initSplitter({
       handle,
       pane: this,
-      storageKey: DRAWER_WIDTH_STORAGE_KEY,
+      // Per-persona on a multi-user mount: the drawer lives in the shell page,
+      // which shares one origin (and one localStorage) across every user.
+      storageKey: scopedStorageKey(DRAWER_WIDTH_STORAGE_KEY),
       axis: 'x',
       anchor: 'end',
       sizing: 'box',
@@ -603,7 +561,7 @@ export class OspreyDrawer extends HTMLElement {
     this._wireResizable();
     this._restorePersistedWidth();
     _syncGlobalOpenState();
-    this._installFocusTrap();
+    installFocusTrap(this);
     this._moveFocusIn();
     this.dispatchEvent(new CustomEvent('drawer:open', { bubbles: true, composed: true }));
     const activePanel = this.querySelector('.drawer-tab-panel.active');
@@ -614,7 +572,7 @@ export class OspreyDrawer extends HTMLElement {
 
   /** Everything that must happen once this drawer is closed. */
   _applyClosedSideEffects() {
-    this._removeFocusTrap();
+    removeFocusTrap(this);
     // Tear the splitter down rather than merely stopping a drag: destroy()
     // discards an unreleased drag without persisting it and clears
     // `data-splitter-dragging`, which would otherwise suppress this drawer's

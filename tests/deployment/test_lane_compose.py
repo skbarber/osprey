@@ -1,0 +1,1509 @@
+"""The Bluesky plan-lane axis across the deploy surface.
+
+A *lane* is a full Bluesky stack — bridge + RE Manager + its own Redis — bound
+at render time to the control-system target it serves. Every project rendered
+before this feature has exactly one, and the second lane is opt-in
+(``bluesky.second_lane``). Four resources that were single-set are now
+per-lane: the document-plane CURVE certificates, the launch token, Redis, and
+the host-port map. Tiled is the one shared component and stays on lane 1.
+
+Two claims are tested here, and the first one is the anchor:
+
+1. **A single-lane deployment renders byte-for-byte what it rendered before.**
+   Not "parses to the same YAML" — literally the same bytes. The goldens under
+   ``goldens/bluesky_single_lane/`` were produced from the template as it stood
+   before the lane axis existed, so a diff against them is a diff against
+   history. Every existing project is single-lane, so this is the whole
+   compatibility surface of the change.
+
+2. **A two-lane deployment isolates the two lanes.** Separate bridges,
+   managers, Redis instances, internal networks, CURVE certificate
+   directories, launch tokens and host ports — because a shared resource on
+   any one of those axes lets either lane's bridge drive the other lane's
+   manager, which is exactly the confusion between "which machine am I talking
+   to" that the run-time target switch exists to make explicit.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+from jinja2 import Environment, FileSystemLoader
+
+from osprey.port_layout import DEFAULT_PORT_BASE, default_port, layout_ports
+
+# Rooted at the templates/ PROJECT root, not services/, because service
+# templates import the shared axis macros as "services/_*.j2" — the spelling
+# compose_generator's own loader resolves. Same two-root loader as
+# tests/cli/test_bluesky_compose_render.py, so both suites render the packaged
+# template the way the deployment does.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_TEMPLATES_ROOT = _REPO_ROOT / "src" / "osprey" / "templates"
+_LOADER_ROOTS = [str(_TEMPLATES_ROOT), str(_TEMPLATES_ROOT / "services")]
+BLUESKY_TEMPLATE = "bluesky/docker-compose.yml.j2"
+
+GOLDEN_DIR = Path(__file__).parent / "goldens" / "bluesky_single_lane"
+
+#: The three lane ports at the default base, named rather than spelled. Lane 1
+#: is the layout's ``bluesky`` slot, lane 2 the ``bluesky_second_lane`` slot the
+#: injector derives from it, and Tiled's host publish the ``tiled`` slot —
+#: exactly the three numbers ``_inject_bluesky`` writes into a rendered config,
+#: so these contexts stay renders a deploy can actually produce.
+BLUESKY_PORT = default_port("bluesky")
+SECOND_LANE_PORT = default_port("bluesky_second_lane")
+TILED_HOST_PORT = default_port("tiled")
+
+#: The literal ``_inject_bluesky`` writes into the live-serving lane's config
+#: block. Restated here as a PREFIX rather than imported whole: the test cares
+#: that compose is handed a required variable (``:?``), not about the wording of
+#: the operator message that follows it.
+#:
+#: Unconditional, and that is now the claim rather than a simplification:
+#: ``live`` names the facility's own machine on every deployment, the ones that
+#: also run the stand-in included. The stand-in is a control target of its own
+#: with a lane of its own, and its addressing is :data:`STANDIN_DIAL` — a
+#: container on this network, never this.
+CA_NAME_SERVERS_REQUIRED_PREFIX = "${EPICS_CA_NAME_SERVERS:?"
+
+
+def _image_defaults(project_name: str) -> dict[str, str]:
+    """The image map ``_inject_project_metadata`` injects, for hand-built ctx.
+
+    Taken from the production helper rather than restated, so these renders
+    follow the registry and tag axes instead of pinning a name the generator
+    may not produce any more.
+    """
+    from osprey.deployment.compose_generator import resolve_image_defaults
+
+    return resolve_image_defaults({"project_name": project_name})
+
+
+def _lane_block(
+    port: int,
+    *,
+    tiled_enabled: bool = False,
+    tiled_port: int | None = None,
+    plan_dir: str | None = None,
+    excluded_plans: str | None = None,
+    env: list[str] | None = None,
+    target: str | None = None,
+    ca_name_servers: str | None = None,
+) -> dict[str, Any]:
+    """One ``services.<lane>`` block, spelled the way ``_inject_bluesky`` writes it.
+
+    Keys absent from a single-lane render (``target``, ``ca_name_servers``) are
+    omitted unless asked for — that omission is what the byte-identity claim
+    rests on.
+    """
+    block: dict[str, Any] = {"path": "./services/bluesky", "port": port}
+    if tiled_enabled:
+        block["tiled_enabled"] = True
+        block["tiled_port"] = tiled_port if tiled_port is not None else TILED_HOST_PORT
+    if plan_dir is not None:
+        block["plan_dir"] = plan_dir
+    if excluded_plans is not None:
+        block["excluded_plans"] = excluded_plans
+    if env is not None:
+        block["env"] = env
+    if target is not None:
+        block["target"] = target
+    if ca_name_servers is not None:
+        block["ca_name_servers"] = ca_name_servers
+    return block
+
+
+#: The finished channel-limits bind mount ``resolve_limits_mount`` computes for
+#: a deployment whose config is read from the repo root. Both halves reach the
+#: template as strings the generator already resolved, so a context that leaves
+#: the key out is not a render any deployment can produce — a writable one can
+#: never reach the template without it.
+LIMITS_MOUNT: dict[str, str] = {
+    "source": "./data/channel_limits.json",
+    "target": "/app/project/data/channel_limits.json",
+}
+
+#: The one staged device document, and the bind that carries it. The source is
+#: literal (the staging step owns the basename), which is what makes the
+#: two-lane claim below checkable: both lanes render this same string.
+DEVICES_FILE_TARGET = "/app/project/data/bluesky_devices.yml"
+DEVICES_MOUNT = f"./build/services/bluesky/bluesky_devices.yml:{DEVICES_FILE_TARGET}:ro"
+
+
+def _context(
+    *,
+    lanes: dict[str, dict[str, Any]],
+    deployed_services: list[str],
+    writes_enabled: bool = False,
+    control_system: dict[str, Any] | None = None,
+    va_port: int = 5064,
+    devices_present: bool = False,
+) -> dict[str, Any]:
+    """Mirror ``compose_generator.render_template``'s context contract.
+
+    Two keys are computed by the generator rather than configured, and both are
+    typed here for the same reason: a production render always carries them, so
+    a context that omits one pins a render no deploy can reach.
+
+    ``bluesky_devices`` is the real boolean ``_stage_bluesky_devices`` returns —
+    ONE value for the whole file, not one per lane, because both lanes declare
+    the same service ``path`` and therefore stage into one directory.
+    ``limits_mount`` is injected whenever some lane is armed, which is exactly
+    when the template mounts it.
+
+    The per-lane ``writes_enabled`` the template gates its limits-DB mount on
+    comes from the production helper rather than being written here by hand:
+    the generator precomputes it for exactly this template, so a hand-supplied
+    value would exercise the gate without exercising what decides it.
+    """
+    from osprey.deployment.compose_generator import _bluesky_lane_write_posture
+
+    section = control_system if control_system is not None else {"writes_enabled": writes_enabled}
+    services: dict[str, Any] = dict(lanes)
+    services["virtual_accelerator"] = {"port": va_port}
+    posture = _bluesky_lane_write_posture(services, section)
+    for lane_key, armed in posture.items():
+        services[lane_key] = {**services[lane_key], "writes_enabled": armed}
+    context: dict[str, Any] = {
+        "osprey_labels": {
+            "project_name": "proj",
+            "project_root": "/tmp/proj",
+            "repo_id": "abc123def456",
+        },
+        "osprey_images": _image_defaults("proj"),
+        "osprey_version": "2026.8.1",
+        "system": {"timezone": "UTC"},
+        "deployment": {},
+        "deployed_services": deployed_services,
+        "control_system": section,
+        "services": services,
+        "bluesky_devices": devices_present,
+        # The layout at this context's base. `deployment` is empty here, so
+        # that is the default base; the template reads every framework port as
+        # `<key> | default(osprey_ports.<slot>, true)`, so a context without it
+        # is not a render any deploy produces.
+        "osprey_ports": layout_ports(DEFAULT_PORT_BASE),
+    }
+    if any(posture.values()):
+        context["limits_mount"] = LIMITS_MOUNT
+    return context
+
+
+def _render_text(context: dict[str, Any]) -> str:
+    """Render the packaged bluesky compose template to raw text."""
+    env = Environment(loader=FileSystemLoader(_LOADER_ROOTS), keep_trailing_newline=True)
+    return env.get_template(BLUESKY_TEMPLATE).render(context)
+
+
+def _render(context: dict[str, Any]) -> dict[str, Any]:
+    """Render and parse the packaged bluesky compose template."""
+    return yaml.safe_load(_render_text(context))
+
+
+# ---------------------------------------------------------------------------
+# The pinned single-lane contexts. Named, because the goldens are named for
+# them and a regenerated golden has to come from the same context.
+# ---------------------------------------------------------------------------
+
+
+def _single_lane_contexts() -> dict[str, dict[str, Any]]:
+    """Every single-lane shape whose rendered bytes are pinned.
+
+    ``minimal`` is the plainest deploy the injector can produce — bridge only,
+    no Tiled, no VA, reads only. ``full`` turns on every optional axis at once
+    (co-deployed VA, Tiled, writes, a facility plan directory, exclusions and
+    a host-env passthrough), because the branches those flags open are where a
+    lane-parameterized template is most likely to drift.
+
+    Both stage no device file. That is not an omission: these contexts are
+    reused as the canonical single-lane render by
+    ``tests/deployment/test_bluesky_substrate_env.py``, whose browse-only test
+    renders them as-is and asserts the device wiring is absent. The staged
+    shape is pinned there instead, beside the staging step that produces it —
+    and as parsed YAML by the device tests in this module and in
+    ``tests/cli/test_bluesky_compose_render.py``.
+    """
+    return {
+        "minimal": _context(
+            lanes={"bluesky": _lane_block(BLUESKY_PORT)},
+            deployed_services=["bluesky"],
+        ),
+        "full": _context(
+            lanes={
+                "bluesky": _lane_block(
+                    BLUESKY_PORT,
+                    tiled_enabled=True,
+                    plan_dir="/facility/plans",
+                    excluded_plans="pkg.a:pkg.b",
+                    env=["HTTP_PROXY", "NO_PROXY"],
+                )
+            },
+            deployed_services=["bluesky", "virtual_accelerator"],
+            writes_enabled=True,
+        ),
+    }
+
+
+@pytest.mark.parametrize("name", sorted(_single_lane_contexts()))
+def test_single_lane_render_is_byte_identical_to_the_pinned_shape(name: str) -> None:
+    """A single-lane render must reproduce its pinned shape exactly.
+
+    The goldens were first produced from the template BEFORE the lane axis was
+    introduced, so what they pin is a before/after equality rather than a
+    self-consistency check. Byte equality rather than parsed equality on
+    purpose: a rendered compose file is also read by humans and diffed by
+    operators, and a reshuffled-but-equivalent document is a change they have
+    to review.
+
+    **Update discipline** — a failure here means a template edit moved a
+    single-lane render, which is never on its own a reason to hand-edit a
+    golden. Regenerate the pair from the same contexts, in the SAME reviewed
+    change as the template edit that moved them::
+
+        PYTHONPATH=src ./.venv/bin/python tests/deployment/test_lane_compose.py
+
+    then account for every changed byte. The device-file rewrite is the second
+    deliberate move these carry: the three retired ``BLUESKY_EPICS`` passthrough
+    variables left both containers, and the channel-limits bind became the pair
+    of strings the generator computes host-side — the same file, spelled once
+    at render time instead of twice in the template.
+    """
+    # Final-newline count is normalized on both sides: the repo's
+    # end-of-file-fixer hook owns the goldens' trailing newline, which the
+    # renderer does not reproduce. Every other byte still has to match.
+    golden = (GOLDEN_DIR / f"{name}.yml").read_text(encoding="utf-8")
+    rendered = _render_text(_single_lane_contexts()[name])
+    assert rendered.rstrip("\n") + "\n" == golden.rstrip("\n") + "\n"
+
+
+# ---------------------------------------------------------------------------
+# The two-lane render
+# ---------------------------------------------------------------------------
+
+VA_BASELINE_LANES = {
+    "bluesky": _lane_block(BLUESKY_PORT, tiled_enabled=True, target="va"),
+    "bluesky_live": _lane_block(
+        SECOND_LANE_PORT,
+        target="live",
+        ca_name_servers=f"{CA_NAME_SERVERS_REQUIRED_PREFIX}set it to <host>:<port>}}",
+    ),
+}
+
+
+@pytest.fixture
+def two_lane() -> dict[str, Any]:
+    """A VA-baseline deployment with a live second lane, as the injector writes it.
+
+    Lane 1 (``bluesky``) serves the deployment baseline — a co-deployed Virtual
+    Accelerator — and owns Tiled; lane 2 (``bluesky_live``) serves the facility
+    and carries the required-variable gateway address.
+    """
+    return _render(
+        _context(
+            lanes=VA_BASELINE_LANES,
+            deployed_services=["bluesky", "bluesky_live", "virtual_accelerator"],
+        )
+    )
+
+
+def _env(rendered: dict[str, Any], service: str) -> dict[str, Any]:
+    return rendered["services"][service].get("environment") or {}
+
+
+def test_each_lane_renders_its_own_bridge_manager_and_redis(two_lane: dict[str, Any]) -> None:
+    """A lane is a whole stack, so two lanes are six containers, not four.
+
+    Lane 1 keeps its historical service keys (``bluesky-bridge``,
+    ``queueserver``, ``bluesky-redis``) because renaming them would recreate
+    every existing project's containers for nothing.
+    """
+    assert set(two_lane["services"]) == {
+        "bluesky-bridge",
+        "queueserver",
+        "bluesky-redis",
+        "bluesky-live-bridge",
+        "bluesky-live-queueserver",
+        "bluesky-live-redis",
+        "tiled",
+    }
+
+
+def test_exactly_one_tiled_and_it_belongs_to_lane_one(two_lane: dict[str, Any]) -> None:
+    """Tiled is the one SHARED component: a catalog per lane, not a lane per catalog.
+
+    Lane 2's config block carries no tiled keys at all (the injector omits
+    them), so the second lane's containers must be silent about Tiled rather
+    than pointing at lane 1's — a second writer into one catalog would merge
+    two machines' run documents into one history.
+    """
+    assert [name for name in two_lane["services"] if name == "tiled"] == ["tiled"]
+    assert two_lane["services"]["tiled"]["ports"] == [f"127.0.0.1:{TILED_HOST_PORT}:8000"]
+    for service in ("bluesky-live-bridge", "bluesky-live-queueserver"):
+        assert "BLUESKY_TILED_URI" not in _env(two_lane, service)
+    assert _env(two_lane, "bluesky-bridge")["BLUESKY_TILED_URI"] == "http://tiled:8000"
+
+
+def test_only_the_second_lanes_bridge_publishes_its_derived_port(
+    two_lane: dict[str, Any],
+) -> None:
+    """Each lane publishes exactly one host port: its bridge's."""
+    published = {
+        name: service.get("ports")
+        for name, service in two_lane["services"].items()
+        if service.get("ports")
+    }
+    assert published == {
+        "bluesky-bridge": [f"127.0.0.1:{BLUESKY_PORT}:{BLUESKY_PORT}"],
+        "bluesky-live-bridge": [f"127.0.0.1:{SECOND_LANE_PORT}:{SECOND_LANE_PORT}"],
+        "tiled": [f"127.0.0.1:{TILED_HOST_PORT}:8000"],
+    }
+
+
+def test_the_live_lane_addresses_a_required_gateway_variable(two_lane: dict[str, Any]) -> None:
+    """`${VAR:?}`, never a bare passthrough, and never the VA's address.
+
+    Compose interpolates an unset BARE reference to the empty string, so a
+    live lane wired that way would come up looking healthy while searching for
+    PVs at nowhere. Both of the lane's containers build devices against this
+    address, so both must carry the refusing form.
+    """
+    for service in ("bluesky-live-bridge", "bluesky-live-queueserver"):
+        addressing = _env(two_lane, service)["EPICS_CA_NAME_SERVERS"]
+        assert addressing.startswith(CA_NAME_SERVERS_REQUIRED_PREFIX)
+        assert "virtual-accelerator" not in addressing
+
+
+def test_the_va_lane_keeps_the_co_deployed_accelerator_addressing(
+    two_lane: dict[str, Any],
+) -> None:
+    """The baseline lane's CA wiring is unchanged: the VA container, by name."""
+    for service in ("bluesky-bridge", "queueserver"):
+        assert _env(two_lane, service)["EPICS_CA_NAME_SERVERS"] == "virtual-accelerator:5064"
+
+
+def test_only_the_va_lane_waits_on_the_virtual_accelerator(two_lane: dict[str, Any]) -> None:
+    """A lane that never talks to the VA has no reason to be ordered after it.
+
+    Both containers of the lane, not just its bridge: the RunEngine worker
+    lives in the manager, so the manager carries the same iocInit guard and
+    therefore the same lane half of it.
+    """
+    for service in ("bluesky-bridge", "queueserver"):
+        assert "virtual-accelerator" in two_lane["services"][service]["depends_on"], service
+    for service in ("bluesky-live-bridge", "bluesky-live-queueserver"):
+        assert "virtual-accelerator" not in two_lane["services"][service]["depends_on"], service
+
+
+# ---------------------------------------------------------------------------
+# The stand-in as a THIRD control target
+#
+# The stand-in used to be deployed *as* the ``live`` target, and a lane serving
+# ``live`` on such a project dialed the co-deployed container instead of a
+# facility gateway. It is now a control target in its own right: a project
+# baselined on it renders a lane whose target is ``standin``, and ``live`` keeps
+# meaning the facility's own machine on every deployment without exception.
+# ---------------------------------------------------------------------------
+
+#: The address ``_standin_lane_ca_name_servers`` writes into a ``standin`` lane's
+#: config block: the stand-in soft IOC's compose service key and the port
+#: ``virtual_accelerator.live_standin`` gave it. Same shape as the VA lane's
+#: ``virtual-accelerator:5064``, because it is the same kind of address — a
+#: container on this network, not a gateway an operator has to supply.
+STANDIN_DIAL = "live-standin:5074"
+
+#: A stand-in baseline with ``bluesky.second_lane``, as the injector writes it.
+#: Lane 1 keeps the historical ``bluesky`` key and serves the ``standin`` target;
+#: the second lane is the VA, which is what ``_SECOND_LANE_TARGET`` pairs a
+#: stand-in baseline with — pairing it with ``live`` would render a lane whose
+#: facility gateway the operator has to supply on a deployment that was handed a
+#: stand-in precisely so they would not have to.
+STANDIN_BASELINE_LANES = {
+    "bluesky": _lane_block(
+        BLUESKY_PORT, tiled_enabled=True, target="standin", ca_name_servers=STANDIN_DIAL
+    ),
+    "bluesky_va": _lane_block(SECOND_LANE_PORT, target="va"),
+}
+
+#: What the deploy carries: both plan lanes, plus both soft IOCs. ``live_standin``
+#: is in ``deployed_services`` because that is what a stand-in render carries —
+#: the VA compose template reads it there to decide whether to render the second
+#: IOC instance, and this template reads it to decide whether ``live-standin`` is
+#: a service it may name in a ``depends_on`` at all.
+STANDIN_BASELINE_SERVICES = [
+    "bluesky",
+    "bluesky_va",
+    "virtual_accelerator",
+    "live_standin",
+]
+
+
+def _standin_baseline_context() -> dict[str, Any]:
+    return _context(
+        lanes=STANDIN_BASELINE_LANES,
+        deployed_services=STANDIN_BASELINE_SERVICES,
+    )
+
+
+@pytest.fixture
+def standin_baseline() -> dict[str, Any]:
+    """A ``live_standin`` baseline with its derived VA second lane."""
+    return _render(_standin_baseline_context())
+
+
+#: The stand-in baseline WITHOUT ``bluesky.second_lane``: the one single-lane
+#: shape whose block carries ``target`` and ``ca_name_servers``. The template's
+#: no-target fallback addresses the co-deployed VA container, which on every
+#: other single-lane baseline is the right machine and on this one is the
+#: simulator standing next to the machine the baseline actually names.
+STANDIN_SINGLE_LANE = {
+    "bluesky": _lane_block(
+        BLUESKY_PORT, tiled_enabled=True, target="standin", ca_name_servers=STANDIN_DIAL
+    ),
+}
+
+
+@pytest.fixture
+def standin_single_lane() -> dict[str, Any]:
+    """A ``live_standin`` baseline deploying its single lane."""
+    return _render(
+        _context(
+            lanes=STANDIN_SINGLE_LANE,
+            deployed_services=["bluesky", "virtual_accelerator", "live_standin"],
+        )
+    )
+
+
+def test_a_standin_single_lane_is_one_stack_pointed_at_the_stand_in(
+    standin_single_lane: dict[str, Any],
+) -> None:
+    """One lane, the historical service keys, and the stand-in's address.
+
+    The single-lane shape of every other baseline is pinned byte-for-byte by
+    the goldens above; this one is pinned by what it must say instead, because
+    the whole point of its ``target`` is to move the lane OFF the fallback
+    address those goldens render.
+    """
+    assert set(standin_single_lane["services"]) == {
+        "bluesky-bridge",
+        "queueserver",
+        "bluesky-redis",
+        "tiled",
+    }
+    for service in ("bluesky-bridge", "queueserver"):
+        env = _env(standin_single_lane, service)
+        assert env["EPICS_CA_NAME_SERVERS"] == STANDIN_DIAL, service
+        assert env["EPICS_CA_AUTO_ADDR_LIST"] == "NO", service
+        depends = standin_single_lane["services"][service]["depends_on"]
+        assert depends["live-standin"] == {"condition": "service_healthy"}, service
+        assert "virtual-accelerator" not in depends, service
+
+
+def test_a_standin_baseline_renders_a_standin_lane_and_a_va_lane(
+    standin_baseline: dict[str, Any],
+) -> None:
+    """Two whole stacks, and lane 1 keeps its historical service keys.
+
+    The stand-in is the BASELINE here, not the second lane, so it is ``bluesky``
+    and ``queueserver`` that serve it — the target-named ``bluesky_va`` keys are
+    the machine this deployment paired it with.
+    """
+    assert set(standin_baseline["services"]) == {
+        "bluesky-bridge",
+        "queueserver",
+        "bluesky-redis",
+        "bluesky-va-bridge",
+        "bluesky-va-queueserver",
+        "bluesky-va-redis",
+        "tiled",
+    }
+
+
+def test_the_standin_lane_dials_the_co_deployed_stand_in_container(
+    standin_baseline: dict[str, Any],
+) -> None:
+    """No required variable to supply: a ``standin`` lane addresses a container.
+
+    Both of the lane's containers, because both build ophyd devices against this
+    address — the same reason both carry the refusing form on a lane that really
+    does serve a facility.
+    """
+    for service in ("bluesky-bridge", "queueserver"):
+        env = _env(standin_baseline, service)
+        assert env["EPICS_CA_NAME_SERVERS"] == STANDIN_DIAL, service
+        assert CA_NAME_SERVERS_REQUIRED_PREFIX not in env["EPICS_CA_NAME_SERVERS"], service
+
+
+def test_the_standin_lane_is_contained_exactly_as_the_va_lane_is(
+    standin_baseline: dict[str, Any],
+) -> None:
+    """Name-server TCP transport, broadcast discovery off — on every lane.
+
+    The containment is the half of the addressing that makes it a POINT, and on
+    this deployment more sharply than anywhere else: TWO soft IOCs share one
+    network, so with ``EPICS_CA_AUTO_ADDR_LIST`` left on a lane pinned to one of
+    them would still answer from the other — the confusion between the two
+    machines that giving the stand-in its own target exists to keep clean.
+    """
+    for service in (
+        "bluesky-bridge",
+        "queueserver",
+        "bluesky-va-bridge",
+        "bluesky-va-queueserver",
+    ):
+        assert _env(standin_baseline, service)["EPICS_CA_AUTO_ADDR_LIST"] == "NO", service
+
+
+def test_the_standin_leaves_the_va_lanes_addressing_alone(
+    standin_baseline: dict[str, Any],
+) -> None:
+    """Two machines, two addresses. The VA lane still dials the VA.
+
+    A stand-in that moved the other lane too would leave the deployment with one
+    machine addressed twice — and no way to tell the two targets apart, which is
+    the whole point of rendering a second lane.
+    """
+    for service in ("bluesky-va-bridge", "bluesky-va-queueserver"):
+        assert (
+            _env(standin_baseline, service)["EPICS_CA_NAME_SERVERS"] == "virtual-accelerator:5064"
+        ), service
+
+
+def test_the_standin_lane_waits_on_the_stand_in_ioc(
+    standin_baseline: dict[str, Any],
+) -> None:
+    """The iocInit race is the stand-in's too, so the lane is ordered after it.
+
+    Both containers of the lane, not just its bridge: the RunEngine worker lives
+    in the manager, so the manager builds devices against the same IOC and
+    carries the same guard. ``service_healthy`` rather than ``service_started``
+    because the stand-in declares a healthcheck of its own — the same raw TCP
+    connect to its Channel Access port the VA instance uses.
+    """
+    for service in ("bluesky-bridge", "queueserver"):
+        depends = standin_baseline["services"][service]["depends_on"]
+        assert depends["live-standin"] == {"condition": "service_healthy"}, service
+        assert "virtual-accelerator" not in depends, service
+
+
+def test_the_va_lane_waits_on_the_virtual_accelerator_and_not_the_stand_in(
+    standin_baseline: dict[str, Any],
+) -> None:
+    """Each lane is ordered after the ONE machine it talks to.
+
+    A ``depends_on`` on the other soft IOC would be an ordering constraint
+    against a machine this lane has no dealings with — and, worse, would make
+    either lane's startup hostage to the health of a container it never reads.
+    """
+    for service in ("bluesky-va-bridge", "bluesky-va-queueserver"):
+        depends = standin_baseline["services"][service]["depends_on"]
+        assert depends["virtual-accelerator"] == {"condition": "service_healthy"}, service
+        assert "live-standin" not in depends, service
+
+
+def test_a_standin_deploy_asks_the_operator_for_no_gateway_at_all(
+    standin_baseline: dict[str, Any],
+) -> None:
+    """SC-7: not one required-variable gateway anywhere in the document.
+
+    Asserted over the RAW TEXT rather than the parsed lanes, because the claim
+    is about the file an operator is handed: both of this deployment's machines
+    are containers it runs for itself, so ``osprey up`` must not refuse to start
+    over an ``EPICS_CA_NAME_SERVERS`` nobody was ever asked to supply. A single
+    stray branch rendering the ``:?`` form — on a lane, on a container, in a
+    comment — turns a self-contained rehearsal deployment into one that cannot
+    boot without facility credentials.
+    """
+    assert CA_NAME_SERVERS_REQUIRED_PREFIX not in _render_text(_standin_baseline_context())
+    # And the parsed form agrees, so a future move of the string into a
+    # non-environment key cannot pass this by accident.
+    for service in standin_baseline["services"]:
+        addressing = _env(standin_baseline, service).get("EPICS_CA_NAME_SERVERS")
+        assert addressing in (None, STANDIN_DIAL, "virtual-accelerator:5064"), service
+
+
+def test_a_live_baseline_still_asks_for_the_gateway_variable() -> None:
+    """The other side of SC-7: ``live`` means the facility, stand-in or not.
+
+    A deployment baselined on the real machine renders the refusing form on lane
+    1, exactly as it did before the stand-in became its own target. The stand-in
+    changed what a ``standin`` lane renders; it did not soften ``live``.
+    """
+    rendered = _render(
+        _context(
+            lanes={
+                "bluesky": _lane_block(
+                    8090,
+                    tiled_enabled=True,
+                    target="live",
+                    ca_name_servers=f"{CA_NAME_SERVERS_REQUIRED_PREFIX}set it to <host>:<port>}}",
+                ),
+                "bluesky_va": _lane_block(8190, target="va"),
+            },
+            deployed_services=["bluesky", "bluesky_va", "virtual_accelerator"],
+        )
+    )
+    for service in ("bluesky-bridge", "queueserver"):
+        addressing = _env(rendered, service)["EPICS_CA_NAME_SERVERS"]
+        assert addressing.startswith(CA_NAME_SERVERS_REQUIRED_PREFIX), service
+        assert "live-standin" not in addressing, service
+        assert "live-standin" not in rendered["services"][service]["depends_on"], service
+
+
+def test_a_declared_standin_second_lane_renders_its_own_stack() -> None:
+    """``bluesky_standin`` is a lane key this template renders, not one it drops.
+
+    The build never DERIVES this pairing — a stand-in baseline is paired with the
+    VA — so the key only ever arrives from a project that declared the lane
+    itself. It still has to render: ``osprey up`` mints a launch token and a
+    CURVE certificate set for every lane the registry names, and a key this
+    template did not know would be a lane provisioned on the host with no
+    containers to use it.
+    """
+    rendered = _render(
+        _context(
+            lanes={
+                "bluesky": _lane_block(
+                    8090,
+                    tiled_enabled=True,
+                    target="live",
+                    ca_name_servers=f"{CA_NAME_SERVERS_REQUIRED_PREFIX}set it to <host>:<port>}}",
+                ),
+                "bluesky_standin": _lane_block(
+                    8190, target="standin", ca_name_servers=STANDIN_DIAL
+                ),
+            },
+            deployed_services=["bluesky", "bluesky_standin", "live_standin"],
+        )
+    )
+    assert {
+        "bluesky-standin-bridge",
+        "bluesky-standin-queueserver",
+        "bluesky-standin-redis",
+    } <= set(rendered["services"])
+    for service in ("bluesky-standin-bridge", "bluesky-standin-queueserver"):
+        assert _env(rendered, service)["EPICS_CA_NAME_SERVERS"] == STANDIN_DIAL, service
+        assert rendered["services"][service]["depends_on"]["live-standin"] == {
+            "condition": "service_healthy"
+        }, service
+
+
+def test_each_lane_carries_its_own_launch_token_variable(two_lane: dict[str, Any]) -> None:
+    """The token ARMS a launch, so a shared one would let an approval be replayed.
+
+    The name inside the container is the same for both — the image is
+    lane-agnostic — and only the host variable filling it differs.
+    """
+    assert _env(two_lane, "bluesky-bridge")["BLUESKY_LAUNCH_TOKEN"] == "${BLUESKY_LAUNCH_TOKEN}"
+    assert (
+        _env(two_lane, "bluesky-live-bridge")["BLUESKY_LAUNCH_TOKEN"]
+        == "${BLUESKY_LIVE_LAUNCH_TOKEN}"
+    )
+
+
+def test_each_lane_carries_its_own_control_socket_keypair(two_lane: dict[str, Any]) -> None:
+    """One keypair across both lanes would let either bridge drive either queue.
+
+    Both halves keep their fail-closed ``:?`` guard on both lanes: an empty
+    value runs the RE manager's control socket in plaintext, which is not a
+    supported mode on any lane.
+    """
+    lane_one = _env(two_lane, "queueserver")
+    lane_two = _env(two_lane, "bluesky-live-queueserver")
+    assert lane_one["QSERVER_ZMQ_PRIVATE_KEY_FOR_SERVER"].startswith(
+        "${BLUESKY_QSERVER_ZMQ_PRIVATE_KEY:?"
+    )
+    assert lane_two["QSERVER_ZMQ_PRIVATE_KEY_FOR_SERVER"].startswith(
+        "${BLUESKY_LIVE_QSERVER_ZMQ_PRIVATE_KEY:?"
+    )
+    assert _env(two_lane, "bluesky-live-bridge")["QSERVER_ZMQ_PUBLIC_KEY"].startswith(
+        "${BLUESKY_LIVE_QSERVER_ZMQ_PUBLIC_KEY:?"
+    )
+
+
+def test_each_lane_mounts_its_own_curve_certificate_directory(two_lane: dict[str, Any]) -> None:
+    """Distinct directories, because one shared pair authenticates either publisher.
+
+    With a single set, a plan running on one machine could inject run
+    documents into the other machine's history — the proxy would accept it,
+    since the credential is the same.
+    """
+    mounts = {
+        service: [v for v in two_lane["services"][service]["volumes"] if "/app/curve" in v]
+        for service in (
+            "bluesky-bridge",
+            "queueserver",
+            "bluesky-live-bridge",
+            "bluesky-live-queueserver",
+        )
+    }
+    assert mounts == {
+        "bluesky-bridge": ["./data/.runtime/bluesky_curve/bridge:/app/curve:ro"],
+        "queueserver": ["./data/.runtime/bluesky_curve/queueserver:/app/curve:ro"],
+        "bluesky-live-bridge": ["./data/.runtime/bluesky_live_curve/bridge:/app/curve:ro"],
+        "bluesky-live-queueserver": [
+            "./data/.runtime/bluesky_live_curve/queueserver:/app/curve:ro"
+        ],
+    }
+
+
+@pytest.fixture
+def two_lane_with_devices() -> dict[str, Any]:
+    """The same two-lane deployment, rendered after a device file was staged.
+
+    ``bluesky_devices`` is one boolean for the whole render — the staging step
+    runs once per lane against the same service directory and reaches the same
+    decision — so there is no per-lane variant of this fixture to write.
+    """
+    return _render(
+        _context(
+            lanes=VA_BASELINE_LANES,
+            deployed_services=["bluesky", "bluesky_live", "virtual_accelerator"],
+            devices_present=True,
+        )
+    )
+
+
+def test_both_lanes_read_the_one_staged_device_file(
+    two_lane_with_devices: dict[str, Any],
+) -> None:
+    """The device document is SHARED, unlike every per-lane resource above.
+
+    Both lanes declare the same service ``path``, so the staging step writes
+    one file into one build context; a mount naming a per-lane path would point
+    the second lane at a file nothing ever writes, and the worker would fail
+    its own load rather than come up browse-only. Any split between the two
+    machines' device sets therefore lives INSIDE the document, not in this
+    mount.
+    """
+    managers = ("queueserver", "bluesky-live-queueserver")
+    mounts = {
+        manager: [
+            volume
+            for volume in two_lane_with_devices["services"][manager]["volumes"]
+            if "bluesky_devices" in str(volume)
+        ]
+        for manager in managers
+    }
+    assert mounts == {
+        "queueserver": [DEVICES_MOUNT],
+        "bluesky-live-queueserver": [DEVICES_MOUNT],
+    }
+
+    named = {
+        manager: _env(two_lane_with_devices, manager).get("BLUESKY_DEVICES_FILE")
+        for manager in managers
+    }
+    assert named == {
+        "queueserver": DEVICES_FILE_TARGET,
+        "bluesky-live-queueserver": DEVICES_FILE_TARGET,
+    }
+
+
+def test_neither_lanes_bridge_is_given_the_device_file(
+    two_lane_with_devices: dict[str, Any],
+) -> None:
+    """Devices are built by the managers; a bridge is a facade over one."""
+    for bridge in ("bluesky-bridge", "bluesky-live-bridge"):
+        service = two_lane_with_devices["services"][bridge]
+        assert "BLUESKY_DEVICES_FILE" not in (service.get("environment") or {}), bridge
+        assert not any("bluesky_devices" in str(v) for v in service["volumes"]), bridge
+
+
+def test_no_lane_carries_the_device_mount_when_nothing_was_staged(
+    two_lane: dict[str, Any],
+) -> None:
+    """Browse-only is fail-closed and applies to the whole render, both lanes."""
+    for service in two_lane["services"].values():
+        assert not any("bluesky_devices" in str(v) for v in service.get("volumes") or [])
+        assert "BLUESKY_DEVICES_FILE" not in (service.get("environment") or {})
+
+
+def test_each_lane_gets_its_own_redis_volume_and_internal_network(
+    two_lane: dict[str, Any],
+) -> None:
+    """Queue state and reachability are both per lane.
+
+    A shared Redis would merge two machines' queues into one keyspace; a
+    shared internal network would put either lane's bridge within reach of the
+    other lane's manager control socket.
+    """
+    assert two_lane["services"]["bluesky-redis"]["volumes"] == ["bluesky_queueserver_redis:/data"]
+    assert two_lane["services"]["bluesky-live-redis"]["volumes"] == [
+        "bluesky_live_queueserver_redis:/data"
+    ]
+    assert set(two_lane["volumes"]) == {
+        "bluesky_queueserver_redis",
+        "bluesky_live_queueserver_redis",
+        "bluesky_tiled_catalog",
+    }
+    assert set(two_lane["networks"]) == {
+        "osprey-network",
+        "bluesky-internal",
+        "bluesky-live-internal",
+    }
+    assert two_lane["services"]["bluesky-redis"]["networks"] == ["bluesky-internal"]
+    assert two_lane["services"]["bluesky-live-redis"]["networks"] == ["bluesky-live-internal"]
+
+
+def test_each_lane_manager_is_reached_only_by_its_own_bridge(two_lane: dict[str, Any]) -> None:
+    """Control address, publish address and Redis address all stay inside the lane."""
+    assert _env(two_lane, "bluesky-bridge")["QSERVER_ZMQ_CONTROL_ADDRESS"] == (
+        "tcp://queueserver:60615"
+    )
+    assert _env(two_lane, "bluesky-live-bridge")["QSERVER_ZMQ_CONTROL_ADDRESS"] == (
+        "tcp://bluesky-live-queueserver:60615"
+    )
+    assert _env(two_lane, "bluesky-live-queueserver")["BLUESKY_ZMQ_PUBLISH_ADDR"] == (
+        "tcp://bluesky-live-bridge:5567"
+    )
+    manager_argv = " ".join(two_lane["services"]["bluesky-live-queueserver"]["command"])
+    assert "--redis-addr bluesky-live-redis:6379" in manager_argv
+
+
+def test_each_lane_is_told_which_lane_it_is(two_lane: dict[str, Any]) -> None:
+    """Both bridges mount ONE config.yml, so identity has to arrive out of band.
+
+    The value is the lane's service key, which is what a reader looks
+    ``services.<lane>.target`` up under.
+    """
+    assert _env(two_lane, "bluesky-bridge")["OSPREY_BLUESKY_LANE"] == "bluesky"
+    assert _env(two_lane, "queueserver")["OSPREY_BLUESKY_LANE"] == "bluesky"
+    assert _env(two_lane, "bluesky-live-bridge")["OSPREY_BLUESKY_LANE"] == "bluesky_live"
+    assert _env(two_lane, "bluesky-live-queueserver")["OSPREY_BLUESKY_LANE"] == "bluesky_live"
+
+
+def test_a_single_lane_deployment_is_told_nothing_and_defaults() -> None:
+    """Omitted rather than emitted as "bluesky": there is one block to read.
+
+    Omission is also what keeps the single-lane render byte-identical, which
+    the golden test above is the full statement of.
+    """
+    rendered = _render(_single_lane_contexts()["minimal"])
+    assert "OSPREY_BLUESKY_LANE" not in _env(rendered, "bluesky-bridge")
+    assert "OSPREY_BLUESKY_LANE" not in _env(rendered, "queueserver")
+
+
+def test_only_lane_one_builds_the_shared_image(two_lane: dict[str, Any]) -> None:
+    """Two services building one tag race each other — the queueserver's own rule.
+
+    Every lane runs the same image, and compose builds every buildable service
+    before creating any container, so the second lane finds the tag already on
+    the host.
+    """
+    assert "build" in two_lane["services"]["bluesky-bridge"]
+    assert "build" not in two_lane["services"]["bluesky-live-bridge"]
+    assert (
+        two_lane["services"]["bluesky-live-bridge"]["image"]
+        == (two_lane["services"]["bluesky-bridge"]["image"])
+    )
+
+
+def test_a_va_second_lane_is_named_for_its_target_too() -> None:
+    """A live BASELINE puts the VA on lane 2, and the naming follows the target.
+
+    Nothing about the axis is "lane 1 is the VA": the lane keeps the key of the
+    machine it serves, whichever way round the deployment is.
+    """
+    rendered = _render(
+        _context(
+            lanes={
+                "bluesky": _lane_block(
+                    BLUESKY_PORT,
+                    target="live",
+                    ca_name_servers=f"{CA_NAME_SERVERS_REQUIRED_PREFIX}set it}}",
+                ),
+                "bluesky_va": _lane_block(SECOND_LANE_PORT, target="va"),
+            },
+            deployed_services=["bluesky", "bluesky_va", "virtual_accelerator"],
+        )
+    )
+    assert {"bluesky-va-bridge", "bluesky-va-queueserver", "bluesky-va-redis"} <= set(
+        rendered["services"]
+    )
+    assert _env(rendered, "bluesky-va-bridge")["EPICS_CA_NAME_SERVERS"] == (
+        "virtual-accelerator:5064"
+    )
+    assert _env(rendered, "bluesky-bridge")["EPICS_CA_NAME_SERVERS"].startswith(
+        CA_NAME_SERVERS_REQUIRED_PREFIX
+    )
+    assert (
+        _env(rendered, "bluesky-va-bridge")["BLUESKY_LAUNCH_TOKEN"] == "${BLUESKY_VA_LAUNCH_TOKEN}"
+    )
+
+
+def test_a_lane_block_present_but_undeployed_renders_nothing() -> None:
+    """Membership in ``deployed_services`` is what conjures a stack, not a config block."""
+    rendered = _render(
+        _context(
+            lanes={
+                "bluesky": _lane_block(BLUESKY_PORT),
+                "bluesky_va": _lane_block(SECOND_LANE_PORT, target="va"),
+            },
+            deployed_services=["bluesky"],
+        )
+    )
+    assert set(rendered["services"]) == {"bluesky-bridge", "queueserver", "bluesky-redis"}
+
+
+# ---------------------------------------------------------------------------
+# Per-lane write posture
+# ---------------------------------------------------------------------------
+
+#: The read-only mount the writes gate opens, spelled as compose reads it.
+LIMITS_DB_MOUNT = f"{LIMITS_MOUNT['source']}:{LIMITS_MOUNT['target']}:ro"
+
+
+def _limits_mounts(rendered: dict[str, Any], service: str) -> list[str]:
+    return [v for v in rendered["services"][service]["volumes"] if "channel_limits.json" in v]
+
+
+def test_a_single_lanes_posture_is_the_deployment_wide_one() -> None:
+    """The value the gate reads now must be the value it used to read.
+
+    Every existing project is single-lane and has exactly one posture, so a
+    lane whose precomputed answer differed from ``control_system.writes_enabled``
+    would arm — or disarm — a deployment nobody reconfigured.
+    """
+    from osprey.deployment.compose_generator import _bluesky_lane_write_posture
+
+    lane = {"bluesky": {"port": BLUESKY_PORT}}
+
+    def posture(control_system: dict[str, Any] | None) -> bool:
+        return _bluesky_lane_write_posture(lane, control_system)["bluesky"]
+
+    assert posture({"writes_enabled": True}) is True
+    assert posture({"writes_enabled": False}) is False
+    assert posture(None) is False
+    # A VA baseline reaches the resolver by a different route (its target
+    # resolves, where a mock deployment's ``live`` does not) and must still
+    # answer the deployment-wide value when no connector block narrows it.
+    assert posture({"type": "virtual_accelerator", "writes_enabled": True}) is True
+
+
+def test_only_the_lane_whose_target_is_armed_mounts_the_limits_db() -> None:
+    """A live-baseline deployment can arm writes on its VA lane alone.
+
+    Both containers of the armed lane, not just its bridge: the per-put
+    reference monitor runs in the RE Manager, and an armed manager without the
+    DB refuses every write from the empty-DB failsafe.
+    """
+    # Writes off deployment-wide, armed in the VA connector block.
+    control_system = {
+        "type": "epics",
+        "writes_enabled": False,
+        "connector": {"virtual_accelerator": {"writes_enabled": True}},
+    }
+    rendered = _render(
+        _context(
+            lanes={
+                "bluesky": _lane_block(
+                    BLUESKY_PORT,
+                    target="live",
+                    ca_name_servers=f"{CA_NAME_SERVERS_REQUIRED_PREFIX}set it}}",
+                ),
+                "bluesky_va": _lane_block(SECOND_LANE_PORT, target="va"),
+            },
+            deployed_services=["bluesky", "bluesky_va", "virtual_accelerator"],
+            control_system=control_system,
+        )
+    )
+
+    assert _limits_mounts(rendered, "bluesky-va-bridge") == [LIMITS_DB_MOUNT]
+    assert _limits_mounts(rendered, "bluesky-va-queueserver") == [LIMITS_DB_MOUNT]
+    assert _limits_mounts(rendered, "bluesky-bridge") == []
+    assert _limits_mounts(rendered, "queueserver") == []
+
+
+# ---------------------------------------------------------------------------
+# The host-port preflight
+# ---------------------------------------------------------------------------
+
+
+def test_the_port_preflight_names_the_key_that_moves_each_lane(tmp_path: Path) -> None:
+    """Every published port a two-lane deploy renders is attributed to its own key.
+
+    The preflight's whole value is naming the config key to change, so a
+    second lane whose bridge falls back to the generic
+    ``services.bluesky-live-bridge.port`` remedy would send an operator to a
+    key that does not exist.
+    """
+    from osprey.deployment.host_ports import _remedy_for_service, parse_host_port_bindings
+
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(
+        _render_text(
+            _context(
+                lanes=VA_BASELINE_LANES,
+                deployed_services=["bluesky", "bluesky_live", "virtual_accelerator"],
+            )
+        ),
+        encoding="utf-8",
+    )
+    bindings = parse_host_port_bindings([compose])
+
+    assert {(b.service, b.host_port) for b in bindings} == {
+        ("bluesky-bridge", BLUESKY_PORT),
+        ("bluesky-live-bridge", SECOND_LANE_PORT),
+        ("tiled", TILED_HOST_PORT),
+    }
+    assert {b.service: _remedy_for_service(b.service) for b in bindings} == {
+        "bluesky-bridge": "services.bluesky.port",
+        "bluesky-live-bridge": "services.bluesky_live.port",
+        "tiled": "services.bluesky.tiled_port",
+    }
+
+
+def test_the_other_second_lane_spelling_is_attributed_too() -> None:
+    """Which lane key exists depends on the baseline, so both are mapped."""
+    from osprey.deployment.host_ports import _remedy_for_service
+
+    assert _remedy_for_service("bluesky-va-bridge") == "services.bluesky_va.port"
+
+
+# ---------------------------------------------------------------------------
+# Per-lane deploy-time resources (`osprey up`)
+# ---------------------------------------------------------------------------
+
+TWO_LANE_CONFIG = {"deployed_services": ["bluesky", "bluesky_live", "virtual_accelerator"]}
+ONE_LANE_CONFIG = {"deployed_services": ["bluesky", "virtual_accelerator"]}
+
+
+@pytest.fixture
+def env_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A project ``.env`` in an isolated project dir, with a clean process env.
+
+    Every per-lane variable these provisioners read is cleared, so a
+    developer's own exported values cannot decide the result.
+    """
+    from osprey.bluesky_bridge_connection import LANE_KEYS, lane_env_prefix
+
+    for lane_key in LANE_KEYS:
+        prefix = lane_env_prefix(lane_key)
+        for suffix in (
+            "_QSERVER_ZMQ_PRIVATE_KEY",
+            "_QSERVER_ZMQ_PUBLIC_KEY",
+            "_EPICS_SUBSTRATE",
+            "_EPICS_SETPOINTS",
+            "_EPICS_READBACKS",
+            "_LAUNCH_TOKEN",
+            "_BRIDGE_URL",
+        ):
+            monkeypatch.delenv(f"{prefix}{suffix}", raising=False)
+    return tmp_path / ".env"
+
+
+def _dotenv(env_path: Path) -> dict[str, str]:
+    from osprey.utils.dotenv import parse_dotenv_file
+
+    return parse_dotenv_file(env_path) if env_path.is_file() else {}
+
+
+def test_lane_keys_come_from_deployed_services_in_render_order() -> None:
+    """A block in config.yml that is not deployed provisions nothing."""
+    from osprey.deployment.container_lifecycle import _bluesky_lane_keys
+
+    assert _bluesky_lane_keys(TWO_LANE_CONFIG) == ["bluesky", "bluesky_live"]
+    assert _bluesky_lane_keys(ONE_LANE_CONFIG) == ["bluesky"]
+    assert _bluesky_lane_keys({"deployed_services": ["postgresql"]}) == []
+    assert _bluesky_lane_keys({"deployed_services": ["bluesky", "bluesky_va"]}) == [
+        "bluesky",
+        "bluesky_va",
+    ]
+
+
+def test_each_lane_gets_its_own_curve_certificate_set(env_path: Path) -> None:
+    """Two complete, unrelated sets — a shared pair authenticates either publisher.
+
+    The negative claim is the load-bearing one: lane 2's publisher secret must
+    not be the credential lane 1's proxy accepts.
+    """
+    from osprey.deployment.container_lifecycle import (
+        _bluesky_curve_paths,
+        _ensure_bluesky_document_plane_certs,
+    )
+
+    _ensure_bluesky_document_plane_certs(TWO_LANE_CONFIG, env_path=env_path)
+
+    one = _bluesky_curve_paths(env_path.parent, "bluesky")
+    two = _bluesky_curve_paths(env_path.parent, "bluesky_live")
+    assert (
+        one["bridge"].relative_to(env_path.parent).as_posix()
+        == "data/.runtime/bluesky_curve/bridge"
+    )
+    assert (
+        two["bridge"].relative_to(env_path.parent).as_posix()
+        == "data/.runtime/bluesky_live_curve/bridge"
+    )
+    for role in ("proxy_secret", "publisher_secret", "proxy_public", "publisher_public"):
+        assert one[role].is_file() and two[role].is_file(), role
+        assert one[role].read_bytes() != two[role].read_bytes(), role
+
+
+def test_a_single_lane_deploy_provisions_only_the_historical_directory(
+    env_path: Path,
+) -> None:
+    """No second lane, no second certificate directory to explain to an operator."""
+    from osprey.deployment.container_lifecycle import _ensure_bluesky_document_plane_certs
+
+    _ensure_bluesky_document_plane_certs(ONE_LANE_CONFIG, env_path=env_path)
+
+    assert (env_path.parent / "data" / ".runtime" / "bluesky_curve").is_dir()
+    assert not (env_path.parent / "data" / ".runtime" / "bluesky_live_curve").exists()
+    assert not (env_path.parent / "data" / ".runtime" / "bluesky_va_curve").exists()
+
+
+def test_each_lane_gets_its_own_control_socket_keypair(env_path: Path) -> None:
+    """Four values, two matched pairs, and the pairs must not be each other's."""
+    import zmq
+
+    from osprey.deployment.container_lifecycle import _ensure_bluesky_control_plane_keys
+
+    _ensure_bluesky_control_plane_keys(TWO_LANE_CONFIG, env_path=env_path)
+    written = _dotenv(env_path)
+
+    for private_var, public_var in (
+        ("BLUESKY_QSERVER_ZMQ_PRIVATE_KEY", "BLUESKY_QSERVER_ZMQ_PUBLIC_KEY"),
+        ("BLUESKY_LIVE_QSERVER_ZMQ_PRIVATE_KEY", "BLUESKY_LIVE_QSERVER_ZMQ_PUBLIC_KEY"),
+    ):
+        assert written[private_var] and written[public_var]
+        assert zmq.curve_public(written[private_var].encode()).decode() == written[public_var]
+    assert (
+        written["BLUESKY_QSERVER_ZMQ_PRIVATE_KEY"]
+        != (written["BLUESKY_LIVE_QSERVER_ZMQ_PRIVATE_KEY"])
+    )
+
+
+def test_a_single_lane_deploy_mints_only_the_historical_keypair(env_path: Path) -> None:
+    """Nothing new appears in an existing project's ``.env``."""
+    from osprey.deployment.container_lifecycle import _ensure_bluesky_control_plane_keys
+
+    _ensure_bluesky_control_plane_keys(ONE_LANE_CONFIG, env_path=env_path)
+
+    assert set(_dotenv(env_path)) == {
+        "BLUESKY_QSERVER_ZMQ_PRIVATE_KEY",
+        "BLUESKY_QSERVER_ZMQ_PUBLIC_KEY",
+    }
+
+
+def test_each_lane_declares_its_own_launch_token(env_path: Path) -> None:
+    """The token map is what ``_ensure_service_tokens`` mints from."""
+    from osprey.deployment.container_lifecycle import _SERVICE_TOKEN_VARS
+
+    assert _SERVICE_TOKEN_VARS["bluesky"] == ("BLUESKY_LAUNCH_TOKEN", "BLUESKY_TILED_API_KEY")
+    assert _SERVICE_TOKEN_VARS["bluesky_va"] == ("BLUESKY_VA_LAUNCH_TOKEN",)
+    assert _SERVICE_TOKEN_VARS["bluesky_live"] == ("BLUESKY_LIVE_LAUNCH_TOKEN",)
+    # The stand-in's own, because the stand-in is its own control target: a lane
+    # serving it must not be armed by the token that arms the live lane.
+    assert _SERVICE_TOKEN_VARS["bluesky_standin"] == ("BLUESKY_STANDIN_LAUNCH_TOKEN",)
+
+
+def test_one_template_serving_two_lanes_is_passed_to_compose_once() -> None:
+    """Both lanes declare the same ``path``, so the lookup reports the file twice.
+
+    Compose would merge a document with itself harmlessly, but passing it twice
+    is a claim the deploy does not mean to make and doubles it up in every
+    listing that echoes the file list.
+    """
+    from osprey.deployment.container_lifecycle import _dedupe_compose_files
+
+    assert _dedupe_compose_files(
+        [
+            "build/services/docker-compose.yml",
+            "build/services/bluesky/docker-compose.yml",
+            "build/services/bluesky/docker-compose.yml",
+            "build/services/virtual_accelerator/docker-compose.yml",
+        ]
+    ) == [
+        "build/services/docker-compose.yml",
+        "build/services/bluesky/docker-compose.yml",
+        "build/services/virtual_accelerator/docker-compose.yml",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Host-side addressing: which lane's bridge does a caller actually reach
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def rendered_config(monkeypatch: pytest.MonkeyPatch):
+    """Patch the config the connection resolvers read, and return the setter."""
+    from osprey.utils import workspace
+
+    def _set(config: dict[str, Any]) -> None:
+        monkeypatch.setattr(workspace, "load_osprey_config", lambda *a, **kw: config)
+
+    _set({})
+    return _set
+
+
+def test_a_lane_unaware_caller_resolves_exactly_what_it_always_did(
+    rendered_config, env_path: Path
+) -> None:
+    """Lane 1 is the default on every entry point, spelled as it always was."""
+    from osprey.bluesky_bridge_connection import (
+        DEFAULT_BRIDGE_URL,
+        resolve_bridge_url,
+        resolve_launch_token,
+    )
+
+    rendered_config({"bluesky": {"bridge_url": f"http://bridge.example:{BLUESKY_PORT}/"}})
+    assert resolve_bridge_url() == f"http://bridge.example:{BLUESKY_PORT}"
+
+    rendered_config({})
+    assert resolve_bridge_url() == DEFAULT_BRIDGE_URL
+
+    rendered_config({"bluesky": {"launch_token": "dev-token"}})
+    assert resolve_launch_token() == "dev-token"
+
+
+def test_each_lane_resolves_its_own_bridge_and_token(
+    rendered_config, env_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second lane is addressed at its own port under its own token.
+
+    The port comes from the lane's own service block rather than from a second
+    ``bluesky.bridge_url`` key, because the build derives it and an operator
+    would otherwise have to keep two values in step.
+    """
+    from osprey.bluesky_bridge_connection import resolve_bridge_url, resolve_launch_token
+
+    rendered_config(
+        {
+            "bluesky": {"lane_launch_tokens": {"bluesky_live": "live-token"}},
+            "services": {"bluesky_live": {"port": SECOND_LANE_PORT}},
+        }
+    )
+    assert resolve_bridge_url("bluesky_live") == f"http://127.0.0.1:{SECOND_LANE_PORT}"
+    assert resolve_launch_token("bluesky_live") == "live-token"
+
+    monkeypatch.setenv("BLUESKY_LIVE_BRIDGE_URL", "http://elsewhere:9000/")
+    monkeypatch.setenv("BLUESKY_LIVE_LAUNCH_TOKEN", "minted")
+    assert resolve_bridge_url("bluesky_live") == "http://elsewhere:9000"
+    assert resolve_launch_token("bluesky_live") == "minted"
+
+
+def test_an_unrendered_lane_is_refused_rather_than_resolved_to_lane_one(
+    rendered_config, env_path: Path
+) -> None:
+    """The fallback this refusal replaces is the wrong-machine bug itself.
+
+    Quietly answering with lane 1 would send a plan to a bridge bound to a
+    different machine than the caller named — recoverable only by noticing
+    afterwards that it ran somewhere else.
+    """
+    from osprey.bluesky_bridge_connection import UnknownBlueskyLaneError, resolve_bridge_url
+
+    rendered_config({"services": {}})
+    with pytest.raises(UnknownBlueskyLaneError):
+        resolve_bridge_url("bluesky_live")
+    with pytest.raises(UnknownBlueskyLaneError):
+        resolve_bridge_url("lane-2")
+
+
+def test_the_env_prefix_matches_what_the_deploy_mints_and_compose_expands() -> None:
+    """Three spellings of one contract: the mint, the template and the resolver."""
+    from osprey.bluesky_bridge_connection import lane_env_prefix
+    from osprey.deployment.container_lifecycle import (
+        _SERVICE_TOKEN_VARS,
+        _qserver_zmq_key_vars,
+    )
+
+    for lane_key in ("bluesky", "bluesky_va", "bluesky_live"):
+        prefix = lane_env_prefix(lane_key)
+        assert _SERVICE_TOKEN_VARS[lane_key][0] == f"{prefix}_LAUNCH_TOKEN"
+        assert _qserver_zmq_key_vars(lane_key) == (
+            f"{prefix}_QSERVER_ZMQ_PRIVATE_KEY",
+            f"{prefix}_QSERVER_ZMQ_PUBLIC_KEY",
+        )
+
+
+def _fake_request(bridge_url: str, bridge_urls: dict[str, str] | None = None):
+    """A stand-in for the sidecar's request, carrying only the state it reads."""
+    from types import SimpleNamespace
+
+    state = SimpleNamespace(bridge_url=bridge_url)
+    if bridge_urls is not None:
+        state.bridge_urls = bridge_urls
+    return SimpleNamespace(app=SimpleNamespace(state=state))
+
+
+def test_the_read_proxy_relays_lane_one_when_no_lane_is_named() -> None:
+    """The single-lane sidecar publishes one URL and is asked no lane."""
+    from osprey.interfaces.bluesky_web.read_proxy import resolve_lane_bridge_url
+
+    request = _fake_request(f"http://bridge:{BLUESKY_PORT}/")
+    assert resolve_lane_bridge_url(request, None) == f"http://bridge:{BLUESKY_PORT}"
+    assert resolve_lane_bridge_url(request, "bluesky") == f"http://bridge:{BLUESKY_PORT}"
+
+
+def test_an_empty_lane_parameter_names_no_lane_rather_than_a_missing_one() -> None:
+    """``?lane=`` behaves as ``?lane`` omitted, not as a lane called "".
+
+    Refusing the empty form would 404 a request whose bare form is served — a
+    distinction the caller cannot see and nothing here means to draw.
+    """
+    from osprey.interfaces.bluesky_web.read_proxy import resolve_lane_bridge_url
+
+    assert (
+        resolve_lane_bridge_url(_fake_request(f"http://bridge:{BLUESKY_PORT}"), "")
+        == f"http://bridge:{BLUESKY_PORT}"
+    )
+
+
+def test_the_read_proxy_relays_each_lane_to_its_own_bridge() -> None:
+    from osprey.interfaces.bluesky_web.read_proxy import resolve_lane_bridge_url
+
+    request = _fake_request(
+        f"http://bridge:{BLUESKY_PORT}", {"bluesky_live": f"http://bridge-live:{SECOND_LANE_PORT}/"}
+    )
+    assert (
+        resolve_lane_bridge_url(request, "bluesky_live") == f"http://bridge-live:{SECOND_LANE_PORT}"
+    )
+
+
+def test_the_read_proxy_refuses_a_lane_it_does_not_serve() -> None:
+    """``None`` here becomes a 404 — never a relay from the other lane.
+
+    A run listing labelled with the wrong machine is worse than no listing.
+    """
+    from osprey.interfaces.bluesky_web.read_proxy import resolve_lane_bridge_url
+
+    assert (
+        resolve_lane_bridge_url(_fake_request(f"http://bridge:{BLUESKY_PORT}"), "bluesky_live")
+        is None
+    )
+    assert (
+        resolve_lane_bridge_url(
+            _fake_request(f"http://bridge:{BLUESKY_PORT}", {"bluesky_va": "http://x:1"}),
+            "bluesky_live",
+        )
+        is None
+    )
+
+
+# ---------------------------------------------------------------------------
+# The sidecar's half of the lane axis: the bluesky-web compose template
+# ---------------------------------------------------------------------------
+#
+# The panel path's sibling of the per-lane resources above. The sidecar is the
+# one service that relays every terminal's BLUESKY tab, and on a two-lane
+# deployment it must be able to reach the second bridge AND present that
+# lane's own token -- so its compose environment carries a `<PREFIX>_` pair
+# per second lane, spelled under the same env-prefix contract the mint and
+# the shared resolvers already speak. The single-lane render's byte identity
+# is pinned separately (tests/templates render_defaults + render_axis_shapes
+# goldens); here the claims are the two-lane additions and their gating.
+
+BLUESKY_WEB_TEMPLATE = "bluesky_web/docker-compose.yml.j2"
+
+
+def _web_context(
+    *,
+    deployed_services: list[str],
+    lanes: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """The bluesky_web render context, mirroring the generator's contract."""
+    return {
+        "services": {"bluesky_web": {}, **(lanes or {})},
+        "deployed_services": deployed_services,
+        "deployment": {},
+        "system": {"timezone": "UTC"},
+        "osprey_labels": {
+            "project_name": "proj",
+            "repo_id": "abc",
+            "project_root": "/deploy/proj",
+        },
+        "osprey_images": _image_defaults("proj"),
+        "osprey_audit_mount_source": "./var/audit",
+        "osprey_service_container_audit_dir": "/app/var/audit",
+        "osprey_ports": layout_ports(DEFAULT_PORT_BASE),
+    }
+
+
+def _render_web(context: dict[str, Any]) -> dict[str, Any]:
+    env = Environment(loader=FileSystemLoader(_LOADER_ROOTS), keep_trailing_newline=True)
+    return yaml.safe_load(env.get_template(BLUESKY_WEB_TEMPLATE).render(context))
+
+
+@pytest.mark.parametrize(
+    ("lane_key", "port"), [("bluesky_va", SECOND_LANE_PORT), ("bluesky_live", SECOND_LANE_PORT)]
+)
+def test_a_two_lane_sidecar_render_carries_the_second_lanes_url_and_token(
+    lane_key: str, port: int
+) -> None:
+    """The gap the panel path had: the sidecar could neither reach the second
+    bridge nor present its token. The pair is spelled under the lane's env
+    prefix, so the shared resolvers pick both up env-first with no new
+    parser, and the URL names the lane's own in-network bridge service."""
+    rendered = _render_web(
+        _web_context(
+            deployed_services=["bluesky", lane_key, "bluesky_web"],
+            lanes={
+                "bluesky": _lane_block(BLUESKY_PORT, target="live"),
+                lane_key: _lane_block(port, target="va"),
+            },
+        )
+    )
+    environment = rendered["services"]["bluesky-web"]["environment"]
+    prefix = lane_key.upper()
+    lane_service = lane_key.replace("_", "-")
+
+    assert environment["BLUESKY_BRIDGE_URL"] == f"http://bluesky-bridge:{BLUESKY_PORT}"
+    assert environment[f"{prefix}_BRIDGE_URL"] == f"http://{lane_service}-bridge:{port}"
+    assert environment[f"{prefix}_LAUNCH_TOKEN"] == f"${{{prefix}_LAUNCH_TOKEN}}"
+
+
+def test_a_two_lane_sidecar_waits_on_both_bridges() -> None:
+    """`depends_on: service_healthy` covered lane 1 only; a sidecar racing the
+    second bridge's startup would 502 that lane's panel reads."""
+    rendered = _render_web(
+        _web_context(
+            deployed_services=["bluesky", "bluesky_va", "bluesky_web"],
+            lanes={
+                "bluesky": _lane_block(BLUESKY_PORT, target="live"),
+                "bluesky_va": _lane_block(SECOND_LANE_PORT, target="va"),
+            },
+        )
+    )
+    depends = rendered["services"]["bluesky-web"]["depends_on"]
+    assert depends["bluesky-bridge"] == {"condition": "service_healthy"}
+    assert depends["bluesky-va-bridge"] == {"condition": "service_healthy"}
+
+
+def test_a_single_lane_sidecar_render_carries_no_second_lane_names() -> None:
+    """The gate: an undeployed lane leaves no trace -- no env pair, no
+    depends_on entry -- which is what keeps the byte-identity pins on the
+    single-lane goldens standing."""
+    rendered = _render_web(
+        _web_context(
+            deployed_services=["bluesky", "bluesky_web"],
+            lanes={"bluesky": _lane_block(BLUESKY_PORT)},
+        )
+    )
+    service = rendered["services"]["bluesky-web"]
+    assert list(service["depends_on"]) == ["bluesky-bridge"]
+    for name in service["environment"]:
+        assert not name.startswith(("BLUESKY_VA_", "BLUESKY_LIVE_"))
+
+
+def _regenerate() -> None:
+    """Overwrite the single-lane goldens from today's template.
+
+    Rendered from :func:`_single_lane_contexts`, the same contexts the pinned
+    test renders, so a regenerated golden can only differ where the template
+    does. See that test's update discipline before running this.
+    """
+    GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
+    for name, context in sorted(_single_lane_contexts().items()):
+        path = GOLDEN_DIR / f"{name}.yml"
+        # The repo's end-of-file-fixer owns the trailing newline the renderer
+        # does not emit, and the pinned test normalizes it on both sides.
+        path.write_text(_render_text(context).rstrip("\n") + "\n", encoding="utf-8")
+        print(f"wrote {path}")
+
+
+if __name__ == "__main__":
+    _regenerate()

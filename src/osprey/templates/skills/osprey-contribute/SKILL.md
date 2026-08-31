@@ -130,10 +130,20 @@ Tell the contributor what you observed and which phase you're entering.
 
 The contributor edits code; the skill is mostly absent. Two reminders:
 
-- **Update `CHANGELOG.md` as you go**, not at the end. Add a bullet under the
-  relevant heading (`### Added`, `### Changed`, `### Fixed`) in the
-  `## [Unreleased]` section. Doing this concurrently keeps it accurate and
-  turns the per-commit CHANGELOG check into a non-event.
+- **Add a changelog fragment as you go**, not at the end. One file per change
+  that touches `src/` or `packages/`, in `changelog.d/`, named
+  `<name>.<type>.md` — user-visible work gets a real type, work users never see
+  gets `internal`. Use the issue number as the name when there is one —
+  `745.fixed.md`, where the leading number becomes the `(#745)` reference in
+  the released entry, so never start a name with a date and do not write
+  `(#745)` in the body yourself (the check rejects a repeated reference).
+  Otherwise use a short slug (`gate.fixed.md`). The
+  seven types, as example filenames: `745.added.md`, `745.changed.md`,
+  `745.deprecated.md`, `745.removed.md`, `745.fixed.md`, `745.security.md`,
+  `745.internal.md` — `internal` is for work users never see. The body is the
+  bullet's text: one or two user-facing sentences, without the leading `- `.
+  Never add entries to `CHANGELOG.md` by hand — the release fold owns that
+  file. `changelog.d/README.md` has the full rules.
 - Keep the change focused. If the working tree starts to span unrelated
   concerns (e.g., "fix bug X" plus an unrelated refactor), suggest invoking
   `commit-organize` to split it before committing.
@@ -159,14 +169,22 @@ The contributor edits code; the skill is mostly absent. Two reminders:
    ```
 
    Where `type ∈ {feat, fix, docs, refactor, test, chore, ci, build, perf}`.
-   Subject ≤ 70 chars, imperative mood ("add", not "added").
+   Subject ≤ 70 chars, imperative mood ("add", not "added"), no trailing
+   period. Separate the subject from the body with a blank line, and wrap the
+   body at 72 columns so `git log` stays readable in a narrow terminal.
+
+   The conventions come from Tim Pope, [A Note About Git Commit
+   Messages](https://tbaggery.com/2008/04/19/a-note-about-git-commit-messages.html),
+   and Chris Beams, [How to Write a Git Commit
+   Message](https://cbea.ms/git-commit/).
 
    **Soft prompt**: if the contributor's preferred message doesn't match the
    conventional form, propose a rewrite once. Accept their version on insist.
 
-5. **Soft prompt — CHANGELOG**: if `CHANGELOG.md` isn't in the staged set, ask
-   whether this commit needs an entry. Some genuinely don't (pure ruff
-   renames, internal refactors invisible to users). Don't block.
+5. **Soft prompt — changelog fragment**: if the commit touches `src/` or
+   `packages/` and nothing under `changelog.d/` is staged, ask whether it needs
+   a fragment. Pure internal work takes an `internal` fragment. Don't block
+   here; CI is the gate.
 
 6. Commit, then `git log -1 --stat` so the contributor sees what was recorded.
 
@@ -203,8 +221,8 @@ The contributor edits code; the skill is mostly absent. Two reminders:
 
    - **Title** — short (≤70 chars), conventional-style summary of the branch
      theme. If there's only one commit, that subject line is usually right.
-   - **Body** — pull from the commit messages and the CHANGELOG entries.
-     Sections:
+   - **Body** — pull from the commit messages and the fragments in
+     `changelog.d/`. Sections:
      - `## Summary` — 1-3 bullets, *why* this change.
      - `## Changes` — what landed.
      - `## Test plan` — bulleted checklist of how this was validated.
@@ -233,6 +251,10 @@ gh pr checks --watch
 When checks complete:
 
 - **All green** → Phase 7.
+- **No rows** — `gh pr checks` printing nothing means the checks could not be
+  seen (not yet registered, or the call failed), not that they passed. That is
+  UNKNOWN: re-poll, or re-query with an explicit selector (`gh pr checks
+  <pr-number>`); do not advance to the green branch on it.
 - **Failures** — fetch the failed run's logs, summarize the root cause, suggest
   a minimal fix. The contributor edits, re-stage, re-commit (or `git commit
   --amend` if the broken commit is the tip and not yet pulled by anyone else).

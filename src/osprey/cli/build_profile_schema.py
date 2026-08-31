@@ -18,6 +18,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from osprey.port_layout import DEFAULT_PORT_BASE, SLOTS_BY_NAME, default_port, layout_ports
+
+#: The shape of an environment-variable NAME wherever a profile names one
+#: (``services.<name>.env``, ``env.required``, ``env.pinned``, ...). Both cases
+#: are admitted: the proxy family (``http_proxy`` / ``https_proxy`` /
+#: ``no_proxy``) is conventionally lowercase, and a deployment behind a proxy
+#: must be able to pass or pin those spellings too — ``urllib``'s
+#: ``getproxies()`` (hence httpx and requests) reads whichever spelling comes
+#: LAST in the environment, so an uppercase-only passthrough is silently
+#: overruled by a lowercase twin the container runtime injects from the host
+#: after the compose ``environment:`` block (#783).
+_ENV_VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 NetworkMode = Literal["bridge", "host"]
 """How a deployed service attaches to the network."""
 
@@ -59,6 +72,50 @@ def network_mode_errors(value: Any, key: str) -> list[str]:
         # re-read the same line looking for a typo that is not there.
         message += ". A bare yes/no/on/off in YAML parses as a boolean — quote the value."
     return [message]
+
+
+def env_names_errors(value: Any, key: str) -> list[str]:
+    """Return the problems with one ``env:`` name list (empty when valid).
+
+    The ``env:`` axis names HOST variables a service passes through to its
+    container; it carries names, never values, so a declaration is well-formed
+    exactly when it is a list of environment-variable names. Like
+    :func:`network_mode_errors` it accumulates rather than raises, and reports
+    every bad entry rather than the first, so an author fixes the whole list in
+    one pass.
+
+    Args:
+        value: The declared list, exactly as it came out of the YAML.
+        key: Dotted path of the declaration (e.g. ``"services.gchat_bridge.env"``),
+            used verbatim in the messages so the author can find it.
+
+    Returns:
+        Human-readable error messages; empty when ``value`` is a list of names
+        matching :data:`_ENV_VAR_RE`.
+    """
+    if not isinstance(value, list):
+        message = f"{key} must be a list of environment variable names (got {type(value).__name__})"
+        if isinstance(value, bool):
+            message += ". A bare yes/no/on/off in YAML parses as a boolean — quote the value."
+        elif isinstance(value, str):
+            message += f". A single name is still a list — write it as [{value}]."
+        return [message]
+
+    errors: list[str] = []
+    for index, name in enumerate(value):
+        if isinstance(name, str) and _ENV_VAR_RE.match(name):
+            continue
+        message = (
+            f"{key}[{index}] must be an environment variable name matching "
+            f"[A-Za-z_][A-Za-z0-9_]* (got {name!r})"
+        )
+        if isinstance(name, bool):
+            # A bare `- on` entry is read on the YAML 1.1 resolver as a bool,
+            # so the author sees a value they never wrote. Name the resolver
+            # rather than let them hunt for a typo that is not there.
+            message += ". A bare yes/no/on/off in YAML parses as a boolean — quote the name."
+        errors.append(message)
+    return errors
 
 
 @dataclass
@@ -125,6 +182,12 @@ class EnvConfig:
     """Environment variable template configuration."""
 
     required: list[str] = field(default_factory=list)
+    # Names the deployment's own env chain owns outright. `required` says a
+    # variable must be set somewhere; `pinned` says where — the chain under the
+    # repo root, and nowhere else. Deploy-side probes read this back off the
+    # repo's profile.yml to judge whether a value reaching the stack came from
+    # the store or from around it. Same upper-snake names as `required`.
+    pinned: list[str] = field(default_factory=list)
     defaults: dict[str, str] = field(default_factory=dict)
     file: str | None = None  # Profile-relative path to copy as .env
 
@@ -206,11 +269,15 @@ class ServiceDef:
 
     :attr:`config` is a free-form pass-through: whatever a profile declares
     under ``services.<name>.config`` is written to the rendered ``config.yml``
-    and is visible to the service's compose template. One key in it is
-    understood by the build itself — ``network:``, the service's attachment,
-    one of :data:`VALID_NETWORK_MODES` and defaulting to
-    :data:`DEFAULT_NETWORK_MODE`. It is validated by
-    :meth:`BuildProfile.validate` and read through :meth:`network_mode`.
+    and is visible to the service's compose template. Two keys in it are
+    understood by the build itself, each validated by
+    :meth:`BuildProfile.validate` and read through its own accessor:
+
+    - ``network:`` — the service's attachment, one of
+      :data:`VALID_NETWORK_MODES` and defaulting to
+      :data:`DEFAULT_NETWORK_MODE`; read through :meth:`network_mode`.
+    - ``env:`` — host environment variable NAMES the service passes through to
+      its container, defaulting to none; read through :meth:`env_names`.
     """
 
     template: str  # Path to template dir (relative to profile dir)
@@ -236,6 +303,27 @@ class ServiceDef:
         # consumer a value it would compare against the vocabulary and miss.
         return mode if isinstance(mode, str) else DEFAULT_NETWORK_MODE
 
+    def env_names(self) -> list[str]:
+        """Return the host variable names the service passes through, in order.
+
+        The single place the axis default is applied for a declared service, so
+        a renderer never has to spell the empty case itself. Order is the
+        author's, because it is what the rendered ``environment:`` block shows.
+
+        Returns:
+            The declared names, or an empty list when the service declares
+            none. Every entry is guaranteed to match :data:`_ENV_VAR_RE` for
+            any profile that passed :meth:`BuildProfile.validate`.
+        """
+        if not isinstance(self.config, dict):
+            return []
+        names = self.config.get("env", [])
+        # A non-list here means the profile never passed validation; hand a
+        # consumer nothing rather than something it would iterate as characters.
+        if not isinstance(names, list):
+            return []
+        return [name for name in names if isinstance(name, str)]
+
 
 @dataclass
 class DispatchConfig:
@@ -252,8 +340,36 @@ class DispatchConfig:
     workspace_mode: Literal["isolated", "shared"] = "isolated"
     max_concurrent_runs: int = 2
     max_queue_depth: int = 50
-    dispatcher_port: int = 8020
-    worker_port_base: int = 9190
+    dispatcher_port: int = default_port("dispatcher")
+    """Host port the event dispatcher publishes, at the layout's ``dispatcher``
+    slot.
+
+    The default here is that slot at the layout's OWN base, which is right only
+    where there is no config to resolve — a hand-built ``DispatchConfig`` that
+    never went through the profile loader. A profile that leaves the key
+    unspelled does NOT get this number: ``_parse_profile`` fills it from the
+    base the profile resolved, so the rendered config and the compose
+    templates' ``osprey_ports`` defaults name the same port."""
+
+    worker_port_base: int = default_port("worker", 1)
+    """Host port dispatch worker 1 publishes, at the first index of the layout's
+    ``worker`` band. Worker *i* is at ``worker_port_base + (i - 1) *
+    worker_port_stride``, and only in host-network mode: bridge-mode workers
+    each own a namespace and publish nothing on the host.
+
+    Same rule as :attr:`dispatcher_port` for where this default applies: the
+    loader fills an unspelled key from the profile's own resolved base."""
+
+    worker_port_stride: int = 1
+    """Host-port spacing between consecutive dispatch workers.
+
+    One is the layout's own spacing — the ``worker`` band gives each worker the
+    next port up — and a facility widens it only to leave room for something
+    else of its own between them. The build records the value in the worker's
+    service config (host mode only) so the compose render and the host-port
+    preflight derive the same ports from one declared rule instead of each
+    hardcoding the step."""
+
     timeout_sec: int = 300
     inactivity_sec: int = 120
     facility_name: str = ""
@@ -272,19 +388,108 @@ class DispatchConfig:
     """
 
 
+#: Host-port distance between a two-lane deploy's first and second bluesky lane.
+#:
+#: ONE, because the two lanes are ADJACENT SLOTS of the port layout: ``bluesky``
+#: at ``port_base + 80`` and ``bluesky_second_lane`` at ``port_base + 81``. The
+#: block reserves lane 2's port up front, so the derivation has nothing to step
+#: over — the neighbours the stride once had to clear sit BELOW the pair now
+#: (``tiled`` at ``+70``, the ``bluesky_web`` sidecar at ``+71``).
+#:
+#: Lane 2's bridge port stays DERIVED (``port + SECOND_LANE_PORT_STRIDE``) rather
+#: than configured, so the lane axis adds one boolean knob and not a second port
+#: an author has to keep clear of the first. The cost of deriving is that an
+#: absolute ``services.bluesky.port`` carries lane 2 with it, off the slot the
+#: block reserved and possibly onto one it already spends — which is why
+#: :meth:`BlueskyConfig.second_lane_port` re-checks the result against the layout
+#: rather than trusting the offset.
+SECOND_LANE_PORT_STRIDE = 1
+
+#: Layout slots the lane pair itself owns, and so the ports a derived lane-2 port
+#: may legitimately equal. ``bluesky_second_lane`` is where the derivation is
+#: meant to land; ``bluesky`` is listed too because a profile that parks lane 1
+#: on the block's own bluesky slot has collided with nothing by doing so.
+_LANE_SLOTS = frozenset({"bluesky", "bluesky_second_lane"})
+
+
+def _off_slot_refusal(slot_name: str, derived: int, lane_one_port: int) -> str:
+    """Compose the refusal for a lane-2 port that landed on another layout slot.
+
+    Args:
+        slot_name: Name of the layout slot the derived port collides with.
+        derived: The derived lane-2 bridge port.
+        lane_one_port: ``bluesky.port`` — the override that carried the pair off
+            the slots the block reserves for it.
+
+    Returns:
+        A message naming the slot in the way and both ways out: drop the
+        override and take the block's reserved pair, or move that slot, named by
+        its own config key where it has one.
+    """
+    remedy = "drop the bluesky.port override and take the block's own lane pair"
+    config_key = SLOTS_BY_NAME[slot_name].config_key
+    if config_key:
+        remedy += f", or move {config_key} off {derived}"
+    return (
+        f"bluesky.second_lane derives lane 2's bridge port from lane 1's "
+        f"(bluesky.port + {SECOND_LANE_PORT_STRIDE} = {derived}), and {derived} is the port "
+        f"layout's {slot_name!r} slot on this deployment's block. The lanes belong on the "
+        f"adjacent slots the block reserves for them; setting bluesky.port to "
+        f"{lane_one_port} moved the pair onto a neighbour. To fix it, {remedy}."
+    )
+
+
 @dataclass
 class BlueskyConfig:
     """Bluesky bridge configuration for a build profile (opt-in via the ``bluesky:`` key).
 
-    Consumed by the build pipeline's bluesky-injection step to deploy the
-    single ``bluesky_bridge`` service (see NAMING-ADDENDUM.md: deploy key
+    Consumed by the build pipeline's bluesky-injection step, which deploys one
+    ``bluesky_bridge`` service per PLAN LANE (see NAMING-ADDENDUM.md: deploy key
     ``bluesky``, env var ``BLUESKY_LAUNCH_TOKEN``, MCP server name ``bluesky``).
-    Ports are validated by :meth:`BuildProfile.validate`.
+    A profile gets one lane unless it opts into :attr:`second_lane`.
+    The authored ports are validated by :meth:`BuildProfile.validate`; lane 2's
+    is derived and validated by :meth:`second_lane_port`.
     """
 
-    port: int = 8090
+    port: int = default_port("bluesky")
+    """Host port lane 1's bridge publishes, at the layout's ``bluesky`` slot.
+
+    The default is that slot at the layout's own base; a profile that leaves the
+    key unspelled is filled by the loader from the base it resolved."""
+
     tiled_enabled: bool = False
-    tiled_port: int = 8091
+
+    tiled_port: int = default_port("tiled")
+    """Host port the tiled data server publishes, at the layout's ``tiled``
+    slot, filled from the profile's resolved base when left unspelled. Tiled is
+    shared, so it stays on lane 1 even in a two-lane deploy."""
+
+    second_lane: bool = False
+    """Render a SECOND plan lane — one full bluesky stack per control-system
+    target — instead of the single stack every build rendered before this field.
+
+    Opt-in, and default ``False`` on purpose: a single-lane deployment is what
+    every existing project has, and leaving this off renders byte-for-byte the
+    ``services.bluesky`` block it rendered before. Such a deployment is still
+    correct under the run-time target switch — it simply refuses ``queue_add`` /
+    ``queue_start`` while the session target differs from the deployment
+    baseline, which is what lets the Bluesky track ship separately from the
+    controls track.
+
+    Set ``True`` and the build renders two SIBLING service blocks: lane 1 stays
+    ``services.bluesky`` and serves the deployment baseline target, and lane 2
+    lands at ``services.bluesky_va`` or ``services.bluesky_live`` — named for the
+    target it serves, never for its index. Lane identity is fixed at render
+    time; the bridge never learns the session target. Lane 2 gets its own bridge
+    port (:meth:`second_lane_port`); tiled is the one shared component and stays
+    on lane 1 only.
+
+    Which pair the two lanes serve is DERIVED from the deployment baseline
+    (``control_system.type``): a ``live`` or ``standin`` baseline gets ``va`` as
+    its second lane, and a ``va`` baseline gets ``live``. A ``mock`` or
+    ``doocs`` baseline has no second target to serve, and the injection refuses
+    rather than rendering a lane that leads nowhere.
+    """
     plan_dir: str | None = None
     """Optional host directory of facility plan files (Task 1.4),
     bind-mounted read-only into the bridge container and surfaced to the
@@ -297,6 +502,97 @@ class BlueskyConfig:
     enabled (dev/local convenience). Production uses the
     ``BLUESKY_EXCLUDED_PLANS`` env var instead.
     """
+    devices_file: str = "data/bluesky_devices.yml"
+    """Where the plan device file is AUTHORED — the YAML/JSON document naming
+    the devices Bluesky plans may address.
+
+    A RELATIVE path (the default) is resolved against the RENDERED CONFIG's own
+    directory, so it names a file that lives inside the built project and
+    travels with it. An ABSOLUTE path is operator-owned: the build reads it
+    as-is and never rewrites, relocates or copies it.
+
+    Unlike :attr:`plan_dir` and :attr:`excluded_plans`, this key is written to
+    every lane's service block on every deploy — a deployment always addresses
+    devices, so the only question is which file names them, and an unwritten
+    key would leave the staging step re-deriving this default for itself.
+    """
+    device_page_size: int = 500
+    """How many devices one page of the bridge's device listing carries.
+
+    ONE number bounds both halves of the same contract: the page size the
+    bridge's ``GET /devices`` returns, and the inline threshold in the body of
+    its ``400`` refusal for an unknown device — below that count the refusal
+    spells the addressable devices out, above it the caller is pointed at the
+    paged listing instead. Keeping them the same number means a facility never
+    tunes one against the other.
+
+    Authored per facility, because "how many devices is too many to read in one
+    breath" is a property of the facility's device file, not of OSPREY. The
+    default is deliberately generous: a deployment whose device file is smaller
+    than this never sees a second page and never sees a truncated refusal.
+
+    At the default value this key renders NOTHING into ``config.yml`` or the
+    compose file — the rendered deployment carries the key only when a profile
+    authors a value that differs, and the bridge falls back to the same default
+    when the env var is absent.
+    """
+
+    def second_lane_port(self, base: int | None = None) -> int:
+        """Host port lane 2's bridge publishes, derived from lane 1's.
+
+        Derived rather than configured (see :data:`SECOND_LANE_PORT_STRIDE`) —
+        but derived is not the same as unchecked. Left alone, the derivation
+        lands exactly on the ``bluesky_second_lane`` slot the block reserves for
+        it. What can move it is an ABSOLUTE ``services.bluesky.port``: lane 2
+        rides along, off its reserved slot and possibly onto a port the block
+        already spends. So the result is re-tested against the whole layout at
+        the base this deployment resolved, and against :attr:`tiled_port`, the
+        one neighbour an author may move on its own.
+
+        Raising is the point: the alternative is a rendered compose file whose
+        services fight over a port, which surfaces as a container that will not
+        start long after the build reported success.
+
+        Only the LAYOUT's slots are checked here — one port per slot, at the
+        first index of a band. A collision with a port this particular profile
+        spends is :meth:`BuildProfile.validate`'s sweep to report, which knows
+        which services the profile actually deploys.
+
+        Args:
+            base: The base the deployment resolved from ``deployment.port_base``
+                — for a caller holding a raw profile, what
+                ``build_profile_load._profile_port_base`` returns. ``None``
+                means :data:`~osprey.port_layout.DEFAULT_PORT_BASE`, which is
+                right only when there is no config to resolve.
+
+        Returns:
+            The derived lane-2 bridge port.
+
+        Raises:
+            ValueError: If the derived port leaves the valid range, collides
+                with the tiled port this profile publishes, or lands on another
+                slot of the deployment's block; or if ``base`` is outside the
+                range a block can start at.
+        """
+        derived = self.port + SECOND_LANE_PORT_STRIDE
+        if not 1 <= derived <= 65535:
+            raise ValueError(
+                f"bluesky.second_lane needs a second bridge port at "
+                f"bluesky.port + {SECOND_LANE_PORT_STRIDE} = {derived}, which is outside "
+                f"1..65535; lower bluesky.port (currently {self.port})"
+            )
+        if self.tiled_enabled and derived == self.tiled_port:
+            raise ValueError(
+                f"bluesky.second_lane needs a second bridge port at "
+                f"bluesky.port + {SECOND_LANE_PORT_STRIDE} = {derived}, which is already "
+                f"bluesky.tiled_port; move bluesky.tiled_port or bluesky.port"
+            )
+        ports = layout_ports(DEFAULT_PORT_BASE if base is None else base)
+        for slot_name, slot_port in ports.items():
+            if slot_port != derived or slot_name in _LANE_SLOTS:
+                continue
+            raise ValueError(_off_slot_refusal(slot_name, derived, self.port))
+        return derived
 
 
 @dataclass
@@ -304,15 +600,29 @@ class VAConfig:
     """Virtual Accelerator soft-IOC configuration for a build profile (opt-in
     via the ``virtual_accelerator:`` key).
 
-    Consumed by the build pipeline's VA-injection step to deploy the single
+    Consumed by the build pipeline's VA-injection step to deploy the
     ``virtual_accelerator`` service (compose service ``virtual-accelerator``,
-    container ``<project>-virtual-accelerator``). Port is validated by
+    container ``<project>-virtual-accelerator``), plus a second copy of it on
+    ``live_standin`` when that port is set. Ports are validated by
     :meth:`BuildProfile.validate`.
     """
 
     port: int = 5064
     """Channel Access TCP port the soft-IOC serves PVs on (see
     src/osprey/services/virtual_accelerator/entrypoint.py's run contract)."""
+
+    live_standin: int | None = None
+    """Channel Access TCP port for a second copy of the soft-IOC, stood up as the
+    deployment's THIRD control target (``standin``) so operators rehearse the
+    write ritual against something that cannot move a magnet. ``live`` is
+    untouched either way — it stays whatever the facility's ``epics:`` block
+    names — so this key adds a target rather than replacing one. Absent (the
+    default) means the deployment has no stand-in and only two targets.
+
+    A profile normally writes ``live_standin: true`` and lets the loader place
+    the stand-in at the layout's ``va_standin`` slot on the deployment's own
+    base; the field stays an ``int | None`` because a facility may still name an
+    absolute port, and every consumer downstream reads one number either way."""
 
 
 @dataclass
@@ -328,9 +638,11 @@ class BlueskyWebConfig:
     by :meth:`BuildProfile.validate`.
     """
 
-    port: int = 8095
+    port: int = default_port("bluesky_web")
     """Host/container port the sidecar's uvicorn process binds and publishes
-    (see ``templates/services/bluesky_web/docker-compose.yml.j2``)."""
+    (see ``templates/services/bluesky_web/docker-compose.yml.j2``), at the
+    layout's ``bluesky_web`` slot — filled from the profile's resolved base when
+    the key is left unspelled."""
 
 
 @dataclass
@@ -391,6 +703,3 @@ class GChatBridgeProfileConfig:
     rather than silently firing a name nobody declared. The value must name a
     trigger declared in the ``dispatch.triggers`` file.
     """
-
-
-_ENV_VAR_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")

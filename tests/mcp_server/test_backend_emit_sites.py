@@ -1,8 +1,15 @@
 """Agent-activity emit sites for backend-direct tools.
 
 Verifies that the mutating backend tools report agent activity via
-``notify_agent_activity_async`` — and, just as important, that refusal paths
-emit NOTHING and that tool results are unchanged when the web terminal is down.
+``notify_agent_activity_async`` — and, just as important, that a path which did
+not act emits NOTHING and that tool results are unchanged when the web terminal
+is down.
+
+"Did not act" is the test, not "was refused": a control-system write refused in
+a readonly run *is* reported, because the operator needs to see that one was
+attempted. That emit comes from the shared gate module rather than from either
+executor tool, so it has its own patch seam (``_GATES_MOD``) and the two are
+asserted separately.
 
 Layout: one ``# ── <tool family> ──`` section per tool family, each owning its
 own helpers and fixtures, followed by a trailing cross-cutting "terminal down"
@@ -24,6 +31,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import yaml
 
+from osprey.connectors.control_system.base import ChannelWriteResult, WriteOutcome
 from tests.mcp_server.conftest import (
     assert_raises_error,
     extract_response_dict,
@@ -58,20 +66,25 @@ def _free_port() -> int:
 def _make_write_result(
     channel="TEST:PV",
     value=1.0,
-    success=True,
+    outcome=WriteOutcome.CONFIRMED,
     error_message=None,
-    blocked=False,
     refusal_reason=None,
 ):
-    result = MagicMock()
-    result.channel_address = channel
-    result.value_written = value
-    result.success = success
-    result.error_message = error_message
-    result.blocked = blocked
-    result.refusal_reason = refusal_reason
-    result.verification = None
-    return result
+    """A real ``ChannelWriteResult``, because the emit reads the outcome word.
+
+    A ``MagicMock`` answers every attribute truthily, so ``str(result.outcome)``
+    would be a mock repr — which is in neither the executed nor the unexecuted
+    set, and every result would read as an executed write whatever the test
+    meant it to be.
+    """
+    return ChannelWriteResult(
+        channel_address=channel,
+        value_written=value,
+        outcome=outcome,
+        refusal_reason=refusal_reason,
+        error_message=error_message,
+        observed_value=value if outcome == WriteOutcome.CONFIRMED else None,
+    )
 
 
 def _get_channel_write():
@@ -134,13 +147,12 @@ async def test_channel_write_partial_success_emits_executed_only(tmp_path, monke
     initialize_server_context()
 
     results = [
-        _make_write_result(channel="SR01:HCM1:SP", value=1.0, success=True),
+        _make_write_result(channel="SR01:HCM1:SP", value=1.0),
         _make_write_result(
             channel="SR02:VCM3:SP",
             value=2.0,
-            success=False,
+            outcome=WriteOutcome.REFUSED,
             error_message="Write to 'SR02:VCM3:SP' blocked: writes are disabled.",
-            blocked=True,
             refusal_reason="WRITES_DISABLED",
         ),
     ]
@@ -183,17 +195,15 @@ async def test_channel_write_all_blocked_no_emit(tmp_path, monkeypatch):
         _make_write_result(
             channel="PV:A",
             value=1.0,
-            success=False,
+            outcome=WriteOutcome.REFUSED,
             error_message="Write to 'PV:A' blocked: writes are disabled.",
-            blocked=True,
             refusal_reason="WRITES_DISABLED",
         ),
         _make_write_result(
             channel="PV:B",
             value=2.0,
-            success=False,
+            outcome=WriteOutcome.REFUSED,
             error_message="Write to 'PV:B' blocked: writes are disabled.",
-            blocked=True,
             refusal_reason="WRITES_DISABLED",
         ),
     ]
@@ -305,10 +315,13 @@ async def test_queue_start_success_emits(_bluesky_context):
 async def test_queue_start_client_side_refusal_no_emit(_bluesky_context, monkeypatch):
     """A client-side refusal (kill switch off) never reaches the emit site.
 
-    ``queue_start`` refuses before any HTTP call when writes are disabled, so
-    neither the bridge nor the activity emitter is touched.
+    ``queue_start`` refuses before any HTTP call when the bound lane's target
+    is not armed for writes, so neither the bridge nor the activity emitter is
+    touched.
     """
-    monkeypatch.setattr(f"{_QUEUE_MOD}._writes_enabled", lambda: False)
+    # Takes the bound lane's control target: write posture is resolved per
+    # target, so the stub has to accept the one `queue_start` passes it.
+    monkeypatch.setattr(f"{_QUEUE_MOD}._writes_enabled", lambda _lane_target: False)
 
     with (
         patch(f"{_QUEUE_MOD}._http_post_json") as post,
@@ -325,9 +338,9 @@ async def test_queue_start_client_side_refusal_no_emit(_bluesky_context, monkeyp
 
 
 async def _save_artifact(title="Test Artifact"):
-    from osprey.mcp_server.workspace.tools.artifact_save import artifact_save
+    from osprey.mcp_server.workspace.tools.artifact_register import artifact_register
 
-    save_fn = get_tool_fn(artifact_save)
+    save_fn = get_tool_fn(artifact_register)
     save_result = await save_fn(title=title, content="# Hello", content_type="markdown")
     return extract_response_dict(save_result)["artifact_id"]
 
@@ -771,6 +784,34 @@ _EXECUTE_WRITE_CODE = "epics.caput('SR:CORR:SP', 1.0)\n"
 _EXECUTE_DETAIL = "ran a script with control-system writes"
 _EXECUTE_TOOLS = ["execute", "execute_file"]
 
+#: Second patch seam for this family. A refused write is reported by the shared
+#: gate module rather than by either tool, so ``{tool_mod}.notify_agent_activity_async``
+#: does not see it — which is what lets a test assert "the run emitted nothing"
+#: and "the refusal was reported" independently of each other.
+_GATES_MOD = "osprey.mcp_server.python_executor.tools._execution_gates"
+
+
+@contextlib.contextmanager
+def _audit_to(root):
+    """Point the audit zone at *root* instead of the real state zone."""
+    from osprey.audit import writer
+
+    with patch.object(writer, "audit_dir", lambda: root / "var" / "audit"):
+        yield
+
+
+def _audit_records(root):
+    """Every executor refusal recorded under *root*, or ``[]`` when none were."""
+    import json
+
+    from osprey.audit.envelope import SURFACE_EXECUTOR
+    from osprey.utils.identity import acting_identity
+
+    path = root / "var" / "audit" / acting_identity() / f"{SURFACE_EXECUTOR}.jsonl"
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
 
 def _execute_patterns(has_writes: bool) -> dict:
     """Canned ``detect_control_system_operations()`` return value."""
@@ -914,17 +955,135 @@ async def test_execute_launch_failure_no_emit(tool_name, tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("tool_name", _EXECUTE_TOOLS)
-async def test_execute_readonly_gate_refusal_no_emit(tool_name, tmp_path, monkeypatch):
-    """Write patterns in readonly mode are refused before launch — emit nothing."""
+async def test_execute_readonly_gate_refusal_alerts_the_operator(tool_name, tmp_path, monkeypatch):
+    """A refused write is an operator-visible event, not just an error to the agent.
+
+    The refusal emit comes from the shared gate module, not the tool module, so
+    the two seams are asserted separately: the tool's own "ran a script with
+    control-system writes" emit must stay silent (nothing ran), while the gate
+    reports that a write was attempted and blocked.
+    """
     monkeypatch.chdir(tmp_path)
     mod, call = _execute_tool_call(tool_name, tmp_path)
 
     with _execute_env(mod, tmp_path) as (notify, exec_code):
-        with assert_raises_error(error_type="safety_error"):
-            await call(execution_mode="readonly")
+        with patch(f"{_GATES_MOD}.notify_agent_activity_async") as blocked, _audit_to(tmp_path):
+            with assert_raises_error(error_type="safety_error"):
+                await call(execution_mode="readonly")
 
     exec_code.assert_not_called()
     notify.assert_not_called()
+    blocked.assert_called_once()
+    emitted_tool, kind = blocked.call_args.args
+    assert (emitted_tool, kind) == (tool_name, "channel")
+    assert "BLOCKED" in blocked.call_args.kwargs["detail"]
+
+
+@pytest.mark.parametrize("tool_name", _EXECUTE_TOOLS)
+async def test_execute_readonly_gate_refusal_is_audited(tool_name, tmp_path, monkeypatch):
+    """...and leaves a durable record naming the source that was refused."""
+    monkeypatch.chdir(tmp_path)
+    mod, call = _execute_tool_call(tool_name, tmp_path)
+
+    with _execute_env(mod, tmp_path) as (_, exec_code):
+        with patch(f"{_GATES_MOD}.notify_agent_activity_async"), _audit_to(tmp_path):
+            with assert_raises_error(error_type="safety_error"):
+                await call(execution_mode="readonly")
+
+    (record,) = _audit_records(tmp_path)
+    assert record["reason"] == "pattern_detection"
+    assert record["subject"] == tool_name
+    assert f"tool={tool_name}" in record["detail"]
+    assert "mode=readonly" in record["detail"]
+    assert _EXECUTE_WRITE_CODE.strip() in record["source"]
+
+
+@pytest.mark.parametrize("tool_name", _EXECUTE_TOOLS)
+async def test_execute_runtime_refusal_alerts_and_audits(tool_name, tmp_path, monkeypatch):
+    """The guard refused mid-run: the tool recognises it in stderr and reports.
+
+    This is the layer that catches the spellings no static check sees, so it is
+    the one that most needs to reach the operator. Nothing but the subprocess's
+    stderr carries the news back.
+    """
+    from osprey.services.python_executor.execution.wrapper import READONLY_REFUSAL
+
+    monkeypatch.chdir(tmp_path)
+    mod, call = _execute_tool_call(tool_name, tmp_path)
+    refused = _execute_result(
+        success=False,
+        launched=True,
+        stderr=f"Traceback...\nRuntimeError: {READONLY_REFUSAL}",
+        error_message=f"RuntimeError: {READONLY_REFUSAL}",
+    )
+
+    with _execute_env(mod, tmp_path, exec_result=refused, has_writes=False) as (notify, _):
+        with patch(f"{_GATES_MOD}.notify_agent_activity_async") as blocked, _audit_to(tmp_path):
+            with assert_raises_error(error_type="execution_error"):
+                await call(execution_mode="readonly")
+
+    notify.assert_not_called()
+    blocked.assert_called_once()
+    (record,) = _audit_records(tmp_path)
+    assert record["reason"] == "runtime_guard"
+    assert record["subject"] == tool_name
+
+
+@pytest.mark.parametrize("tool_name", _EXECUTE_TOOLS)
+async def test_execute_connector_refusal_is_reported_too(tool_name, tmp_path, monkeypatch):
+    """A write refused by the connector — the *approved* path in the wrong mode.
+
+    Its message is not the guard's, so this pins that the tool matches on what
+    the two share, and that the audit record keeps the channel name the
+    connector's message carries rather than a generic marker.
+    """
+    monkeypatch.chdir(tmp_path)
+    mod, call = _execute_tool_call(tool_name, tmp_path)
+    connector_message = (
+        "Write to 'SR:CORR:SP' blocked: this script is running in readonly "
+        "execution mode. Resubmit it with execution_mode='readwrite' "
+        "(human approval required) if the write is intended."
+    )
+    refused = _execute_result(
+        success=False,
+        launched=True,
+        stderr=f"Traceback...\nChannelWriteBlockedError: {connector_message}",
+        error_message=f"ChannelWriteBlockedError: {connector_message}",
+    )
+
+    with _execute_env(mod, tmp_path, exec_result=refused, has_writes=False) as (_, _exec):
+        with patch(f"{_GATES_MOD}.notify_agent_activity_async") as blocked, _audit_to(tmp_path):
+            with assert_raises_error(error_type="execution_error"):
+                await call(execution_mode="readonly")
+
+    blocked.assert_called_once()
+    (record,) = _audit_records(tmp_path)
+    assert record["reason"] == "runtime_guard"
+    assert "SR:CORR:SP" in record["detail"]
+
+
+@pytest.mark.parametrize("tool_name", _EXECUTE_TOOLS)
+async def test_execute_ordinary_failure_is_not_reported_as_a_refusal(
+    tool_name, tmp_path, monkeypatch
+):
+    """A script that merely crashed must not land in the refusal audit log."""
+    monkeypatch.chdir(tmp_path)
+    mod, call = _execute_tool_call(tool_name, tmp_path)
+    crashed = _execute_result(
+        success=False,
+        launched=True,
+        stderr="Traceback...\nZeroDivisionError: division by zero",
+        error_message="ZeroDivisionError: division by zero",
+    )
+
+    with _execute_env(mod, tmp_path, exec_result=crashed, has_writes=False) as (notify, _):
+        with patch(f"{_GATES_MOD}.notify_agent_activity_async") as blocked, _audit_to(tmp_path):
+            with assert_raises_error(error_type="execution_error"):
+                await call(execution_mode="readonly")
+
+    notify.assert_not_called()
+    blocked.assert_not_called()
+    assert _audit_records(tmp_path) == []
 
 
 @pytest.mark.parametrize("tool_name", _EXECUTE_TOOLS)
@@ -1125,6 +1284,14 @@ async def test_lattice_read_only_tool_never_emits(tool_name, kwargs):
 # coincidental substring can let a leak through, and check every notify
 # argument rather than just the detail.
 #
+# The keys patched below are all outside the protected set — `command`, `args`,
+# `env.*` and every `control_system.*` key are refused before the file is read
+# (tests/mcp_server/test_setup_patch_protected.py), so a landed-patch emit can
+# only be observed on a key an agent-side writer may actually set. The sentinels
+# therefore ride on an unprotected `.mcp.json` key; the file still carries a
+# real-looking credential beside it, which is what makes the value exclusion
+# worth asserting at all.
+#
 # Both tools refuse before touching anything, so each refusal shape is pinned
 # as a no-emit: an out-of-whitelist file, a malformed key path, a missing
 # file and an unparseable file for setup_patch; an unknown action, both
@@ -1147,8 +1314,9 @@ def setup_project(tmp_path):
         yaml.dump({"control_system": {"type": "mock", "writes_enabled": False}})
     )
     (tmp_path / ".mcp.json").write_text(
-        '{\n  "mcpServers": {\n    "demo": {\n      "env": {\n'
-        f'        "API_KEY": "{_OLD_SENTINEL}"\n'
+        '{\n  "mcpServers": {\n    "demo": {\n'
+        f'      "description": "{_OLD_SENTINEL}",\n'
+        '      "env": {\n        "API_KEY": "sk-live-credential"\n'
         "      }\n    }\n  }\n}\n"
     )
     with patch(f"{_SETUP_MOD}.resolve_config_path", return_value=tmp_path / "config.yml"):
@@ -1188,25 +1356,21 @@ def _backend_unavailable():
 async def test_setup_patch_emits_config_activity(setup_project):
     """A landed patch reports the file and key path under the 'config' kind."""
     with patch(f"{_SETUP_MOD}.notify_agent_activity_async") as notify:
-        result = await _get_setup_patch()(
-            file="config.yml", key_path="agent_data.base_dir", value="./_agent_data"
-        )
+        result = await _get_setup_patch()(file="config.yml", key_path="ui.theme", value="dark")
 
-    assert extract_response_dict(result)["key_path"] == "agent_data.base_dir"
-    notify.assert_called_once_with(
-        "setup_patch", "config", detail="config.yml: agent_data.base_dir"
-    )
+    assert extract_response_dict(result)["key_path"] == "ui.theme"
+    notify.assert_called_once_with("setup_patch", "config", detail="config.yml: ui.theme")
 
 
 async def test_setup_patch_emits_for_json_target(setup_project):
     """The `.mcp.json` branch reports too — it is the same mutation."""
     with patch(f"{_SETUP_MOD}.notify_agent_activity_async") as notify:
         await _get_setup_patch()(
-            file=".mcp.json", key_path="mcpServers.demo.env.API_KEY", value=_NEW_SENTINEL
+            file=".mcp.json", key_path="mcpServers.demo.description", value=_NEW_SENTINEL
         )
 
     notify.assert_called_once_with(
-        "setup_patch", "config", detail=".mcp.json: mcpServers.demo.env.API_KEY"
+        "setup_patch", "config", detail=".mcp.json: mcpServers.demo.description"
     )
 
 
@@ -1216,13 +1380,13 @@ async def test_setup_patch_detail_never_carries_the_patched_values(setup_project
 
     with patch(f"{_SETUP_MOD}.notify_agent_activity_async") as notify:
         await _get_setup_patch()(
-            file=".mcp.json", key_path="mcpServers.demo.env.API_KEY", value=_NEW_SENTINEL
+            file=".mcp.json", key_path="mcpServers.demo.description", value=_NEW_SENTINEL
         )
 
     # The patch really did swap the sentinels, so their absence below is a
     # property of the emit and not of an inert test.
     on_disk = json.loads((setup_project / ".mcp.json").read_text())
-    assert on_disk["mcpServers"]["demo"]["env"]["API_KEY"] == _NEW_SENTINEL
+    assert on_disk["mcpServers"]["demo"]["description"] == _NEW_SENTINEL
 
     call = notify.call_args
     reported = [str(arg) for arg in call.args] + [str(v) for v in call.kwargs.values()]
@@ -1231,17 +1395,21 @@ async def test_setup_patch_detail_never_carries_the_patched_values(setup_project
             assert sentinel not in piece, f"value leaked into the activity feed: {piece!r}"
 
 
-async def test_setup_patch_marks_control_system_keys_as_safety_config(setup_project):
-    """A safety-relevant key path is distinguishable at a glance in the feed."""
-    with patch(f"{_SETUP_MOD}.notify_agent_activity_async") as notify:
-        await _get_setup_patch()(
-            file="config.yml", key_path="control_system.writes_enabled", value="true"
-        )
+async def test_setup_patch_marks_control_system_keys_as_safety_config():
+    """A safety-relevant key path is distinguishable at a glance in the feed.
 
-    notify.assert_called_once_with(
-        "setup_patch",
-        "config",
-        detail="safety config — config.yml: control_system.writes_enabled",
+    Asserted at the detail builder rather than through the tool: every
+    `control_system.*` key is protected now, so the tool refuses such a patch
+    before it can emit a landed-patch detail (the refusal emits its own, pinned
+    in tests/mcp_server/test_setup_patch_protected.py). The marker still has to
+    be right — `_activity_detail` is what any future emit site would call — so
+    it is pinned where it can still be observed.
+    """
+    from osprey.mcp_server.workspace.tools.setup import _activity_detail
+
+    assert (
+        _activity_detail("config.yml", "control_system.writes_enabled")
+        == "safety config — config.yml: control_system.writes_enabled"
     )
 
 
@@ -1287,7 +1455,9 @@ async def test_setup_patch_missing_file_no_emit(setup_project):
 
     with patch(f"{_SETUP_MOD}.notify_agent_activity_async") as notify:
         with assert_raises_error(error_type="not_found"):
-            await _get_setup_patch()(file=".mcp.json", key_path="mcpServers.x", value="1")
+            await _get_setup_patch()(
+                file=".mcp.json", key_path="mcpServers.demo.description", value="1"
+            )
 
     notify.assert_not_called()
 
@@ -1298,7 +1468,9 @@ async def test_setup_patch_unparseable_file_no_emit(setup_project):
 
     with patch(f"{_SETUP_MOD}.notify_agent_activity_async") as notify:
         with assert_raises_error(error_type="internal_error"):
-            await _get_setup_patch()(file=".mcp.json", key_path="mcpServers.x", value="1")
+            await _get_setup_patch()(
+                file=".mcp.json", key_path="mcpServers.demo.description", value="1"
+            )
 
     notify.assert_not_called()
 
@@ -1444,4 +1616,4 @@ async def test_channel_write_result_unchanged_when_terminal_down(tmp_path, monke
 
     data = extract_response_dict(result)
     assert data["status"] == "success"
-    assert data["summary"]["successful"] == 1
+    assert data["summary"]["outcomes"] == {"confirmed": 1}

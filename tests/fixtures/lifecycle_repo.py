@@ -87,6 +87,7 @@ EXEMPLAR_DIRNAME = "als-exemplar"
 #: logbook terminal the stack runs beside them.
 EXEMPLAR_PRESET = "control-assistant"
 PERSONA_PRESETS: Mapping[str, str] = {
+    "admin": "control-assistant-admin",
     "ariel": "control-assistant-ariel",
     "readonly": "control-assistant-readonly",
     "readwrite": "control-assistant-readwrite",
@@ -142,10 +143,28 @@ app_template: control_assistant
 # Which model answers. `osprey set provider=...` / `osprey set model=...` edit
 # these in place, keeping your comments.
 provider: anthropic
-model: haiku   # tier (haiku/sonnet/opus), or a model ID the provider serves
+model: haiku   # tier (haiku/sonnet/opus), or any model ID the provider serves
+
+# Any custom gateway works too: name it as the provider, describe it under
+# `config:` below, and put its key in this repo's .env — the variable name
+# derives from the provider name, <NAME>_API_KEY. Worked example:
+#
+# provider: my-gateway
+# config:
+#   api.providers.my-gateway.api_key: ${MY_GATEWAY_API_KEY}
+#   api.providers.my-gateway.base_url: https://my-gateway.example.com/v1
+#   # Optional — the gateway speaks Anthropic natively (e.g. a LiteLLM proxy
+#   # in Anthropic mode), so the local translation proxy is skipped:
+#   api.providers.my-gateway.api_protocol: anthropic
+#   # Optional tier map, model IDs as the gateway names them. Unmapped tiers
+#   # fall back to `model:` above, with a build-time warning:
+#   api.providers.my-gateway.models:
+#     haiku: claude-haiku-4-5
+#     sonnet: claude-sonnet-4-6
+#     opus: claude-opus-4-6
 
 # How the agent searches for channels. `osprey set channel_finder_mode=...`
-# also accepts in_context or middle_layer.
+# also accepts in_context, middle_layer, or graph (the knowledge graph store).
 channel_finder_mode: hierarchical
 
 # ── What the agent can do ────────────────────────────────────────────────────
@@ -154,12 +173,13 @@ channel_finder_mode: hierarchical
 
 hooks:
   - hook-log          # Append every tool call to a structured JSONL audit log
+  - target-state      # Stdlib reader for the control-target state file (helper, not wired to an event)
   - hook-config       # Inject project config.yml path into every tool call env
   - approval          # Gate hardware-write tool calls on human approval prompt
-  - writes-check      # Pre-write safety check: confirm channel is writable
+  - writes-check      # Kill switch: refuse every write while writes_enabled is false
   - limits            # Enforce per-channel min/max limits before writes
   - error-guidance    # Post-error hook that surfaces remediation hints
-  - memory-guard      # Warn when context window approaches threshold
+  - memory-guard      # Gate Write/MultiEdit to memory files, NotebookEdit to agent-data artifacts
   - notebook-update   # Sync CLAUDE.md notebook after each session
   - cf-feedback-capture  # Capture channel-finder accuracy feedback for tuning
   - config-drift      # Warn at session start when the build is out of date
@@ -182,12 +202,17 @@ rules:
 skills:
   - diagnose        # Run a structured fault-diagnosis workflow
   # setup-mode is left out on purpose: it can edit config.yml and .mcp.json,
-  # which is admin work. Add it to an admin-facing profile to turn it on.
+  # which is admin work. The `control-assistant-admin` persona adds it back,
+  # which is where an admin-facing profile of your own should start too.
   - session-report  # Summarise session actions and outcomes to the logbook
   - demo-gallery    # Launch guided capability demonstrations
   - demo-ui         # Run a scripted demo of the agent driving the web workspace
   - writing-bluesky-plans  # Write, check and queue a plan (needs the Bluesky server)
   - operating-bluesky-plans  # Stage, queue and watch a plan (needs the Bluesky server)
+  - bluesky-plans  # Browse which plans this deployment can run
+  # Available — uncomment to enable:
+  # - logbook-deep-research  # Multi-phase logbook investigation skill
+  # - sim-scenarios  # List and switch simulated machine scenarios
 
 agents:
   - channel-finder          # Semantic search over channel databases (hierarchical)
@@ -195,11 +220,21 @@ agents:
   - logbook-search          # Search facility logbook for historical entries
   - logbook-deep-research   # Multi-hop logbook research with synthesis
   - facility-knowledge      # Look up facility documentation, procedures, and device specs
+  - facility-knowledge-graph  # Structural machine queries against the facility knowledge graph
   - pyat-specialist         # Lattice/optics computation sub-agent (pyAT)
 
 output_styles:
   - control-operator  # Terse, actionable output style for control-room operators
 
+# Tabs the web workspace offers beside the terminal. To turn on a panel
+# the framework already ships, uncomment one listed under this key.
+# A panel of your own is a list entry plus its address under `config:`:
+#
+#   web_panels:
+#     - elog
+#
+# and, under `config:`, web.panels.elog.url alongside web.panels.elog.label,
+# web.panels.elog.path and — optional — web.panels.elog.health_endpoint.
 web_panels:
   - ariel           # ARIEL search interface (past experiments, papers)
   - channel-finder  # Interactive channel-finder web UI
@@ -207,24 +242,52 @@ web_panels:
   - system-health   # SYSTEM tab, a framework health dashboard
   # The events and bluesky panels are declared in personas/readwrite.yml
   # instead, so the read-only login is built without them.
+  # Available — uncomment to enable:
+  # - lattice  # Lattice dashboard
 
 # ── Scanning and simulated hardware ──────────────────────────────────────────
 # These three blocks give you a working plan setup with no real hardware: a
 # Bluesky bridge with a Tiled data catalog, a simulated accelerator that speaks
-# EPICS, and the web panels for both. Delete this section (and the bluesky
-# panel above) if you do not want it.
+# EPICS, and the web panels for both. To drop it, delete this section, the
+# bluesky panel above, AND the `claude_code.servers.bluesky.enabled: true`
+# line under `config:` below — the block deploys the bridge, the line switches
+# on the server that dials it, and the build refuses the line left on alone.
 bluesky:
-  port: 8090
+  # The bridge and its Tiled catalog publish inside this deployment's port
+  # block, so neither needs a number here. Add `port:` or `tiled_port:` only to
+  # pin one somewhere outside the block.
   tiled_enabled: true      # also runs the Tiled data catalog
-  tiled_port: 8091
 
 virtual_accelerator:
   # EPICS port the simulator serves on. The agent follows this value, so
   # changing it moves both.
   port: 5064
+  # A second copy of the simulator with a small fixed offset on its readouts,
+  # stood up as this deployment's own third control target: `standin`. From
+  # this key alone the build derives the target's connector block,
+  # `control_system.connector.live_standin` — seven leaves, nothing else.
+  # `control_target_set standin` points a session at it, and what an operator
+  # meets there is a real machine's behaviour — approval prompts, strict-limit
+  # refusals, the LIVE MACHINE (stand-in) banner — on something that cannot
+  # move a magnet.
+  # Delete the line on a laptop: the simulator image is amd64-only, so a
+  # second emulated container on Apple Silicon doubles what QEMU has to run —
+  # one more emulated soft-IOC for the life of the deployment.
+  # `live` still means the machine YOU author under `epics:`, on a deployment
+  # running a stand-in exactly as on one that is not — the build writes no key
+  # in that block — so pointing this deployment at your facility is that one
+  # edit and nothing here.
+  # `osprey sim apply` moves both machines — a scenario changes the world, not
+  # one lane. The archiver records the stand-in, and its seeded history carries
+  # the same offsets: the archive belongs to the machine.
+  # `true` serves the stand-in on this deployment's own stand-in port, so two
+  # deployments on one host never collide over it. Write a Channel Access port
+  # number instead only to pin it somewhere specific.
+  live_standin: true
 
-bluesky_web:
-  port: 8095
+# The block's presence is the switch, and its only key — `port:` — comes from
+# this deployment's port block, so there is nothing to write inside it.
+bluesky_web: {}
 
 # ── Stored archive (MongoDB) ─────────────────────────────────────────────────
 # With this block, `osprey up` runs a real archive: a MongoDB store that is
@@ -255,10 +318,43 @@ va_archiver:
 # This block is where configuration lives. build/config.yml is generated from
 # it and should never be hand-edited. `osprey set` writes here.
 config:
-  # Which control system to talk to. "virtual_accelerator" is the built-in
-  # simulator and works out of the box; "epics" is real hardware; "mock" needs
-  # no containers but cannot complete a plan. `osprey set connector=epics`.
-  control_system.type: virtual_accelerator
+  # Which machine a session starts on. "live_standin" is the stand-in declared
+  # above, so this deployment's baseline is a facility-shaped soft IOC that
+  # behaves like hardware and moves nothing. "virtual_accelerator" is the
+  # sandbox simulator, "epics" your own control system, "mock" needs no
+  # containers but cannot complete a plan.
+  # `control_target_set live` moves a session onto the machine authored under
+  # `epics:`. The template ships that block unconfigured — author its
+  # `gateways` and `probe_channel` first — then the switch probes that target,
+  # requires the strict limits pair below, then your own
+  # `control_system.target_switch.live_gateway_acknowledged` — the operator
+  # saying those gateways really are this facility's — and it still refuses
+  # while this deployment records its own archive from the stand-in, because
+  # that store's history is the stand-in's (see `va_archiver:` above).
+  # `osprey set connector=epics` makes your facility's machine the session
+  # baseline again, in place of the stand-in — together with
+  # `osprey set config.archiver.type=epics_archiver` and
+  # `osprey set va_archiver=null`, because the recorded archive goes with it.
+  control_system.type: live_standin
+  # Every write checked against data/channel_limits.json, and a channel that
+  # file does not list refused rather than waved through. Both hardware-shaped
+  # targets — `standin` and `live` — require this pair before a session may
+  # switch onto them, so a rehearsal runs the posture the real machine gets.
+  control_system.limits_checking.enabled: true
+  control_system.limits_checking.allow_unlisted_channels: false
+  # The sandbox simulator is the exception, and it states the exception as a
+  # whole block: a per-type posture REPLACES the pair above for that connector
+  # type rather than merging with it, so both leaves are written out here.
+  # Writes to the simulator are still checked against the same file; what
+  # changes is that a channel the file does not list is allowed through
+  # instead of refused, because on a scratch machine an unlisted channel is a
+  # gap in the file rather than a hazard. `live_standin` deliberately gets NO
+  # block of its own: it is hardware-shaped, so it keeps the strict pair the
+  # real machine gets, and a permissive block here would make
+  # `control_target_set standin` refuse the very switch this preset exists to
+  # rehearse.
+  control_system.connector.virtual_accelerator.limits_checking.enabled: true
+  control_system.connector.virtual_accelerator.limits_checking.allow_unlisted_channels: true
   # Use the archive declared by `va_archiver:` above. Declaring the block does
   # not turn it on; without this line you would deploy a store and not read it.
   archiver.type: mongodb_archiver
@@ -266,6 +362,33 @@ config:
   # write and launch plans, and run read-only health checks.
   claude_code.servers.bluesky.enabled: true
   claude_code.servers.health.enabled: true
+  # ── Tier floor ─────────────────────────────────────────────────────────────
+  # The privileges every tier built from this preset starts WITHOUT. Each key
+  # here is off at the bottom and lifted back on by exactly the tier that is
+  # meant to have it, so a new persona inherits the restricted posture by
+  # default and a privilege is something a profile has to ask for by name.
+  #
+  # The agent's own deployment-editing tool. It rewrites this repo's profile
+  # and config, which is administration, not control-room work — so the base
+  # takes it away and the admin tier lifts it back with
+  # `claude_code.permissions.remove_deny`.
+  #
+  # Deliberately a `deny` and NOT a base-level `remove_ask`. String lists UNION
+  # across `extends`: a child can add to an inherited list but never subtract
+  # from it, so a `remove_ask` written here would leak into EVERY tier —
+  # including admin — and strip the approval prompt the admin tier relies on to
+  # keep the tool supervised. `deny` inverts that: it is subtractable per tier
+  # via `remove_deny`, which is the direction a floor has to work in.
+  claude_code.permissions.deny:
+    - mcp__osprey_workspace__setup_patch
+  # The web Config panel edits the running deployment's configuration from the
+  # browser. Same reasoning as the tool above: administration, so it is off
+  # here and turned back on by the admin tier alone.
+  web.config_panel.enabled: false
+  # The scaffold gallery stays READABLE at every tier — browsing the prompt and
+  # skill library is ordinary work. What this turns off is writing to it: the
+  # gallery's edit, create and delete surfaces are shared deployment state.
+  web.scaffold_gallery.write_enabled: false
   # system.timezone: America/Los_Angeles
   # Your facility's name, used in the agent's prompts and on the web landing
   # page. Defaults to the deployment name.
@@ -275,8 +398,9 @@ config:
   web.theme: light
   # ── Web terminals ──────────────────────────────────────────────────────────
   # `osprey up` runs a landing page and one terminal per user listed below.
-  # `osprey web` ignores all of this, so a single terminal on your own machine
-  # works at any time. Set `modules.web_terminals.enabled: false` for backend
+  # `osprey web` honours only `auth.session_lifetime` from this block, so a
+  # single terminal on your own machine works at any time. Set
+  # `modules.web_terminals.enabled: false` to have `osprey up` deploy backend
   # services only.
   #
   # Short prefix for the web container names (`<prefix>-nginx`, `<prefix>-web-
@@ -290,26 +414,55 @@ config:
   modules.web_terminals:
     enabled: true
 @WEB_TERMINALS_IMAGE_SOURCE@
-    nginx_port: 9080            # the landing page everyone opens first
-    # User number i gets base + i in each family below, so removing a user
-    # never shifts anyone else's ports. These all sit above this deployment's
-    # own service ports (5064, 8020, 8090/8091/8095) to avoid collisions.
-    web_base_port: 9091           # first per-user web-terminal port
-    artifact_base_port: 9291      # first per-user artifact-gallery port
-    ariel_base_port: 9391         # first per-user ARIEL search port
-    lattice_base_port: 9491       # first per-user lattice-dashboard port
-    channel_finder_base_port: 9591  # first per-user channel-finder panel port
+    # No port keys here on purpose. Every host port this deployment publishes
+    # is `deployment.port_base` (10000 unless you set it) plus a fixed offset:
+    # the landing page at the base itself, the shared services just above it,
+    # one hundred ports per per-user family from base + 100 up, and the stores
+    # at base + 800. User number i gets its family's first port + i, so
+    # removing a user never shifts anyone else's ports. Give a second
+    # deployment its own `port_base` and its whole block moves with it; the
+    # virtual accelerator's Channel Access port (5064) is the one exception.
+    # The reference guide's ports page prints the table.
+    # Browsers reach the landing page's nginx directly here, so the address
+    # they open is deploy.fqdn plus that port — and that is the address every
+    # terminal checks an action against. Put something in front of this nginx
+    # (a load balancer terminating TLS, a reverse proxy, a DNS alias) and add
+    # `external_origin: https://<what browsers open>` here, or every action
+    # inside a terminal is refused while every page still loads.
+    # To override one port rather than move the block, name it here:
+    #   nginx_port: 18000         # the landing page everyone opens first
+    #   web_base_port: 18100      # first per-user web-terminal port
     default_persona: readonly   # used for any user below with no persona
     # Every terminal below asks for a login (user alice: password alice, and
     # so on — set in this repo's .env; rotate with `osprey users passwd`).
     auth:
       method: password
+      # How long a browser stays signed in, in whole seconds. Applies to every
+      # terminal here and to `osprey web`; 43200 is twelve hours.
+      session_lifetime: 43200
       # Accepts login over plain HTTP, which fits 127.0.0.1 and nothing else.
       # For any reachable host, delete this line and configure tls instead.
       allow_insecure_http: true
+    # Which tier a user lands on is pinned per entry below. Single sign-on can
+    # pick it instead by mapping provider groups onto declared roles — see
+    # "Let single sign-on pick the tier" in the multi-user login guide.
+    #   authorization:
+    #     roles: {operator: {persona: readwrite}, viewer: {persona: readonly}}
+    #     claims: {claim: groups, map: {ca-operators: operator, ca-viewers: viewer}}
     # How the landing page is laid out. Omit this whole block and you get one
     # section holding every entry below, headed "Terminals".
     landing:
+      # Each file below becomes one collapsible section at the bottom of the
+      # landing page, in this order. The file's `# H1` is the section label, so
+      # adding a section means adding a markdown file and listing it here.
+      # `data/landing/working-safely.md` ships with this preset and is yours to
+      # rewrite; add your own for local procedures, contacts or shift handover.
+      # Drop this key entirely and you get OSPREY's built-in safety notice
+      # instead; set it to [] for no notices at all.
+      notices:
+        - data/landing/working-safely.md
+      # The line under everything. Set to "" for no footer.
+      footer: OSPREY multi-user web terminal stack. Experimental system. Proceed with caution.
       groups:
         # `users` renders the roster. It also SPLITS it: any entry whose
         # persona declares a `landing_group` (see `ariel` below) moves into a
@@ -336,8 +489,18 @@ config:
         index: 2
         persona: ariel
         display_name: "ARIEL Logbook Research"
-        # Read-only research service, open without a login on purpose.
+        # Outside the login wall on purpose — entered through its own login URL
+        # instead (`osprey users login-url ariel`), not open to anyone.
         login: false
+      # The one login that can change this deployment's configuration — the web
+      # Config panel, the scaffold gallery's editors, and the agent's own setup
+      # tool. Behind the login wall like every other person on this page: an
+      # admin card without one would hand deployment edits to anyone who opens
+      # it. Last in the roster so the operator cards stay where they are.
+      - name: carol
+        index: 3
+        persona: admin
+        display_name: "Deployment Admin (Carol)"
     personas:
       # `osprey build` builds one of these per file in personas/, into build/.
       # `osprey up` builds nothing: if one is missing it stops and says so.
@@ -349,6 +512,10 @@ config:
         project: als-exemplar-readwrite
         project_path: build/als-exemplar-readwrite
         build_profile: personas/readwrite.yml
+      admin:
+        project: als-exemplar-admin
+        project_path: build/als-exemplar-admin
+        build_profile: personas/admin.yml
       ariel:
         project: als-exemplar-ariel
         project_path: build/als-exemplar-ariel
@@ -374,6 +541,19 @@ dispatch:
 # the service refuses to start without them. `osprey up` generates a strong
 # random value for each one into this repo's .env, so a new deployment is
 # secure with no editing. Put your own values in .env to override.
+# Environment variables the deployment needs. Replace `env: {}` with any
+# of `required` (the variable must be set somewhere), `pinned` (this
+# repo's own env chain owns it outright, and nowhere else), `defaults`
+# (name to value) and `file` (a profile-relative path copied in as .env):
+#
+#   env:
+#     required: [EPICS_CA_ADDR_LIST]
+#     pinned: [ARIEL_DB_PASSWORD]
+#     defaults:
+#       EPICS_CA_ADDR_LIST: 127.0.0.1
+#     file: env/facility.env
+#
+# If `env:` already has children, add yours under it.
 env:
   required:
     - EVENT_DISPATCHER_TOKEN
@@ -383,6 +563,7 @@ env:
   defaults:
     OSPREY_AUTH_PW_ALICE: alice
     OSPREY_AUTH_PW_BOB: bob
+    OSPREY_AUTH_PW_CAROL: carol
 data: data
 # Minimum OSPREY release that understands this profile's keys. Builds below it abort.
 requires_osprey_version: '>=2026.9.0'
@@ -421,8 +602,18 @@ panel_presets: {}
 # "http"; "sse" is the legacy event-stream wire and needs an explicit url.
 # Tool names under permissions are bare — `allow` runs them unprompted, `ask`
 # prompts the operator on every call.
+# A Python server's package lives at mcp_servers/<package>/ beside this file;
+# the build copies it to build/_mcp_servers/<package>/ for `-m <package>`.
 #
 # mcp_servers:
+#   my_server:
+#     command: "{current_python_env}"
+#     args: [-m, my_server]
+#     env:
+#       OSPREY_CONFIG: "{project_root}/build/config.yml"
+#       PYTHONPATH: "{project_root}/build/_mcp_servers"
+#     permissions:
+#       allow: [my_tool]
 #   matlab:
 #     command: /opt/matlab/bin/mcp-matlab
 #     args: [--workspace, /opt/matlab/scripts]
@@ -582,6 +773,7 @@ exclude:
     - demo-ui
     - writing-bluesky-plans    # Plan authoring needs the Bluesky server
     - operating-bluesky-plans  # and so does running one
+    - bluesky-plans            # and so does listing them
   agents:
     - channel-finder
     - data-visualizer
@@ -620,6 +812,12 @@ config:
   claude_code.servers.bluesky.enabled: false
   claude_code.servers.health.enabled: false
   claude_code.servers.osprey_facility_knowledge.enabled: false
+  # The graph store is a control-room surface too, and this tier's exclusion
+  # of it has to be said: the build tells every attached render where the
+  # hosting deployment's services are (the Reach Contract), and a
+  # `services.graphdb` block is what makes the graph server render. Only a
+  # server switched off is told nothing about the store.
+  claude_code.servers.graph.enabled: false
   # Pinned even though the server that would honour it is gone, for the same
   # reason the other two tiers pin it: this key is the write boundary, and it
   # must not drift if the base's default ever changes.
@@ -635,6 +833,16 @@ config:
   # containers). Without this override the inherited roster would make this
   # render try to host a second web tier on the same host ports.
   modules.web_terminals.enabled: false
+  # Nothing here says where the hosting deployment's services are — the qmd
+  # sidecar hybrid logbook search dials (the point of this tier), the Postgres
+  # the logbook lives in, the telemetry store. This persona is an attached
+  # render (`services: {}` of its own) built beside that deployment, and the
+  # build copies every such fact from the deployment's own render into it
+  # (the Reach Contract, `osprey.deployment.reach`). Per-user web-terminal
+  # containers run `network_mode: host`, so container `localhost` IS the
+  # deployment host and the copied ports are dialed there. Built alone, with
+  # no hosting deployment in the repo, the build copies what the app template
+  # deploys at its defaults instead — and a host that differs is named here.
 """
 
 PERSONA_READONLY_YML = """\
@@ -661,10 +869,15 @@ deploy_services: false
 # ── Config overrides ─────────────────────────────────────────────────────────
 # Dotted keys ONLY — see the base profile's block.
 config:
-  # The single axis this persona hard-pins: this key is the tier boundary, so
-  # it must not drift if the base's default ever changes — it is what makes
-  # the read-only terminal read-only.
+  # The axis this persona hard-pins, and it takes three keys rather than one.
+  # The flat key is the posture a connector type inherits when its own block
+  # says nothing, so on its own it is not a floor: a per-type `true` anywhere
+  # in the chain — the base, an overlay, a facility's own edit — would arm that
+  # type over it. So the read-only tier pins every block off as well as the key
+  # they inherit from, and a type that arms writes here has to be added by name.
   control_system.writes_enabled: false
+  control_system.connector.epics.writes_enabled: false
+  control_system.connector.virtual_accelerator.writes_enabled: false
   # Pared-down operator layout: chat only, workspace hidden until the agent
   # puts something in it. Pinned on both sides of the tier boundary (readwrite
   # pins `expert`), same rationale as writes_enabled.
@@ -677,6 +890,18 @@ config:
   # per-user containers). Without this override the inherited roster would
   # make this render try to host a second web tier on the same host ports.
   modules.web_terminals.enabled: false
+  # Nothing here says where the hosting deployment's services are — the graph
+  # store's bolt port, the qmd sidecar's port, the Postgres the logbook lives
+  # in, the telemetry store, the bluesky bridge. This persona is an attached
+  # render (`services: {}` of its own) built beside that deployment, and the
+  # build copies every such fact from the deployment's own render into it
+  # (the Reach Contract, `osprey.deployment.reach`). Per-user web-terminal
+  # containers run `network_mode: host`, so container `localhost` IS the
+  # deployment host and the copied ports are dialed there. Move a port on the
+  # hosting profile and every persona follows; spell a different one here and
+  # the build refuses the contradiction. Built alone, with no hosting
+  # deployment in the repo, the build copies what the app template deploys
+  # at its defaults instead — and a host that differs IS named here.
 """
 
 PERSONA_READWRITE_YML = """\
@@ -698,9 +923,12 @@ name: Als Exemplar (readwrite)
 # connects to the shared web tier the hosting deployment runs on the same host.
 deploy_services: false
 
-# The write-oriented panels, listed beside their web.panels.<id>.url overrides
-# below (a panel id and its URL declaration travel together). Persona lists
-# UNION over the base, so these are added to the inherited builtin set.
+# The write-oriented panels. Persona lists UNION over the base, so these are
+# added to the inherited builtin set. Each tab's URL, path and label are not
+# spelled here: the hosting deployment's build derives them when it injects
+# the event dispatcher and the bluesky-web sidecar, and this attached render
+# is told them from that render (the Reach Contract, `osprey.deployment.reach`)
+# — so a sidecar moved on the hosting profile moves the tab with it.
 web_panels:
   - events          # EVENTS dashboard tab (event dispatcher)
   - bluesky         # Plan authoring, the plan queue, and the run's live results
@@ -708,8 +936,11 @@ web_panels:
 # ── Config overrides ─────────────────────────────────────────────────────────
 # Dotted keys ONLY — see the base profile's block.
 config:
-  # The single axis this persona hard-pins: this key is the tier boundary, so
-  # it must not drift silently if the base's default ever changes.
+  # The single axis this persona hard-pins. It is the inherited posture rather
+  # than a verdict: a `control_system.connector.<type>.writes_enabled` key
+  # anywhere in the chain answers for that type instead, which is how the
+  # simulator-only tier is built. With none written, every type reads this key,
+  # so it must not drift silently if the base's default ever changes.
   control_system.writes_enabled: true
   # Full split-pane terminal + workspace layout for the write-armed operator.
   # Pinned on both sides of the tier boundary (readonly pins `simple`) rather
@@ -719,23 +950,95 @@ config:
   # per-user containers). Without this override the inherited roster would
   # make this render try to host a second web tier on the same host ports.
   modules.web_terminals.enabled: false
-  # EVENTS + BLUESKY: the write-oriented panels, declared HERE and not in the
-  # base so the readonly persona is built without them (a persona can only add
-  # config keys, never subtract inherited ones — see the note in the base's
-  # config: block).
-  # EVENTS — the event-dispatcher dashboard as an in-terminal tab. URL defaults
-  # to the host-run dispatcher; override EVENT_DISPATCHER_URL for
-  # containerized/remote web terminals.
-  web.panels.events.label: EVENTS
-  web.panels.events.url: "${EVENT_DISPATCHER_URL:-http://localhost:8020}"
-  web.panels.events.path: /dashboard
-  web.panels.events.health_endpoint: /health
-  # BLUESKY — operator UI for the mediated Bluesky stack, served by the
-  # bluesky-web sidecar. Override BLUESKY_WEB_URL for containerized/
-  # remote web terminals (same pattern as EVENTS above).
-  web.panels.bluesky.label: BLUESKY
-  web.panels.bluesky.url: "${BLUESKY_WEB_URL:-http://localhost:8095}"
-  web.panels.bluesky.path: /bluesky/
+  # Nothing here says where the hosting deployment's services are — the graph
+  # store's bolt port, the qmd sidecar's port, the Postgres the logbook lives
+  # in, the telemetry store, the bluesky bridge, the EVENTS and BLUESKY tabs'
+  # URLs. This persona is an attached render (`services: {}` of its own) built
+  # beside that deployment, and the build copies every such fact from the
+  # deployment's own render into it (the Reach Contract,
+  # `osprey.deployment.reach`). Per-user web-terminal containers run
+  # `network_mode: host`, so container `localhost` IS the deployment host and
+  # the copied ports are dialed there. Move a port on the hosting profile and
+  # every persona follows; spell a different one here and the build refuses
+  # the contradiction. Built alone, with no hosting deployment in the repo,
+  # the build copies what the app template deploys at its defaults instead
+  # — and a host that differs IS named here.
+"""
+
+PERSONA_ADMIN_YML = """\
+# Als Exemplar (admin) — settings for one web login
+#
+# Only the differences from profile.yml belong here. The build merges this
+# file over that one, picking up any edit you make there. To see the combined
+# result:
+#   osprey validate personas/admin.yml
+#
+# Made from the bundled `control-assistant-admin` preset.
+#
+#   emitted by OSPREY @OSPREY_VERSION@
+#   preset content hash: @PRESET_HASH:control-assistant-admin@
+
+name: Als Exemplar (admin)
+
+# Attached render: this persona builds per-user terminal images only and
+# connects to the shared web tier the hosting deployment runs on the same host.
+# No services are scaffolded — the injector blocks inherited from the base are
+# all gated on this flag and skip cleanly.
+deploy_services: false
+
+# The guided configuration workflow, left out of the base on purpose because it
+# edits config.yml and .mcp.json. Skill lists UNION over the base, so this is
+# added to the inherited selection rather than replacing it.
+skills:
+  - setup-mode      # Inspect the deployment's configuration and patch it
+
+# ── Config overrides ─────────────────────────────────────────────────────────
+# Dotted keys ONLY — see the base profile's block.
+config:
+  # The admin tier sits above readwrite: it keeps the write-armed control
+  # posture and adds deployment editing on top. This is the posture every
+  # connector type inherits when its own
+  # `control_system.connector.<type>.writes_enabled` block says nothing, and
+  # none is written here, so it is the answer for every machine the session can
+  # be pointed at. Pinned like the tiers beneath it pin their own side, so the
+  # boundary cannot drift if the base's default ever changes.
+  control_system.writes_enabled: true
+  # The axis this tier is defined by: the three privileges the base floors, all
+  # lifted here and nowhere else.
+  #
+  # The deployment-editing tool. `remove_deny` subtracts the base's deny for
+  # this render alone — the direction a floor has to be lifted in, since string
+  # lists only ever union across `extends`. What is left is the `ask` entry the
+  # workspace server declares, which routes the call through the approval hook.
+  claude_code.permissions.remove_deny:
+    - mcp__osprey_workspace__setup_patch
+  # The same capability from the browser: the web Config panel edits the
+  # running deployment's configuration.
+  web.config_panel.enabled: true
+  # The gallery is readable at every tier; this turns its edit, create and
+  # delete surfaces back on. Its contents are shared deployment state, which is
+  # exactly what this tier is for.
+  web.scaffold_gallery.write_enabled: true
+  # Full split-pane terminal + workspace layout: the Config panel and the
+  # gallery editors need the panel area. Pinned rather than left to the server
+  # default, for the same reason the other tiers pin theirs.
+  web.ui_mode: expert
+  # The hosting deployment owns the web-terminal tier (nginx, landing, per-user
+  # containers). Without this override the inherited roster would make this
+  # render try to host a second web tier on the same host ports.
+  modules.web_terminals.enabled: false
+  # Nothing here says where the hosting deployment's services are — the graph
+  # store's bolt port, the qmd sidecar's port, the Postgres the logbook lives
+  # in, the telemetry store, the bluesky bridge. This persona is an attached
+  # render (`services: {}` of its own) built beside that deployment, and the
+  # build copies every such fact from the deployment's own render into it
+  # (the Reach Contract, `osprey.deployment.reach`). Per-user web-terminal
+  # containers run `network_mode: host`, so container `localhost` IS the
+  # deployment host and the copied ports are dialed there. Move a port on the
+  # hosting profile and every persona follows; spell a different one here and
+  # the build refuses the contradiction. Built alone, with no hosting
+  # deployment in the repo, the build copies what the app template deploys
+  # at its defaults instead — and a host that differs IS named here.
 """
 
 
@@ -755,13 +1058,16 @@ TRIGGERS_YML = """\
 #   3. save-report       — tool use, a short multi-turn loop, and persistence
 #   4. denied-tool-demo  — the worker's server-side tool denylist (safety)
 #
-# Fire one with (`osprey up` mints EVENT_DISPATCHER_TOKEN into this repo's
-# .env; load it first: export $(grep -E '^EVENT_DISPATCHER_TOKEN=' .env | xargs)):
-#   curl -X POST http://localhost:8020/webhook/hello-dispatch \\
+# The dispatcher answers on this deployment's dispatcher port:
+# `deployment.port_base` + 10, which is 10010 unless the deployment moved its
+# port block. Fire one with (`osprey up` mints EVENT_DISPATCHER_TOKEN into this
+# repo's .env; load it first:
+# export $(grep -E '^EVENT_DISPATCHER_TOKEN=' .env | xargs)):
+#   curl -X POST http://localhost:10010/webhook/hello-dispatch \\
 #     -H "Authorization: Bearer $EVENT_DISPATCHER_TOKEN" \\
 #     -H "Content-Type: application/json" -d '{}'
 #
-# Watch progress stream in the dashboard at http://localhost:8020/dashboard
+# Watch progress stream in the dashboard at http://localhost:10010/dashboard
 #
 # (Retries fire on *dispatch failure* — i.e. when the dispatcher cannot reach
 # the worker — via the per-trigger `on_error: retry` policy. That path is not
@@ -770,9 +1076,12 @@ TRIGGERS_YML = """\
 
 dispatcher:
   # The dispatcher forwards each fired trigger to this worker. The compose
-  # template names the single worker "dispatch-worker-1" on port 9190.
+  # template names the single worker "dispatch-worker-1", one port above the
+  # dispatcher itself — `deployment.port_base` + 11, so 10011 at the default
+  # base. Moving the block moves both. Under `dispatch.network: host` the build
+  # rewrites this line to the worker's host address instead.
   # (Multi-worker load distribution is not yet implemented — see docs.)
-  dispatch_target: http://dispatch-worker-1:9190
+  dispatch_target: http://dispatch-worker-1:10011
   max_concurrent_runs: 2
   max_queue_depth: 50
 
@@ -789,7 +1098,7 @@ triggers:
   # 2. The webhook JSON body arrives as the agent's context. Zero tools keeps
   #    this cheap and focused on the payload lesson. Try it with a realistic
   #    event body, e.g.:
-  #      curl -X POST http://localhost:8020/webhook/triage-event \\
+  #      curl -X POST http://localhost:10010/webhook/triage-event \\
   #        -H "Authorization: Bearer $EVENT_DISPATCHER_TOKEN" \\
   #        -H "Content-Type: application/json" \\
   #        -d '{"signal":"demo:vacuum:pressure","value":4.2,"threshold":3.0}'
@@ -816,12 +1125,12 @@ triggers:
         Investigate this event and save a short status report. First take a
         quick look at the working directory (Glob/Read) to ground yourself, then
         use the workspace artifact tool to save a concise markdown report
-        summarizing the event payload and what you would do next. Confirm the
-        artifact you created.
+        (content_type markdown) summarizing the event payload and what you would
+        do next. Confirm the artifact you created.
       allowed_tools:
         - Glob
         - Read
-        - mcp__osprey_workspace__artifact_save
+        - mcp__osprey_workspace__artifact_register
         - mcp__osprey_workspace__create_document
 
   # 4. Requests a tool the worker blocks server-side; teaches the denylist.
@@ -869,6 +1178,11 @@ GITIGNORE = """\
 # unanchored `build/` or `.env*` would also swallow a same-named path anywhere
 # deeper in the tree — including files moved there later — and it would do it
 # silently.
+#
+# The same pattern covers `.env.variant`, which is not a secret but is
+# host-local for the same reason: it holds `OSPREY_PROFILE_VARIANT=<name>`, naming
+# which `profiles/<name>.yml` overlay THIS host builds. Committing it would
+# hand this host's choice to every other one.
 /.env*
 !/.env.example
 !/.env.shared
@@ -878,10 +1192,13 @@ GITIGNORE = """\
 # `osprey reset` — anchored for the same reason the zones above are.
 /.osprey-compose.yml
 
-# OS / editor noise. Deliberately unanchored: these are junk at any depth.
+# OS / editor noise, and the bytecode Python leaves beside any server package
+# run in place. Deliberately unanchored: these are junk at any depth.
 .DS_Store
 *.swp
 *.swo
+__pycache__/
+*.py[co]
 """
 
 ENV_EXAMPLE = """\
@@ -925,6 +1242,7 @@ DISPATCH_WORKER_TOKEN=
 # your facility needs a different value.
 OSPREY_AUTH_PW_ALICE=alice
 OSPREY_AUTH_PW_BOB=bob
+OSPREY_AUTH_PW_CAROL=carol
 
 # Runtime overrides (optional - for advanced use cases)
 #LOCAL_PYTHON_VENV=/path/to/your/venv/bin/python
@@ -941,9 +1259,14 @@ OSPREY_AUTH_PW_BOB=bob
 # DISPATCH_WORKER_TOKEN=  # event_dispatcher, dispatch_worker — authenticates the dispatch worker back to the dispatcher
 # BLUESKY_LAUNCH_TOKEN=  # bluesky — arms the Bluesky bridge's plan-launch endpoint
 # BLUESKY_TILED_API_KEY=  # bluesky — the key the bridge presents to the co-deployed Tiled catalog
+# BLUESKY_VA_LAUNCH_TOKEN=  # bluesky_va — arms the plan-launch endpoint of the second Bluesky lane, the one serving the virtual accelerator (only on a deployment with `bluesky.second_lane`)
+# BLUESKY_LIVE_LAUNCH_TOKEN=  # bluesky_live — arms the plan-launch endpoint of the second Bluesky lane, the one serving the live machine (only on a deployment with `bluesky.second_lane`)
+# BLUESKY_STANDIN_LAUNCH_TOKEN=  # bluesky_standin — arms the plan-launch endpoint of the Bluesky lane serving the live stand-in soft IOC (only on a deployment with `bluesky.second_lane`)
+# OSPREY_TERMINAL_SECRET=  # bluesky_web — the operator login secret for the bluesky-web panel's web gate
 # ZO_ROOT_USER_PASSWORD=  # openobserve — OpenObserve root/ingest credential
 # ARIEL_DB_PASSWORD=  # postgresql — ARIEL Postgres password (also fills the agent's derived DSN)
 # MONGO_ROOT_PASSWORD=  # mongodb — archiver store root password (the seeder, recorder and agent all authenticate with it)
+# GRAPHDB_PASSWORD=  # graphdb — graph store password (the seeder, health check and deploy staging all authenticate with it)
 """
 
 #: The committed half of the env chain, as `osprey init` authors it: every line
@@ -966,6 +1289,10 @@ ENV_SHARED = """\
 # A key set in both files takes its value from `.env`. There is nothing more to
 # it than that: same syntax, same variables, lower precedence.
 #
+# One exception, and only if profile.yml asks for it: a variable listed under
+# `env.pinned` is this file's to decide. `osprey up` refuses to start when
+# `.env` or a shell export sets one.
+#
 # Never put a secret here — this file is committed. An API key, a token or a
 # password goes in `.env`, which git ignores and which never leaves the host.
 # Neither file ever enters a container image; both are read at run time.
@@ -974,6 +1301,12 @@ ENV_SHARED = """\
 # NO_PROXY=localhost,127.0.0.1
 # HTTP_PROXY=http://proxy.example.com:8080
 # HTTPS_PROXY=http://proxy.example.com:8080
+
+# Site CA bundle — uncomment if a proxy re-signs TLS with a site CA.
+# On RHEL-family hosts the system bundle lives here:
+# SSL_CERT_FILE=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+# REQUESTS_CA_BUNDLE=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+# NODE_EXTRA_CA_CERTS=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
 """
 
 #: Written only when the factory is asked for a seeded repo. Values are the
@@ -1021,6 +1354,10 @@ edited by hand.
 setting appears in both, the one in `.env` wins. That is how a single host
 changes a shared default without affecting anyone else. None of these files go
 into a container image — they are all read when the deployment starts.
+
+If `profile.yml` lists a variable under `env.pinned`, that one is the exception:
+`.env.shared` decides it, and `osprey up` refuses to start when `.env`
+or a shell export disagrees.
 
 `.osprey-compose.yml` at the root is generated the same way, so a deploy
 can hand the container runtime one file instead of several. It is kept out of
@@ -1083,6 +1420,63 @@ is a copy of those two, and a restore is:
 ```bash
 git clone <this repo> && tar xf state.tar.gz && osprey build && osprey up -d
 ```
+
+## Common questions
+
+### Adding an MCP server of your own
+
+Put the server's Python package at `mcp_servers/<name>/`. `osprey build` copies
+it to `build/_mcp_servers/<name>/`, and an entry under `mcp_servers:`
+in `profile.yml` says how to start it:
+
+```yaml
+mcp_servers:
+  my_server:
+    command: "{current_python_env}"
+    args: [-m, my_server]
+    env:
+      PYTHONPATH: "{project_root}/build/_mcp_servers"
+```
+
+The hello-world preset ships `example_server` as a worked copy to read. Which
+buckets the artifact gallery sorts into is a separate, top-level key, one entry
+per bucket:
+
+```yaml
+artifact_server:
+  categories:
+    beam_studies: {label: Beam studies, color: "#4C6EF5"}
+```
+
+### Adding a panel of your own
+
+A panel is two halves, and one without the other is a tab that opens nothing.
+The id goes in the `web_panels:` list, and its address goes under `config:`, as
+the comment above `web_panels:` in `profile.yml` shows:
+
+```yaml
+web_panels:
+  - elog
+
+config:
+  web.panels.elog.url: http://elog.example.org
+  web.panels.elog.label: Elog
+  web.panels.elog.path: /elog
+```
+
+### Mounting an extra directory into a web terminal
+
+Deployments that give people their own web terminals mount per persona, under
+`config:`. Each entry is a container volume string of two or three non-empty
+parts, `source:target` or `source:target:mode`:
+
+```yaml
+config:
+  modules.web_terminals.personas.operator.extra_mounts:
+    - /opt/facility/data:/data:ro
+```
+
+Every key named here is written up in full at https://als-apg.github.io/osprey/.
 """
 
 
@@ -1296,18 +1690,23 @@ if wants services; then
 fi
 
 # ── Web tier ─────────────────────────────────────────────────────────────────
+# The landing page is nginx's own file, served before anything asks
+# the caller for a credential. A terminal is the application, which
+# answers an uncredentialed GET / with a 401 — so it is probed at
+# /health, the route its auth gate lets through.
 if wants web; then
   printf '\\n%s── Web terminal ──%s\\n\\n' "$BOLD" "$RESET"
-  probe_http 'landing page'      http://localhost:9080/
-  probe_http 'terminal (alice)'  http://localhost:9091/
-  probe_http 'terminal (bob)'    http://localhost:9092/
-  probe_http 'terminal (ariel)'  http://localhost:9093/
+  probe_http 'landing page'      http://localhost:10000/
+  probe_http 'terminal (alice)'  http://localhost:10100/health
+  probe_http 'terminal (bob)'    http://localhost:10101/health
+  probe_http 'terminal (ariel)'  http://localhost:10102/health
+  probe_http 'terminal (carol)'  http://localhost:10103/health
 fi
 
 # ── Event dispatch ───────────────────────────────────────────────────────────
 if wants dispatch; then
   printf '\\n%s── Event dispatch ──%s\\n\\n' "$BOLD" "$RESET"
-  probe_http 'dispatcher health' http://localhost:8020/health
+  probe_http 'dispatcher health' http://localhost:10010/health
 fi
 
 printf '\\n%sProbes are advisory — a failure here does not mean the deploy failed.%s\\n\\n' \\
@@ -1339,6 +1738,7 @@ data/
 │   └── TEMPLATE_EXAMPLE.json            # database format example
 ├── benchmarks/cross_paradigm/queries/    # staged query sets, one per tier
 ├── channel_limits.json                   # per-channel write limits
+├── facility_ontology.json                # device vocabulary (facility.ontology)
 ├── machine_state_channels.json           # channels in the machine-state view
 ├── facility_knowledge/                   # markdown knowledge bundle
 └── simulation/                           # mock-connector scenarios
@@ -1443,6 +1843,48 @@ BENCHMARK_QUERIES_JSON = """\
     "targeted_pv": ["SR:DIAG:BPM:01:POSITION:X", "SR:DIAG:BPM:02:POSITION:X"]
   }
 ]
+"""
+
+#: The exemplar's own compiled ontology — the table ``facility.ontology`` names.
+#:
+#: A profile that carries a ``data:`` tree REPLACES the bundle's, so the copy
+#: control-assistant ships never reaches this repo: an exemplar facility
+#: declares its own vocabulary or it declares none, and a declared table that is
+#: not on disk stops the build by design. Written against this repo's own three
+#: families (``BPM``, ``DCCT``, ``HCM``) rather than copied from the demo
+#: machine, because that is what a real facility's table looks like and what the
+#: rendered terminology tables should show.
+FACILITY_ONTOLOGY_JSON = """\
+{
+  "_generated": "Generated from facility_ontology.yaml by `osprey knowledge compile-ontology`. Do not edit.",
+  "root": "AcceleratorDevice",
+  "family_to_class": {
+    "BPM": "BeamPositionMonitor",
+    "DCCT": "BeamCurrentMonitor",
+    "HCM": "HCorrector"
+  },
+  "classes": {
+    "AcceleratorDevice": { "altLabels": [], "parent": null },
+    "BeamCurrentMonitor": {
+      "altLabels": ["beam current monitor", "current monitor", "dcct"],
+      "parent": "Instrumentation"
+    },
+    "BeamPositionMonitor": {
+      "altLabels": ["beam position monitor", "bpm", "position monitor"],
+      "parent": "Instrumentation"
+    },
+    "Corrector": {
+      "altLabels": ["corrector", "orbit corrector", "steering magnet"],
+      "parent": "Magnet"
+    },
+    "HCorrector": {
+      "altLabels": ["hcor", "horizontal corrector", "horizontal steering magnet"],
+      "parent": "Corrector"
+    },
+    "Instrumentation": { "altLabels": ["diagnostics", "instrumentation"], "parent": "AcceleratorDevice" },
+    "Magnet": { "altLabels": ["electromagnet", "magnet"], "parent": "AcceleratorDevice" }
+  }
+}
 """
 
 CHANNEL_LIMITS_JSON = """\
@@ -1625,6 +2067,7 @@ BASE_SOURCE_FILES: Mapping[str, str] = {
     "personas/ariel.yml": PERSONA_ARIEL_YML,
     "personas/readonly.yml": PERSONA_READONLY_YML,
     "personas/readwrite.yml": PERSONA_READWRITE_YML,
+    "personas/admin.yml": PERSONA_ADMIN_YML,
     "web-terminal-context/alice/.gitkeep": "",
     "web-terminal-context/ariel/.gitkeep": "",
     "web-terminal-context/bob/.gitkeep": "",
@@ -1634,6 +2077,7 @@ BASE_SOURCE_FILES: Mapping[str, str] = {
     "data/channel_databases/tiers/tier3/hierarchical.json": CHANNEL_DB_HIERARCHICAL_JSON,
     "data/benchmarks/cross_paradigm/queries/tier3_queries.json": BENCHMARK_QUERIES_JSON,
     "data/channel_limits.json": CHANNEL_LIMITS_JSON,
+    "data/facility_ontology.json": FACILITY_ONTOLOGY_JSON,
     "data/machine_state_channels.json": MACHINE_STATE_CHANNELS_JSON,
     "data/raw/address_list.csv": RAW_ADDRESS_LIST_CSV,
     "data/facility_knowledge/index.md": FK_INDEX_MD,

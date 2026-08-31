@@ -10,20 +10,29 @@
 # Project identity
 project_name: "{{ project_name }}"
 
-# Facility identity — one block, two keys:
-#   name   — display name woven into the agent prompts (CLAUDE.md, subagents)
-#            and the web-terminal landing page. Keep it in sync with
-#            .claude/rules/facility.md. A top-level `facility_name` is
-#            honored as a fallback, but this is the canonical spelling and
-#            wins over it.
-#   prefix — short abbreviation the deployed web stack uses for container
-#            names (`<prefix>-nginx`, `<prefix>-web-<user>`); must be a
-#            non-empty valid Docker name start ([a-zA-Z0-9]). Only the
-#            multi-user web-terminal stack reads it, so it stays commented
-#            here.
+# Facility identity — one block, three keys:
+#   name     — display name woven into the agent prompts (CLAUDE.md, subagents)
+#              and the web-terminal landing page. Keep it in sync with
+#              .claude/rules/facility.md. A top-level `facility_name` is
+#              honored as a fallback, but this is the canonical spelling and
+#              wins over it.
+#   prefix   — short abbreviation the deployed web stack uses for container
+#              names (`<prefix>-nginx`, `<prefix>-web-<user>`); must be a
+#              non-empty valid Docker name start ([a-zA-Z0-9]). Only the
+#              multi-user web-terminal stack reads it, so it stays commented
+#              here.
+#   ontology — path, relative to the project root, to this facility's compiled
+#              ontology table: the JSON `osprey knowledge compile-ontology`
+#              writes. It is the one source for the device vocabulary the
+#              channel-finder subagent's terminology table renders, so pointing
+#              it at your own table is how that table learns your words. Drop
+#              the key and the subagent is told plainly that no vocabulary was
+#              declared, which is better than shipping somebody else's; point
+#              it at a file that is not there and the build stops and says so.
 facility:
   name: "Example Research Facility"
   # prefix: ex
+  ontology: data/facility_ontology.json
 
 build_dir: ./build
 
@@ -143,6 +152,16 @@ hooks:
 # Natural language channel finding service. Pipeline mode: {{ channel_finder_mode }}
 # The active pipeline and its enable flags are derived at build time from the
 # profile's `channel_finder_mode` (in_context | hierarchical | middle_layer).
+#
+# The fourth paradigm, `graph`, is deliberately not among them: it answers from
+# a graph store rather than a channel-database file, and this template renders
+# no `services.graphdb` block for one to live in. So the build-profile
+# validator refuses `channel_finder_mode: graph` on this app template, naming
+# the missing block, rather than letting the build render a channel finder with
+# nothing behind it. A channel-finder deployment that wants graph search either
+# builds on an app template that deploys a store (control_assistant,
+# ariel_standalone) or names a store the facility already runs by adding
+# `services.graphdb.uri` through the profile's `config:` overlay.
 
 channel_finder:
   # Active pipeline mode
@@ -152,15 +171,16 @@ channel_finder:
   # CHANNELS tab: the channel-finder UI is a web server of its own, configured
   # under this section. It launches when `channel-finder` is in the panel list
   # under `web:` below AND this `channel_finder:` section exists — it does, so
-  # 8092 is bound by default. Resolution order: OSPREY_CHANNEL_FINDER_PORT wins
-  # (multi-user deployments export it per user), then `port` here, then the
-  # built-in 8092; `host` has no env override. The launcher resolves host/port
+  # {{ osprey_ports.channel_finder }} is bound by default. Resolution order:
+  # OSPREY_CHANNEL_FINDER_PORT wins (multi-user deployments export it per
+  # user), then `port` here, then this deployment's layout slot
+  # ({{ osprey_ports.channel_finder }}); `host` has no env override. The launcher resolves host/port
   # through one shared function; the web terminal computes this panel's URL
   # separately and is kept in step by hand, so an env override must be set
   # consistently. Uncomment to move or disable it.
   # web:
   #   host: "127.0.0.1"
-  #   port: 8092
+  #   port: {{ osprey_ports.channel_finder }}
   #   auto_launch: true
 
   # Descriptive names for channels that belong to no device family, generated
@@ -261,11 +281,11 @@ file_paths:
 # stops it — and when it does, the tab is reported unavailable rather than
 # serving a dead iframe. Port resolution is the one shared function every launcher and URL
 # builder uses: OSPREY_ARTIFACT_SERVER_PORT wins (multi-user deployments export
-# it per user), then `port` here, then the built-in 8086. `host` has no env
-# override.
+# it per user), then `port` here, then this deployment's layout slot
+# ({{ osprey_ports.artifact }}). `host` has no env override.
 artifact_server:
   host: "127.0.0.1"
-  port: 8086
+  port: {{ osprey_ports.artifact }}
   auto_launch: true
 
 # ============================================================
@@ -301,11 +321,58 @@ claude_code:
 # ============================================================
 # WEB PANEL CONFIGURATION
 # ============================================================
-# Controls which panel tabs appear in the web terminal (osprey web).
-# The Workspace panel is always shown; the Activity log is a separate page,
-# not a tab.
+# Controls the web terminal UI (osprey web): its Documentation and Feedback
+# controls, and which panel tabs appear. The Workspace panel is always shown;
+# the Activity log is a separate page, not a tab.
 
 web:
+  # Target of the Documentation button in the web terminal's utility cluster.
+  # Point it at a locally hosted copy of the docs when the control room has no
+  # route to the public site.
+  docs_url: https://als-apg.github.io/osprey
+
+  # Whether the web terminal's Config panel may edit this deployment's own
+  # config.yml and .claude/ setup files. `false` withdraws the panel's whole
+  # SERVER surface, not just its tab: /api/config and /api/claude-setup refuse
+  # every verb with 403, and GET /api/panels stops advertising the panel. That
+  # is the difference that matters — these files are what the agent's
+  # permission surface is rendered from, so hiding the tab alone would leave
+  # anyone who types the URL able to re-render the agent that runs here.
+  # Leave it true for a single-user deployment: the panel is that operator's
+  # own config editor. Set it false for the read-only tiers of a multi-user
+  # deployment, where a separate admin persona owns configuration.
+  config_panel:
+    enabled: true
+
+  # Whether this deployment's Scaffold gallery may WRITE. `false` closes the
+  # gallery's whole server surface for writes — create, claim, save, reset,
+  # register and delete all answer 403 — while every read stays open, so a
+  # read-only tier can still see exactly what the agent is running. This is a
+  # privilege boundary, not a UI preference: what the gallery authors is
+  # .claude/rules, .claude/skills and .claude/agents content, which the agent
+  # loads at project scope and obeys on every turn. Hiding the buttons alone
+  # would leave anyone who types the URL able to author what the agent reads.
+  # Leave it true for a single-user deployment: the gallery is that operator's
+  # own editor. Set it false for the read-only tiers of a multi-user
+  # deployment, where a separate admin persona owns the agent's setup.
+  scaffold_gallery:
+    write_enabled: true
+
+  # Where the Feedback dialog's two outbound channels send a user. Nothing is
+  # ever posted for them: the browser opens a prefilled GitHub issue form or a
+  # prefilled mail draft, and the user decides whether to send it. Every
+  # submission is also recorded on this deployment, readable with
+  # `osprey feedback list` / `osprey feedback export`.
+  feedback:
+    # owner/repo whose new-issue form the GitHub channel prefills. Point it at
+    # the repository your users' reports should land in.
+    github_repo: als-apg/osprey
+    # Recipient of the prefilled mailto: draft the Email channel opens.
+    email: thellert@lbl.gov
+    # Ceiling in bytes on the on-disk feedback store (256 MB). Above it the
+    # OLDEST saved session contexts are deleted; the small submission headers
+    # are always kept, so the submission history stays complete.
+    max_store_bytes: 268435456
 {%- set _BUILTIN_PANELS = builtin_panels | default(["ariel", "channel-finder"]) %}
 {%- set _enabled_builtin_panels = selected_web_panels | select("in", _BUILTIN_PANELS) | list %}
 {%- if default_panel is defined and default_panel %}

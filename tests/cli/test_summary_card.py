@@ -44,11 +44,22 @@ def recording_console(*, terminal: bool = False) -> tuple[Console, io.StringIO]:
 
     The theme is not optional: the card's heading and labels are semantic
     tokens, and a bare ``Console()`` raises ``MissingStyle`` on the first one.
-    ``terminal`` asks for the styled rendering; the default plain one is what
-    every line assertion here reads.
+    Explicit color settings keep the terminal rendering independent of
+    ``NO_COLOR`` and ``TERM``; the default non-terminal rendering stays plain
+    for every line assertion here.
     """
     buffer = io.StringIO()
-    return Console(file=buffer, theme=osprey_theme, force_terminal=terminal, width=200), buffer
+    return (
+        Console(
+            file=buffer,
+            theme=osprey_theme,
+            force_terminal=terminal,
+            color_system="standard" if terminal else None,
+            no_color=not terminal,
+            width=200,
+        ),
+        buffer,
+    )
 
 
 class RecordingReporter(PhaseReporter):
@@ -171,6 +182,43 @@ def cards(monkeypatch) -> list[tuple[Path, str]]:
 
 
 @pytest.fixture
+def repo_with_token_logins(repo: Path) -> Path:
+    """A multi-user deployment with NO login wall — the default posture.
+
+    With `auth.method` at `none` nginx runs no login flow and injects no
+    operator secret, so each terminal's own token->cookie gate is the only one
+    and the only way through it is that user's `?token=` URL.
+    """
+    (repo / "build" / "config.yml").write_text(
+        "project_name: demo\n"
+        "deployed_services: []\n"
+        "modules:\n"
+        "  web_terminals:\n"
+        "    enabled: true\n"
+        "    nginx_port: 8080\n"
+        "    users:\n"
+        "      - name: alice\n"
+        "        index: 0\n"
+        "      - name: bob\n"
+        "        index: 1\n"
+    )
+    return repo
+
+
+@pytest.fixture
+def repo_with_fqdn(repo: Path) -> Path:
+    """The same repo, declaring the host browsers actually reach it on.
+
+    Every real multi-user deployment has this: the render refuses to produce one
+    with a roster and no origin. The bare `repo` fixture is the degenerate case
+    (module on, roster empty), which is why the two are separate.
+    """
+    config = repo / "build" / "config.yml"
+    config.write_text(config.read_text() + "deploy:\n  host: dls-deploy\n  fqdn: dls.example.org\n")
+    return repo
+
+
+@pytest.fixture
 def repo_with_logins(repo: Path) -> Path:
     """The same repo, with a password-authenticated roster whose two logins the
     profile declared and nobody has since edited."""
@@ -228,17 +276,45 @@ class TestCardContent:
             deploy_summary,
             "as_built_endpoint_entries",
             lambda root: [
-                ("event-dispatcher", "http://127.0.0.1:8001"),
-                ("postgres", "127.0.0.1:5432"),
-                ("web terminal", "(not configured in this project)"),
+                ("gateway", "web terminal", "(not configured in this project)"),
+                ("dispatch", "event-dispatcher", "http://127.0.0.1:10010"),
+                ("stores", "postgres", "127.0.0.1:10800"),
             ],
         )
 
         card = "\n".join(format_summary_card(repo, "running"))
 
-        assert "http://127.0.0.1:8001" in card
+        assert "http://127.0.0.1:10010" in card
         assert "postgres" not in card
         assert "not configured" not in card
+
+    def test_the_card_keeps_the_order_the_block_puts_the_endpoints_in(
+        self, repo: Path, monkeypatch
+    ) -> None:
+        """The tier is dropped; the ordering it produced is not.
+
+        A card that re-sorted these by name would lead with whichever service
+        happens to sort first rather than with the gateway a reader opens.
+        """
+        from osprey.deployment import deploy_summary
+
+        monkeypatch.setattr(
+            deploy_summary,
+            "as_built_endpoint_entries",
+            lambda root: [
+                ("gateway", "web terminal", "http://127.0.0.1:10000  (landing page)"),
+                ("dispatch", "event-dispatcher", "http://127.0.0.1:10010"),
+                ("services", "openobserve", "http://127.0.0.1:10050"),
+            ],
+        )
+
+        card = "\n".join(format_summary_card(repo, "running"))
+
+        assert [line.split()[0] for line in card.splitlines() if "http://" in line] == [
+            "web",
+            "event-dispatcher",
+            "openobserve",
+        ]
 
     @pytest.mark.parametrize("state", ["created", "built", "stopped"])
     def test_a_deployment_that_is_not_running_advertises_no_endpoints(
@@ -618,7 +694,57 @@ class TestClosingCallToAction:
     def test_the_closing_line_names_the_landing_page(self, repo: Path, recorder: Recorded) -> None:
         print_summary_card(repo, "running")
 
-        assert recorder.lines[-1] == "Everything is running. Open http://127.0.0.1:8080 to start."
+        assert "Everything is running. Open http://127.0.0.1:8080 to start." in recorder.lines, (
+            recorder.lines
+        )
+
+    def test_a_loopback_only_address_says_so(self, repo: Path, recorder: Recorded) -> None:
+        """This repo declares no `deploy.fqdn` and no `external_origin`, so the
+        only address there is to print is the deploy host's own loopback — where
+        the landing page answers and no terminal will accept a write, because
+        each checks a mutating request's Origin against a value this deployment
+        never declared. Said out loud rather than left to be met as a 403 inside
+        a container.
+        """
+        print_summary_card(repo, "running")
+
+        printed = "\n".join(recorder.lines)
+        assert "serves the landing page only" in printed
+        assert "external_origin" in printed
+
+    def test_the_closing_line_names_the_origin_the_terminals_check_against(
+        self, repo_with_fqdn: Path, recorder: Recorded
+    ) -> None:
+        """`deploy.fqdn` is set, so that IS the address browsers reach — and the
+        one every terminal compares a mutating request's Origin against. Sending
+        an operator to 127.0.0.1 instead would produce a deployment whose pages
+        all load and whose every write is refused."""
+        print_summary_card(repo_with_fqdn, "running")
+
+        printed = "\n".join(recorder.lines)
+        assert "Everything is running. Open http://dls.example.org:8080 to start." in printed
+        assert "127.0.0.1:8080 to start" not in printed
+        assert "serves the landing page only" not in printed
+
+    def test_an_explicit_external_origin_wins_over_the_derived_one(
+        self, repo_with_fqdn: Path, recorder: Recorded
+    ) -> None:
+        """A load balancer terminating TLS in front of this nginx is what the
+        browser actually reaches, so its address is the origin — and the address
+        to open. Nothing derivable from `deploy.fqdn` can name it."""
+        config = repo_with_fqdn / "build" / "config.yml"
+        config.write_text(
+            config.read_text().replace(
+                "    nginx_port: 8080\n",
+                "    nginx_port: 8080\n    external_origin: https://terminals.example.org\n",
+            )
+        )
+
+        print_summary_card(repo_with_fqdn, "running")
+
+        printed = "\n".join(recorder.lines)
+        assert "Everything is running. Open https://terminals.example.org to start." in printed
+        assert "dls.example.org" not in printed
 
     def test_the_closing_line_comes_after_the_card(self, repo: Path, recorder: Recorded) -> None:
         """Order is the point: what was written, then where it answers, then
@@ -691,3 +817,123 @@ class TestClosingCallToAction:
         print_summary_card(tmp_path, "running")
 
         assert not any(line.startswith("Everything is running") for line in recorder.lines)
+
+
+class TestTokenLoginClosingLine:
+    """A terminal with no login page needs the verb that opens it.
+
+    "Open the landing page" is the whole instruction for a deployment behind a
+    login wall. Without one, the landing page routes to a terminal that answers
+    nothing — and the only way to a first session is that user's own `?token=`
+    URL, which nothing else in the multi-user shape hands out.
+    """
+
+    def test_an_auth_off_roster_is_told_the_verb(
+        self, repo_with_token_logins: Path, recorder: Recorded
+    ) -> None:
+        """Two token-login users get the plural phrasing: `each need`."""
+        print_summary_card(repo_with_token_logins, "running")
+
+        printed = "\n".join(recorder.lines)
+        assert "osprey users login-url alice" in printed
+        assert "alice, bob" in printed
+        assert "these terminals have no login page" in printed
+        assert "alice, bob each need their own login URL" in printed
+
+    def test_the_urls_themselves_are_never_printed(
+        self, repo_with_token_logins: Path, recorder: Recorded
+    ) -> None:
+        """Each carries a live operator secret, and this output is read over
+        shoulders, pasted into tickets and captured whole by CI logs."""
+        (repo_with_token_logins / ".env").write_text(
+            "OSPREY_TERMINAL_SECRET_ALICE=alice-operator-secret\n"
+        )
+
+        print_summary_card(repo_with_token_logins, "running")
+
+        printed = "\n".join(recorder.lines)
+        assert "alice-operator-secret" not in printed
+        assert "?token=" not in printed
+
+    def test_a_walled_roster_gets_no_such_line(
+        self, repo_with_logins: Path, recorder: Recorded
+    ) -> None:
+        """Every user there logs in through the sidecar, so the login page is
+        the front door and naming a second one would be noise."""
+        print_summary_card(repo_with_logins, "running")
+
+        assert "login-url" not in "\n".join(recorder.lines)
+
+    def test_a_login_exempt_entry_is_named_even_with_auth_on(
+        self, repo_with_logins: Path, recorder: Recorded
+    ) -> None:
+        """`login: false` puts one entry outside the wall, and that terminal is
+        reached exactly the way an auth-off one is -- singular phrasing: `needs`."""
+        config = repo_with_logins / "build" / "config.yml"
+        config.write_text(
+            config.read_text() + "      - name: kiosk\n        index: 2\n        login: false\n"
+        )
+
+        print_summary_card(repo_with_logins, "running")
+
+        printed = "\n".join(recorder.lines)
+        assert "osprey users login-url kiosk" in printed
+        assert "this terminal has no login page" in printed
+        assert "kiosk needs its own login URL" in printed
+        # ...and only that entry: alice and bob still have a login page.
+        assert "alice" not in printed.split("no login page")[1]
+
+
+def test_the_card_flags_dangerously_allow_bash(repo: Path):
+    """A deployment running under the waiver says so on the card operators read
+    after every deploy; one absent from the config leaves no trace."""
+    assert not any(
+        "dangerously_allow_bash" in line for line in format_summary_card(repo, "running")
+    )
+
+    config = repo / "build" / "config.yml"
+    config.write_text(config.read_text() + "dangerously_allow_bash: true\n")
+
+    lines = format_summary_card(repo, "running")
+    flagged = [line for line in lines if "dangerously_allow_bash" in line]
+    assert flagged and "Bash" in flagged[0] and "launch token" in flagged[0]
+
+
+class TestStaleSeededLogins:
+    """A seeded default the deployed hash contradicts is never printed as a
+    working login — the card says what happened and which verb fixes it."""
+
+    def test_a_contradicted_default_is_dropped_and_named(
+        self, repo_with_logins: Path, recorder: Recorded
+    ) -> None:
+        from osprey.deployment.web_terminals.auth_credentials import AUTH_ENV_FILENAME
+        from osprey.services.auth_sidecar.passwords import hash_password
+
+        (repo_with_logins / AUTH_ENV_FILENAME).write_text(
+            f"OSPREY_AUTH_PW_HASH_ALICE={hash_password('alice')}\n"
+            f"OSPREY_AUTH_PW_HASH_BOB={hash_password('minted-by-an-older-deploy')}\n"
+        )
+
+        print_summary_card(repo_with_logins, "running")
+
+        printed = "\n".join(recorder.lines)
+        assert "alice / alice" in printed
+        assert "bob / bob" not in printed
+        assert "osprey users passwd bob" in printed
+
+    def test_no_stale_note_when_every_default_verifies(
+        self, repo_with_logins: Path, recorder: Recorded
+    ) -> None:
+        from osprey.deployment.web_terminals.auth_credentials import AUTH_ENV_FILENAME
+        from osprey.services.auth_sidecar.passwords import hash_password
+
+        (repo_with_logins / AUTH_ENV_FILENAME).write_text(
+            f"OSPREY_AUTH_PW_HASH_ALICE={hash_password('alice')}\n"
+            f"OSPREY_AUTH_PW_HASH_BOB={hash_password('bob')}\n"
+        )
+
+        print_summary_card(repo_with_logins, "running")
+
+        printed = "\n".join(recorder.lines)
+        assert "alice / alice · bob / bob" in printed
+        assert "passwd" not in printed

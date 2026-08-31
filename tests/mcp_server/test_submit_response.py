@@ -28,8 +28,13 @@ _fn = submit_response.fn if hasattr(submit_response, "fn") else submit_response
 
 
 @pytest.fixture
-def workspace(tmp_path):
-    """Initialize a temporary ArtifactStore workspace."""
+def workspace(tmp_path, monkeypatch):
+    """Initialize a temporary ArtifactStore workspace.
+
+    ``OSPREY_CONFIG`` is pinned into the same temp dir so the tool resolves its
+    project there rather than wherever pytest happens to run.
+    """
+    monkeypatch.setenv("OSPREY_CONFIG", str(tmp_path / "config.yml"))
     initialize_artifact_store(workspace_root=tmp_path)
     yield tmp_path
     reset_artifact_store()
@@ -236,3 +241,97 @@ class TestSubmitResponse:
         _exc_ctx["envelope"]
         store = get_artifact_store()
         assert len(store.list_entries()) == 0
+
+    @pytest.mark.asyncio
+    async def test_unnamed_category_falls_back_to_uncategorized(self, workspace):
+        """A hand-in that names no category files under the generic fallback.
+
+        The fallback is deliberately unhelpful — it shows as "Uncategorized" in
+        the gallery — because an agent that names nothing has told the operator
+        nothing about what its answer holds. Agent templates are gated on
+        naming one (tests/registry/test_agent_submit_categories.py).
+        """
+        raw = await _fn(
+            title="AR Optics Summary",
+            content="Tunes and beta functions computed from the design lattice.",
+            source_agent="pyat-specialist",
+        )
+        data = extract_response_dict(raw)
+
+        entry = get_artifact_store().get_entry(data["artifact_id"])
+        assert entry is not None
+        assert entry.artifact_type == "markdown"
+        assert entry.category == "agent_response"
+
+    @pytest.mark.asyncio
+    async def test_one_call_files_exactly_one_artifact(self, workspace):
+        """Prose is the whole deliverable: one hand-in, one artifact.
+
+        A computing agent used to owe a second JSON copy of its own numbers,
+        re-typed by the model out of its own stdout. The values live in the
+        answer; the executed code and its output are already saved as the
+        notebook artifact of the run that produced them.
+        """
+        raw = await _fn(
+            title="AR optics",
+            content="| quantity | value |\n|---|---|\n| nu_x | 0.2345 |",
+            data_type="lattice_analysis",
+            source_agent="pyat-specialist",
+        )
+        data = extract_response_dict(raw)
+
+        assert data["status"] == "success"
+        assert "data_artifact_id" not in data
+
+        entries = get_artifact_store().list_entries()
+        assert len(entries) == 1
+        assert entries[0].artifact_type == "markdown"
+        assert entries[0].category == "lattice_analysis"
+        assert entries[0].source_agent == "pyat-specialist"
+
+    @pytest.mark.asyncio
+    async def test_description_carries_the_label_not_the_key(self, workspace):
+        """The description is operator-facing, so it reads as words.
+
+        Storing the raw key put plumbing in front of the user
+        ("channel_addresses from channel-finder").
+        """
+        raw = await _fn(
+            title="BPM Channel Addresses",
+            content="Found 12 BPM channels.",
+            data_type="channel_addresses",
+            source_agent="channel-finder",
+        )
+        data = extract_response_dict(raw)
+
+        entry = get_artifact_store().get_entry(data["artifact_id"])
+        assert entry is not None
+        assert entry.description == "Channel Addresses — channel-finder"
+
+    @pytest.mark.asyncio
+    async def test_description_without_an_agent_is_the_bare_label(self, workspace):
+        raw = await _fn(
+            title="Ad-hoc note",
+            content="Some prose.",
+            data_type="document",
+        )
+        data = extract_response_dict(raw)
+
+        entry = get_artifact_store().get_entry(data["artifact_id"])
+        assert entry is not None
+        assert entry.description == "Document"
+
+    @pytest.mark.asyncio
+    async def test_explicit_data_type_drives_the_category(self, workspace):
+        """An explicit data_type is the category — the agent name never overrides it."""
+        raw = await _fn(
+            title="BPM Channel Addresses",
+            content="Found 12 BPM channels.",
+            data_type="channel_addresses",
+            source_agent="channel-finder",
+        )
+        data = extract_response_dict(raw)
+
+        entry = get_artifact_store().get_entry(data["artifact_id"])
+        assert entry is not None
+        assert entry.category == "channel_addresses"

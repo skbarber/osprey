@@ -12,6 +12,14 @@ to key them off.
 time. One engine, called twice, so a repo created today and a repo
 re-scaffolded a year later carry the same two files.
 
+``osprey scaffold systemd`` emits two more files through the same engine: the
+boot unit at :data:`SYSTEMD_OUTPUT_NAME`, and the boot hook at
+:data:`BOOT_HOOK_OUTPUT_PATH` that starts that unit on a host whose home is a
+late mount. Neither is part of what ``init`` writes, because both are rendered
+for a HOST rather than for the repo — the two absolute paths in them are
+properties of the machine that will run the deployment, so they are emitted
+when an operator is standing on that machine and asks for them.
+
 Re-emission is the whole difficulty. A generated file that lands in a git
 repository is read, diffed and eventually edited by people, so the engine has
 to answer two questions before it writes anything:
@@ -34,6 +42,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,12 +55,20 @@ from .build_profile_deploy import SUPPORTED_CI_PLATFORMS, DeployConfig, parse_de
 from .build_profile_document import _read_profile_document
 from .build_profile_merge import resolve_profile_document
 from .deploy_scaffold_templates import (
+    BOOT_HOOK_MARKER,
+    BOOT_HOOK_PATH,
+    BOOT_HOOK_TEMPLATE,
     CI_MARKER,
     CI_TEMPLATES,
+    SYSTEMD_MARKER,
+    SYSTEMD_TEMPLATE,
+    SYSTEMD_UNIT_NAME,
     VERIFY_MARKER,
     VERIFY_PATH,
     VERIFY_TEMPLATE,
+    build_boot_hook_context,
     build_ci_context,
+    build_systemd_context,
     build_verify_context,
     render,
 )
@@ -76,9 +94,38 @@ CI_OUTPUT_NAMES: dict[str, str] = {"gitlab": ".gitlab-ci.yml"}
 #: both without a single test noticing.
 VERIFY_OUTPUT_PATH: tuple[str, ...] = tuple(VERIFY_PATH.split("/"))
 
+#: Where the boot unit is emitted, relative to the repo root. Not the directory
+#: it is installed in: a unit takes effect from ``~/.config/systemd/user/``, and
+#: writing there directly would put a generated file outside the repo and
+#: outside review, in a directory the operator's other units live in. It lands
+#: beside the profile instead, under the name ``systemctl`` will know it by, and
+#: the emitted header plus the verb's own output say to copy it across.
+SYSTEMD_OUTPUT_NAME: str = SYSTEMD_UNIT_NAME
+
+#: Where the boot hook is emitted, as path segments relative to the repo root.
+#: Derived from the emitted script's own spelling of it
+#: (:data:`~.deploy_scaffold_templates.BOOT_HOOK_PATH`), the same way
+#: :data:`VERIFY_OUTPUT_PATH` is: the hook's header prints the ``@reboot``
+#: crontab line an operator pastes, and that line is this path under the repo
+#: root, so a second literal here could move the file out from under the line
+#: that installs it.
+#:
+#: Under ``scripts/`` rather than at the repo root, and deliberately so.
+#: :mod:`osprey.cli.profile_conventions` keeps ``_SOURCE_ZONE_ENTRIES``, the set
+#: of repo-root entries ``osprey build``'s unknown-root-entry warning knows
+#: about. A new root file would not be in it, so a build would warn about a file
+#: OSPREY itself told the operator to create — the exact thing that module's
+#: docstring says must not happen. ``scripts`` is already covered (it is where
+#: ``verify.sh`` lands), so emitting the hook there needs no edit to that table,
+#: nor to the python-executor write-guard that mirrors it.
+BOOT_HOOK_OUTPUT_PATH: tuple[str, ...] = tuple(BOOT_HOOK_PATH.split("/"))
+
 #: The health check is meant to be runnable by hand (``./scripts/verify.sh``),
 #: as its own header advertises. The post-up hook runs it through ``bash`` and
-#: would not care, but an operator following the header would.
+#: would not care, but an operator following the header would. The boot hook is
+#: the same case one directory over: cron invokes the ``@reboot`` line its
+#: header prints as a command, not through an interpreter, so a hook without
+#: the bit set is a boot that silently never happens.
 _EXECUTABLE_MODE = 0o755
 _REGULAR_MODE = 0o644
 
@@ -87,6 +134,19 @@ _REGULAR_MODE = 0o644
 #: mentioned in prose — a README pasted into a comment, this docstring quoted
 #: in a template — from being read as provenance.
 _MARKER_SCAN_LINES = 20
+
+#: Filesystem types that mean ``$HOME`` is not local storage. Matched as
+#: prefixes, so ``nfs`` covers ``nfs`` and ``nfs4`` alike; ``autofs`` is the
+#: automounter's own type, reported for a home that is mounted on first access.
+#: These are the two a lingering user manager loses at boot, and the whole test
+#: the issue behind :func:`detect_network_home` asks for.
+_NETWORK_HOME_FSTYPES: tuple[str, ...] = ("nfs", "autofs")
+
+#: How long ``findmnt`` is given to answer. It reads ``/proc/self/mountinfo``
+#: and returns in milliseconds normally, but a stuck network mount is exactly
+#: the situation this detection is about, and a scaffolding verb must not hang
+#: on one.
+_FINDMNT_TIMEOUT_SECONDS = 2.0
 
 _MARKER_RE = re.compile(r"^#\s*osprey-scaffold:\s*(?P<marker>\S+)\s*$")
 _VERSION_RE = re.compile(r"^#\s*osprey-version:.*$", re.MULTILINE)
@@ -182,33 +242,183 @@ def scaffold_deploy_files(
     verify_text = render(VERIFY_TEMPLATE, build_verify_context(profile, osprey_version))
 
     return [
-        _emit(repo_root / ci_name, ci_text, CI_MARKER, mode=_REGULAR_MODE, force=force),
+        _emit(
+            repo_root / ci_name,
+            ci_text,
+            CI_MARKER,
+            mode=_REGULAR_MODE,
+            force=force,
+            command="osprey scaffold ci",
+        ),
         _emit(
             repo_root.joinpath(*VERIFY_OUTPUT_PATH),
             verify_text,
             VERIFY_MARKER,
             mode=_EXECUTABLE_MODE,
             force=force,
+            command="osprey scaffold ci",
         ),
     ]
 
 
-def _load_deploy_profile(profile_file: Path) -> tuple[dict[str, Any], Path, DeployConfig]:
-    """Read the profile the scaffolding renders from.
+def scaffold_systemd_unit(
+    repo_root: Path,
+    *,
+    force: bool = False,
+    osprey_bin: str | None = None,
+    osprey_version: str | None = None,
+) -> list[ScaffoldedFile]:
+    """Emit the boot unit that brings this deployment up after a reboot, and
+    the hook that starts that unit on a host whose home is a late mount.
+
+    Both are rendered from the profile's ``name:`` and from two paths on the
+    machine they will run on: the repo, and the ``osprey`` executable. No
+    ``deploy:`` block is read, because none of it applies — a unit runs the
+    deployment where it already is, rather than shipping it anywhere.
+
+    The hook is emitted beside the unit rather than on request, because the
+    situation it exists for is not one an operator can see while scaffolding:
+    it is a boot that does not come back, several reboots from now. A file
+    already sitting in the repo is one somebody can read when that happens.
+
+    Args:
+        repo_root: The deployment repo. Also the unit's ``WorkingDirectory``,
+            resolved absolute, and the path the hook waits for.
+        force: Overwrite files that carry no marker of ours.
+        osprey_bin: Absolute path to the ``osprey`` executable the unit invokes.
+            Defaults to the one resolvable here.
+        osprey_version: Version for the provenance stamp. Defaults to the
+            installed framework's; tests pass a frozen value.
+
+    Returns:
+        One :class:`ScaffoldedFile` per emitted file, in emission order — the
+        unit at :data:`SYSTEMD_OUTPUT_NAME`, then the hook at
+        :data:`BOOT_HOOK_OUTPUT_PATH`. A refusal is reported here rather than
+        raised, for the same reason the CI pair reports one: the two files have
+        independent histories, and a hand-edited unit is no reason to leave the
+        hook stale.
+
+    Raises:
+        ConfigurationError: If the repo holds no profile, or holds one that is
+            not a YAML mapping.
+        FileNotFoundError: If no ``osprey`` executable can be found and none was
+            given. A unit naming a command that is not there fails at boot, and
+            a hook waiting on a path that will never exist gives up every boot
+            — both where nobody is watching, so neither file is written.
+    """
+    repo_root = repo_root.resolve()
+    profile, _ = _load_profile(repo_root / PROFILE_FILENAME, command="osprey scaffold systemd")
+
+    unit_text = render(
+        SYSTEMD_TEMPLATE,
+        build_systemd_context(profile, repo_root, osprey_bin, osprey_version),
+    )
+    hook_text = render(
+        BOOT_HOOK_TEMPLATE,
+        build_boot_hook_context(profile, repo_root, osprey_bin, osprey_version),
+    )
+
+    return [
+        _emit(
+            repo_root / SYSTEMD_OUTPUT_NAME,
+            unit_text,
+            SYSTEMD_MARKER,
+            mode=_REGULAR_MODE,
+            force=force,
+            command="osprey scaffold systemd",
+        ),
+        _emit(
+            repo_root.joinpath(*BOOT_HOOK_OUTPUT_PATH),
+            hook_text,
+            BOOT_HOOK_MARKER,
+            mode=_EXECUTABLE_MODE,
+            force=force,
+            command="osprey scaffold systemd",
+        ),
+    ]
+
+
+def detect_network_home(home: Path) -> str | None:
+    """Report the filesystem type of *home* when it is a network mount.
+
+    A ``systemd --user`` unit installed under ``~/.config/systemd/user/`` is
+    only found if the home directory is mounted when the user manager starts.
+    With linger enabled that happens at boot, and a manager that reaches
+    ``default.target`` before an NFS or autofs home is there resolves its unit
+    search path once, finds nothing, and does not look again — so the unit, and
+    ``podman.socket`` with it, stay ``not-found`` until somebody runs
+    ``daemon-reload`` by hand. The scaffolding verb warns about that, and this
+    is what it keys the warning off.
+
+    ``findmnt -T <home> -no FSTYPE`` is the whole test: it resolves *home* to
+    the mount point that actually carries it, so a home nested inside a mounted
+    parent answers correctly.
+
+    Everything that is not a confident "yes" degrades to ``None``. The binary
+    is Linux-only, so macOS and minimal containers have none; a container
+    without ``/proc`` mount information, a non-zero exit, a hang and output
+    that is not a filesystem type all mean the same thing here — we do not
+    know, and a scaffolding run that does not know says nothing extra.
+
+    Args:
+        home: The home directory of the account whose user manager will run
+            the unit.
+
+    Returns:
+        The filesystem type as ``findmnt`` reports it (``nfs``, ``nfs4``,
+        ``autofs``) when *home* is on a network mount, and ``None`` otherwise
+        — local storage, or no way to tell.
+    """
+    findmnt = shutil.which("findmnt")
+    if findmnt is None:
+        return None
+
+    try:
+        completed = subprocess.run(
+            [findmnt, "-T", str(home), "-no", "FSTYPE"],
+            capture_output=True,
+            text=True,
+            timeout=_FINDMNT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    if completed.returncode != 0:
+        return None
+
+    # One mount point, so one line; anything else is not an answer we can read.
+    lines = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+
+    fstype = lines[0]
+    return fstype if fstype.startswith(_NETWORK_HOME_FSTYPES) else None
+
+
+def _load_profile(profile_file: Path, *, command: str) -> tuple[dict[str, Any], Path]:
+    """Read the profile a scaffolding verb renders from.
 
     Resolved the same way a build resolves it — aliases normalized, ``extends:``
-    followed, a persona delta anchored at its root — so the pipeline is rendered
-    from what the profile *means* rather than from what one file happens to say.
+    followed, a persona delta anchored at its root — so a file is rendered from
+    what the profile *means* rather than from what one file happens to say.
 
     The profile is not otherwise validated: ``osprey validate`` is that check,
     and the emitted pipeline runs it as its first job. Scaffolding a repo whose
     data tree is not yet populated is a normal thing to do.
+
+    Args:
+        profile_file: The repo's ``profile.yml``.
+        command: The verb asking, named in the message an operator sees when
+            there is no profile there. The two verbs render different files from
+            the same profile, and "run it from a repo holding profile.yml" is
+            only actionable if it says which command to re-run.
     """
     if not profile_file.is_file():
         raise ConfigurationError(
-            f"No profile at {profile_file}. 'osprey scaffold ci' emits a "
-            f"deployment repo's CI files from its profile — run it from a repo "
-            f"holding {PROFILE_FILENAME}, or create one with 'osprey init'."
+            f"No profile at {profile_file}. '{command}' renders from a "
+            f"deployment repo's profile — run it from a repo holding "
+            f"{PROFILE_FILENAME}, or create one with 'osprey init'."
         )
 
     raw = _read_profile_document(profile_file)
@@ -217,8 +427,14 @@ def _load_deploy_profile(profile_file: Path) -> tuple[dict[str, Any], Path, Depl
             f"{profile_file} must be a YAML mapping, got {type(raw).__name__}."
         )
     document = resolve_profile_document(raw, profile_file.resolve())
+    return document.raw, document.root_dir
 
-    deploy = parse_deploy_block(document.raw)
+
+def _load_deploy_profile(profile_file: Path) -> tuple[dict[str, Any], Path, DeployConfig]:
+    """Read the profile, and the deployment coordinates the CI files need."""
+    raw, root_dir = _load_profile(profile_file, command="osprey scaffold ci")
+
+    deploy = parse_deploy_block(raw)
     if deploy is None:
         raise ConfigurationError(
             f"{profile_file} declares no 'deploy:' block, so there are no "
@@ -227,10 +443,12 @@ def _load_deploy_profile(profile_file: Path) -> tuple[dict[str, Any], Path, Depl
             f"blocks at the end of the file — uncomment it, fill in the CI "
             f"platform, the registry and the deploy host, then re-run."
         )
-    return document.raw, document.root_dir, deploy
+    return raw, root_dir, deploy
 
 
-def _emit(path: Path, text: str, marker: str, *, mode: int, force: bool) -> ScaffoldedFile:
+def _emit(
+    path: Path, text: str, marker: str, *, mode: int, force: bool, command: str
+) -> ScaffoldedFile:
     """Write one emitted file, unless what is already there says not to."""
     existing = _read_existing(path)
 
@@ -238,7 +456,7 @@ def _emit(path: Path, text: str, marker: str, *, mode: int, force: bool) -> Scaf
         if _marker_of(existing) != marker and not force:
             reason = (
                 f"carries no '{marker}' marker, so it was not written by the "
-                f"scaffolder. Re-run with 'osprey scaffold ci --force' to replace it."
+                f"scaffolder. Re-run with '{command} --force' to replace it."
             )
             return ScaffoldedFile(path, marker, "refused", reason)
         if _normalized(existing) == _normalized(text):

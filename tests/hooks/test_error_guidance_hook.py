@@ -99,7 +99,7 @@ def test_validation_error_injects_guidance(hook_runner, make_config):
     config = make_config({})
     result = hook_runner(
         "osprey_error_guidance.py",
-        "mcp__osprey_workspace__artifact_save",
+        "mcp__osprey_workspace__artifact_register",
         {"content": "test"},
         config_path=config,
         tool_response=_make_error_response(
@@ -179,6 +179,44 @@ def test_lattice_error_injects_guidance(hook_runner, make_config):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("error_type", "expected_class"),
+    [
+        # Refusals are gates saying no — "check the server logs" (Internal,
+        # the pre-fix fallthrough) is exactly the wrong guidance for them.
+        ("write_refused", "Safety"),
+        ("target_switched", "Safety"),
+        ("target_switch_refused", "Safety"),
+        # A switch attempted whose destination did not answer.
+        ("target_switch_failed", "Connection"),
+        # A deployment with no such target to offer.
+        ("target_switch_unavailable", "Validation"),
+    ],
+)
+def test_switch_and_refusal_types_do_not_fall_through_to_internal(
+    hook_runner, make_config, error_type, expected_class
+):
+    """The target-switch family classifies deliberately, never by fallthrough."""
+    config = make_config({})
+    result = hook_runner(
+        "osprey_error_guidance.py",
+        "mcp__controls__channel_write",
+        {"channel": "SR:TEST:SP", "value": 1.0},
+        config_path=config,
+        tool_response=_make_error_response(
+            error_type,
+            f"rendered as {error_type}",
+        ),
+        hook_config=DEFAULT_ERROR_CONFIG,
+    )
+
+    assert result is not None
+    ctx = result["hookSpecificOutput"]["additionalContext"]
+    assert expected_class in ctx
+    assert "Internal" not in ctx
+
+
+@pytest.mark.unit
 def test_service_unavailable_injects_guidance(hook_runner, make_config):
     """service_unavailable is classified as Connection class."""
     config = make_config({})
@@ -205,7 +243,7 @@ def test_file_not_found_injects_guidance(hook_runner, make_config):
     config = make_config({})
     result = hook_runner(
         "osprey_error_guidance.py",
-        "mcp__osprey_workspace__artifact_save",
+        "mcp__osprey_workspace__artifact_register",
         {"path": "missing.h5"},
         config_path=config,
         tool_response=_make_error_response(
@@ -491,7 +529,7 @@ def test_data_no_results_injects_guidance(hook_runner, make_config):
     config = make_config({})
     result = hook_runner(
         "osprey_error_guidance.py",
-        "mcp__osprey_workspace__artifact_save",
+        "mcp__osprey_workspace__artifact_register",
         {"query": "nonexistent artifact"},
         config_path=config,
         tool_response=_make_error_response(
@@ -616,19 +654,94 @@ def error_guidance(hook_module):
 #: so a change to the hook's own map has to be made deliberately in both
 #: places; ``test_error_class_map_matches_expected_table`` asserts they agree.
 EXPECTED_ERROR_CLASSES = {
+    # Connection
     "connection_error": "Connection",
     "timeout_error": "Connection",
     "service_unavailable": "Connection",
+    "target_switch_failed": "Connection",
+    "bluesky_bridge_unreachable": "Connection",
+    "phoebus_unreachable": "Connection",
+    "gallery_unreachable": "Connection",
+    "web_terminal_unreachable": "Connection",
+    "manager_unreachable": "Connection",
+    "environment_unavailable": "Connection",
+    "abort_pause_timeout": "Connection",
+    "health_suppressed": "Connection",
+    "search_timeout": "Connection",
+    "auth_required": "Connection",
+    # Validation
     "validation_error": "Validation",
     "limits_violation": "Validation",
+    "target_switch_unavailable": "Validation",
+    "invalid_query": "Validation",
+    "invalid_pattern": "Validation",
+    "sql_error": "Validation",
+    "file_too_large": "Validation",
+    "conversion_not_supported": "Validation",
+    "arrange_rejected": "Validation",
+    "set_draft_no_argument": "Validation",
+    "draft_conflict": "Validation",
+    "plan_write_rejected": "Validation",
+    "phoebus_handle_required": "Validation",
+    "phoebus_rejected": "Validation",
+    "unknown_category": "Validation",
+    "unknown_panel": "Validation",
+    "unknown_bluesky_lane": "Validation",
+    "unknown_device": "Validation",
+    "lane_required": "Validation",
+    "stale_draft_revision": "Validation",
+    "draft_revision_already_launched": "Validation",
+    "session_plan_unvalidated": "Validation",
+    "session_plan_not_in_namespace": "Validation",
+    "manager_not_idle": "Validation",
+    "queue_request_rejected": "Validation",
+    # Data
     "not_found": "Data",
     "no_results": "Data",
     "file_not_found": "Data",
+    "no_draft": "Data",
+    "unknown_plan": "Data",
+    "unknown_run": "Data",
+    "unknown_session_plan": "Data",
+    "window_not_found": "Data",
+    "plan_source_unavailable": "Data",
+    "nothing_running": "Data",
+    # Execution
     "execution_error": "Execution",
     "lattice_error": "Execution",
+    "compilation_error": "Execution",
+    # Safety
     "safety_error": "Safety",
+    "write_refused": "Safety",
+    "target_switched": "Safety",
+    "target_switch_refused": "Safety",
+    "target_changed": "Safety",
+    "writes_disabled": "Safety",
+    "launch_token_required": "Safety",
+    "path_traversal": "Safety",
+    "protected_key": "Safety",
+    "session_target_mismatch": "Safety",
+    "lane_mismatch": "Safety",
+    "browse_only_connector": "Safety",
+    "unsupported_connector": "Safety",
+    "not_supported": "Safety",
+    "interrupted_item_in_queue": "Safety",
+    # Internal
     "internal_error": "Internal",
     "platform_error": "Internal",
+    "configuration_error": "Internal",
+    "not_configured": "Internal",
+    "server_not_initialised": "Internal",
+    "dependency_missing": "Internal",
+    "conversion_error": "Internal",
+    "capture_error": "Internal",
+    "permission_denied": "Internal",
+    "bluesky_bridge_error": "Internal",
+    "phoebus_error": "Internal",
+    "phoebus_open_failed": "Internal",
+    "gallery_error": "Internal",
+    "config_unreadable": "Internal",
+    "manager_not_configured": "Internal",
 }
 
 #: The taxonomy documented in ``.claude/rules/error-handling.md``. Every class

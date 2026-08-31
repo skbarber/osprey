@@ -7,6 +7,11 @@ generates rather than authors:
   check from the profile's ``deploy:`` block — the same engine
   ``osprey init`` runs at creation, so a repo scaffolded years apart carries
   the same two files.
+* ``osprey scaffold systemd`` emits the boot unit for the host the operator is
+  standing on, through the same engine. It is a separate verb rather than a
+  third file under ``ci`` because it is rendered from that machine's paths
+  rather than from the profile alone, and because a repo deployed by hand or by
+  the pipeline needs no unit at all.
 * ``osprey scaffold list|claim|diff|unclaim`` inspect and take over the build
   artifacts a build renders into ``build/``.
 
@@ -27,6 +32,7 @@ the repo the operator is standing in, whichever subdirectory that is.
 from __future__ import annotations
 
 import difflib
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -768,10 +774,11 @@ def profile_slot_for(project_dir: Path, name: str) -> Path | None:
 @click.group(name="scaffold", invoke_without_command=True)
 @click.pass_context
 def scaffold(ctx):
-    """Emit CI files and manage artifact ownership.
+    """Emit generated files and manage artifact ownership.
 
     The ci verb regenerates the repo's pipeline and health check from the
-    profile's deploy: block. The other verbs cover build artifacts, which can
+    profile's deploy: block, and the systemd verb writes a unit that starts
+    this deployment at boot. The other verbs cover build artifacts, which can
     be claimed per-facility: claiming moves the artifact out of the build zone
     and into the profile beside it, which is where you then edit it. Every
     build copies it back and marks it yours.
@@ -780,6 +787,7 @@ def scaffold(ctx):
 
     \b
       osprey scaffold ci                          # Re-emit the CI files
+      osprey scaffold systemd                     # Write the boot unit
       osprey scaffold list                        # Show all artifacts
       osprey scaffold claim agents/channel-finder # Move it into the profile
       osprey scaffold diff agents/channel-finder  # Compare yours vs framework
@@ -843,6 +851,228 @@ def ci(repo: Path | None, force: bool) -> None:
         # Non-zero, because an operator who asked for a re-emission did not get
         # one. The reason above already names the flag that overrides it.
         raise SystemExit(1)
+
+
+@scaffold.command(name="systemd")
+@repo_option
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Replace an existing file that the scaffolder did not write.",
+)
+def systemd(repo: Path | None, force: bool) -> None:
+    """Emit a systemd unit that starts this deployment at boot.
+
+    Writes two files and prints how to install them: osprey.service at the repo
+    root, and scripts/osprey-boot-hook.sh beside it. The unit runs
+    'osprey up -d' from this repo and 'osprey down' on stop; both the repo and
+    the osprey program are written into it as full paths, because systemd
+    starts a unit with no working directory and a short PATH. The hook is for
+    one situation only — a home directory that arrives after the user manager
+    does — and this verb says so when it finds one. Run it on the machine that
+    will run the deployment, and again after the repo moves or OSPREY is
+    reinstalled somewhere else.
+
+    Re-running is safe. A file whose content already matches is left untouched,
+    stamp included, so an OSPREY upgrade alone produces no diff. A file the
+    scaffolder did not write is reported and left alone; --force replaces it.
+
+    Examples:
+
+    \b
+      $ osprey scaffold systemd
+      $ osprey scaffold systemd --repo ~/deployments/als-exemplar
+      $ osprey scaffold systemd --force
+    """
+    # Imported here for the same reason `ci` does it: the build-profile chain
+    # behind these two verbs is not loaded for any of the ownership ones.
+    from .deploy_scaffold import detect_network_home, scaffold_systemd_unit
+    from .deploy_scaffold_templates import (
+        BOOT_HOOK_MARKER,
+        SYSTEMD_MARKER,
+        SYSTEMD_UNIT_NAME,
+    )
+
+    repo_root = find_repo_root(repo)
+
+    try:
+        emitted = scaffold_systemd_unit(repo_root, force=force)
+    except ConfigurationError as exc:
+        raise click.ClickException(str(exc)) from None
+    except RuntimeError as exc:
+        # `Path.home()` — the boot hook writes the account's home in as a
+        # literal, and a host with no resolvable home has no account for a
+        # user unit to belong to. Reported rather than traced for the same
+        # reason as the missing program below: it is the host, not OSPREY.
+        raise click.ClickException(
+            f"cannot resolve this account's home directory: {exc}\n\n"
+            "The boot hook names the home in full, and a systemd user unit "
+            "belongs to an account. Set HOME, or run this on the account that "
+            "will run the deployment."
+        ) from None
+    except FileNotFoundError as exc:
+        # The unit names the program in full, so there is nothing to write
+        # until one can be found. Reported as a refusal rather than a
+        # traceback: on a deploy host this is a PATH that a login shell sets
+        # and a scaffolding run did not inherit, which the operator fixes.
+        raise click.ClickException(
+            f"{exc}\n\n"
+            "A systemd unit starts with a short PATH, so 'osprey up' has to be "
+            "written into it as a full path, and no osprey program was found "
+            "to name. Run 'command -v osprey' here: it has to answer before "
+            "this unit can be written. If OSPREY lives in a virtual "
+            "environment, activate it and re-run."
+        ) from None
+
+    for result in emitted:
+        shown = result.path.relative_to(repo_root)
+        if result.refused:
+            console.print(f"  [error]✗[/error] {shown} not written: {result.reason}")
+        elif result.action == "unchanged":
+            console.print(f"  [dim]= {shown} (unchanged)[/dim]")
+        else:
+            console.print(f"  [success]✓[/success] {shown} ({result.action})")
+
+    # Found by marker rather than by position: the emission order is the
+    # engine's business, and the two files below are told apart by what they
+    # are, not by where they happened to land in the list.
+    unit = next(f for f in emitted if f.marker == SYSTEMD_MARKER)
+    hook = next(f for f in emitted if f.marker == BOOT_HOOK_MARKER)
+
+    # Gated on the unit alone. A hand-written boot hook already sitting in the
+    # repo is refused, and rightly — but the unit beside it may have been
+    # written perfectly, and an operator who just got one still needs to be
+    # told how to install it and what a late-mounting home does to it.
+    if not unit.refused:
+        console.print()
+        console.print("  Install it on this machine:")
+        # The full path, not the one reported above: --repo and any subdirectory
+        # both put the operator somewhere this line has to work from anyway. Soft
+        # wrapped, so a deep repo path stays one line for whoever copies it.
+        console.print(f"    cp {unit.path} ~/.config/systemd/user/", soft_wrap=True)
+        console.print("    systemctl --user daemon-reload")
+        console.print(f"    systemctl --user enable --now {SYSTEMD_UNIT_NAME}")
+        console.print()
+        console.print("  For it to start at boot, the account also needs:")
+        console.print("    loginctl enable-linger $USER")
+
+        home = Path.home()
+        _warn_about_a_network_home(
+            home, detect_network_home(home), hook.path, hook_written=not hook.refused
+        )
+
+    if any(result.refused for result in emitted):
+        # Last, after everything above has been said. Non-zero for the same
+        # reason `ci` exits non-zero on a refusal: the operator asked for a file
+        # and did not get one. The reason printed above names the overriding
+        # flag.
+        raise SystemExit(1)
+
+
+def _warn_about_a_network_home(
+    home: Path, fstype: str | None, hook: Path, *, hook_written: bool
+) -> None:
+    """Say what linger does not cover when ``$HOME`` is a network mount.
+
+    Printed after the install instructions rather than instead of them: those
+    lines are still exactly what the operator has to run. What they do not do
+    is survive a reboot on this host. When systemd manages the mount the fix
+    needs root — a drop-in on ``user@<uid>.service`` ordering the user manager
+    after the mount — so the drop-in is printed verbatim, for the operator to
+    hand to whoever has root, and nothing here is refused or withheld. A home
+    served by the autofs daemon has no mount unit for it to order against;
+    ``findmnt`` reports ``autofs`` for a systemd automount too, so the two
+    cannot be told apart here and the scope is stated rather than detected.
+
+    Then the boot hook this verb already wrote, and the two crontab lines that
+    run it — the only route on a daemon-managed autofs home, and the fallback
+    for an operator who has nobody to hand the drop-in to. That is the only
+    reason the hook exists, and this is the only place its path is named — an
+    operator on a local home never needs it. OSPREY prints the lines rather
+    than installing them; the crontab is the account's.
+
+    Silent when *fstype* is ``None``, which covers both a local home and a host
+    the detection could not read.
+
+    Args:
+        home: The home directory that was inspected, and the one the drop-in
+            has to name.
+        fstype: What :func:`~.deploy_scaffold.detect_network_home` reported.
+        hook: Absolute path to the emitted boot hook, as the crontab line has
+            to name it.
+        hook_written: Whether this run wrote (or found unchanged) the hook at
+            that path. When it refused — a hand-written file sits there — the
+            crontab lines are withheld: printing them would wire cron to the
+            operator's own script, which is most likely the very hook that
+            "does nothing", and the sentence saying this run wrote one would
+            be false.
+    """
+    if fstype is None:
+        return
+
+    # Local for the same reason the verb's own imports are.
+    from .deploy_scaffold_templates import BOOT_HOOK_LOG, boot_hook_crontab_lines
+
+    console.print()
+    console.print(
+        f"  [warning]\u26a0[/warning] $HOME is on an {fstype} mount, so linger alone will "
+        "not survive a reboot:"
+    )
+    console.print(f"      {home}", soft_wrap=True)
+    # Wrapped by hand: the console reflows a long line to column zero, which
+    # would drop these out of the block they belong to.
+    console.print("    A lingering user manager starts before that mount is there. It")
+    console.print("    resolves its unit search path once, finds nothing, and does not")
+    console.print("    look again, so after every reboot the unit reads as not-found")
+    console.print("    until someone runs 'systemctl --user daemon-reload' by hand.")
+    console.print()
+    console.print("    When systemd manages the mount, from an fstab entry or a .mount or")
+    console.print("    .automount unit, ordering the manager after it needs root. Whoever")
+    console.print("    has it can write:")
+    # markup=False for the whole drop-in: '[Unit]' is a systemd section header,
+    # and Rich would read it as a style tag and swallow it. soft_wrap keeps a
+    # long home path on one line for whoever copies it.
+    console.print(
+        f"      /etc/systemd/system/user@{os.getuid()}.service.d/network-home.conf",
+        markup=False,
+        soft_wrap=True,
+    )
+    console.print("    containing:")
+    console.print("      [Unit]", markup=False)
+    console.print(f"      RequiresMountsFor={home}", markup=False, soft_wrap=True)
+    console.print("      After=remote-fs.target autofs.service", markup=False)
+    console.print("    and then run:")
+    console.print("      sudo systemctl daemon-reload")
+    console.print()
+    console.print("    A home served by the autofs daemon has no mount unit for that drop-in")
+    console.print("    to order against, so there it changes nothing. For that host, and")
+    if not hook_written:
+        console.print("    for one where nobody has root, this verb writes a boot hook, but")
+        console.print("    this run did not (see above): a file it did not write is already at")
+        console.print(f"      {hook}", soft_wrap=True)
+        console.print("    Re-run with --force to replace it; that run prints the crontab lines")
+        console.print("    that wire it up. Do not wire the existing file up as it is.")
+        return
+    console.print("    for one where nobody has root, this run also wrote a boot hook:")
+    console.print(f"      {hook}", soft_wrap=True)
+    console.print("    It waits for the home, this deployment and the user manager to show")
+    console.print("    up, then reloads the unit files and starts the unit. Run it once per")
+    console.print("    boot from the account's own crontab, all of these lines pasted whole:")
+    console.print("      crontab -e")
+    # markup=False: the job holds `[ -x ... ]` tests that Rich would read as
+    # style tags. soft_wrap keeps it one line for whoever pastes it.
+    for line in boot_hook_crontab_lines(str(hook)):
+        console.print(f"      {line}", markup=False, soft_wrap=True)
+    console.print("    HOME=/ is what lets the job start at all: cron changes into the")
+    console.print("    crontab's HOME before it runs a job, and on this host the home is")
+    console.print("    not there yet. The script restores the real home itself; the job")
+    console.print(f"    first notes in {BOOT_HOOK_LOG} that it fired, then waits for the")
+    console.print("    script to be readable. Put these lines LAST in the crontab: every job")
+    console.print("    below them runs from / with HOME=/ in its environment, so a job that")
+    console.print("    expands $HOME breaks unless it starts with its own export HOME=... .")
+    console.print("    Where the drop-in applies, the hook repairs each boot after the")
+    console.print("    fact rather than ordering the manager correctly in the first place,")
+    console.print("    so it is a fallback there, not a replacement.")
 
 
 def _owned_row(profile_root: Path | None, name: str) -> tuple[str, str, str]:
@@ -1242,13 +1472,30 @@ def _print_web_terminals_lint_errors(errors: list[Any]) -> None:
     """Print the ``modules.web_terminals lint`` "Errors:" block.
 
     Shared by ``lint`` (as part of its full errors+warnings report) and
-    ``render``'s pre-render lint gate (errors only, no warnings section). Takes
-    a list of ``osprey.deployment.web_terminals.lint.Finding`` (not type-hinted
-    as such here to keep this module's lazy-import convention for that package).
+    ``render``'s pre-render lint gate. Takes a list of
+    ``osprey.deployment.web_terminals.lint.Finding`` (not type-hinted as such
+    here to keep this module's lazy-import convention for that package).
     """
     console.print("  [dim]Errors:[/dim]")
     for finding in errors:
         console.print(f"    [error]\u2717[/error] [{finding.code}] {finding.message}")
+
+
+def _print_web_terminals_lint_warnings(warnings: list[Any]) -> None:
+    """Print the ``modules.web_terminals lint`` "Warnings:" block.
+
+    The sibling of :func:`_print_web_terminals_lint_errors`, and it exists
+    because the render gate used to filter the findings to errors and drop the
+    rest on the floor. Some of what it dropped is the only report an operator
+    ever gets: a privileged terminal with no login wall (``auth.method: token``,
+    the default, or ``none``) is deliberately not build-failing (it is the
+    shipped loopback posture, not a mistake), so discarding it means the
+    exposure is never named anywhere.
+    Advisory, never fatal \u2014 the caller decides what blocks.
+    """
+    console.print("  [dim]Warnings:[/dim]")
+    for finding in warnings:
+        console.print(f"    [warning]\u26a0[/warning] [{finding.code}] {finding.message}")
 
 
 @web_terminals.command(name="lint")
@@ -1272,8 +1519,14 @@ def web_terminals_lint(repo, config_path):
 
     from osprey.deployment.web_terminals.lint import lint_web_terminals
 
-    config = _load_config(_build_zone(repo))
-    findings = lint_web_terminals(config)
+    repo_root = find_repo_root(repo)
+    config = _load_config(repo_root / BUILD_OUTPUT_DIR)
+    # The repo root, not the working directory: a catalog entry's
+    # `project_path` is relative to the deployment repo — the same anchor
+    # `write_web_terminal_artifacts` resolves it against — so a lint run from
+    # anywhere else used to read no persona `config.yml` at all and report
+    # every persona as unprivileged.
+    findings = lint_web_terminals(config, project_root=repo_root)
 
     if not findings:
         console.print("[success]\u2713[/success] modules.web_terminals: no issues found\n")
@@ -1333,16 +1586,30 @@ def web_terminals_render(repo, config_path, output_dir, no_lint):
 
     from osprey.deployment.web_terminals.render import render_web_terminals
 
-    config = _load_config(_build_zone(repo))
+    repo_root = find_repo_root(repo)
+    config = _load_config(repo_root / BUILD_OUTPUT_DIR)
 
     if not no_lint:
         from osprey.deployment.web_terminals.lint import lint_web_terminals
 
-        errors = [f for f in lint_web_terminals(config) if f.severity == "error"]
-        if errors:
+        # `project_root` for the same reason `lint` passes it: persona
+        # `project_path` values anchor on the deployment repo, and a gate that
+        # cannot find a persona's rendered config.yml passes every roster.
+        findings = lint_web_terminals(config, project_root=repo_root)
+        errors = [f for f in findings if f.severity == "error"]
+        warnings = [f for f in findings if f.severity == "warn"]
+        if errors or warnings:
             console.print("\n[bold]modules.web_terminals lint[/bold]\n")
+        if errors:
             _print_web_terminals_lint_errors(errors)
+        # Printed even when nothing blocks. These are advisory by design, not by
+        # omission, so dropping them is how an exposure the lint DID find
+        # reaches nobody at all.
+        if warnings:
+            _print_web_terminals_lint_warnings(warnings)
+        if errors or warnings:
             console.print()
+        if errors:
             raise click.ClickException(
                 "modules.web_terminals has lint errors; fix them or pass --no-lint to render anyway."
             )

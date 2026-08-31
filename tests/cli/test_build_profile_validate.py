@@ -19,8 +19,10 @@ the per-field branches those files leave untouched.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
+from click.testing import CliRunner, Result
 
 from osprey.cli.build_profile import (
     BlueskyConfig,
@@ -45,6 +47,21 @@ def _errors(profile: BuildProfile, profile_dir: Path) -> list[str]:
     header, _, body = message.partition(":\n  - ")
     assert header == "Build profile validation failed"
     return body.split("\n  - ")
+
+
+def _graph_errors(profile: BuildProfile, profile_dir: Path) -> list[str]:
+    """The validation errors about the graph store alone, or ``[]`` if it validates.
+
+    An attached profile fails the qmd-sidecar rule on the same run — its render
+    keeps hybrid search on over ``services: {}`` — and these tests are about
+    the store rule, not the count of rules.
+    """
+    try:
+        profile.validate(profile_dir)
+    except BuildProfileError as exc:
+        _, _, body = str(exc).partition(":\n  - ")
+        return [error for error in body.split("\n  - ") if "services.graphdb" in error]
+    return []
 
 
 def _write_triggers(tmp_path: Path, name: str = "trig.yml") -> str:
@@ -104,6 +121,25 @@ def test_tier_one_with_hierarchical_mode_is_rejected(tmp_path: Path) -> None:
     assert errors == [
         "tier 1 requires channel_finder_mode: in_context (got channel_finder_mode: 'hierarchical')"
     ]
+
+
+def test_explicit_tier_with_graph_mode_is_rejected(tmp_path: Path) -> None:
+    """``graph``'s store is a seeded service, so no tier selects anything for it.
+
+    The rule is checked ahead of the tier-1/in_context rule, so a ``tier: 1``
+    graph profile reports the graph message rather than being told to switch to
+    in_context — the fix is to drop ``tier``, not to change the paradigm.
+    """
+    for tier in (1, 3):
+        profile = BuildProfile(name="x", tier=tier, channel_finder_mode="graph")
+        assert _errors(profile, tmp_path) == [
+            f"channel_finder_mode: graph has no tiered artifacts; omit tier (got tier: {tier})"
+        ]
+
+
+def test_graph_mode_without_tier_validates(tmp_path: Path) -> None:
+    """Omitting ``tier`` is the supported way to build the graph paradigm."""
+    BuildProfile(name="x", channel_finder_mode="graph").validate(tmp_path)
 
 
 def test_unknown_channel_finder_mode_is_rejected(tmp_path: Path) -> None:
@@ -285,6 +321,39 @@ def test_invalid_env_var_name_is_rejected(tmp_path: Path) -> None:
     """Required env var names must be upper-snake shell identifiers."""
     profile = BuildProfile(name="x", env=EnvConfig(required=["OK_VAR", "not-a-var"]))
     assert _errors(profile, tmp_path) == ["Invalid env var name: not-a-var"]
+
+
+def test_pinned_env_var_names_are_held_to_the_required_pattern(tmp_path: Path) -> None:
+    """``pinned`` names the same kind of thing as ``required``, one message per name."""
+    profile = BuildProfile(name="x", env=EnvConfig(pinned=["OK_VAR", "not-a-var", "also bad"]))
+    assert _errors(profile, tmp_path) == [
+        "Invalid env.pinned var name: 'not-a-var'",
+        "Invalid env.pinned var name: 'also bad'",
+    ]
+
+
+def test_pinned_env_entries_that_are_not_strings_are_rejected(tmp_path: Path) -> None:
+    """A YAML author who writes a bare number gets a name error, not a crash."""
+    profile = BuildProfile(name="x", env=EnvConfig(pinned=[7]))  # type: ignore[list-item]
+    assert _errors(profile, tmp_path) == ["Invalid env.pinned var name: 7"]
+
+
+def test_pinned_env_block_that_is_not_a_list_is_rejected(tmp_path: Path) -> None:
+    """A scalar where a list belongs would otherwise validate character by character."""
+    profile = BuildProfile(name="x", env=EnvConfig(pinned="OSPREY_TOKEN"))  # type: ignore[arg-type]
+    assert _errors(profile, tmp_path) == ["env.pinned must be a list of env var names (got str)"]
+
+
+def test_pinned_env_names_reach_the_profile_from_yaml() -> None:
+    """The key is parsed, not silently dropped — the validator has to see it."""
+    profile = _parse_profile({"name": "x", "env": {"pinned": ["OSPREY_TOKEN"]}})
+    assert profile.env.pinned == ["OSPREY_TOKEN"]
+    assert profile.env.required == []
+
+
+def test_a_profile_without_pinned_env_names_declares_none() -> None:
+    """Absent means empty, so nothing changes for a profile written before pins."""
+    assert _parse_profile({"name": "x", "env": {"required": ["OSPREY_TOKEN"]}}).env.pinned == []
 
 
 def test_missing_env_file_is_rejected(tmp_path: Path) -> None:
@@ -477,10 +546,10 @@ def test_bluesky_tiled_port_out_of_range_is_rejected(tmp_path: Path) -> None:
 def test_bluesky_tiled_port_colliding_with_bridge_port_is_rejected(tmp_path: Path) -> None:
     """Tiled and the bridge cannot bind the same port in one container."""
     profile = BuildProfile(
-        name="x", bluesky=BlueskyConfig(port=8090, tiled_enabled=True, tiled_port=8090)
+        name="x", bluesky=BlueskyConfig(port=10080, tiled_enabled=True, tiled_port=10080)
     )
     assert _errors(profile, tmp_path) == [
-        "bluesky.tiled_port must differ from bluesky.port (both 8090)"
+        "bluesky.tiled_port must differ from bluesky.port (both 10080)"
     ]
 
 
@@ -493,3 +562,457 @@ def test_virtual_accelerator_port_out_of_range_is_rejected(tmp_path: Path) -> No
     """The soft-IOC Channel Access port must be a usable TCP port."""
     profile = BuildProfile(name="x", virtual_accelerator=VAConfig(port=0))
     assert _errors(profile, tmp_path) == ["virtual_accelerator.port must be in 1..65535 (got 0)"]
+
+
+# --- graph mode's store prerequisite ---------------------------------------
+
+
+def test_graph_mode_on_a_store_deploying_app_template_validates(tmp_path: Path) -> None:
+    """The app templates that render a ``services.graphdb`` block need nothing else."""
+    for bundle in ("control_assistant", "ariel_standalone"):
+        BuildProfile(name="x", data_bundle=bundle, channel_finder_mode="graph").validate(tmp_path)
+
+
+def test_graph_mode_on_a_storeless_app_template_is_rejected(tmp_path: Path) -> None:
+    """``channel_finder_standalone`` renders no store, so graph has nothing to read.
+
+    The refusal names the missing block rather than the paradigm alone: the fix
+    is to configure a graph store, not to abandon the mode.
+    """
+    profile = BuildProfile(
+        name="x", data_bundle="channel_finder_standalone", channel_finder_mode="graph"
+    )
+    (error,) = _errors(profile, tmp_path)
+    assert "channel_finder_mode: graph" in error
+    assert "services.graphdb" in error
+    assert "channel_finder_standalone" in error
+
+
+def test_graph_mode_with_an_external_store_uri_validates(tmp_path: Path) -> None:
+    """Naming a store the facility runs is the other half of the rule.
+
+    ``services.graphdb.uri`` on the ``config:`` overlay creates the block the
+    app template omits, so a storeless template plus an external store passes —
+    no local Neo4j is deployed and none is required.
+    """
+    profile = BuildProfile(
+        name="x",
+        data_bundle="channel_finder_standalone",
+        channel_finder_mode="graph",
+        config={
+            "services.graphdb.uri": "bolt://graph.facility.org:7687",
+            "services.graphdb.username": "neo4j",
+        },
+    )
+    profile.validate(tmp_path)
+
+
+def test_graph_mode_on_an_attached_project_follows_its_hosts_template(tmp_path: Path) -> None:
+    """``deploy_services: false`` renders ``services: {}`` — and is then told the
+    store's address by the build, from the hosting deployment's render.
+
+    The attached profile IS the hosting profile plus a delta, so whether a
+    store will be there to project is the hosting template's question, answered
+    the same way: ``control_assistant`` deploys one, so no refusal; a storeless
+    template refuses exactly as it does for a deploying profile. An attached
+    profile built with no host in its repo is caught after the render instead
+    (``osprey.deployment.reach.reach_errors``), on the config it actually wrote.
+    """
+    assert (
+        _graph_errors(
+            BuildProfile(name="x", channel_finder_mode="graph", deploy_services=False), tmp_path
+        )
+        == []
+    )
+    profile = BuildProfile(
+        name="x", data_bundle="hello_world", channel_finder_mode="graph", deploy_services=False
+    )
+    (error,) = _graph_errors(profile, tmp_path)
+    assert "services.graphdb" in error
+    assert "deploy_services: false" in error
+
+
+def test_graph_mode_on_an_attached_project_with_an_external_store_validates(
+    tmp_path: Path,
+) -> None:
+    """An attached project reaches a shared stack's store by naming its uri."""
+    profile = BuildProfile(
+        name="x",
+        channel_finder_mode="graph",
+        deploy_services=False,
+        config={"services.graphdb.uri": "bolt://127.0.0.1:7687"},
+    )
+    assert _graph_errors(profile, tmp_path) == []
+
+
+def test_graph_mode_with_the_template_block_overridden_away_is_rejected(tmp_path: Path) -> None:
+    """A bare ``services.graphdb:`` override deletes the block the template rendered."""
+    profile = BuildProfile(name="x", channel_finder_mode="graph", config={"services.graphdb": None})
+    (error,) = _errors(profile, tmp_path)
+    assert "services.graphdb" in error
+
+
+def test_graph_mode_with_a_profile_declared_graph_service_validates(tmp_path: Path) -> None:
+    """A profile that declares the service itself carries the block into the render."""
+    profile = BuildProfile(
+        name="x",
+        data_bundle="channel_finder_standalone",
+        channel_finder_mode="graph",
+        services={"graphdb": ServiceDef(template="osprey.graphdb")},
+    )
+    profile.validate(tmp_path)
+
+
+def test_a_malformed_graph_store_override_is_not_reported_as_a_missing_block(
+    tmp_path: Path,
+) -> None:
+    """A store named with a bad port is still a store this profile means to dial.
+
+    The resolver raises about the port where it can be acted on — the deploy
+    preflight — so this validator must not turn that into "no block at all".
+    """
+    profile = BuildProfile(
+        name="x",
+        data_bundle="channel_finder_standalone",
+        channel_finder_mode="graph",
+        config={"services.graphdb.port_host": "not-a-port"},
+    )
+    profile.validate(tmp_path)
+
+
+def test_non_graph_modes_need_no_graph_store(tmp_path: Path) -> None:
+    """The prerequisite belongs to graph alone; the file-database paradigms pass."""
+    for mode in ("in_context", "hierarchical", "middle_layer", None):
+        BuildProfile(
+            name="x", data_bundle="channel_finder_standalone", channel_finder_mode=mode
+        ).validate(tmp_path)
+
+
+def test_graph_mode_skips_the_store_rule_when_the_channel_finder_is_off(
+    tmp_path: Path,
+) -> None:
+    """A persona with no channel finder inherits the mode but not the rule.
+
+    The logbook persona of a graph deployment switches the channel-finder server
+    off and still inherits ``channel_finder_mode: graph`` from the profile it
+    narrows — the mode belongs to the deployment. With no channel finder in that
+    render there is no toolless agent to prevent, so the store is not required.
+    Both spellings of the switch are honoured: the dotted one the renderer
+    applies, and the nested one a hand-written profile can reach for.
+    """
+    dotted = {"claude_code.servers.channel-finder.enabled": False}
+    nested = {"claude_code": {"servers": {"channel-finder": {"enabled": False}}}}
+    mixed = {"claude_code.servers": {"channel-finder": {"enabled": False}}}
+    for overlay in (dotted, nested, mixed):
+        profile = BuildProfile(
+            name="x",
+            channel_finder_mode="graph",
+            deploy_services=False,
+            config=overlay,
+        )
+        assert _graph_errors(profile, tmp_path) == []
+
+
+def test_graph_mode_still_needs_a_store_when_the_channel_finder_is_on(
+    tmp_path: Path,
+) -> None:
+    """The carve-out is an explicit ``false``, not any mention of the key.
+
+    A persona that leaves the channel finder on — or spells the switch ``true``
+    — is exactly the render the rule protects, so on a template that deploys
+    no store (``hello_world``; ``control_assistant`` would answer the store
+    question itself) it is still refused.
+    """
+    for overlay in (
+        {},
+        {"claude_code.servers.channel-finder.enabled": True},
+        {"claude_code": {"servers": {"channel-finder": {"enabled": True}}}},
+        {"claude_code.servers.controls.enabled": False},
+    ):
+        profile = BuildProfile(
+            name="x",
+            data_bundle="hello_world",
+            channel_finder_mode="graph",
+            deploy_services=False,
+            config=overlay,
+        )
+        (error,) = _graph_errors(profile, tmp_path)
+        assert "services.graphdb" in error
+
+
+# ---------------------------------------------------------------------------
+# Hybrid logbook search needs the qmd sidecar it dials
+# ---------------------------------------------------------------------------
+
+
+def _qmd_errors(profile: BuildProfile, profile_dir: Path) -> list[str]:
+    """The validation errors about the qmd sidecar alone.
+
+    An attached profile can fail the graph-store rule at the same time, and
+    these tests are about the sidecar rule, not the count of rules.
+    """
+    return [e for e in _errors(profile, profile_dir) if "services.qmd" in e]
+
+
+def test_hybrid_search_on_a_sidecar_deploying_app_template_validates(tmp_path: Path) -> None:
+    """The app templates that render a ``services.qmd`` block need nothing else."""
+    for bundle in ("control_assistant", "ariel_standalone"):
+        BuildProfile(name="x", data_bundle=bundle).validate(tmp_path)
+
+
+def test_hybrid_search_on_an_attached_project_follows_its_hosts_template(tmp_path: Path) -> None:
+    """``deploy_services: false`` renders ``services: {}`` — and is then told the
+    sidecar's port by the build, from the hosting deployment's render.
+
+    The template still switches ``ariel.search_modules.hybrid`` on, and the
+    hosting template deploys the sidecar the module dials, so nothing is
+    refused here; the build copies ``services.qmd.port`` into the attached
+    render (``osprey.deployment.reach``). What IS refused is the same shape a
+    deploying profile is refused for — a template that deploys no sidecar while
+    the module stays on — and, after the render, an attached profile built with
+    no host to be told by (``reach_errors``, on the config it actually wrote).
+    """
+    BuildProfile(name="x", deploy_services=False).validate(tmp_path)
+    profile = BuildProfile(name="x", deploy_services=False, config={"services.qmd": None})
+    (error,) = _qmd_errors(profile, tmp_path)
+    assert "ariel.search_modules.hybrid" in error
+    assert "services.qmd.port" in error
+    assert "deploy_services: false" in error
+
+
+def test_hybrid_search_on_an_attached_project_with_the_sidecar_port_validates(
+    tmp_path: Path,
+) -> None:
+    """An attached project with no host names a shared stack's sidecar itself."""
+    profile = BuildProfile(name="x", deploy_services=False, config={"services.qmd.port": 8180})
+    profile.validate(tmp_path)
+
+
+def test_hybrid_search_switched_off_needs_no_sidecar(tmp_path: Path) -> None:
+    """A profile that turns the module off has nothing to dial.
+
+    Only an explicit ``false`` counts, the same way the channel-finder switch
+    reads for the graph rule: the key is absent from every profile that keeps
+    the template's default, so absence reads as on. Both spellings of the
+    switch are honoured.
+    """
+    dotted = {"ariel.search_modules.hybrid.enabled": False}
+    nested = {"ariel": {"search_modules": {"hybrid": {"enabled": False}}}}
+    for overlay in (dotted, nested):
+        BuildProfile(name="x", deploy_services=False, config=overlay).validate(tmp_path)
+
+
+def test_hybrid_search_with_the_sidecar_block_overridden_away_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """A bare ``services.qmd:`` override deletes the block the template rendered.
+
+    The template's own comment tells an operator to drop the block, the
+    ``deployed_services`` entry AND the two ariel modules together; dropping
+    the block alone leaves hybrid search enabled with nothing behind it.
+    """
+    profile = BuildProfile(name="x", config={"services.qmd": None})
+    (error,) = _qmd_errors(profile, tmp_path)
+    assert "ariel.search_modules.hybrid" in error
+
+
+def test_hybrid_search_with_the_sidecar_block_and_the_module_dropped_together_validates(
+    tmp_path: Path,
+) -> None:
+    """Dropping the block together with the module is the supported no-sidecar path."""
+    BuildProfile(
+        name="x",
+        config={"services.qmd": None, "ariel.search_modules.hybrid.enabled": False},
+    ).validate(tmp_path)
+
+
+def test_a_malformed_sidecar_port_override_is_not_reported_as_a_missing_block(
+    tmp_path: Path,
+) -> None:
+    """A sidecar named with a bad port is still one this profile means to dial.
+
+    The resolver raises about the port where it can be acted on — the deploy
+    preflight — so this validator must not turn that into "no block at all".
+    """
+    BuildProfile(
+        name="x", deploy_services=False, config={"services.qmd.port": "not-a-port"}
+    ).validate(tmp_path)
+
+
+def test_an_app_template_without_ariel_needs_no_sidecar(tmp_path: Path) -> None:
+    """The prerequisite belongs to the hybrid module; a template with no ARIEL passes."""
+    BuildProfile(name="x", data_bundle="channel_finder_standalone").validate(tmp_path)
+    BuildProfile(name="x", data_bundle="channel_finder_standalone", deploy_services=False).validate(
+        tmp_path
+    )
+
+
+# ---------------------------------------------------------------------------
+# The build's render-side limits-block refusal
+# ---------------------------------------------------------------------------
+#
+# The profile-side lint reads what a `config:` block spelled; this one reads
+# the config a deployment actually runs, so a half-written per-type block that
+# no profile spelling explains — one an injector assembled, one an app template
+# shipped — is still refused before it reaches a machine.
+
+
+def _write_render(tmp_path: Path, control_system: object) -> Path:
+    """A render directory holding nothing but the ``control_system:`` section.
+
+    The build reads its own ``config.yml`` back after the injectors have run,
+    which is the only file this check touches.
+    """
+    import yaml
+
+    render_dir = tmp_path / "render"
+    render_dir.mkdir()
+    (render_dir / "config.yml").write_text(
+        yaml.safe_dump({"project_name": "demo", "control_system": control_system}),
+        encoding="utf-8",
+    )
+    return render_dir
+
+
+def _render_limits_errors(render_dir: Path) -> list[str]:
+    """The build's own render-side limits check, as ``_render_project`` runs it."""
+    from osprey.cli.build_cmd import _incomplete_limits_errors
+
+    return _incomplete_limits_errors(render_dir)
+
+
+def test_render_with_a_half_written_limits_block_is_unrunnable(tmp_path: Path) -> None:
+    """A per-type block stating only ``enabled`` answers no posture at all.
+
+    It overrides the deployment-wide pair whole, so the deployment silently
+    falls back to refusing unlisted channels — the refusal names the leaf an
+    operator has to add rather than letting a build ship that surprise.
+    """
+    render_dir = _write_render(
+        tmp_path, {"connector": {"virtual_accelerator": {"limits_checking": {"enabled": True}}}}
+    )
+
+    (error,) = _render_limits_errors(render_dir)
+
+    assert (
+        "control_system.connector.virtual_accelerator.limits_checking.allow_unlisted_channels"
+        in error
+    )
+
+
+def test_render_with_a_complete_limits_block_is_runnable(tmp_path: Path) -> None:
+    """Both leaves stated is the supported way to relax a simulator alone."""
+    render_dir = _write_render(
+        tmp_path,
+        {
+            "connector": {
+                "virtual_accelerator": {
+                    "limits_checking": {"enabled": True, "allow_unlisted_channels": True}
+                }
+            }
+        },
+    )
+
+    assert _render_limits_errors(render_dir) == []
+
+
+def test_render_without_a_per_type_limits_block_is_runnable(tmp_path: Path) -> None:
+    """Silence is every deployment predating per-type blocks; only a half-written one is refused."""
+    render_dir = _write_render(
+        tmp_path,
+        {
+            "type": "virtual_accelerator",
+            "connector": {"virtual_accelerator": {"prefix": "SR:"}},
+            "limits_checking": {"enabled": True},
+        },
+    )
+
+    assert _render_limits_errors(render_dir) == []
+
+
+# ---------------------------------------------------------------------------
+# The build's profile-side limits-block refusal
+# ---------------------------------------------------------------------------
+#
+# `osprey validate` is the verb an operator runs by hand; `osprey build` is the
+# one that has to refuse, because a deployment reaches a machine through the
+# build and not through the verb somebody remembered to run. Both ask
+# `limits_block_errors` about the same `config:` block, so a profile refused by
+# one is refused by the other with the same words.
+#
+# Profile-side, not render-side: raising here means a build stops before the
+# render, so the one-leaf case is reported once — by the check that can name
+# the profile key an author has to fix — instead of twice.
+
+
+def _build_with_config(tmp_path: Path, config: dict[str, Any], name: str) -> Result:
+    """Run ``osprey build`` against a repo whose profile states *config*.
+
+    The profile names no provider, so a build that gets past the profile-side
+    lint stops at the next refusal instead of rendering — which is what makes
+    the passing case below cheap and what its assertion reads.
+    """
+    import yaml
+
+    from osprey.cli.build_cmd import build
+
+    repo = tmp_path / name
+    repo.mkdir()
+    (repo / "profile.yml").write_text(
+        yaml.safe_dump(
+            {"name": "Demo Facility", "data_bundle": "hello_world", "config": config},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return CliRunner().invoke(build, ["--repo", str(repo), "--skip-deps", "--skip-lifecycle"])
+
+
+def test_build_refuses_a_profile_writing_only_one_limits_leaf(tmp_path: Path) -> None:
+    """One leaf states a posture nothing answers: the per-type block overrides
+    the deployment-wide pair whole, so the missing leaf falls back to refusing
+    unlisted channels rather than to what the profile meant."""
+    result = _build_with_config(
+        tmp_path,
+        {"control_system.connector.virtual_accelerator.limits_checking.enabled": True},
+        "half-a-block",
+    )
+
+    assert result.exit_code != 0, result.output
+    assert "Profile validation failed" in result.output
+    assert "allow_unlisted_channels" in result.output
+    assert "virtual_accelerator" in result.output
+
+
+def test_build_refuses_a_flat_dotted_custom_type(tmp_path: Path) -> None:
+    """Flattened, the dots in ``mypkg.TangoConnector`` are indistinguishable
+    from path separators, so the emitter renders a key no connector reads. The
+    build names the offending key instead of rendering the dead spelling."""
+    key = "control_system.connector.mypkg.TangoConnector.limits_checking.enabled"
+
+    result = _build_with_config(tmp_path, {key: True}, "dotted-type")
+
+    assert result.exit_code != 0, result.output
+    assert "Profile validation failed" in result.output
+    assert key in result.output
+
+
+def test_build_passes_a_complete_per_type_limits_block(tmp_path: Path) -> None:
+    """The supported spelling reaches the checks past the lint untouched.
+
+    Pinned beside the two refusals because a lint that refuses every profile
+    passes both of those on its own. The provider refusal is the marker: it is
+    the next thing the build asks after the profile-side lint.
+    """
+    result = _build_with_config(
+        tmp_path,
+        {
+            "control_system.connector.virtual_accelerator.limits_checking.enabled": True,
+            "control_system.connector.virtual_accelerator.limits_checking."
+            "allow_unlisted_channels": True,
+        },
+        "whole-block",
+    )
+
+    assert "Profile validation failed" not in result.output
+    assert "names no provider" in result.output

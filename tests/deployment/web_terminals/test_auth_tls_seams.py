@@ -39,6 +39,7 @@ import pytest
 import yaml
 
 from osprey.deployment.web_terminals.render import render_web_terminals
+from osprey.port_layout import default_port
 
 _BASE_PORTS = {"web": 9091, "artifact": 9291, "ariel": 9391, "lattice": 9491}
 
@@ -47,6 +48,11 @@ _TLS_STANZA = {
     "cert": "/etc/nginx/certs/dls.crt",
     "key": "/etc/nginx/certs/dls.key",
 }
+
+#: The TLS listener a rootless nginx can bind, for the non-default-port seam
+#: case. Outside this deployment's port block, so a number in the rendered
+#: config can only have come from `tls.port`.
+_ALT_TLS_PORT = 8443
 
 
 def _config(users: list[str]) -> dict:
@@ -167,9 +173,14 @@ def test_seam_auth_method_set_gates_every_user_behind_its_own_internal_target() 
 def test_seam_login_false_entry_is_served_ungated_while_the_rest_stay_gated() -> None:
     """SEAM 1 (deliberate exemption): a roster entry with `login: false` renders
     with no `auth_request` and no internal verify target, while every other
-    entry keeps both — and the exempt location still strips the origin's cookie
-    jar before proxying, since a public container must never see another user's
-    session cookie."""
+    entry keeps both — and the exempt location gets neither of the two things a
+    gated location gets: no operator-secret `include`, and no cookie strip. Both
+    are bound to the same predicate (authenticated AND not exempt), because an
+    exempt container has no gate here to vouch for a request, so there is no
+    authorized identity to inject a secret for; and the app's own token->cookie
+    session becomes the gate in front of it, which only holds if the browser's
+    cookie is allowed to reach the app rather than being cut on the way in.
+    alice's gated location, by contrast, keeps both."""
     # Arrange
     config = _auth_config(
         [
@@ -184,16 +195,25 @@ def test_seam_login_false_entry_is_served_ungated_while_the_rest_stay_gated() ->
 
     # Assert — exactly one gate, and it is alice's
     assert directives.count("auth_request ") == 1
-    assert "auth_request /_osprey_auth/alice;" in _location_body(nginx_conf, "location /u/alice/")
+    alice_body = _location_body(nginx_conf, "location /u/alice/")
+    assert "auth_request /_osprey_auth/alice;" in alice_body
     assert "location = /_osprey_auth/alice {" in nginx_conf
+
+    # Assert — alice's gated location gets BOTH the operator-secret include and
+    # the cookie strip, the pair the exemption is defined against.
+    assert "include /etc/nginx/osprey/secret-alice.conf;" in alice_body
+    assert 'proxy_set_header Cookie "";' in alice_body
 
     # Assert — ariel is proxied with no gate and no verify target at all
     ariel_body = _location_body(nginx_conf, "location /u/ariel/")
     assert "auth_request" not in _directives(ariel_body)
     assert "location = /_osprey_auth/ariel" not in nginx_conf
 
-    # Assert — the cookie strip survives the exemption
-    assert 'proxy_set_header Cookie "";' in ariel_body
+    # Assert — the exemption drops both halves: no operator secret is injected
+    # (there is no authorized request here to vouch for), and the cookie is NOT
+    # stripped (the app's own session cookie is the gate now and must reach it).
+    assert "include /etc/nginx/osprey/secret-ariel.conf;" not in ariel_body
+    assert 'proxy_set_header Cookie "";' not in ariel_body
 
 
 def test_seam_login_exemption_is_fail_closed_against_typos() -> None:
@@ -235,7 +255,8 @@ def test_seam_auth_target_asks_the_sidecar_about_a_render_time_username() -> Non
     # Assert
     for user in users:
         body = _location_body(nginx_conf, f"location = /_osprey_auth/{user}")
-        assert f"proxy_pass http://127.0.0.1:9070/verify?user={user};" in body
+        auth_port = default_port("auth")
+        assert f"proxy_pass http://127.0.0.1:{auth_port}/verify?user={user};" in body
         assert "proxy_pass_request_body off;" in body
         assert 'proxy_set_header Content-Length "";' in body
         assert "proxy_connect_timeout 2s;" in body
@@ -243,7 +264,14 @@ def test_seam_auth_target_asks_the_sidecar_about_a_render_time_username() -> Non
 
     # The identity is never reconstructed from client-controlled input — the two
     # places a crafted URL could otherwise smuggle a different username in.
-    assert "$request_uri" not in directives
+    # Scoped to the auth surface: `$request_uri` does appear at http level, as
+    # the SOURCE of the access log's path map — where it is trimmed at the first
+    # `?` and written to a log, never used to authorize anything.
+    auth_surface = directives
+    log_map_start = auth_surface.index("map $request_uri $osprey_log_path {")
+    log_map_end = auth_surface.index("}", log_map_start) + 1
+    auth_surface = auth_surface[:log_map_start] + auth_surface[log_map_end:]
+    assert "$request_uri" not in auth_surface
     assert "X-Original-URI" not in directives
     # `/verify` is reachable only through the internal targets: it is not a
     # location of its own and is not exposed under the public `/auth/` prefix.
@@ -294,7 +322,7 @@ def test_seam_auth_redirects_stay_on_the_clients_own_origin() -> None:
     Left at nginx's default, a relative Location becomes an absolute URL built
     from `$host` plus nginx's OWN listening port: a browser on
     `https://facility/u/alice` behind a facility TLS terminator would be walked
-    to `http://facility:9080/u/alice/`. It is gated on auth being on, so the
+    to `http://facility:10000/u/alice/`. It is gated on auth being on, so the
     `method: none` render must not carry it at all.
     """
     # Act
@@ -413,6 +441,43 @@ def test_seam_tls_enabled_with_both_cert_and_key_emits_ssl_listen_and_paths() ->
     assert "ssl_certificate /etc/nginx/certs/dls.crt;" in content
     assert "ssl_certificate_key /etc/nginx/certs/dls.key;" in content
     assert "location = / {" in content
+
+
+def test_seam_tls_on_a_non_default_port_moves_the_whole_encrypted_seam() -> None:
+    """SEAM 2 (the seam survives a rootless listener): `tls.port` must move the
+    two `listen ... ssl` lines AND the cleartext server's redirect target
+    together.
+
+    Each half alone reopens the seam it was built to close. Listeners moved
+    without the redirect leave the front door bouncing every client to 443,
+    where this deployment listens on nothing — so the only reachable surface is
+    the cleartext one. A redirect moved without the listeners points at a port
+    nginx never binds. The encrypted server stays the sole content server either
+    way: the plain port keeps carrying nothing but the 301.
+    """
+    # Arrange
+    config = _auth_config(tls=True)
+    config["modules"]["web_terminals"]["tls"]["port"] = _ALT_TLS_PORT
+    users = config["modules"]["web_terminals"]["users"]
+
+    # Act
+    redirect, content = _server_blocks(_render_nginx(config))
+
+    # Assert — both listeners follow the configured port, and 443 is gone
+    assert f"listen {_ALT_TLS_PORT} ssl;" in content
+    assert f"listen [::]:{_ALT_TLS_PORT} ssl;" in content
+    assert "listen 443 ssl;" not in content
+    assert "listen [::]:443 ssl;" not in content
+
+    # Assert — the redirect names the port the content server is actually on
+    assert f"return 301 https://$host:{_ALT_TLS_PORT}$request_uri;" in redirect
+    assert "return 301 https://$host$request_uri;" not in redirect
+
+    # Assert — the split itself is unchanged: cleartext redirects, TLS serves
+    assert "location" not in redirect
+    assert _directives(content).count("auth_request ") == len(users)
+    assert "ssl_certificate /etc/nginx/certs/dls.crt;" in content
+    assert "ssl_certificate_key /etc/nginx/certs/dls.key;" in content
 
 
 def _nginx_volumes(config: dict) -> list[str]:

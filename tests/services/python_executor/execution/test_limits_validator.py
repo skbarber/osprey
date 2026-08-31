@@ -312,25 +312,25 @@ class TestLimitsValidator:
         error_msg = str(exc_info.value)
         assert "Failed to load channel limits database" in error_msg
 
-    def test_load_database_skips_invalid_entries(self, tmp_path):
-        """Test that database loader skips entries with invalid config."""
+    def test_load_database_fails_closed_on_an_invalid_entry(self, tmp_path):
+        """One bad entry fails the whole load, naming the channel.
+
+        Skipping the entry used to drop the channel from the database, which
+        with ``allow_unlisted_channels`` then waved its writes through with no
+        limits at all. The load now raises instead.
+        """
         db_file = tmp_path / "test_boundaries.json"
         db_content = {
             "VALID:PV": {"min_value": 0.0, "max_value": 100.0},
             "INVALID:PV1": {"min_value": "not_a_number"},  # Invalid type
-            "INVALID:PV2": {"max_step": "also_invalid"},  # Invalid type
             "VALID:PV2": {"writable": False},
         }
         db_file.write_text(json.dumps(db_content))
 
-        db, raw_db = LimitsValidator._load_limits_database(str(db_file))
+        with pytest.raises(ValueError) as exc_info:
+            LimitsValidator._load_limits_database(str(db_file))
 
-        # Should load only valid entries
-        assert len(db) == 2
-        assert "VALID:PV" in db
-        assert "VALID:PV2" in db
-        assert "INVALID:PV1" not in db
-        assert "INVALID:PV2" not in db
+        assert "INVALID:PV1" in str(exc_info.value)
 
     # =========================================================================
     # Configuration Loading Tests
@@ -338,7 +338,12 @@ class TestLimitsValidator:
 
     @patch("osprey.utils.config.get_config_value")
     def test_from_config_disabled(self, mock_get_config):
-        """Test that from_config returns None when disabled."""
+        """Test that from_config returns None when disabled.
+
+        Every key answers ``False``, the ``control_system`` section included: a
+        section that is not a mapping is a deployment that stated no posture, so
+        the answer is still no validator rather than a crash on the shape.
+        """
         mock_get_config.return_value = False
 
         validator = LimitsValidator.from_config()
@@ -350,7 +355,9 @@ class TestLimitsValidator:
         """Test that from_config returns empty validator when no database path."""
 
         def config_side_effect(key, default):
-            if key == "control_system.limits_checking.enabled":
+            if key == "control_system":
+                return {"limits_checking": {"enabled": True, "database_path": None}}
+            elif key == "control_system.limits_checking.enabled":
                 return True
             elif key == "control_system.limits_checking.database_path":
                 return None
@@ -373,7 +380,15 @@ class TestLimitsValidator:
         db_file.write_text(json.dumps(db_content))
 
         def config_side_effect(key, default):
-            if key == "control_system.limits_checking.enabled":
+            if key == "control_system":
+                return {
+                    "limits_checking": {
+                        "enabled": True,
+                        "database_path": str(db_file),
+                        "allow_unlisted_channels": False,
+                    }
+                }
+            elif key == "control_system.limits_checking.enabled":
                 return True
             elif key == "control_system.limits_checking.database_path":
                 return str(db_file)
@@ -402,7 +417,15 @@ class TestLimitsValidator:
         db_file.write_text('{"PV1": {"min_value": 0.0},}')  # Trailing comma
 
         def config_side_effect(key, default):
-            if key == "control_system.limits_checking.enabled":
+            if key == "control_system":
+                return {
+                    "limits_checking": {
+                        "enabled": True,
+                        "database_path": str(db_file),
+                        "allow_unlisted_channels": False,
+                    }
+                }
+            elif key == "control_system.limits_checking.enabled":
                 return True
             elif key == "control_system.limits_checking.database_path":
                 return str(db_file)
@@ -423,7 +446,14 @@ class TestLimitsValidator:
         (same contract as the invalid-JSON case above)."""
 
         def config_side_effect(key, default):
-            if key == "control_system.limits_checking.enabled":
+            if key == "control_system":
+                return {
+                    "limits_checking": {
+                        "enabled": True,
+                        "database_path": "/nonexistent/path/to/limits.json",
+                    }
+                }
+            elif key == "control_system.limits_checking.enabled":
                 return True
             elif key == "control_system.limits_checking.database_path":
                 return "/nonexistent/path/to/limits.json"
@@ -466,7 +496,15 @@ class TestLimitsValidator:
         bogus_project_root = tmp_path / "host_build_path_does_not_exist"
 
         def config_side_effect(key, default):
-            if key == "control_system.limits_checking.enabled":
+            if key == "control_system":
+                return {
+                    "limits_checking": {
+                        "enabled": True,
+                        "database_path": "data/channel_limits.json",
+                        "allow_unlisted_channels": False,
+                    }
+                }
+            elif key == "control_system.limits_checking.enabled":
                 return True
             elif key == "control_system.limits_checking.database_path":
                 return "data/channel_limits.json"
@@ -498,7 +536,15 @@ class TestLimitsValidator:
         db_file.write_text(json.dumps({"TEST:PV": {"min_value": 0.0, "max_value": 100.0}}))
 
         def config_side_effect(key, default):
-            if key == "control_system.limits_checking.enabled":
+            if key == "control_system":
+                return {
+                    "limits_checking": {
+                        "enabled": True,
+                        "database_path": "data/channel_limits.json",
+                        "allow_unlisted_channels": False,
+                    }
+                }
+            elif key == "control_system.limits_checking.enabled":
                 return True
             elif key == "control_system.limits_checking.database_path":
                 return "data/channel_limits.json"

@@ -55,7 +55,7 @@ services:
         "--host",
         "0.0.0.0",
         "--port",
-        "8090",
+        "10080",
       ]
     labels:
       osprey.project.name: "golden-project"
@@ -72,7 +72,7 @@ services:
       osprey.config.digest: "${OSPREY_CONFIG_DIGEST:-}"
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8090:8090"
+      - "127.0.0.1:10080:10080"
     environment:
       # No :-default — an unset token must stay EMPTY so the bridge's
       # POST /runs/{id}/launch route fails closed (HTTP 503) rather than
@@ -175,7 +175,7 @@ services:
       # holds the proxy's secret certificate plus a `clients/` directory of the
       # publisher public keys it will accept — and never the publisher's
       # secret, which lives only in the queueserver's own mount.
-      - ./data/bluesky_curve/bridge:/app/curve:ro
+      - ./data/.runtime/bluesky_curve/bridge:/app/curve:ro
 
 
     networks:
@@ -184,7 +184,7 @@ services:
       - osprey-network
       - bluesky-internal
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8090/health').status==200 else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:10080/health').status==200 else 1)\""]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -284,8 +284,9 @@ services:
     environment:
       # Same CONFIG_FILE convention as the bridge: the per-put reference
       # monitor now runs in THIS container (the RunEngine lives here), so it
-      # reads control_system.type / writes_enabled / limits_checking from the
-      # mounted config.yml, not from the image's WORKDIR.
+      # reads control_system.type / writes_enabled / limits_checking /
+      # connector.<type>.limits_checking from the mounted config.yml, not
+      # from the image's WORKDIR.
       CONFIG_FILE: /app/project/config.yml
       TZ: UTC
       # ── queue control plane (server side) ────────────────────────────────
@@ -327,14 +328,7 @@ services:
       BLUESKY_ZMQ_PUBLISH_ADDR: "tcp://bluesky-bridge:5567"
       BLUESKY_ZMQ_CURVE_SECRET_KEY: /app/curve/publisher.key_secret
       BLUESKY_ZMQ_CURVE_SERVER_PUBLIC_KEY: /app/curve/proxy.key
-      # Substrate wiring for the devices the startup module builds. Unlike the
-      # bridge's copy above this is NOT gated on the VA being co-deployed: a
-      # facility pointing at real EPICS has no VA container but still needs
-      # its substrate. The `:-` empty defaults keep an unset substrate
-      # harmless — the module then yields an empty namespace (browse-only).
-      BLUESKY_EPICS_SUBSTRATE: "${BLUESKY_EPICS_SUBSTRATE:-}"
-      BLUESKY_EPICS_SETPOINTS: "${BLUESKY_EPICS_SETPOINTS:-}"
-      BLUESKY_EPICS_READBACKS: "${BLUESKY_EPICS_READBACKS:-}"
+
 
 
 
@@ -351,8 +345,11 @@ services:
       # Split per container by directory rather than by file so each side can
       # only read the secret it is supposed to hold: this one carries the
       # publisher's secret certificate and the bridge proxy's PUBLIC one, and
-      # never the proxy's secret. Same ./data/ convention as the limits DB.
-      - ./data/bluesky_curve/queueserver:/app/curve:ro
+      # never the proxy's secret. Minted by `osprey up` itself, so it lives
+      # under data/.runtime/ — the runtime-output subpath the build-drift
+      # fingerprint reserves for exactly this material (#716).
+      - ./data/.runtime/bluesky_curve/queueserver:/app/curve:ro
+
 
 
     networks:

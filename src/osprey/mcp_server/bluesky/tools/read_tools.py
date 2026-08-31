@@ -1,7 +1,7 @@
 """MCP tools: read/allow-listed Bluesky bridge operations.
 
 Each tool is a thin HTTP client of one endpoint of the facility-side Bluesky
-bridge. All six are safe to call without operator approval
+bridge. All seven are safe to call without operator approval
 (``permissions_allow``) — none of them can start motion; ``queue_start`` is
 the sole path by which execution begins.
 
@@ -14,6 +14,7 @@ list_devices               GET  /devices
 list_runs                   GET  /runs
 get_run_data               GET  /runs/{id}/data
 get_run_figure             GET  /runs/{id}/figure
+get_plan_source            GET  /plans/{name}/source
 ==========================  =================================================
 
 The HTTP primitive (``_http_get_json``) and the
@@ -33,6 +34,7 @@ the "Figure projection" section at the bottom of this file.
 
 import json
 from collections.abc import Sequence
+from urllib.parse import quote, urlencode
 
 import anyio
 from pydantic import ValidationError
@@ -146,8 +148,8 @@ async def list_plans() -> str:
 # Tool 4: list devices
 # ---------------------------------------------------------------------------
 @mcp.tool()
-async def list_devices() -> str:
-    """List the device names this deployment's plans accept.
+async def list_devices(prefix: str = "", limit: int | None = None, offset: int = 0) -> str:
+    """List the device names this deployment's plans accept, one page at a time.
 
     Plan parameters carry devices as strings, and this is the set those strings
     must come from — a name that is not here is not a device the worker has,
@@ -157,18 +159,76 @@ async def list_devices() -> str:
     whose declared role matches how it is meant to be used. Read this before
     staging any device name into the draft; never invent or guess one.
 
+    One page comes back per call, alongside ``total`` — how many names matched
+    before the page was cut — so "that is all of them" is always
+    distinguishable from "there is more". A facility-scale namespace is far
+    larger than one page: when a specific device is wanted, ``prefix`` is the
+    way to reach it, not paging to the end.
+
+    Args:
+        prefix: Return only names starting with this, matched literally and
+            CASE-SENSITIVELY, exactly as the worker spells them. Empty (the
+            default) returns every name.
+        limit: Maximum entries in this page. ``None`` (the default) asks for
+            the bridge's full page size. Values outside 1..page-size are
+            clamped by the bridge, never rejected.
+        offset: Index into the matching names to start this page at, counted
+            from 0. Clamped up to at least 0, likewise never rejected.
+
     Returns:
-        JSON ``{"status": "success", "devices": [...]}``, each entry
-        ``{"name"}`` plus whichever of ``is_movable``/``is_readable``/
-        ``is_flyable`` the worker reported — ``is_movable`` marks a device that
-        can be driven as a setpoint, ``is_readable`` one that can be read as a
-        readback. A missing flag means the worker did not say, not "no".
-        An empty list means this deployment's worker built no devices at all.
+        JSON ``{"status": "success", "devices": [...], "total", "offset",
+        "limit"}``. Each entry is ``{"name"}`` plus whichever of
+        ``is_movable``/``is_readable``/``is_flyable`` the worker reported —
+        ``is_movable`` marks a device that can be driven as a setpoint,
+        ``is_readable`` one that can be read as a readback. A missing flag
+        means the worker did not say, not "no".
+
+        ``total`` counts the matches before the page cut; ``offset`` and
+        ``limit`` are the EFFECTIVE values the bridge used after clamping, not
+        necessarily the ones asked for. A ``"note"`` appears whenever this page
+        holds fewer than ``total`` entries, saying how many are missing and how
+        to reach them — relay that rather than describing the page as the whole
+        set. ``devices: []`` with ``total: 0`` means nothing matched: for an
+        empty ``prefix`` the worker built no devices at all, and otherwise no
+        name starts with it (check the spelling and the case).
     """
-    status, body = await anyio.to_thread.run_sync(_http_get_json, "/devices")
+    params: dict[str, str | int] = {}
+    if prefix:
+        params["prefix"] = prefix
+    if limit is not None:
+        params["limit"] = limit
+    if offset:
+        params["offset"] = offset
+    path = "/devices" + (f"?{urlencode(params)}" if params else "")
+    status, body = await anyio.to_thread.run_sync(_http_get_json, path)
     if status != 200:
         return make_error("bluesky_bridge_error", bridge_error_message(body, status))
-    return json.dumps({"status": "success", "devices": body})
+    # The route clamps; this tool reports what came back rather than what was
+    # asked for, so `offset`/`limit` below are the bridge's effective values.
+    devices = body["devices"]
+    total = body["total"]
+    effective_offset = body["offset"]
+    result = {
+        "status": "success",
+        "devices": devices,
+        "total": total,
+        "offset": effective_offset,
+        "limit": body["limit"],
+    }
+    if len(devices) < total:
+        if effective_offset >= total:
+            result["note"] = (
+                f"This page is empty because offset {effective_offset} is past the end of "
+                f"the namespace, which holds {total} matching devices — read again from a "
+                "lower offset."
+            )
+        else:
+            result["note"] = (
+                f"{total - effective_offset - len(devices)} of the {total} matching devices "
+                "are not on this page — narrow the search with prefix, or read the next page "
+                "with offset."
+            )
+    return json.dumps(result)
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +471,85 @@ async def get_run_figure(run_id: str) -> str:
             ],
         )
     return json.dumps(projected)
+
+
+# ---------------------------------------------------------------------------
+# Tool 8: get plan source
+# ---------------------------------------------------------------------------
+
+# The bridge's own bounds on ``max_chars`` (see ``_SOURCE_TRUNCATE_CHARS`` /
+# ``_SOURCE_TRUNCATE_CHARS_MAX`` in ``services.bluesky_bridge.app``). Mirrored
+# here so this tool clamps an out-of-range ask instead of letting the route
+# answer it with a 422 the agent can do nothing useful with.
+_SOURCE_DEFAULT_MAX_CHARS = 4000
+_SOURCE_MIN_MAX_CHARS = 1
+_SOURCE_MAX_MAX_CHARS = 200_000
+
+
+@mcp.tool()
+async def get_plan_source(name: str, max_chars: int = _SOURCE_DEFAULT_MAX_CHARS) -> str:
+    """Read one plan's source text as it sits on disk.
+
+    This is the plan as written, not a description of it: read it when the
+    question is what a plan does step by step, which channels it touches, or
+    whether it matches what was asked for. list_plans is where a plan is
+    chosen; this is where the choice is checked. Reading source starts
+    nothing — execution begins only at queue_start, after a human reviews the
+    draft in the plan panel.
+
+    Args:
+        name: Plan name exactly as list_plans reports it.
+        max_chars: Maximum characters of source text to return. Clamped into
+            [1, 200000] before the request, so an over-large ask comes back
+            truncated rather than refused.
+
+    Returns:
+        JSON ``{"name", "source", "provenance", "validated", "truncated"}``.
+        ``source`` is the first ``max_chars`` characters of the file;
+        ``truncated`` is true when the file is longer than that, in which case
+        never describe the plan's ending — ask again with a larger
+        ``max_chars``, up to the 200000 ceiling. If the ask was already
+        200000, the rest of the file is not retrievable through this tool and
+        must not be described at all. ``provenance`` is the directory layer
+        the bridge's own source scan found the file in (``shipped``/
+        ``preset``/``facility``/``session``), never something the file
+        declares about itself. That scan runs in ascending trust order and
+        stops at the first match, so for a name declared in more than one
+        layer both ``source`` and ``provenance`` describe the LOWEST-trust
+        layer declaring it — which need not be the file the loader would run.
+        Treat a plan name you know to be declared in several layers as
+        ambiguous here rather than authoritative. ``validated`` is a fresh
+        check for a session-tier plan —
+        recomputed from the file's current content, so a re-authored file
+        reads false until it passes again — and is true by construction for
+        the operator-trusted shipped/preset/facility tiers.
+
+    Refusals:
+        - plan_source_unavailable: the bridge located no source file for this
+          name. That means EITHER the name is not a registered plan, OR it is
+          a plan supplied through the legacy ``bluesky.plan_module`` contract,
+          whose plans list_plans reports but whose source this endpoint's
+          layer scan does not reach. So a 404 here is not proof the plan does
+          not exist: check list_plans before telling anyone the name is wrong.
+    """
+    bounded = max(_SOURCE_MIN_MAX_CHARS, min(int(max_chars), _SOURCE_MAX_MAX_CHARS))
+    path = f"/plans/{quote(name, safe='')}/source?max_chars={bounded}"
+    status, body = await anyio.to_thread.run_sync(_http_get_json, path)
+    if status == 404:
+        return make_error(
+            "plan_source_unavailable",
+            f"The bridge has no source file for plan {name!r}: "
+            f"{bridge_error_message(body, status)}",
+            [
+                "Confirm the name against list_plans — it must match exactly.",
+                "A plan supplied through the legacy bluesky.plan_module config key appears "
+                "in list_plans but has no source file this endpoint can reach, so it 404s "
+                "here even though the plan is real and runnable.",
+            ],
+        )
+    if status != 200:
+        return make_error("bluesky_bridge_error", bridge_error_message(body, status))
+    return json.dumps(body)
 
 
 # ---------------------------------------------------------------------------

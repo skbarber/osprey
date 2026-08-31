@@ -33,11 +33,12 @@ import click
 from osprey.errors import BuildProfileError
 from osprey.utils.logger import get_logger
 
-from .output import report
+from .output import report, section
 from .profile_conventions import (
     BUILD_OUTPUT_DIR,
     CONTEXT_BASELINE_FILENAME,
     PER_USER_CONTEXT_DIRNAME,
+    context_baseline_slot,
 )
 
 if TYPE_CHECKING:
@@ -76,6 +77,20 @@ def presets() -> None:
     Every name printed here is usable as 'osprey init --preset NAME'.
     """
     echo_preset_names()
+
+
+@profile.command()
+def artifacts() -> None:
+    """List every artifact the six profile lists can name.
+
+    One section per list key (hooks, rules, skills, agents, output_styles,
+    web_panels), each entry with a one-line description. The same menu
+    appears as commented entries in an emitted profile.yml.
+    """
+    from .build_profile_emit import artifact_menu_catalog
+
+    for kind, entries in artifact_menu_catalog().items():
+        section(kind, list(entries))
 
 
 @profile.command()
@@ -297,6 +312,23 @@ def _roster_user_names(config: Mapping[str, Any]) -> list[str]:
     from .build_profile_emit import effective_web_terminals
 
     return roster_user_names(effective_web_terminals(config))
+
+
+def _stands_up_a_web_tier(config: Mapping[str, Any]) -> bool:
+    """Whether the profile switches the web-terminal module on.
+
+    An empty roster covers two cases the seeding has to tell apart: a profile
+    with no web-terminal module at all, which has no context convention to
+    seed, and one whose module is on but names no users yet, which does — its
+    shared baseline is roster-independent, so it belongs in the profile whether
+    or not anyone is on the roster. The subtree is read through the same fold
+    :func:`_roster_user_names` uses, on the same "not switched on means no web
+    tier" rule as
+    :func:`~osprey.deployment.web_terminals.personas.roster_user_names`.
+    """
+    from .build_profile_emit import effective_web_terminals
+
+    return bool(effective_web_terminals(config).get("enabled"))
 
 
 # The two config paths a profile names a provider at. `claude_code.provider`
@@ -645,6 +677,82 @@ def _off_chain_problem(persona_name: str, persona_preset: str, host_preset: str)
     )
 
 
+def _privileged_persona_problems(
+    config: Mapping[str, Any],
+    privileges: Mapping[str, tuple[str, ...]],
+    absolute_privileges: Mapping[str, tuple[str, ...]],
+) -> list[str]:
+    """Why this profile's roster must not deploy as written, from the tiers it names.
+
+    The build-time half of the deployment-editing guard, run where the persona
+    presets have just been resolved and their privileges are therefore known
+    exactly (see
+    :func:`~osprey.deployment.web_terminals.personas.persona_privileges`). Two
+    rules, both owned by that module so the lint belt behind this reports the
+    same thing in the same words:
+
+    * ``default_persona`` must not be a privileged tier — it is what every entry
+      that names no tier inherits;
+    * no entry served without a login may resolve to one.
+
+    **The two rules read two different maps**, and handing one map to both is
+    what left this surface exempt on a floorless host preset: every persona
+    there sits at the baseline, so the relative map is empty for all of them and
+    the login rule had nothing to report about a terminal holding everything.
+    See
+    :func:`~osprey.deployment.web_terminals.personas.privileges_beyond_baseline`
+    for why the ``default_persona`` rule keeps the relative reading.
+
+    Args:
+        config: The host profile's ``config:`` block, from which the roster and
+            the ``auth`` stanza are folded out — and the baseline both the
+            relative map and the remedy are measured against.
+        privileges: Persona name → what it holds BEYOND that baseline, for the
+            personas whose presets resolved. A persona absent from this mapping
+            contributes nothing — its entry already failed to resolve and is
+            reported as such.
+        absolute_privileges: Persona name → what it holds outright, same
+            personas. What the login rule is judged on.
+
+    Returns:
+        One message per problem, ``default_persona`` first, then roster order.
+    """
+    from osprey.deployment.web_terminals.personas import (
+        persona_privileges,
+        privileged_default_persona_problem,
+        resolve_personas,
+        unauthenticated_privileged_terminal_problems,
+    )
+
+    from .build_profile_emit import effective_web_terminals
+
+    web_terminals = effective_web_terminals(config)
+    problems: list[str] = []
+    default_persona = web_terminals.get("default_persona")
+    default_problem = privileged_default_persona_problem(
+        default_persona,
+        privileges.get(default_persona, ()) if isinstance(default_persona, str) else (),
+    )
+    if default_problem is not None:
+        problems.append(default_problem)
+
+    # Lenient resolution: an entry naming a persona that is not in the catalog
+    # is a different mistake, reported by the deploy lint that owns it, and
+    # raising here would replace that report with a worse one.
+    resolved = resolve_personas(web_terminals, {}, "", strict=False)
+    problems.extend(
+        unauthenticated_privileged_terminal_problems(
+            resolved,
+            absolute_privileges,
+            # The host profile's own posture, which decides which remedy is
+            # honest: a profile that floors nothing has no unprivileged tier to
+            # point the entry at, so it is told how to create one instead.
+            baseline_privileges=persona_privileges(config),
+        )
+    )
+    return problems
+
+
 def _persona_profile_texts(
     resolved: BuildProfile,
     profile_name: str,
@@ -673,9 +781,22 @@ def _persona_profile_texts(
     ``control-assistant``) is rejected rather than approximated — see
     :func:`_off_chain_problem`.
 
+    One thing beyond emission is decided here, because this is the only moment
+    the resolved persona tiers are all in hand: whether the roster hands
+    deployment editing to a terminal that must not have it (see
+    :func:`_privileged_persona_problems`). Refusing at materialization is what
+    keeps the bad roster from reaching a repo at all.
+
     Raises:
-        click.UsageError: With every unusable catalog entry named at once.
+        click.UsageError: With every unusable catalog entry named at once — or,
+            once they all resolve, with every privileged-terminal problem named
+            at once.
     """
+    from osprey.deployment.web_terminals.personas import (
+        persona_privileges,
+        privileges_beyond_baseline,
+    )
+
     from .build_profile import resolve_build_profile
     from .build_profile_emit import emit_persona_delta_yaml, persona_catalog
     from .build_profile_presets import _normalize_preset_name
@@ -683,6 +804,16 @@ def _persona_profile_texts(
     catalog = persona_catalog(resolved.config)
     texts: dict[str, str] = {}
     problems: list[str] = []
+    # What each persona can edit, recorded as its preset resolves — this is the
+    # one moment the whole composed tier is in hand, and the emitted delta
+    # deliberately drops the `extends:` that produced it. Recorded BOTH ways,
+    # because the two rules in `_privileged_persona_problems` read two different
+    # answers: relative to the host for the inherited `default_persona`,
+    # absolute for the `login: false` key an author typed on purpose. See
+    # `privileges_beyond_baseline`.
+    host_privileges = persona_privileges(resolved.config)
+    privileges: dict[str, tuple[str, ...]] = {}
+    absolute: dict[str, tuple[str, ...]] = {}
     for persona_name in sorted(catalog):
         preset_ref = catalog[persona_name].get("build_profile")
         # `..` needs naming explicitly: `Path("..").name` is `".."`, not the
@@ -726,6 +857,12 @@ def _persona_profile_texts(
         if off_chain is not None:
             problems.append(off_chain)
             continue
+        held = persona_privileges(persona_resolved.config)
+        if held:
+            absolute[persona_name] = held
+        lifted = privileges_beyond_baseline(held, host_privileges)
+        if lifted:
+            privileges[persona_name] = lifted
         texts[persona_name] = emit_persona_delta_yaml(
             preset_name=persona_preset,
             profile_name=f"{profile_name} ({persona_name})",
@@ -738,10 +875,19 @@ def _persona_profile_texts(
             "Cannot materialize the persona profiles this profile's web-terminal "
             "catalog calls for:\n  - " + "\n  - ".join(problems)
         )
+    # Reported only once every entry resolved: a capability verdict drawn from a
+    # catalog half of which did not resolve would name the wrong tiers, and the
+    # failure above is the one the operator has to fix first anyway.
+    privilege_problems = _privileged_persona_problems(resolved.config, privileges, absolute)
+    if privilege_problems:
+        raise click.UsageError(
+            "This profile's web-terminal roster would hand deployment editing to a "
+            "terminal that must not have it:\n  - " + "\n  - ".join(privilege_problems)
+        )
     return texts
 
 
-def _cleanup(target: Path) -> str:
+def _cleanup(target: Path, seeded: tuple[str, ...] = ()) -> str:
     """Remove what a failed materialization wrote, and say what is left.
 
     Only the entries a materialization owns (:data:`MATERIALIZED_SOURCE_ENTRIES`)
@@ -749,19 +895,29 @@ def _cleanup(target: Path) -> str:
     operator's own files — a ``.git``, an ``.env``, a clone's README — and a
     failed run must never cost one of those.
 
+    Args:
+        target: The repo root the failed materialization was writing into.
+        seeded: Write-once directories THIS run created (the ``seed_dirs`` it
+            actually copied — never one it found already there). They are not
+            in :data:`MATERIALIZED_SOURCE_ENTRIES`, because a later ``--force``
+            must leave an operator's own edits inside them alone; but a run that
+            just created one and then failed owns it, so a first init that fails
+            leaves nothing behind.
+
     Returns:
         A sentence for the refusal it is appended to, naming anything that could
         not be removed so the operator knows a retry will refuse too.
     """
     import shutil
 
-    for name in MATERIALIZED_SOURCE_ENTRIES:
+    owned = (*MATERIALIZED_SOURCE_ENTRIES, *seeded)
+    for name in owned:
         entry = target / name
         if entry.is_dir():
             shutil.rmtree(entry, ignore_errors=True)
         else:
             entry.unlink(missing_ok=True)
-    remaining = [name for name in MATERIALIZED_SOURCE_ENTRIES if (target / name).exists()]
+    remaining = [name for name in owned if (target / name).exists()]
     if remaining:
         return (
             f"Partly-written files remain in {target}: {', '.join(remaining)} — "
@@ -781,14 +937,12 @@ def _context_baseline_source(manager: TemplateManager, data_bundle: str) -> Path
     starts byte-identical to what the build would have used anyway, and every
     edit to it from then on is visible in the operator's own repo.
     """
-    bundle = (
+    bundle = context_baseline_slot(
         manager.template_root / "apps" / data_bundle / PER_USER_CONTEXT_DIRNAME
-    ) / CONTEXT_BASELINE_FILENAME
+    )
     if bundle.is_file():
         return bundle
-    return (
-        manager.template_root / "claude_code" / PER_USER_CONTEXT_DIRNAME
-    ) / CONTEXT_BASELINE_FILENAME
+    return context_baseline_slot(manager.template_root / "claude_code" / PER_USER_CONTEXT_DIRNAME)
 
 
 def _packaged_data_source(manager: TemplateManager, data_bundle: str) -> Path:
@@ -839,6 +993,24 @@ class _MaterializedProfile(NamedTuple):
     commented out, so this is normally false on a fresh materialization; it
     decides whether there is anything to render a CI pipeline from."""
 
+    resolved: BuildProfile
+    """The materialized profile, resolved back from the written ``profile.yml``
+    — the same read-back that validates the round-trip, so what the caller
+    summarizes (the composition card) is a fact about what is on disk rather
+    than about what the inputs asked for."""
+
+    persona_deltas: dict[str, Mapping[str, Any]]
+    """The emitted persona deltas, parsed, keyed by persona name — empty for a
+    profile that emits none. The per-persona facts a summary needs (each tier's
+    panels and its write posture) live in these, not in the host profile."""
+
+    seeded: tuple[str, ...]
+    """The write-once directories this materialization seeded — empty on every
+    re-run, because a name already present in the target is left as the operator
+    left it. Returned because only this run knows which of them it created, and
+    that is the difference between a directory the caller may still clear and
+    one that is now the operator's."""
+
 
 def _materialize_profile_directory(
     target_dir: Path,
@@ -847,6 +1019,7 @@ def _materialize_profile_directory(
     set_pairs: tuple[str, ...] = (),
     *,
     profile_name: str | None = None,
+    seed_dirs: Mapping[str, str] | None = None,
 ) -> _MaterializedProfile:
     """Materialize an editable, standalone profile directory from ``preset_name``.
 
@@ -874,6 +1047,14 @@ def _materialize_profile_directory(
         profile_name: Display name for the emitted profile. Defaults to one
             derived from the repo directory's own name. ``--set name=`` wins
             over both.
+        seed_dirs: Write-once directories to copy out of the bundle, mapping a
+            profile-root directory name to the bundle-relative tree it comes
+            from (e.g. ``{"mcp_servers": "mcp_servers"}``). Each is copied only
+            when the bundle ships it and the target does not already have it, so
+            the copy happens on a repo's first init and never again — which is
+            why these are NOT in :data:`MATERIALIZED_SOURCE_ENTRIES`: a later
+            ``--force`` re-materialization must not delete servers an operator
+            has since written.
 
     Returns:
         What was written, for the caller's summary (:class:`_MaterializedProfile`).
@@ -980,6 +1161,10 @@ def _materialize_profile_directory(
     # settled by the caller, which also owns what to clear if this fails.
     target.mkdir(parents=True, exist_ok=True)
 
+    # Bound before the try so both failure arms can hand it to `_cleanup`: the
+    # seeds this run created are the only ones it is allowed to remove.
+    seeded: list[str] = []
+
     try:
         # Verbatim copy (D1/FR2): staging subdirectories and any stray `.j2`
         # come across byte-identical — a profile data tree is content, never
@@ -1023,19 +1208,25 @@ def _materialize_profile_directory(
             user_dir = target / _CONTEXT_CONVENTION_DIRNAME / user
             user_dir.mkdir(parents=True, exist_ok=True)
             (user_dir / ".gitkeep").touch()
-        if roster:
+        if _stands_up_a_web_tier(resolved.config):
             # The shared baseline, beside the slots — the one seeded entry that
             # carries content, because it IS content the deployment ships: the
             # build copies this file over the framework's fallback, so the text
             # every seeded user starts from lives in the operator's repo where
-            # they can read and edit it.
+            # they can read and edit it. Seeded on the module rather than the
+            # roster, because the copy side is roster-independent too
+            # (plan_convention_copies): a profile that names no users yet still
+            # starts from text it can see.
+            context_dir = target / _CONTEXT_CONVENTION_DIRNAME
+            context_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(
                 _context_baseline_source(manager, resolved.data_bundle),
-                target / _CONTEXT_CONVENTION_DIRNAME / CONTEXT_BASELINE_FILENAME,
+                context_baseline_slot(context_dir),
             )
             logger.debug(
                 "  Per-user context: %s (+ shared %s)",
-                ", ".join(f"{_CONTEXT_CONVENTION_DIRNAME}/{user}/" for user in roster),
+                ", ".join(f"{_CONTEXT_CONVENTION_DIRNAME}/{user}/" for user in roster)
+                or "no roster yet",
                 CONTEXT_BASELINE_FILENAME,
             )
 
@@ -1051,6 +1242,27 @@ def _materialize_profile_directory(
                 "  Persona deltas: %s",
                 ", ".join(f"{_PERSONA_PROFILE_DIRNAME}/{name}.yml" for name in persona_texts),
             )
+        # Write-once seeds, outside the web-tier branch because they
+        # are not a web-tier fact: a directory the deployment OWNS from its first
+        # init — an operator's MCP servers, say — copied out of the bundle once
+        # and never replaced. An existing one is left exactly as the operator
+        # left it, and nothing is written when the bundle ships no such tree, so
+        # a bundle gaining or losing one changes only what a fresh init seeds.
+        # `__pycache__` and its byte-code are dropped so the seed from a source
+        # checkout is byte-identical to the seed from a wheel.
+        for name, src_rel in (seed_dirs or {}).items():
+            src = Path(manager.template_root) / "apps" / resolved.data_bundle / src_rel
+            if src.is_dir() and not (target / name).exists():
+                # Recorded BEFORE the copy starts, so a copy that dies half-way
+                # still leaves `_cleanup` a name to remove.
+                seeded.append(name)
+                shutil.copytree(
+                    src,
+                    target / name,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.py[co]"),
+                )
+        if seeded:
+            logger.debug("  Seeded: %s", ", ".join(f"{name}/" for name in seeded))
 
         # The round-trip runs last because it validates `data:` against the tree
         # that must already be on disk. Only the host profile is resolved: a
@@ -1071,11 +1283,11 @@ def _materialize_profile_directory(
             if (overrides or set_pairs)
             else "The materialized profile does not validate"
         )
-        raise click.UsageError(f"{blame}: {e}\n{_cleanup(target)}") from e
+        raise click.UsageError(f"{blame}: {e}\n{_cleanup(target, seeded=tuple(seeded))}") from e
     except Exception:
         # Any other failure (a copy error, a full disk) must not leave a
         # half-materialized directory that looks buildable.
-        _cleanup(target)
+        _cleanup(target, seeded=tuple(seeded))
         raise
 
     logger.debug("Wrote profile directory: %s", target)
@@ -1084,4 +1296,7 @@ def _materialize_profile_directory(
         shell_keys.skipped,
         profile_name_default,
         written.deploy is not None,
+        written,
+        persona_deltas,
+        tuple(seeded),
     )

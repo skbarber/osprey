@@ -35,8 +35,10 @@ from .build_profile_document import _normalize_profile_aliases, _read_profile_do
 from .build_profile_load import (
     CONNECTOR_CONFIG_KEY,
     CONNECTOR_PROFILE_KEY,
+    PORT_BASE_PROFILE_KEY,
     LoadedProfile,
     _apply_connector_shorthand,
+    _apply_port_base_shorthand,
     _parse_profile,
 )
 from .build_profile_merge import _deep_merge, _resolve_extends, resolve_profile_document
@@ -107,7 +109,11 @@ MODEL_SELECTION_OVERRIDE_KEYS = ("provider", "model", "channel_finder_mode")
 # in the same sense: which control system a project talks to is a property of
 # the deployment, not of one persona, so it belongs in profile.yml where every
 # persona delta inherits it rather than in any one persona's own file.
-SHORTHAND_OVERRIDE_KEYS = (*MODEL_SELECTION_OVERRIDE_KEYS, CONNECTOR_PROFILE_KEY)
+SHORTHAND_OVERRIDE_KEYS = (
+    *MODEL_SELECTION_OVERRIDE_KEYS,
+    CONNECTOR_PROFILE_KEY,
+    PORT_BASE_PROFILE_KEY,
+)
 
 
 def explicit_model_override_keys(set_pairs: tuple[str, ...]) -> list[str]:
@@ -338,7 +344,7 @@ def merge_cli_overrides(
     _reject_connector_type_conflict(cli_layers)
     if set_config_paths is not None:
         set_config_paths.extend(_set_config_paths(set_pairs))
-    return _apply_connector_shorthand(raw)
+    return _apply_port_base_shorthand(_apply_connector_shorthand(raw))
 
 
 def resolve_build_profile(
@@ -466,6 +472,36 @@ def resolve_build_document(
         is_persona_delta=is_persona_delta,
         excluded_artifacts=excluded_artifacts,
     )
+
+
+def preset_authored_config(preset: str) -> dict[str, Any]:
+    """The ``config:`` block a bundled preset writes DOWN ITSELF.
+
+    The counterpart of what :func:`resolve_build_document` returns for the same
+    preset: this is the layer read straight off the preset file, before
+    ``extends`` folds its parents in, so a key here is one the preset's own
+    author typed rather than one it inherits.
+
+    A build never wants this — it wants the resolved answer, which is the only
+    thing that describes what will be deployed. A *guard* sometimes does: the
+    difference between "this file says read-only" and "this file resolves to
+    read-only" is the whole question a check about accidental inheritance asks,
+    and it cannot be recovered from the merged document.
+
+    Args:
+        preset: A bundled preset name, in either spelling
+            (``control-assistant`` / ``control_assistant``).
+
+    Returns:
+        The preset's own ``config:`` mapping, empty when it declares none.
+        Dotted keys, nested blocks, or both — exactly as written.
+
+    Raises:
+        BuildProfileError: If the preset is unknown or is not a YAML mapping.
+    """
+    raw, _base_anchor = _load_preset_raw(preset)
+    config = raw.get("config")
+    return config if isinstance(config, dict) else {}
 
 
 # ---------------------------------------------------------------------------

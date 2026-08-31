@@ -1,6 +1,6 @@
 /* OSPREY Web Terminal — Application Entry Point */
 
-import { initTerminal, focusTerminal, getTerminalDimensions, pasteToTerminal, clearStoredSessionId } from './terminal.js';
+import { initTerminal, focusTerminal, getTerminalDimensions, pasteToTerminal, clearStoredSessionId, getCurrentSessionId, getTerminalInstance } from './terminal.js';
 import { onConnectionStateChange, withPrefix } from './api.js';
 import { initPanelManager, broadcastMode, handleUiModeFlip, navigateAndActivatePanel } from './panel-manager.js';
 import '/design-system/js/components/osprey-drawer.js';
@@ -11,11 +11,16 @@ import { initHookDebug } from './hook-debug.js';
 import { initSessionSelector, startNewSession } from './sessions.js';
 import { initCommandPalette } from './palette-boot.js';
 import { getFamily, initTheme, subscribe as subscribeTheme } from '/design-system/js/theme-manager.js';
+import { onModeChange } from '/design-system/js/frame-params.js';
+import '/design-system/js/components/osprey-display-menu.js';
 import { initChat } from './chat.js';
 import { initDockWorkspace, applyDockMode } from './dock-workspace.js';
 import { initHeaderContrib } from './tile-header-contrib.js';
-import { initDisplayMenu } from './display-menu.js';
+import { initIdentityMenu } from './identity-menu.js';
+import { initControlTargetChip } from './control-target-chip.js';
+import { initControlTargetPopover } from './control-target-popover.js';
 import { followThemeFamily, getRailPosition, setRailPosition } from './rail-position.js';
+import { initFeedback } from './feedback-boot.js';
 
 document.addEventListener('DOMContentLoaded', () => {
   initTheme({ role: 'hub' });
@@ -55,9 +60,20 @@ document.addEventListener('DOMContentLoaded', () => {
   initCommandPalette();
   initNewSessionButton();
   initLogoutButton();
-  initModeToggle();
+  initUiModeFollowUps();
   initDisplayMenu();
+  initIdentityMenu();
+  // The control-target chip: which machine this session stands on, and
+  // whether a write there would land. Mounts itself into `.header-actions`
+  // ahead of the palette trigger and stays hidden until the terminal reports
+  // a session, so boot order only needs the static header markup.
+  initControlTargetChip();
+  // Its popover — the roster and every gesture that changes where this session
+  // writes. Mounts under the chip's own positioning context, so it has to
+  // follow the chip's init and no-ops on a page that renders no chip.
+  initControlTargetPopover();
   initRailPosition();
+  initFeedbackDialog();
   initDrawerTriggerHighlight();
   initSettings();
   initMemoryGallery();
@@ -88,8 +104,11 @@ function initNewSessionButton() {
 /* ---- Logout Button ---- */
 
 /**
- * Only present in the DOM when the server rendered a non-empty `landing_url`
- * (multi-user deployments). Plain `osprey web` never emits the button, so
+ * Log out renders in TWO places — `#logout-btn` in the header identity chip's
+ * menu (the copy palette-boot.js's "Log out" command also resolves) and
+ * `#display-menu-logout-btn` in the display menu's action row — and both are
+ * only present in the DOM when the server rendered a non-empty `landing_url`
+ * (multi-user deployments). Plain `osprey web` never emits either button, so
  * this is a no-op there.
  *
  * Real logout, in order: (1) POST the server logout route — prefix-aware via
@@ -103,8 +122,8 @@ function initNewSessionButton() {
  * and navigates — the client's own record of "my session" is what matters
  * for this browser, and getting stuck on the page helps no one.
  *
- * The click handler locks the button (`disabled` + `aria-busy`) once a safe
- * logout is under way: `disabled` stops a second POST, and `aria-busy`
+ * The click handler locks the clicked button (`disabled` + `aria-busy`) once
+ * a safe logout is under way: `disabled` stops a second POST, and `aria-busy`
  * announces the in-flight state to assistive tech. Neither is reset — every
  * path out of the handler navigates away, unloading the page. The unsafe
  * `landing_url` guard returns before the lock, leaving the button usable.
@@ -114,28 +133,40 @@ function initNewSessionButton() {
  * that event has already passed, e.g. in a test environment.
  */
 export function initLogoutButton() {
-  const btn = /** @type {HTMLButtonElement} */ (document.getElementById('logout-btn'));
-  if (!btn) return;
+  for (const id of ['logout-btn', 'display-menu-logout-btn']) {
+    const btn = /** @type {HTMLButtonElement|null} */ (document.getElementById(id));
+    if (!btn) continue;
 
-  const landingUrl = btn.dataset.landingUrl;
-  if (!landingUrl) return;
+    const landingUrl = btn.dataset.landingUrl;
+    if (!landingUrl) continue;
 
-  btn.addEventListener('click', async () => {
-    if (!isSafeLandingUrl(landingUrl)) {
-      console.error('Refusing to navigate to unsafe landing_url:', landingUrl);
-      return;
-    }
-    btn.disabled = true;
-    btn.setAttribute('aria-busy', 'true');
-    try {
-      await fetch(withPrefix('/api/terminal/logout'), { method: 'POST' });
-    } catch (err) {
-      console.error('Logout request failed:', err);
-    }
-    await endAuthSession();
-    clearStoredSessionId();
-    window.location.assign(landingUrl);
-  });
+    btn.addEventListener('click', () => handleLogoutClick(btn, landingUrl));
+  }
+}
+
+/**
+ * The shared click flow behind both logout buttons; `btn` is the copy that
+ * was clicked, so the in-flight lock lands on the control the operator is
+ * looking at.
+ *
+ * @param {HTMLButtonElement} btn
+ * @param {string} landingUrl
+ */
+async function handleLogoutClick(btn, landingUrl) {
+  if (!isSafeLandingUrl(landingUrl)) {
+    console.error('Refusing to navigate to unsafe landing_url:', landingUrl);
+    return;
+  }
+  btn.disabled = true;
+  btn.setAttribute('aria-busy', 'true');
+  try {
+    await fetch(withPrefix('/api/terminal/logout'), { method: 'POST' });
+  } catch (err) {
+    console.error('Logout request failed:', err);
+  }
+  await endAuthSession();
+  clearStoredSessionId();
+  window.location.assign(landingUrl);
 }
 
 /**
@@ -197,30 +228,19 @@ async function endAuthSession() {
 /* ---- UI Mode Toggle (Expert / Simple) ---- */
 
 /**
- * Wire the Expert/Simple toggle (the View row inside the header display-menu
- * popover — see display-menu.js). The active segment is styled
- * purely off html[data-ui-mode] (see terminal.css), and mode-boot.js already
- * resolved the initial mode pre-paint; this only handles the runtime flip:
- * swap the attribute, persist the explicit choice, drop a leftover one-shot
- * ?mode= (mirrors theme-manager's _stripQueryTheme), and broadcast to panels.
+ * The hub-only half of an Expert/Simple flip. The View row of the header
+ * `<osprey-display-menu>` owns the pick itself — it persists the choice,
+ * drops a leftover one-shot ?mode=, and posts the same-origin
+ * `osprey-mode-change` message to this window — and frame-params.js's shared
+ * receive side stamps html[data-ui-mode] before handing the mode here. What
+ * follows is what only the hub has to do with it: broadcast to the panels,
+ * then the dock and panel follow-ups. mode-boot.js already resolved the
+ * initial mode pre-paint, so this only ever handles the runtime flip.
  */
-function initModeToggle() {
-  const STORAGE_KEY = 'osprey-ui-mode';
-  const toggle = document.getElementById('mode-toggle');
-  if (!toggle) return;
-
-  toggle.addEventListener('click', (e) => {
-    const target = e.target instanceof Element ? e.target.closest('.mode-segment') : null;
-    if (!(target instanceof HTMLElement)) return;
-    const mode = target.dataset.mode;
-    if (mode !== 'expert' && mode !== 'simple') return;
-
-    document.documentElement.setAttribute('data-ui-mode', mode);
-    try {
-      localStorage.setItem(STORAGE_KEY, mode);
-    } catch { /* storage blocked — mode still applies for this session */ }
-    stripQueryMode();
-    // Panels read the current mode off <html>, so broadcast only after the swap.
+function initUiModeFollowUps() {
+  onModeChange((mode) => {
+    // Panels read the current mode off <html>, so broadcast only after the
+    // swap (onModeChange stamped it before calling back).
     broadcastMode();
     // Dock half of the flip: stash+lock into the simple layout, or reconcile+
     // restore the expert layout. Runs after the CSS/attribute swap so the dock
@@ -231,6 +251,50 @@ function initModeToggle() {
     // after applyDockMode so the activation docks into the target layout.
     handleUiModeFlip(mode);
   });
+}
+
+/**
+ * The hub's glue around the header `<osprey-display-menu>`: its projected
+ * Settings row is the one entry that closes the card, because opening the
+ * drawer moves the operator to another surface. The component leaves
+ * projected children alone by design (the projected Log out must NOT be
+ * closed away — see index.html), so the hub asks for the close itself. The
+ * open itself stays settings.js's: it binds the same `[data-drawer-trigger]`
+ * button behind its first-time warning gate.
+ */
+function initDisplayMenu() {
+  const menu = /** @type {any} */ (document.getElementById('display-menu'));
+  const settings = document.getElementById('display-menu-settings');
+  if (!menu || !settings || typeof menu.closeMenu !== 'function') return;
+  settings.addEventListener('click', () => menu.closeMenu());
+}
+
+/**
+ * Wire the rail's utility cluster (Documentation + Feedback) and the feedback
+ * dialog — see feedback-boot.js, which owns the whole arrangement.
+ *
+ * Returns as soon as the button is live; the deployment's own config arrives
+ * over HTTP afterwards and fills itself in. Guarded like the other
+ * network-dependent inits above, so a failure costs the two rail controls and
+ * nothing more.
+ *
+ * Both terminal dependencies are injected from here rather than imported
+ * inside the dialog: app.js is already the module that knows about the
+ * terminal, and keeping the dependency pointing this way is what lets the
+ * dialog and its transport be tested without one. They are passed as function
+ * references, not values — the session id changes as the operator switches
+ * sessions, and the terminal does not exist yet when a guarded `initTerminal()`
+ * has failed.
+ */
+function initFeedbackDialog() {
+  try {
+    initFeedback({
+      getSessionId: getCurrentSessionId,
+      getTerminal: getTerminalInstance,
+    });
+  } catch (err) {
+    console.error('Failed to init feedback:', err);
+  }
 }
 
 /**
@@ -274,23 +338,6 @@ function isSafeLandingUrl(/** @type {string} */ url) {
   } catch {
     return false;
   }
-}
-
-/**
- * Strip a one-shot `mode` param from the URL's query string, if present,
- * without adding a history entry — the mode-axis twin of theme-manager's
- * _stripQueryTheme(). Once the user makes an explicit choice, a leftover
- * `?mode=` must not out-rank it (or localStorage) on the next reload.
- */
-function stripQueryMode() {
-  try {
-    const params = new URLSearchParams(window.location.search);
-    if (!params.has('mode')) return;
-    params.delete('mode');
-    const query = params.toString();
-    const url = `${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`;
-    window.history.replaceState(window.history.state, '', url);
-  } catch { /* non-browser environment or a blocked history API — non-fatal */ }
 }
 
 /* ---- Drawer Trigger Highlight ---- */

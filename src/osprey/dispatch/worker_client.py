@@ -116,7 +116,9 @@ async def dispatch_to_worker(
     """POST a prompt to a dispatch worker's /dispatch endpoint.
 
     Args:
-        url: Base URL of the dispatch worker service (e.g. "http://dispatch-worker-1:9190").
+        url: Base URL of the dispatch worker service (e.g.
+            ``http://dispatch-worker-1:10011`` — worker 1's slot at the default
+            port base).
         prompt: The prompt text to dispatch.
         allowed_tools: List of tool names the agent is allowed to use.
         token: Bearer token for authentication.
@@ -204,7 +206,9 @@ async def fetch_worker_runs(url: str, token: str, timeout: float = 10.0) -> list
     so the dispatcher's worker token is forwarded.
 
     Args:
-        url: Base URL of the worker service (e.g. "http://dispatch-worker-1:9190").
+        url: Base URL of the worker service (e.g.
+            ``http://dispatch-worker-1:10011`` — worker 1's slot at the default
+            port base).
         token: Bearer token for the worker (DISPATCH_WORKER_TOKEN).
         timeout: Request timeout in seconds.
 
@@ -238,7 +242,9 @@ async def cancel_worker_run(
     """DELETE /dispatch/{run_id} on the worker to request cancellation.
 
     Args:
-        url: Base URL of the worker service (e.g. "http://dispatch-worker-1:9190").
+        url: Base URL of the worker service (e.g.
+            ``http://dispatch-worker-1:10011`` — worker 1's slot at the default
+            port base).
         token: Bearer token for authentication.
         run_id: The run ID to cancel.
         timeout: Request timeout in seconds.
@@ -267,6 +273,56 @@ async def cancel_worker_run(
         raise WorkerAuthRejectedError(f"Unauthorized (401) from {cancel_url}")
     if response.status_code == 404:
         raise WorkerRejectedRequestError(f"run_id {run_id!r} not found on worker")
+    response.raise_for_status()
+    return cast(dict[str, Any], response.json())
+
+
+async def clear_worker_history(
+    url: str, token: str, older_than_days: int = 0, timeout: float = 30.0
+) -> dict[str, Any]:
+    """DELETE /dispatch/runs on the worker to drop finished run records.
+
+    Args:
+        url: Base URL of the worker service (e.g.
+            ``http://dispatch-worker-1:10011`` — worker 1's slot at the default
+            port base).
+        token: Bearer token for authentication.
+        older_than_days: Age floor in days. ``0`` (the default) clears every
+            finished run; a positive value clears only those older than it,
+            which is the retention sweep's horizon applied on demand.
+        timeout: Request timeout in seconds. Longer than the cancel path's: this
+            unlinks up to a full history's worth of records in one call.
+
+    Returns:
+        Worker's response dict (``{"cleared": int, "records_deleted": int,
+        "older_than_days": int}``).
+
+    Raises:
+        WorkerAuthRejectedError: If the worker returns HTTP 401.
+        WorkerUnreachableError: On connection errors or timeouts.
+    """
+    clear_url = url.rstrip("/") + "/dispatch/runs"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {"older_than_days": older_than_days}
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # ``client.delete`` takes no body, so go through ``request``: the age
+            # floor rides in the body rather than the URL, keeping it out of
+            # access logs alongside the rest of the worker's write surface.
+            response = await client.request("DELETE", clear_url, headers=headers, json=payload)
+    except httpx.TimeoutException as exc:
+        raise WorkerUnreachableError(f"Timeout clearing history at {clear_url}: {exc}") from exc
+    except httpx.ConnectError as exc:
+        raise WorkerUnreachableError(
+            f"Connection error clearing history at {clear_url}: {exc}"
+        ) from exc
+    except httpx.RequestError as exc:
+        raise WorkerUnreachableError(
+            f"Request error clearing history at {clear_url}: {exc}"
+        ) from exc
+
+    if response.status_code == 401:
+        raise WorkerAuthRejectedError(f"Unauthorized (401) from {clear_url}")
     response.raise_for_status()
     return cast(dict[str, Any], response.json())
 

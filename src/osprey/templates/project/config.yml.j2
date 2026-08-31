@@ -52,7 +52,7 @@ services:
   # queryable observability store out of the box. Bound to localhost.
   openobserve:
     path: ./services/openobserve
-    port: 5080          # Host port for the OpenObserve UI + OTLP ingest
+    port: {{ osprey_ports.openobserve }}         # Host port for the OpenObserve UI + OTLP ingest
     retention_days: 14  # Growth bound: drop data older than N days (min 3). A
                         # named volume has no size cap, so age is the size knob.
 
@@ -150,15 +150,17 @@ file_paths:
 # WORKSPACE tab of `osprey web` — the artifact gallery, served by its own web
 # server. No section ships here, so it runs at its defaults: it is a universal
 # panel — launched at `osprey web` startup whatever panels are configured, and
-# on the first artifact save in headless runs — and it binds 127.0.0.1:8086.
+# on the first artifact save in headless runs — and it binds
+# 127.0.0.1:{{ osprey_ports.artifact }}.
 # Port resolution is the one shared function every launcher and URL builder
 # uses: OSPREY_ARTIFACT_SERVER_PORT wins (multi-user deployments
-# export it per user), then `port` below, then the built-in 8086. `host` has no
+# export it per user), then `port` below, then this deployment's layout slot
+# ({{ osprey_ports.artifact }}). `host` has no
 # env override. Uncomment to move it, or set `auto_launch: false` to switch it
 # off — the tab is then reported unavailable rather than serving a dead iframe.
 # artifact_server:
 #   host: "127.0.0.1"
-#   port: 8086
+#   port: {{ osprey_ports.artifact }}
 #   auto_launch: true
 
 # ============================================================
@@ -188,40 +190,40 @@ execution:
 # ============================================================
 # CONTROL SYSTEM CONFIGURATION
 # ============================================================
-# Control system type, write access, limits checking, and verification
+# Control system type, write access, and limits checking. Whether a write is
+# confirmed is per-channel policy and lives in the limits database
+# (`confirm: true|false`), not here.
 # Default: mock connector (no hardware required, safe for development)
 
 control_system:
   # Control system type - determines which runtime connector to use
   # Note: Pattern detection is control-system-agnostic (same for all types)
-  type: "mock"  # Options: mock | epics
+  type: "mock"  # Options: mock | virtual_accelerator | epics
 
   # Write Access Control - Master safety switch
   writes_enabled: false  # Set true only for production hardware control
+  # This is the posture each connector type inherits when its own block says
+  # nothing about itself. A type can state its own instead - see the commented
+  # `writes_enabled` lines in the connector blocks below - so a project pointed
+  # at a real machine can arm writes on its simulator alone. Only a literal
+  # `true` arms writes anywhere: the quoted string "true" and 1 leave them off.
   # write_tools:                # Additional tools blocked by writes kill switch
   #   - "mcp__my_server__dangerous_write"
+
+  # Operator-facing names for the control targets, shown on the web terminal's
+  # control-target chip. Defaults come from what each target is - real machine
+  # "Real machine" ("Demo" on a simulated connector), stand-in "Rehearsal",
+  # virtual accelerator "Simulator". Uncomment to rename any of them.
+  # target_display_names:
+  #   live: "Real machine"
+  #   standin: "Rehearsal"
+  #   va: "Simulator"
 
   # Runtime Channel Limits Checking
   limits_checking:
     enabled: false  # Enable for production safety
     database_path: null  # Path to channel_limits.json
-    allow_unlisted_channels: true
-
-  # Write Verification Configuration
-  # How the connector confirms a write took effect. Applies only when the caller does
-  # not name a level: osprey.runtime.write_channel scripts and direct connector calls.
-  # The channel_write MCP tool, multi-channel writes, and Bluesky device writes pass an
-  # explicit level ("callback"); for those, only a per-channel "verification" entry in
-  # channel_limits.json changes the level, and only on single-channel tool writes.
-  # A failed verification is not a hard stop: the channel_write MCP tool reports it
-  # (verification.verified: false), osprey.runtime.write_channel discards it (a readback
-  # mismatch is logged at debug level only), and only write_channel_checked raises (plans,
-  # which write through the Bluesky bridge's connector-backed devices). A write
-  # the CA layer could not deliver at all - for example a PV that never connects -
-  # sets success: false, which does raise from osprey.runtime.write_channel.
-  write_verification:
-    default_level: "callback"  # Options: none | callback | readback ("none" = no verification)
-    default_tolerance_percent: 0.1  # "readback" only; per-channel override in channel_limits.json
+    allow_unlisted_channels: true  # false refuses any channel the database does not list
 
   # Channel-read response size
   # Array channels (waveforms, camera frames) can be far larger than an agent's
@@ -246,8 +248,70 @@ control_system:
     mock:
       response_delay_ms: 10   # Simulated per-operation response delay
       noise_level: 0.01       # Relative noise on generated values (0-1)
+    # Virtual Accelerator connector - a containerized PyAT-backed soft-IOC
+    # reached over real EPICS Channel Access. VirtualAcceleratorConnector is an
+    # EPICSConnector subclass, so the gateway shape below is identical to the
+    # `epics` block's. Requires the VA service running first: add
+    # virtual_accelerator to deployed_services and run `osprey up`. Select it
+    # with `type: virtual_accelerator` above, or switch a running session to it.
+    virtual_accelerator:
+      timeout: 5.0
+      # Write posture for this connector type alone. Uncomment to arm writes on
+      # the simulator while the deployment-wide `writes_enabled` above keeps the
+      # real machine read-only. Left out, this type inherits that key.
+      # writes_enabled: true
+      # Limits-checking posture for this connector type alone. A block here
+      # overrides the deployment-wide `limits_checking` block above as a whole
+      # (both leaves required) - database_path stays deployment-wide.
+      # limits_checking:
+      #   enabled: true
+      #   allow_unlisted_channels: true
+      # Channel the target switch reads to prove this target is reachable
+      # before making it active. A target with no probe_channel is never
+      # switched to. Replace with a channel your VA's machine model serves.
+      probe_channel: YOUR:PROBE:CHANNEL
+      # CA name-server (TCP) mode against localhost: the one host<->container
+      # CA configuration confirmed to work across container runtimes -
+      # broadcast discovery does not reliably cross the macOS<->container VM
+      # boundary.
+      #
+      # The gateway port is deliberately not written out: with it unset the
+      # connector follows services.virtual_accelerator.port, so moving the
+      # deployed soft-IOC's port is a one-place edit. Set `port:` on a gateway
+      # only to reach a VA this project does not deploy - one on another host,
+      # or a container published on a host port different from the one it
+      # serves on. The example below reads {{ osprey_ports.va_standin + 1 }}, not
+      # {{ osprey_ports.va_standin }}, on purpose: the shipped build-profile
+      # example puts the live stand-in VA on {{ osprey_ports.va_standin }}
+      # (`virtual_accelerator.live_standin`), the first port of this
+      # deployment's VA band, so the example here names the next one up — a
+      # port no OSPREY service claims unless a second stand-in is deployed.
+      gateways:
+        read_only:
+          address: localhost
+          # port: {{ osprey_ports.va_standin + 1 }}
+          use_name_server: true
+        write_access:
+          address: localhost
+          # port: {{ osprey_ports.va_standin + 1 }}
+          use_name_server: true
     epics:
       timeout: 5.0
+      # Write posture for the live machine. A type that states its own posture
+      # never falls back to the deployment-wide key, so `false` here holds even
+      # if a profile or an overlay turns that key on.
+      # writes_enabled: false
+      # Limits-checking posture for the live machine. A block here overrides
+      # the deployment-wide `limits_checking` block above as a whole (both
+      # leaves required) - database_path stays deployment-wide.
+      # limits_checking:
+      #   enabled: true
+      #   allow_unlisted_channels: false
+      # Channel the target switch reads to prove the live machine is reachable
+      # before making it active. Facility-specific, so nothing is shipped set:
+      # while it is unset this target is never switched to (the deployment
+      # baseline still connects normally).
+      # probe_channel: YOUR:PROBE:CHANNEL
       # PVAccess (PVA) read routing. Addresses matching any glob below are read
       # through the p4p client (needed for NTNDArray camera frames); every other
       # address stays on Channel Access. Absent or empty means pure CA, exactly
@@ -278,6 +342,21 @@ control_system:
           port: 5084
           use_name_server: false
 
+  # Control-System Target Switch
+  # Bounds how a running session moves between the connector targets above.
+  #
+  # The `live_gateway_acknowledged` key below is the operator acknowledgment for
+  # the live machine. Set it to your own live gateway's hostname to confirm the
+  # `epics` gateways above really are your facility's. While it is unset a
+  # session may not switch TO the live target; returning to it when it is this
+  # deployment's baseline is always allowed.
+  target_switch:
+    drain_timeout_s: 5      # Seconds in-flight operations get to finish on the
+                            # old target before it is torn down regardless
+    probe_interval_s: 30    # Seconds between background reachability probes of
+                            # every target's gateways
+    # live_gateway_acknowledged: your-gateway.example.com
+
   # Pattern Detection (Security Layer)
   # Purpose: Detect ALL control system operations for approval workflows
   # Security: Catches approved API AND circumvention attempts (direct library calls)
@@ -304,6 +383,10 @@ archiver:
   #   - mock_archiver: Development mode (generates synthetic data)
   #   - epics_archiver: EPICS Archiver Appliance (add an `epics_archiver.url`)
   type: mock_archiver  # Change to 'epics_archiver' for production
+  # When a read names no bin size, the bin is chosen from the time span so a
+  # continuously archived channel returns about this many points (1 s bins up
+  # to ~2.8 h, ~53 min bins for a year). The agent is told which bin was used.
+  auto_bin_points: 10000
   # epics_archiver:
   #   url: https://archiver.example.com  # Replace with your archiver address
   #   timeout: 60
@@ -370,7 +453,7 @@ claude_code:
   # ── Telemetry / Observability (on by default, local + loopback-bound) ──
   # The agent emits OTLP logs + metrics to the co-deployed OpenObserve store
   # (declared in `services:` and listed in `deployed_services:` above; UI at
-  # http://localhost:5080). On by default: the underlying harness already records
+  # http://localhost:{{ osprey_ports.openobserve }}). On by default: the underlying harness already records
   # every prompt, response, and API body to disk, so this adds no new exposure —
   # it just makes that data queryable in a local store you own. To turn it off,
   # set `enabled: false`. Tracing and OTEL_LOG_TOOL_CONTENT are intentionally
@@ -380,20 +463,26 @@ claude_code:
     backend: openobserve                 # openobserve | generic
     protocol: http/protobuf              # http/protobuf | grpc — grpc requires an explicit `endpoint:` below; it is refused against the auto-derived openobserve endpoint (HTTP only)
     # backend: openobserve auto-derives the endpoint per network context —
-    # http://localhost:5080/api/<org> on the host, http://openobserve:5080/api/<org>
-    # inside the deploy network — so `endpoint` is intentionally OMITTED here.
+    # http://localhost:{{ osprey_ports.openobserve }}/api/<org> on the host,
+    # http://openobserve:5080/api/<org> inside the deploy network (5080 there is
+    # the store's own listen port inside its container, which port_base does not
+    # move) — so `endpoint` is intentionally OMITTED here.
     # (Hardcoding localhost would make the in-container dispatch worker emit to
     # its own loopback and silently drop everything. For a GENERIC OTLP backend
     # instead, set backend: generic and endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT}.)
     #
-    # OpenObserve auth + org routing. user/password read the OpenObserve root
-    # credentials from the project .env — the SAME values the openobserve service
-    # reads — so container and agent auth stay in sync (single source of truth).
-    # `osprey up` mints a strong ZO_ROOT_USER_PASSWORD into .env; the
-    # ${VAR:-default} fallbacks keep the agent launchable before the first deploy.
+    # OpenObserve auth + org routing. These are the store's dedicated INGEST
+    # account, not its root credentials: `osprey up` creates a service account
+    # named ZO_INGEST_USER_EMAIL and writes the token the store issues for it
+    # to the project .env as ZO_INGEST_SA_TOKEN. The store itself still
+    # initializes from ZO_ROOT_USER_* — that stays in the compose file, and the
+    # root password never reaches the agent's config.
+    # The token reference carries NO ${VAR:-default} on purpose: a literal
+    # default would be a published credential, and there is nothing to fall
+    # back to before the first deploy provisions the account.
     openobserve:
-      user: ${ZO_ROOT_USER_EMAIL:-root@example.com}
-      password: ${ZO_ROOT_USER_PASSWORD:-Complexpass#123}
+      user: ${ZO_INGEST_USER_EMAIL:-ingest@example.com}
+      password: ${ZO_INGEST_SA_TOKEN}
       org: default
     # Content gates — all default ON. The store is local and loopback-bound, so
     # full capture is the default posture; set any to false to suppress that
@@ -417,7 +506,7 @@ claude_code:
 #                        # sets it on every per-user container so nginx is the
 #                        # only off-host path — overrides both this key and
 #                        # --host, so this cannot punch through that chokepoint.
-#   port: 8087           # Likewise outranked by OSPREY_TERMINAL_WEB_PORT.
+#   port: {{ osprey_ports.web }}          # Likewise outranked by OSPREY_TERMINAL_WEB_PORT.
 #   shell: /path/to/claude
 #                        # argv spawned in every PTY. Setting it REPLACES the
 #                        # launcher, so it also defeats the
@@ -444,6 +533,54 @@ web:
   # In a multi-user deployment, a roster entry's `theme:` (rendered as
   # OSPREY_WEB_THEME) overrides this per user.
   theme: main
+
+  # Target of the Documentation button in the web terminal's utility cluster.
+  # Point it at a locally hosted copy of the docs when the control room has no
+  # route to the public site.
+  docs_url: https://als-apg.github.io/osprey
+
+  # Whether the web terminal's Config panel may edit this deployment's own
+  # config.yml and .claude/ setup files. `false` withdraws the panel's whole
+  # SERVER surface, not just its tab: /api/config and /api/claude-setup refuse
+  # every verb with 403, and GET /api/panels stops advertising the panel. That
+  # is the difference that matters — these files are what the agent's
+  # permission surface is rendered from, so hiding the tab alone would leave
+  # anyone who types the URL able to re-render the agent that runs here.
+  # Leave it true for a single-user deployment: the panel is that operator's
+  # own config editor. Set it false for the read-only tiers of a multi-user
+  # deployment, where a separate admin persona owns configuration.
+  config_panel:
+    enabled: true
+
+  # Whether this deployment's Scaffold gallery may WRITE. `false` closes the
+  # gallery's whole server surface for writes — create, claim, save, reset,
+  # register and delete all answer 403 — while every read stays open, so a
+  # read-only tier can still see exactly what the agent is running. This is a
+  # privilege boundary, not a UI preference: what the gallery authors is
+  # .claude/rules, .claude/skills and .claude/agents content, which the agent
+  # loads at project scope and obeys on every turn. Hiding the buttons alone
+  # would leave anyone who types the URL able to author what the agent reads.
+  # Leave it true for a single-user deployment: the gallery is that operator's
+  # own editor. Set it false for the read-only tiers of a multi-user
+  # deployment, where a separate admin persona owns the agent's setup.
+  scaffold_gallery:
+    write_enabled: true
+
+  # Where the Feedback dialog's two outbound channels send a user. Nothing is
+  # ever posted for them: the browser opens a prefilled GitHub issue form or a
+  # prefilled mail draft, and the user decides whether to send it. Every
+  # submission is also recorded on this deployment, readable with
+  # `osprey feedback list` / `osprey feedback export`.
+  feedback:
+    # owner/repo whose new-issue form the GitHub channel prefills. Point it at
+    # the repository your users' reports should land in.
+    github_repo: als-apg/osprey
+    # Recipient of the prefilled mailto: draft the Email channel opens.
+    email: thellert@lbl.gov
+    # Ceiling in bytes on the on-disk feedback store (256 MB). Above it the
+    # OLDEST saved session contexts are deleted; the small submission headers
+    # are always kept, so the submission history stays complete.
+    max_store_bytes: 268435456
 
 # ============================================================
 # CLI CONFIGURATION

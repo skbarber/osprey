@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from osprey.connectors.archiver.mock_archiver_connector import MockArchiverConnector
+from osprey.connectors.control_system.base import WriteOutcome
 from osprey.connectors.control_system.mock_connector import MockConnector
 
 
@@ -111,7 +112,7 @@ class TestMockConnector:
             channel = "TEST:SETPOINT:SP"
             test_value = 123.45
             result = await connector.write_channel(channel, test_value)
-            assert result.success is True
+            assert result.outcome is WriteOutcome.CONFIRMED
 
             # Read it back
             result = await connector.read_channel(channel)
@@ -150,7 +151,7 @@ class TestMockConnector:
             await connector.connect({"response_delay_ms": 0})
 
             result = await connector.write_channel("TEST:PV", 100.0)
-            assert result.success is False
+            assert result.outcome is WriteOutcome.REFUSED
 
             await connector.disconnect()
 
@@ -640,3 +641,174 @@ class TestKindAwareNoiseFloor:
             await connector.disconnect()
 
         assert len(values) == 1, "noise_level 0.0 must produce identical reads, not just tight ones"
+
+
+class TestMockWriteConfirmationContract:
+    """Mock write results carry one outcome word and the value observed.
+
+    Consumers decide what happened from ``outcome`` and ``observed_value``,
+    never by parsing the display-only ``notes``. The confirming re-read is
+    ``_confirming_read``, not ``read_channel``: confirmation reports what the
+    simulated control system holds, so it is the seam these tests patch to
+    reach the failure paths a mock cannot produce on its own.
+    """
+
+    @staticmethod
+    async def _connected_mock(monkeypatch, noise_level=0.0):
+        """A connected mock with writes enabled for the whole test.
+
+        The writes_enabled gate is re-read on every write, so the config patch
+        has to outlive connect().
+        """
+        monkeypatch.setattr("osprey.utils.config.get_config_value", _config_with_writes_enabled)
+        connector = MockConnector()
+        await connector.connect({"response_delay_ms": 0, "noise_level": noise_level})
+        return connector
+
+    @staticmethod
+    def _raising_read(message):
+        async def _read(channel_address):
+            raise RuntimeError(message)
+
+        return _read
+
+    async def test_a_write_confirms_against_what_the_store_holds(self, monkeypatch):
+        """A re-read holding the value sent is ``confirmed``, with no message."""
+        connector = await self._connected_mock(monkeypatch)
+
+        result = await connector.write_channel("TEST:CHANNEL:SP", 42.0)
+
+        assert result.outcome is WriteOutcome.CONFIRMED
+        assert result.observed_value == pytest.approx(42.0)
+        assert result.error_message is None
+        assert result.refusal_reason is None
+        # Mock has no alarm metadata to report; "not reported" stays None.
+        assert result.alarm_status is None
+        assert result.alarm_severity is None
+
+        await connector.disconnect()
+
+    async def test_read_noise_does_not_manufacture_a_mismatch(self, monkeypatch):
+        """A noisy channel still confirms: noise is measurement, not storage.
+
+        There is no tolerance to absorb a noise draw, so a confirming read that
+        went through ``read_channel`` would report a mismatch on essentially
+        every write at the shipped default noise level.
+        """
+        connector = await self._connected_mock(monkeypatch, noise_level=0.5)
+
+        for _ in range(5):
+            result = await connector.write_channel("TEST:CHANNEL:SP", 42.0)
+            assert result.outcome is WriteOutcome.CONFIRMED
+            assert result.observed_value == pytest.approx(42.0)
+
+        # The ordinary read path is untouched and still noisy.
+        noisy = await connector.read_channel("TEST:CHANNEL:SP")
+        assert noisy.value != pytest.approx(42.0, abs=1e-9)
+
+        await connector.disconnect()
+
+    async def test_a_perturbed_store_value_is_a_mismatch_without_an_error_message(
+        self, monkeypatch
+    ):
+        """A setpoint the machine did not keep is reported, not tolerated.
+
+        Both numbers are already on the result, so ``error_message`` stays None
+        — it is reserved for the outcomes that carry something the numbers
+        cannot say.
+        """
+        connector = await self._connected_mock(monkeypatch)
+
+        def _clamping_put(channel_address, value):
+            connector._state[channel_address] = 10.0
+
+        monkeypatch.setattr(connector, "_put", _clamping_put)
+
+        result = await connector.write_channel("TEST:CHANNEL:SP", 42.0)
+
+        assert result.outcome is WriteOutcome.MISMATCH
+        assert result.observed_value == pytest.approx(10.0)
+        assert result.value_written == pytest.approx(42.0)
+        assert result.error_message is None
+
+        await connector.disconnect()
+
+    async def test_confirming_read_that_raises_is_unconfirmed(self, monkeypatch):
+        """The value went out but what the channel holds is unknown."""
+        connector = await self._connected_mock(monkeypatch)
+        monkeypatch.setattr(connector, "_confirming_read", self._raising_read("CA disconnected"))
+
+        result = await connector.write_channel("TEST:CHANNEL:SP", 42.0)
+
+        assert result.outcome is WriteOutcome.UNCONFIRMED
+        assert result.observed_value is None
+        assert "CA disconnected" in result.error_message
+        assert result.alarm_status is None
+        assert result.alarm_severity is None
+
+        await connector.disconnect()
+
+    async def test_confirm_false_does_not_read(self, monkeypatch):
+        """``unrequested`` is the fast path: a read that would raise is never issued."""
+        connector = await self._connected_mock(monkeypatch)
+        monkeypatch.setattr(connector, "_confirming_read", self._raising_read("must not be called"))
+
+        result = await connector.write_channel("TEST:CHANNEL:SP", 42.0, confirm=False)
+
+        assert result.outcome is WriteOutcome.UNREQUESTED
+        assert result.observed_value is None
+        assert result.error_message is None
+
+        await connector.disconnect()
+
+    async def test_a_value_the_store_cannot_hold_is_a_failed_write(self, monkeypatch):
+        """The put itself failing is ``failed``: the control system did not take it."""
+        connector = await self._connected_mock(monkeypatch)
+        monkeypatch.setattr(connector, "_confirming_read", self._raising_read("must not be called"))
+
+        result = await connector.write_channel("TEST:CHANNEL:SP", "not-a-number")
+
+        assert result.outcome is WriteOutcome.FAILED
+        assert result.observed_value is None
+        assert result.error_message is not None
+
+        await connector.disconnect()
+
+    async def test_notes_text_does_not_change_the_outcome(self, monkeypatch):
+        """Two confirming reads failing differently classify identically.
+
+        The exception text flows into ``notes`` and ``error_message`` and
+        nowhere else — the machine-readable verdict must be identical.
+        """
+        connector = await self._connected_mock(monkeypatch)
+
+        monkeypatch.setattr(connector, "_confirming_read", self._raising_read("timeout after 3s"))
+        first = await connector.write_channel("TEST:CHANNEL:SP", 42.0)
+
+        monkeypatch.setattr(connector, "_confirming_read", self._raising_read("channel not found"))
+        second = await connector.write_channel("TEST:CHANNEL:SP", 42.0)
+
+        def structured(result):
+            return (
+                result.outcome,
+                result.refusal_reason,
+                result.observed_value,
+                result.alarm_status,
+                result.alarm_severity,
+            )
+
+        assert first.notes != second.notes, "notes should differ"
+        assert structured(first) == structured(second)
+
+        await connector.disconnect()
+
+    async def test_write_still_mirrors_the_setpoint_onto_its_readback(self, monkeypatch):
+        """The :SP -> :RB mirror is state-store cosmetics and survives untouched."""
+        connector = await self._connected_mock(monkeypatch)
+
+        await connector.write_channel("MAGNET:CURRENT:SP", 100.0)
+
+        readback = await connector.read_channel("MAGNET:CURRENT:RB")
+        assert readback.value == pytest.approx(100.0, abs=1.0)
+
+        await connector.disconnect()

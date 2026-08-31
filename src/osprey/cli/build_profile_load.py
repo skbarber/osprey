@@ -13,13 +13,19 @@ assembled its own raw dict.
 from __future__ import annotations
 
 import difflib
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-from osprey.connectors.types import CLI_CONTROL_SYSTEM_TYPES
 from osprey.errors import BuildProfileError
+from osprey.port_layout import (
+    DEFAULT_PORT_BASE,
+    PORT_BASE_CONFIG_KEY,
+    default_port,
+    resolve_port_base,
+)
+from osprey_connectors.types import SET_CONTROL_SYSTEM_TYPES
 
 from .build_profile_archiver import parse_va_archiver_block
 from .build_profile_deploy import parse_deploy_block
@@ -152,6 +158,9 @@ _KNOWN_PROFILE_KEYS = frozenset(
         # because a materialized or hand-written profile may spell it, and
         # because this frozenset doubles as the "valid keys are:" list.
         "connector",
+        # Shorthand for config's `deployment.port_base`, consumed by
+        # _apply_port_base_shorthand — same contract as `connector` above.
+        "port_base",
         "provider",
         "model",
         "channel_finder_mode",
@@ -211,6 +220,109 @@ _KNOWN_BLUESKY_KEYS = frozenset(f.name for f in fields(BlueskyConfig))
 # default bridge network, and the deployment would come up looking healthy while
 # unreachable from the address the facility asked for.
 _KNOWN_DISPATCH_KEYS = frozenset(f.name for f in fields(DispatchConfig))
+
+
+# Keys recognized inside the ``virtual_accelerator:`` block, derived from its
+# dataclass like the two sets above. What a dropped key costs here is a
+# deployment that quietly stays on simulated channels: a misspelled
+# `live_standin` leaves the stand-in unbuilt, so the deployment never gains its
+# `standin` target — `control_target_set standin` has no machine to point at,
+# and a session meant for the soft IOC runs against the same lane the operator
+# was already on.
+_KNOWN_VA_KEYS = frozenset(f.name for f in fields(VAConfig))
+
+
+def _profile_port_base(raw: dict[str, Any]) -> int:
+    """Return the port base this profile's ``config:`` block resolves to.
+
+    The one rule the port layout runs on is that a port is derived from the base
+    the deployment actually resolved, never from the layout's own default — so a
+    loader that places a service by slot has to read the profile's own
+    ``deployment.port_base`` first. A ``config:`` block is a flat bag of dotted
+    keys that may spell that path at any depth, which is what
+    :func:`~osprey.cli.build_profile_emit.effective_config_subtree` folds into
+    one subtree; re-wrapping the result under ``deployment`` keeps
+    :func:`~osprey.port_layout.resolve_port_base` on its single input shape, so
+    the range refusal fires here too.
+
+    Args:
+        raw: The fully-merged raw profile mapping — presets, ``extends``
+            parents, ``-O`` layers and ``--set`` pairs already folded in.
+
+    Returns:
+        The base the profile configures, or
+        :data:`~osprey.port_layout.DEFAULT_PORT_BASE` when it configures none.
+
+    Raises:
+        ValueError: If the profile names a base whose thousand-port block could
+            not exist (below 1024, or running past port 65535).
+    """
+    # Imported inside the function on purpose: build_profile_emit imports this
+    # module at import time, so a module-level import would close the cycle.
+    from .build_profile_emit import effective_config_subtree
+
+    config = raw.get("config")
+    if not isinstance(config, Mapping):
+        return DEFAULT_PORT_BASE
+    # Only the keys that address `deployment` are folded. Handing the whole
+    # block to the folder would make a prefix conflict anywhere in it — a
+    # scalar `env:` beside an `env.required:`, say — a refusal raised here, at
+    # profile parse, on behalf of a key this function never reads. Those
+    # conflicts belong to the axis that owns the key and are reported there.
+    deployment_keys = {
+        key: value
+        for key, value in config.items()
+        if key == "deployment" or (isinstance(key, str) and key.startswith("deployment."))
+    }
+    return resolve_port_base(
+        {"deployment": effective_config_subtree(deployment_keys, ("deployment",))}
+    )
+
+
+def _parse_live_standin(value: Any, base: int) -> int | None:
+    """Normalise ``virtual_accelerator.live_standin`` to a port or ``None``.
+
+    ``true`` is the spelling a profile should use: it asks for the stand-in
+    without naming a number, and the number it gets is the layout's
+    ``va_standin`` slot on *this deployment's* base, so two deployments on one
+    host never collide over it. An explicit integer is still honoured — a
+    facility may have to place the second soft-IOC somewhere specific — and the
+    field stays an ``int | None`` either way, so nothing downstream has to know
+    which spelling was used.
+
+    ``false`` is refused rather than read as "off": a profile that inherits the
+    key from a preset switches the stand-in off by excluding the key, and
+    silently accepting ``false`` here would leave two spellings for absence.
+
+    Args:
+        value: The raw ``live_standin`` value, or ``None`` when unset.
+        base: The base the profile resolved, from :func:`_profile_port_base`.
+
+    Returns:
+        The Channel Access port of the stand-in, or ``None`` when the profile
+        does not deploy one.
+
+    Raises:
+        BuildProfileError: If the value is ``false`` or is neither ``true`` nor
+            an integer.
+    """
+    if value is None:
+        return None
+    if value is True:
+        return default_port("va_standin", base=base)
+    if value is False:
+        raise BuildProfileError(
+            "virtual_accelerator.live_standin: false is not a way to switch the "
+            "stand-in off. Write `true` to deploy it on the layout's stand-in port, "
+            "or omit the key (exclude it, if a parent profile sets it) to deploy no "
+            "stand-in at all."
+        )
+    if not isinstance(value, int):
+        raise BuildProfileError(
+            "virtual_accelerator.live_standin must be `true` — the layout's stand-in "
+            f"port on this deployment's base — or a Channel Access port number (got {value!r})"
+        )
+    return value
 
 
 def _parse_environment(raw: dict[str, Any]) -> EnvironmentConfig:
@@ -308,12 +420,234 @@ def _reject_unknown_keys(raw: dict[str, Any]) -> None:
     _reject_unknown_block_keys(raw.keys(), _KNOWN_PROFILE_KEYS, "profile")
 
 
+#: The ``claude_code.permissions`` keys whose value is a list of tool matchers.
+#:
+#: Every one of them is consumed by *iterating* it: ``settings.json.j2`` renders
+#: each element as one JSON array entry, and the deny composition subtracts with
+#: ``d not in remove_deny`` over the raw value
+#: (:func:`osprey.cli.templates.claude_code._rendered_deny_list`). A value that
+#: is not a list of strings therefore does not mean what its author meant — a
+#: bare string iterates as its characters, and ``in`` against it is *substring*
+#: containment. Refusing the shape here is what lets every later reader assume a
+#: list and still agree with the render and with each other; see
+#: :func:`osprey.cli.profile_conventions.permission_entries`, which reads a
+#: non-list as no entries precisely because this refusal stands in front of it.
+_PERMISSION_LIST_KEYS: tuple[str, ...] = ("allow", "ask", "deny", "remove_ask", "remove_deny")
+
+#: The ``config:`` key the Claude Code block lives under, and the dotted path to
+#: its permissions mapping. Both spellings of the block reach the same rendered
+#: ``config.yml`` keys, so both are checked.
+_CLAUDE_CODE_CONFIG_KEY = "claude_code"
+_PERMISSIONS_CONFIG_PATH = f"{_CLAUDE_CODE_CONFIG_KEY}.permissions"
+
+
+def _permission_lists(config: dict[str, Any]) -> list[tuple[str, Any]]:
+    """Every permissions list a ``config:`` block spells, in each of its spellings.
+
+    A ``config:`` block is a flat bag of dotted keys, but ``config_update_fields``
+    accepts three ways of reaching the same rendered leaf: the fully dotted key
+    (``claude_code.permissions.deny``), a dotted key carrying a mapping
+    (``claude_code.permissions:`` with ``deny:`` under it), and the fully nested
+    ``claude_code:`` mapping. A shape check that saw only the flattest one would
+    wave the other two straight through to the render.
+
+    Args:
+        config: The profile's ``config:`` block.
+
+    Returns:
+        ``(label, value)`` pairs, where the label names the key AND the spelling
+        it was written in, so a refusal points at the line the author wrote.
+    """
+    found: list[tuple[str, Any]] = []
+    for key in _PERMISSION_LIST_KEYS:
+        dotted = f"{_PERMISSIONS_CONFIG_PATH}.{key}"
+        if dotted in config:
+            found.append((dotted, config[dotted]))
+    sources = (
+        (
+            config.get(_PERMISSIONS_CONFIG_PATH),
+            f"nested under the {_PERMISSIONS_CONFIG_PATH!r} mapping",
+        ),
+        (
+            block.get("permissions")
+            if isinstance(block := config.get(_CLAUDE_CODE_CONFIG_KEY), dict)
+            else None,
+            f"nested under the {_CLAUDE_CODE_CONFIG_KEY + ':'!r} mapping",
+        ),
+    )
+    for permissions, spelling in sources:
+        if not isinstance(permissions, dict):
+            continue
+        for key in _PERMISSION_LIST_KEYS:
+            if key in permissions:
+                found.append((f"{_PERMISSIONS_CONFIG_PATH}.{key} ({spelling})", permissions[key]))
+    return found
+
+
+def _misshapen_permission_list(value: Any) -> str | None:
+    """Why *value* cannot serve as a permissions list, or ``None`` when it can.
+
+    Args:
+        value: The value written under one of :data:`_PERMISSION_LIST_KEYS`.
+
+    Returns:
+        A phrase completing "…, but <reason>", or ``None`` if the value is a
+        list of non-empty strings.
+    """
+    if isinstance(value, str):
+        return (
+            f"it is a bare string ({value!r}). The render iterates the value, so this "
+            f"renders one entry per character and names no tool at all"
+        )
+    if not isinstance(value, list):
+        return f"it is a {type(value).__name__} ({value!r})"
+    bad = [entry for entry in value if not isinstance(entry, str) or not entry.strip()]
+    if bad:
+        shown = ", ".join(repr(entry) for entry in bad[:3])
+        more = f" (and {len(bad) - 3} more)" if len(bad) > 3 else ""
+        return f"it contains {shown}{more}, which is not a non-empty tool-matcher string"
+    return None
+
+
+def _reject_permission_list_shapes(config: Any) -> None:
+    """Refuse a ``config:`` block whose permission lists are not lists of strings.
+
+    The one place a loose spelling of ``claude_code.permissions.deny`` and
+    friends is caught, so that everything downstream may assume the shape. Three
+    readers compose these lists — the ``settings.json`` render, the container's
+    setup-capability check
+    (``build_cmd._profile_setup_patch_capable``), and the persona predicate
+    :func:`osprey.cli.profile_conventions.is_setup_patch_capable` — and a
+    non-list makes them disagree in *both* directions at once: a bare-string
+    ``deny`` renders 34 single-character deny entries and denies the tool
+    nowhere, while a bare-string ``remove_deny`` lifts by substring and can drop
+    a deny nobody named. There is no reading that is right for all three, so the
+    profile is refused instead of guessed at.
+
+    Runs on the fully-resolved ``config:`` block, so no source escapes: the
+    preset, an ``-O`` overlay, a ``--set`` pair, an ``extends`` parent or a
+    persona base.
+
+    Args:
+        config: The profile's ``config:`` block (ignored when not a mapping —
+            ``BuildProfile.validate`` rejects that by name).
+
+    Raises:
+        BuildProfileError: naming every offending key at once, in the spelling
+            it was written in, with the shape that was expected.
+    """
+    if not isinstance(config, dict):
+        return
+    problems = [
+        f"  {label} — {reason}"
+        for label, value in _permission_lists(config)
+        if (reason := _misshapen_permission_list(value))
+    ]
+    if not problems:
+        return
+    keys = ", ".join(repr(key) for key in _PERMISSION_LIST_KEYS)
+    raise BuildProfileError(
+        "Misshapen Claude Code permission list(s) in the profile's config: block:\n"
+        + "\n".join(problems)
+        + f"\n\nEach of {_PERMISSIONS_CONFIG_PATH}.<{keys}> must be a YAML list of "
+        "non-empty tool-matcher strings. Write it as a list — '[]' or no key at all "
+        "for none:\n"
+        "  config:\n"
+        f"    {_PERMISSIONS_CONFIG_PATH}.deny:\n"
+        "      - mcp__osprey_workspace__setup_patch\n"
+        "The build will not guess at a looser spelling: settings.json renders these "
+        "lists by iterating them and subtracts remove_deny with 'not in', so a bare "
+        "string renders one entry per character and lifts denies by substring."
+    )
+
+
+def _reject_mixed_claude_code_spellings(config: Any) -> None:
+    """Refuse a ``config:`` block that addresses one ``claude_code`` path twice over.
+
+    Two keys where one path-PREFIXES the other are different dict keys, so both
+    survive every merge — and then one of them is silently discarded.
+    ``config_update_fields`` applies keys in iteration order and sets each
+    addressed path verbatim (``node[leaf] = value``), so the shallower key
+    applied second REPLACES the whole subtree the deeper one just wrote;
+    :func:`~osprey.cli.build_profile_emit._collapse_config_prefixes` folds the
+    same pair the other way, deeper-key-wins. Which of the author's two values
+    reaches ``config.yml`` depends on where they left the lines.
+
+    Prefixing is by SEGMENT and the rule covers every split point, not just the
+    bare ``claude_code:`` mapping it was originally written for. The middle
+    spelling is the one that got away: ``claude_code.permissions:`` holding a
+    ``deny`` list beside a dotted ``claude_code.permissions.deny`` is exactly
+    the same hazard — measured, it renders whichever of the two comes last —
+    and the guard that only looked for the bare key let it through.
+
+    That is the same hazard :func:`~osprey.cli.build_profile_resolve._reject_set_config_collisions`
+    refuses for a ``--set config.*`` path, raised to the whole ``config:`` block:
+    that guard only sees paths ``--set`` addressed, so a nested mapping arriving
+    from a preset, an ``-O`` overlay or an ``extends`` parent went unrefused.
+
+    It is a privilege question and not only a tidiness one. The container's
+    setup-capability check reads BOTH spellings and unions them, which is exact
+    only while at most one of them is present: a profile carrying
+    ``claude_code.permissions.remove_deny: [setup_patch]`` beside
+    ``claude_code: {permissions: {deny: [setup_patch]}}`` renders a
+    ``config.yml`` with the deny and no lift — settings.json denies the tool —
+    while the union reads the lift and chowns ``build/config.yml`` to the agent.
+    Refusing the shape is what makes that union honest.
+
+    Args:
+        config: The profile's ``config:`` block.
+
+    Raises:
+        BuildProfileError: naming the nested key and every dotted key beside it.
+    """
+    if not isinstance(config, dict):
+        return
+    # Every key that addresses somewhere inside `claude_code`, as segments. The
+    # bare key is one of them: a nested `claude_code:` mapping is just the
+    # shallowest way to address the subtree, not a different kind of thing.
+    addressed = {
+        key: tuple(key.split("."))
+        for key in config
+        if isinstance(key, str)
+        and (key == _CLAUDE_CODE_CONFIG_KEY or key.startswith(f"{_CLAUDE_CODE_CONFIG_KEY}."))
+    }
+    for shallow, shallow_segments in sorted(addressed.items()):
+        deeper = sorted(
+            key
+            for key, segments in addressed.items()
+            if len(segments) > len(shallow_segments)
+            and segments[: len(shallow_segments)] == shallow_segments
+        )
+        if not deeper:
+            continue
+        raise BuildProfileError(
+            f"The profile's config: block addresses {shallow!r} twice over: the key "
+            f"{shallow!r} itself, and the deeper key(s) "
+            f"{', '.join(repr(key) for key in deeper)} inside it. Both survive the merge "
+            "as separate keys, and which one reaches config.yml depends on key order — "
+            f"the value at {shallow!r} is written verbatim and replaces that whole "
+            "subtree — so one of the two would be discarded silently. That includes the "
+            "permissions lists the build's setup-capability check reads, which is why "
+            "this is refused rather than resolved by a rule. Keep one spelling: fold the "
+            "shallower key's leaves into the deeper spelling, e.g.\n"
+            "  config:\n"
+            f"    {_PERMISSIONS_CONFIG_PATH}.deny:\n"
+            "      - mcp__osprey_workspace__setup_patch"
+        )
+
+
 # The top-level shorthand for the control-system connector, and the literal
 # dotted `config:` key it resolves to. `connector: epics` is the short spelling
 # of `config: {control_system.type: epics}` — one place in the schema sets the
 # connector, so the two can never disagree in the rendered project.
 CONNECTOR_PROFILE_KEY = "connector"
 CONNECTOR_CONFIG_KEY = "control_system.type"
+
+#: Top-level shorthand for ``config: {deployment.port_base: N}`` — the
+#: convenient spelling that moves a whole deployment off the default port
+#: block (``osprey init --set port_base=42000``), so a dev or CI stack never
+#: collides with a real deployment running on the defaults.
+PORT_BASE_PROFILE_KEY = "port_base"
 
 
 def _apply_connector_shorthand(raw: dict[str, Any]) -> dict[str, Any]:
@@ -326,8 +660,16 @@ def _apply_connector_shorthand(raw: dict[str, Any]) -> dict[str, Any]:
     the shorthand and have it silently ignored. Idempotent: a mapping without
     the key is returned unchanged.
 
-    The value is validated against the built-in connector types the rest of the
-    CLI offers (:data:`~osprey.connectors.types.CLI_CONTROL_SYSTEM_TYPES`).
+    The value is validated against
+    :data:`~osprey_connectors.types.SET_CONTROL_SYSTEM_TYPES` — the built-in
+    connector types the CLI offers, plus ``live_standin``. That list rather
+    than :data:`~osprey_connectors.types.CLI_CONTROL_SYSTEM_TYPES` because the
+    two questions differ: a deployment that already runs a stand-in may be
+    pointed at it (``osprey set connector=live_standin``), while ``osprey
+    init`` never materializes a project onto one, having no stand-in to point
+    at. The nearest-type suggestion draws from the same list, so a typo for the
+    stand-in is corrected rather than told the type does not exist.
+
     A custom connector is addressed by its dotted module path, which the
     shorthand does not cover — write ``config: {control_system.type: ...}``
     for those.
@@ -347,14 +689,14 @@ def _apply_connector_shorthand(raw: dict[str, Any]) -> dict[str, Any]:
         return raw
 
     value = raw.pop(CONNECTOR_PROFILE_KEY)
-    known = sorted(CLI_CONTROL_SYSTEM_TYPES)
+    known = sorted(SET_CONTROL_SYSTEM_TYPES)
     if not isinstance(value, str) or not value.strip():
         raise BuildProfileError(
             f"Profile key 'connector' must name a connector type (got {value!r}) — "
             f"one of: {', '.join(known)}."
         )
     value = value.strip()
-    if value not in CLI_CONTROL_SYSTEM_TYPES:
+    if value not in SET_CONTROL_SYSTEM_TYPES:
         # Case-insensitive first: difflib scores 'EPICS' against 'epics' at
         # zero, so the likeliest mistake would otherwise get no suggestion.
         close = [name for name in known if name.lower() == value.lower()] or (
@@ -377,6 +719,54 @@ def _apply_connector_shorthand(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
+def _apply_port_base_shorthand(raw: dict[str, Any]) -> dict[str, Any]:
+    """Fold a top-level ``port_base:`` shorthand into the ``config:`` block.
+
+    Applied beside :func:`_apply_connector_shorthand` on both entry paths
+    (CLI-layer merge and parse), for the same reason: no path a profile can
+    arrive by may carry the shorthand and have it silently ignored. Idempotent:
+    a mapping without the key is returned unchanged.
+
+    The value is range-checked through
+    :func:`~osprey.port_layout.resolve_port_base` — the resolver every runtime
+    consumer uses — so a base whose thousand-port block cannot exist fails the
+    parse with the layout's own refusal rather than surfacing at deploy.
+
+    Args:
+        raw: Raw profile mapping, mutated in place like the connector
+            shorthand it sits beside.
+
+    Returns:
+        The same mapping, with the shorthand consumed.
+
+    Raises:
+        BuildProfileError: If the value is not an in-range integer, or
+            ``config:`` is not a mapping to fold it into.
+    """
+    if PORT_BASE_PROFILE_KEY not in raw:
+        return raw
+
+    value = raw.pop(PORT_BASE_PROFILE_KEY)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise BuildProfileError(
+            f"Profile key 'port_base' must be an integer port base (got {value!r}) "
+            "— e.g. port_base: 42000."
+        )
+    try:
+        resolve_port_base({"deployment": {"port_base": value}})
+    except ValueError as exc:
+        raise BuildProfileError(f"Profile key 'port_base': {exc}") from exc
+
+    config = raw.setdefault("config", {})
+    if not isinstance(config, dict):
+        raise BuildProfileError(
+            f"Profile 'config' must be a mapping to carry the 'port_base' shorthand "
+            f"(got {type(config).__name__})"
+        )
+    config[PORT_BASE_CONFIG_KEY] = value
+    return raw
+
+
 def _parse_profile(raw: dict[str, Any]) -> BuildProfile:
     """Parse raw YAML dict into a BuildProfile.
 
@@ -388,6 +778,7 @@ def _parse_profile(raw: dict[str, Any]) -> BuildProfile:
     _normalize_profile_aliases(raw, "profile")
     _reject_unknown_keys(raw)
     _apply_connector_shorthand(raw)
+    _apply_port_base_shorthand(raw)
     mcp_servers: dict[str, McpServerDef] = {}
     for name, sdef in raw.get("mcp_servers", {}).items():
         if not isinstance(sdef, dict):
@@ -464,6 +855,7 @@ def _parse_profile(raw: dict[str, Any]) -> BuildProfile:
     env_raw = raw.get("env", {})
     env = EnvConfig(
         required=env_raw.get("required", []),
+        pinned=env_raw.get("pinned", []),
         defaults=env_raw.get("defaults", {}),
         file=env_raw.get("file"),
     )
@@ -471,6 +863,14 @@ def _parse_profile(raw: dict[str, Any]) -> BuildProfile:
     environment = _parse_environment(raw)
 
     dependencies = raw.get("dependencies", [])
+
+    # Resolved ONCE, here, and handed to every block below. The layout's rule is
+    # that a port comes from the base the deployment actually resolved, so an
+    # unspelled port key cannot fall back to the dataclass default: those are
+    # computed at the layout's own base and would bake 10010 into a deployment
+    # that asked for 20000, leaving the rendered config disagreeing with the
+    # compose templates that derive from `osprey_ports`.
+    port_base = _profile_port_base(raw)
 
     dispatch_raw = raw.get("dispatch")
     dispatch = None
@@ -486,8 +886,15 @@ def _parse_profile(raw: dict[str, Any]) -> BuildProfile:
             workspace_mode=dispatch_raw.get("workspace_mode", "isolated"),
             max_concurrent_runs=dispatch_raw.get("max_concurrent_runs", 2),
             max_queue_depth=dispatch_raw.get("max_queue_depth", 50),
-            dispatcher_port=dispatch_raw.get("dispatcher_port", 8020),
-            worker_port_base=dispatch_raw.get("worker_port_base", 9190),
+            dispatcher_port=dispatch_raw.get(
+                "dispatcher_port", default_port("dispatcher", base=port_base)
+            ),
+            worker_port_base=dispatch_raw.get(
+                "worker_port_base", default_port("worker", 1, base=port_base)
+            ),
+            worker_port_stride=dispatch_raw.get(
+                "worker_port_stride", DispatchConfig.worker_port_stride
+            ),
             timeout_sec=dispatch_raw.get("timeout_sec", 300),
             inactivity_sec=dispatch_raw.get("inactivity_sec", 120),
             facility_name=dispatch_raw.get("facility_name", ""),
@@ -512,12 +919,29 @@ def _parse_profile(raw: dict[str, Any]) -> BuildProfile:
                 "bluesky.excluded_plans must be a list of plan-name strings "
                 f"(got {excluded_plans!r})"
             )
+        devices_file = bluesky_raw.get("devices_file", BlueskyConfig.devices_file)
+        if not isinstance(devices_file, str) or not devices_file:
+            raise BuildProfileError(
+                f"bluesky.devices_file must be a non-empty path string (got {devices_file!r})"
+            )
+        device_page_size = bluesky_raw.get("device_page_size", BlueskyConfig.device_page_size)
+        if (
+            not isinstance(device_page_size, int)
+            or isinstance(device_page_size, bool)
+            or device_page_size < 1
+        ):
+            raise BuildProfileError(
+                f"bluesky.device_page_size must be an integer >= 1 (got {device_page_size!r})"
+            )
         bluesky = BlueskyConfig(
-            port=bluesky_raw.get("port", 8090),
+            port=bluesky_raw.get("port", default_port("bluesky", base=port_base)),
             tiled_enabled=bluesky_raw.get("tiled_enabled", False),
-            tiled_port=bluesky_raw.get("tiled_port", 8091),
+            tiled_port=bluesky_raw.get("tiled_port", default_port("tiled", base=port_base)),
+            second_lane=bool(bluesky_raw.get("second_lane", False)),
             plan_dir=bluesky_raw.get("plan_dir"),
             excluded_plans=excluded_plans,
+            devices_file=devices_file,
+            device_page_size=device_page_size,
         )
 
     va_raw = raw.get("virtual_accelerator")
@@ -525,8 +949,11 @@ def _parse_profile(raw: dict[str, Any]) -> BuildProfile:
     if va_raw is not None:
         if not isinstance(va_raw, dict):
             raise BuildProfileError("Profile 'virtual_accelerator' must be a mapping")
+        _reject_unknown_block_keys(va_raw, _KNOWN_VA_KEYS, "virtual_accelerator")
+        live_standin = _parse_live_standin(va_raw.get("live_standin"), port_base)
         virtual_accelerator = VAConfig(
-            port=va_raw.get("port", 5064),
+            port=va_raw.get("port", VAConfig.port),
+            live_standin=live_standin,
         )
 
     bluesky_web_raw = raw.get("bluesky_web")
@@ -535,7 +962,7 @@ def _parse_profile(raw: dict[str, Any]) -> BuildProfile:
         if not isinstance(bluesky_web_raw, dict):
             raise BuildProfileError("Profile 'bluesky_web' must be a mapping")
         bluesky_web = BlueskyWebConfig(
-            port=bluesky_web_raw.get("port", 8095),
+            port=bluesky_web_raw.get("port", default_port("bluesky_web", base=port_base)),
         )
 
     nextcloud_bridge_raw = raw.get("nextcloud_bridge")
@@ -579,6 +1006,13 @@ def _parse_profile(raw: dict[str, Any]) -> BuildProfile:
     # a list is a real mistake that `BuildProfile.validate()` rejects by name.
     config_raw = raw.get("config")
     config = {} if config_raw is None else config_raw
+    # Checked on the fully-resolved block, like the bluesky/dispatch shapes
+    # above: every layer has been folded in by the time the parser runs, so a
+    # spelling a preset or an `extends` parent contributes is visible here.
+    # Ambiguity first, then shape — a block spelling `claude_code` both ways has
+    # no single permissions list to check the shape of.
+    _reject_mixed_claude_code_spellings(config)
+    _reject_permission_list_shapes(config)
 
     return BuildProfile(
         name=raw.get("name", ""),
@@ -616,6 +1050,6 @@ def _parse_profile(raw: dict[str, Any]) -> BuildProfile:
         bluesky_web=bluesky_web,
         nextcloud_bridge=nextcloud_bridge,
         gchat_bridge=gchat_bridge,
-        va_archiver=parse_va_archiver_block(raw),
+        va_archiver=parse_va_archiver_block(raw, base=port_base),
         provenance=provenance,
     )

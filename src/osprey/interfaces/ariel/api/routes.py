@@ -24,6 +24,7 @@ from osprey.interfaces.ariel.api.schemas import (
     EntryCreateRequest,
     EntryCreateResponse,
     EntryResponse,
+    ExpandedTermResponse,
     SearchRequest,
     SearchResponse,
     StatusResponse,
@@ -61,14 +62,24 @@ def _localize_facility(dt: datetime | None) -> datetime | None:
 
 
 def _require_service(request: Request) -> ARIELSearchService:
-    """Get the ARIEL service or raise 503 if the database is unavailable."""
+    """Get the ARIEL service or raise 503 if the database is unavailable.
+
+    The database text is unchanged: this is reached only when the database is
+    genuinely unreachable, never because the configuration is broken (a
+    configuration problem leaves the service constructed and degrades only the
+    search path). When both are true the stored configuration errors are
+    appended, so an operator staring at a 503 sees every reason at once.
+    """
     service = getattr(request.app.state, "ariel_service", None)
     if service is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Database unavailable — search, browse, and entry creation "
-            "require a database connection. Drafts and settings still work.",
+        detail = (
+            "Database unavailable — search, browse, and entry creation "
+            "require a database connection. Drafts and settings still work."
         )
+        errors = getattr(request.app.state, "config_errors", None) or []
+        if errors:
+            detail = f"{detail} Configuration errors: " + "; ".join(errors)
+        raise HTTPException(status_code=503, detail=detail)
     return service
 
 
@@ -164,17 +175,107 @@ def _resolve_search_mode(service: ARIELSearchService, requested: str | None) -> 
     return mode
 
 
+def _validate_hybrid_overrides(advanced_params: dict[str, Any]) -> None:
+    """Reject malformed hybrid per-query overrides before the search runs.
+
+    The search panel sends ``rerank`` from a toggle and ``candidate_limit`` from
+    a number field, so real traffic is already well-formed; a hand-written HTTP
+    caller is not. Both keys are forwarded to the hybrid module verbatim, where
+    ``"false"`` is truthy and would silently run the slow reranked path the
+    caller asked to skip, and a zero or negative width is a nonsense retrieval
+    size. The wording matches the config-side parser, so an operator who sets
+    the same value badly in ``config.yml`` reads the same sentence either way.
+
+    A missing key -- and an explicit ``null``, which is how JSON spells the same
+    thing -- means "use the configured default" and is left alone.
+
+    Args:
+        advanced_params: The request's mode-specific parameters.
+
+    Raises:
+        HTTPException: 400 naming the offending key and the value it got.
+    """
+    rerank = advanced_params.get("rerank")
+    if rerank is not None and not isinstance(rerank, bool):
+        raise HTTPException(
+            status_code=400,
+            detail=f"rerank must be a boolean, got {rerank!r}",
+        )
+
+    candidate_limit = advanced_params.get("candidate_limit")
+    if candidate_limit is not None and (
+        not isinstance(candidate_limit, int)
+        or isinstance(candidate_limit, bool)
+        or candidate_limit < 1
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"candidate_limit must be a positive integer, got {candidate_limit!r}",
+        )
+
+
+def _invalid_capabilities(config_errors: list[str], remedy: str | None) -> dict:
+    """Build the capabilities payload for a configuration that did not parse.
+
+    Shape-compatible with the normal payload (the frontend's ``Capabilities``
+    typedef requires ``vocabulary``), but built from nothing: no config, no
+    service and no database are needed to render the banner that tells the
+    operator which key to fix.
+
+    Args:
+        config_errors: Every stored configuration error, in collection order.
+        remedy: The class-derived operator action.
+
+    Returns:
+        The degraded capabilities payload.
+    """
+    return {
+        "status": "configuration_invalid",
+        "config_errors": list(config_errors),
+        "remedy": remedy,
+        "categories": {"direct": {"modes": []}},
+        "default_mode": None,
+        "shared_parameters": [],
+        "vocabulary": {"enabled": False, "concepts": 0, "expand_by_default": False},
+    }
+
+
 @router.get("/capabilities")
 async def get_capabilities(request: Request) -> dict:
     """Return available search modes and their tunable parameters.
 
-    The frontend calls this at startup to dynamically render
-    mode tabs and advanced options.
+    The frontend calls this at startup to dynamically render mode tabs and
+    advanced options — and, when the configuration is broken, the banner that
+    explains why search is dead. It is therefore service-independent: a
+    ``configuration_invalid`` state answers 200 with the degraded payload
+    without touching the service. A ``configuration_warning`` state has a
+    working service, so it returns the normal payload with the three
+    configuration keys added; if that service is missing the database really
+    is down and ``_require_service`` raises 503 as it does everywhere else.
+    An app whose state carries no configuration fields at all behaves exactly
+    as it did before this endpoint learned about them.
     """
+    from osprey.interfaces.ariel.app import CONFIG_STATUS_INVALID, CONFIG_STATUS_WARNING
     from osprey.services.ariel_search.capabilities import get_capabilities as _get_caps
 
+    status = getattr(request.app.state, "config_status", None)
+    errors = getattr(request.app.state, "config_errors", None) or []
+    remedy = getattr(request.app.state, "config_remedy", None)
+    service = getattr(request.app.state, "ariel_service", None)
+
+    if status == CONFIG_STATUS_INVALID or (errors and status is None and service is None):
+        return _invalid_capabilities(errors, remedy)
+
     service = _require_service(request)
-    return _get_caps(service.config)
+    payload = _get_caps(service.config)
+    if errors:
+        payload = {
+            **payload,
+            "status": status or CONFIG_STATUS_WARNING,
+            "config_errors": list(errors),
+            "remedy": remedy,
+        }
+    return payload
 
 
 @router.get("/publish-info")
@@ -237,6 +338,39 @@ async def get_filter_options(request: Request, field_name: str) -> dict:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+def _expanded_terms(result: Any) -> list[ExpandedTermResponse]:
+    """Map a search result's applied vocabulary expansion onto the wire model.
+
+    Reports only what the executed search actually contained. Defensive about
+    the shape: a result object that carries no real groups (a stub, or a module
+    that never learned about expansion) yields an empty list rather than an
+    error.
+
+    Args:
+        result: The service's search result.
+
+    Returns:
+        One response model per expanded span, in the order the service reported.
+    """
+    groups = getattr(result, "expanded_terms", None) or ()
+    if not isinstance(groups, (tuple, list)):
+        return []
+    terms: list[ExpandedTermResponse] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        alternatives = group.get("alternatives") or ()
+        if not isinstance(alternatives, (tuple, list)):
+            alternatives = ()
+        terms.append(
+            ExpandedTermResponse(
+                original=str(group.get("original", "")),
+                alternatives=[str(a) for a in alternatives],
+            )
+        )
+    return terms
+
+
 @router.post("/search", response_model=SearchResponse)
 async def search(request: Request, search_req: SearchRequest) -> SearchResponse:
     """Execute search query.
@@ -244,11 +378,15 @@ async def search(request: Request, search_req: SearchRequest) -> SearchResponse:
     Routes to the search module named by ``mode``; an unknown or disabled mode
     is rejected with 400 rather than falling back to another module.
     """
+    from osprey.services.ariel_search.exceptions import PatternError, VocabularyError
+
     service = _require_service(request)
     start_time = time.time()
 
     # Validated before the try block so the 400 is not swallowed into a 500.
     service_mode = _resolve_search_mode(service, search_req.mode)
+    if service_mode == "hybrid":
+        _validate_hybrid_overrides(search_req.advanced_params)
 
     try:
         # advanced_params takes precedence over top-level filter fields
@@ -305,8 +443,26 @@ async def search(request: Request, search_req: SearchRequest) -> SearchResponse:
                 )
                 for d in result.diagnostics
             ],
+            expanded_terms=_expanded_terms(result),
         )
 
+    except VocabularyError as e:
+        # The deployment asked for vocabulary expansion and cannot have it.
+        # 503, not 500: the service is up, this one path is unavailable until
+        # the operator acts, and the detail names the key and that action.
+        first = e.errors[0] if e.errors else e.message
+        raise HTTPException(
+            status_code=503,
+            detail=f"{e.config_key}: {first}. {e.remedy}",
+        ) from e
+    except PatternError as e:
+        # Defensive: the keyword module turns a rejected pattern into an ERROR
+        # diagnostic, so this should not surface — if it ever does, it is the
+        # operator's regex, not a server fault.
+        detail = f"Invalid search pattern: {e.message}"
+        if e.pattern:
+            detail = f"Invalid search pattern '{e.pattern}': {e.message}"
+        raise HTTPException(status_code=400, detail=detail) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -747,14 +903,30 @@ def _find_project_root() -> Path:
     return Path.cwd()
 
 
-def _config_path() -> Path:
+def _config_path(request: Request) -> Path:
+    """Return the config.yml the running panel actually loaded.
+
+    The lifespan stores the resolved path on ``app.state.config_path``, so the
+    editor writes the same file the loader read (and the same file a relative
+    ``ariel.vocabulary.path`` resolves against). The candidate search survives
+    only as the fallback for an app that never set it.
+
+    Args:
+        request: The incoming request, for its app state.
+
+    Returns:
+        Path to config.yml.
+    """
+    configured = getattr(request.app.state, "config_path", None)
+    if configured is not None:
+        return Path(configured)
     return _find_project_root() / "config.yml"
 
 
 @router.get("/config")
-async def get_config() -> dict:
+async def get_config(request: Request) -> dict:
     """Return the current config.yml as a dict and raw YAML."""
-    path = _config_path()
+    path = _config_path(request)
     if not path.exists():
         raise HTTPException(status_code=404, detail="config.yml not found")
     raw = path.read_text()
@@ -770,19 +942,57 @@ class ConfigUpdateRequest(BaseModel):
 
 
 @router.put("/config")
-async def update_config(req: ConfigUpdateRequest) -> dict:
-    """Write new content to config.yml with backup + fsync."""
-    path = _config_path()
+async def update_config(request: Request, req: ConfigUpdateRequest) -> dict:
+    """Write new content to config.yml with backup + fsync.
+
+    This replaces the whole document verbatim, which makes it the widest write
+    surface ARIEL has onto the file that carries the write gate, the approval
+    gate and the paths the safety layers derive their allow and deny areas from
+    -- and the only one that could change any of them without naming them,
+    simply by handing over different bytes. The protected set is consulted by
+    every framework writer, so it is consulted here too, on exactly the terms
+    the Web Terminal's ``PUT /api/config`` uses: the replacement must leave every
+    protected key exactly as it found it, and one that does not is refused with
+    the same 403, the same wording and the same ``http_config`` audit
+    record. Both surfaces share one implementation rather than two copies of it,
+    so they cannot drift into telling an operator different stories about the
+    same rule.
+
+    The check sits between the parse and the *first* thing that touches disk --
+    ahead of the backup, which is itself a write derived from a file this
+    request may turn out not to be allowed to replace.
+    """
+    # Both helpers are the Web Terminal config route's, imported rather than
+    # restated: the refusal an operator sees, the audit record it leaves and the
+    # document diff it is based on are then the same objects, not two spellings
+    # of the same intent.
+    from osprey.interfaces.web_terminal.routes.config import (
+        _as_document,
+        _changed_protected_keys,
+        _current_document,
+        _refuse_protected_keys,
+    )
+
+    path = _config_path(request)
     if not path.exists():
         raise HTTPException(status_code=404, detail="config.yml not found")
 
     try:
-        yaml.safe_load(req.content)
+        parsed = yaml.safe_load(req.content)
     except yaml.YAMLError as e:
         raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}") from e
 
-    bak = path.with_suffix(".yml.bak")
-    bak.write_text(path.read_text())
+    changed = _changed_protected_keys(_current_document(path), _as_document(parsed))
+    if changed:
+        raise _refuse_protected_keys(request, changed)
+
+    # Into the agent-data state zone, not beside the config: this file lives in
+    # the render, which the container split makes root-owned, and creating a new
+    # file there would fail before a byte of the save was written. See
+    # osprey.utils.config_writer.CONFIG_BACKUP_DIRNAME.
+    from osprey.utils.config_writer import write_config_backup
+
+    write_config_backup(path)
 
     # fsync for crash safety
     fd = os.open(str(path), os.O_WRONLY | os.O_TRUNC | os.O_CREAT)

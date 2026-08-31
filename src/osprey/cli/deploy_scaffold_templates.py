@@ -1,21 +1,24 @@
-"""Templates and render contexts for ``osprey scaffold ci``.
+"""Templates and render contexts for the ``osprey scaffold`` verbs.
 
-The scaffolding verb emits two files into a deployment repo — a CI pipeline and
-a post-deploy health check — and both are Jinja templates under
-``osprey/templates/deploy/``. This module owns three things the verb needs and
-nothing else: which template a platform selects, what context each template
-expects, and how to turn a profile into that context.
+Scaffolding emits generated files into a deployment repo — a CI pipeline, a
+post-deploy health check, a systemd unit and its boot hook — and every one of
+them is a Jinja template under ``osprey/templates/deploy/``. This module owns
+three things the verbs need and nothing else: which template a platform
+selects, what context each template expects, and how to turn a profile into
+that context.
 
 The split matters because the templates are held to a byte-for-byte golden
 (``tests/deployment/goldens/``). Layout decisions — column alignment, comment
 wording, divider widths — belong to the templates; the facts a facility supplies
 belong here, where they can be derived once and tested directly.
 
-Every input is a profile fact. Deployment coordinates come from the ``deploy:``
-block via :func:`osprey.cli.build_profile_deploy.parse_deploy_block`; everything
-else is read from the profile proper. The only value that is not a profile fact
-is the project name, which is the facility repo's directory name and therefore
-known only at emission time.
+Nearly every input is a profile fact. Deployment coordinates come from the
+``deploy:`` block via
+:func:`osprey.cli.build_profile_deploy.parse_deploy_block`; everything else is
+read from the profile proper. The exceptions are the handful of values a
+profile cannot know — the repo's directory name, and, for the systemd unit, the
+two absolute paths that describe the machine the unit will run on — and each
+one is passed in at emission time rather than guessed at here.
 """
 
 from __future__ import annotations
@@ -28,6 +31,9 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 import osprey
 from osprey.deployment.web_terminals.env_production import USERS_ENV_FILENAME
+from osprey.deployment.web_terminals.ports import resolve_nginx_port
+from osprey.port_layout import PORT_BASE_CONFIG_KEY, default_port, resolve_port_base
+from osprey.utils.shell_resolver import resolve_shell_command
 
 from .build_profile_deploy import DeployConfig
 from .build_profile_emit import effective_web_terminals
@@ -46,11 +52,82 @@ CI_TEMPLATES: dict[str, str] = {"gitlab": "gitlab-ci.yml.j2"}
 #: The post-deploy health check, emitted for every platform.
 VERIFY_TEMPLATE: str = "verify.sh.j2"
 
+#: The systemd unit that brings a deployment up at boot.
+SYSTEMD_TEMPLATE: str = "osprey.service.j2"
+
+#: The no-root fallback for a host whose home is a late mount. A lingering user
+#: manager resolves its unit search path once, at boot, before an NFS or autofs
+#: home is there — and never looks again, so the unit reads ``not-found`` until
+#: someone reloads by hand. The supported fix is a ``RequiresMountsFor``
+#: drop-in on ``user@<uid>.service``, which needs root; this script is what an
+#: operator without root ends up writing instead, so it is shipped rather than
+#: left to be rediscovered.
+BOOT_HOOK_TEMPLATE: str = "osprey-boot-hook.sh.j2"
+
 #: Provenance markers the emitted files carry. A file whose first lines name one
 #: of these was written by the scaffolder and may be re-emitted; anything else is
 #: treated as hand-written.
 CI_MARKER: str = "deploy/gitlab-ci"
 VERIFY_MARKER: str = "deploy/verify"
+SYSTEMD_MARKER: str = "deploy/systemd"
+BOOT_HOOK_MARKER: str = "deploy/boot-hook"
+
+#: What the emitted unit is called. Fixed rather than chosen at emission time:
+#: the unit's own header tells the operator which file to copy and which name to
+#: pass ``systemctl``, and a name the caller could change is a name that header
+#: could get wrong.
+SYSTEMD_UNIT_NAME: str = "osprey.service"
+
+#: What the emitted boot hook is called, fixed for the same reason the unit's
+#: name is: the script's own header tells the operator the ``@reboot`` line to
+#: paste into their crontab, and a name the caller could change is a name that
+#: line could get wrong.
+BOOT_HOOK_OUTPUT_NAME: str = "osprey-boot-hook.sh"
+
+#: How long systemd may wait for ``osprey up -d``. A oneshot gets 90 seconds by
+#: default, which a start that pulls images first will exceed — and a start
+#: timeout kills the deploy halfway through. Fifteen minutes is long enough for
+#: a cold pull on a slow link and still short enough to end a genuinely wedged
+#: start rather than hang the boot on it.
+SYSTEMD_START_TIMEOUT_SEC: int = 900
+
+#: How long the crontab job waits for the hook to become readable — in practice
+#: how long the home may take to arrive — and, separately, how long the hook
+#: then waits for the deployment and the user manager. On a normal boot the
+#: automounter followed cron by under twenty seconds; the boot that matters is
+#: the messy one, a site power event with the filer coming up after the compute
+#: host, where the home can be minutes late and giving up recreates the silent
+#: dead stack the hook exists to prevent. Ten minutes of a sleeping shell costs
+#: nothing; a hook that waits past that holds a cron slot open on a host nobody
+#: is watching.
+BOOT_HOOK_TOTAL_WAIT_SEC: int = 600
+
+#: Seconds between the hook's attempts. Short enough that a mount landing two
+#: seconds after boot does not cost the deployment a visible delay, long enough
+#: that the wait is not a spin.
+BOOT_HOOK_POLL_SEC: int = 5
+
+#: Where the boot hook and the crontab job that launches it record their
+#: progress: under ``/tmp``, on the local disk, because on the host this exists
+#: for the home is the thing that has not arrived yet. Written before any wait,
+#: so a boot that never mounted the home still shows whether cron fired the job
+#: at all — the one question a mail that never came cannot answer. ``$(id -u)``
+#: is expanded by the shell that runs the line, so the same spelling serves the
+#: crontab and the script.
+#:
+#: A directory rather than a bare file, because ``/tmp`` is world-writable and
+#: the name is predictable: appending to a file there follows a symlink any
+#: local user could have planted, turning the log into an append to a file of
+#: their choosing, as the deploying account. Both writers create the directory
+#: with mode 700 and use it only if it is a real directory they own — otherwise
+#: they log to ``/dev/null`` — and ``/tmp``'s sticky bit keeps anyone else from
+#: swapping it out afterwards.
+BOOT_HOOK_LOG_DIR: str = "/tmp/osprey-boot-hook.$(id -u)"
+BOOT_HOOK_LOG: str = f"{BOOT_HOOK_LOG_DIR}/boot.log"
+
+#: Where the unit's ``Documentation=`` points. The deployment how-to is the page
+#: that covers what a host needs before the unit can bring a stack up.
+DEPLOY_DOCS_URL: str = "https://als-apg.github.io/osprey/how-to/deploy-a-facility.html"
 
 #: The CI-only variable holding the deploy host's SSH private key. Fixed rather
 #: than profile-named: it authenticates the pipeline to the host and is never
@@ -67,10 +144,15 @@ DEPLOY_SSH_KEY_VAR: str = "DEPLOY_SSH_KEY"
 #: the engine derives its output path from it, and ``test_scaffold_ci`` asks
 #: every reader (engine, rendered pipeline, init, post-up hook) about the file
 #: that was actually written, so the spellings cannot drift apart in silence.
+#: ``BOOT_HOOK_PATH`` is the same idea one directory over: the hook's header
+#: prints the ``@reboot`` crontab line an operator pastes, and that line is this
+#: path under the repo root, so the spelling the script shows and the spelling
+#: the emitter writes to have to be one constant.
 PROFILE_PATH: str = PROFILE_FILENAME
 BUILD_DIR: str = BUILD_OUTPUT_DIR
 STATE_DIR_PATH: str = STATE_DIR
 VERIFY_PATH: str = "scripts/verify.sh"
+BOOT_HOOK_PATH: str = f"scripts/{BOOT_HOOK_OUTPUT_NAME}"
 
 #: What ``osprey users env --output`` writes on the deploy host, at the repo
 #: root where compose reads it. Aliased from the writer's own constant rather
@@ -83,6 +165,13 @@ USERS_ENV_NAME: str = USERS_ENV_FILENAME
 #: Probes run on the deploy host itself, so every target is loopback regardless
 #: of how the outside world reaches the service.
 PROBE_HOST: str = "localhost"
+
+#: Where a per-user web terminal answers a probe. Not ``/``: the application
+#: asks every caller for a credential, and the deploy host's probe has none, so
+#: ``/`` would report a perfectly healthy terminal as down. This route is the
+#: one the app's auth gate lets through unauthenticated, for exactly this kind
+#: of liveness question.
+TERMINAL_LIVENESS_PATH: str = "/health"
 
 
 @dataclass(frozen=True)
@@ -212,7 +301,132 @@ class VerifyContext:
         return any(probe.kind == "tcp" for group in self.groups for probe in group.probes)
 
 
-def render(template_name: str, context: CIContext | VerifyContext) -> str:
+@dataclass(frozen=True)
+class SystemdContext:
+    """Everything ``osprey.service.j2`` renders from.
+
+    Frozen, and every field a plain string: a unit file is read by systemd on a
+    host the scaffolder may never see, so nothing here may be recomputed from
+    the local machine after the caller has decided what it says.
+
+    Attributes:
+        facility_name: The profile's ``name:`` — the unit's ``Description``.
+        osprey_version: Installed framework version, for the provenance header.
+        repo_root: Absolute path of the deployment repo on the deploy host, and
+            the unit's ``WorkingDirectory``. Every ``osprey`` verb finds the
+            deployment by walking up from where it runs, and systemd starts a
+            unit in no particular directory.
+        osprey_bin: Absolute path to the ``osprey`` executable on that host. A
+            unit inherits a stripped ``PATH``, so a bare command name is not
+            reliably resolvable at boot.
+        timeout_start_sec: Seconds systemd allows ``osprey up -d`` — see
+            :data:`SYSTEMD_START_TIMEOUT_SEC`.
+    """
+
+    facility_name: str
+    osprey_version: str
+    repo_root: str
+    osprey_bin: str
+    timeout_start_sec: int = SYSTEMD_START_TIMEOUT_SEC
+
+
+@dataclass(frozen=True)
+class BootHookContext:
+    """Everything ``osprey-boot-hook.sh.j2`` renders from.
+
+    Frozen, and every field a plain string or integer, for the same reason
+    :class:`SystemdContext` is: the script runs at boot on a host the
+    scaffolder may never see, so nothing here may be recomputed from the local
+    machine after the caller has decided what it says.
+
+    Attributes:
+        facility_name: The profile's ``name:`` — the script's title. One host
+            can carry a hook per deployment, and cron mails their output to the
+            same account.
+        osprey_version: Installed framework version, for the provenance header.
+        repo_root: Absolute path of the deployment repo on the deploy host. The
+            hook waits for it, because on the host this exists for it sits under
+            the same late mount as the home; it is also what makes the
+            ``@reboot`` line in the header absolute.
+        osprey_bin: Absolute path to the ``osprey`` executable on that host. The
+            hook waits for this too: a pip install under the home directory is
+            just as absent as the repo until the mount lands, and a unit started
+            without it fails where nobody is looking.
+        home: Absolute path of the account's home on that host, written into
+            the script rather than read from ``$HOME`` at boot: the crontab
+            that launches it sets ``HOME=/`` (see
+            :func:`boot_hook_crontab_lines`), and asking the identity stack
+            with ``getent`` at that moment depends on a service that may have
+            started seconds earlier, or not yet.
+        crontab_lines: Every line the header tells the operator to paste, from
+            :func:`boot_hook_crontab_lines` — one spelling for the header and
+            the console.
+        poll_seconds: Seconds between attempts — see :data:`BOOT_HOOK_POLL_SEC`.
+        total_wait_seconds: Seconds the hook waits in total before giving up and
+            saying which piece never arrived — see
+            :data:`BOOT_HOOK_TOTAL_WAIT_SEC`.
+    """
+
+    facility_name: str
+    osprey_version: str
+    repo_root: str
+    osprey_bin: str
+    home: str
+    crontab_lines: tuple[str, ...]
+    poll_seconds: int = BOOT_HOOK_POLL_SEC
+    total_wait_seconds: int = BOOT_HOOK_TOTAL_WAIT_SEC
+
+
+def boot_hook_crontab_lines(hook: str) -> tuple[str, ...]:
+    """The crontab lines that run the boot hook at every boot.
+
+    All of them are needed, and the job is deliberately not a bare
+    ``@reboot <hook>``. Two things happen before a cron job's command runs,
+    and on a host whose home is a late mount each one kills the job silently:
+    cron changes into the crontab's ``HOME`` first, and dies if that directory
+    is not there yet; then ``sh`` has to read the script, which sits on the
+    same mount. ``HOME=/`` gives cron a directory that exists at boot.
+    ``SHELL=/bin/sh`` makes the job's shell a property of these lines rather
+    than of whatever an existing crontab set above them — the job is POSIX
+    ``sh`` and would not parse under a ``csh``. The job itself lives in the
+    crontab — on the local disk — and does the waiting the script cannot do
+    for itself: it writes a launch marker to :data:`BOOT_HOOK_LOG` before
+    anything else, waits up to :data:`BOOT_HOOK_TOTAL_WAIT_SEC` for the script
+    to become readable, and only then runs it. The script restores the real
+    ``HOME`` as its first act. Giving up is said on stdout as well as in the
+    log: cron mails what a job prints, and this is the one branch where that
+    mail is the whole point.
+
+    The log directory is created and checked the way :data:`BOOT_HOOK_LOG`
+    describes, in the job as well as in the script: the job writes first.
+
+    No ``%`` anywhere: cron reads it as a newline.
+
+    Args:
+        hook: Absolute path of the emitted boot hook on the deploy host.
+
+    Returns:
+        The lines in the order they go into the crontab: the two preamble
+        assignments, then the ``@reboot`` job.
+    """
+    attempts = BOOT_HOOK_TOTAL_WAIT_SEC // BOOT_HOOK_POLL_SEC
+    job = (
+        f'@reboot d={BOOT_HOOK_LOG_DIR}; mkdir -m 700 "$d" 2>/dev/null; '
+        f'if [ -d "$d" ] && [ ! -L "$d" ] && [ -O "$d" ]; then log={BOOT_HOOK_LOG}; '
+        f"else log=/dev/null; fi; "
+        f'echo "$(date) osprey-boot-hook: cron fired" >> "$log"; '
+        f"n=0; until [ -x {hook} ] || [ $n -ge {attempts} ]; "
+        f"do sleep {BOOT_HOOK_POLL_SEC}; n=$((n+1)); done; "
+        f"if [ -x {hook} ]; then exec {hook}; fi; "
+        f'echo "$(date) osprey-boot-hook: gave up, {hook} never appeared" | tee -a "$log"'
+    )
+    return ("SHELL=/bin/sh", "HOME=/", job)
+
+
+def render(
+    template_name: str,
+    context: CIContext | VerifyContext | SystemdContext | BootHookContext,
+) -> str:
     """Render one deploy template.
 
     Args:
@@ -236,7 +450,12 @@ def render(template_name: str, context: CIContext | VerifyContext) -> str:
         build_dir=BUILD_DIR,
         state_dir=STATE_DIR_PATH,
         verify_path=VERIFY_PATH,
+        boot_hook_path=BOOT_HOOK_PATH,
+        boot_hook_log=BOOT_HOOK_LOG,
+        boot_hook_log_dir=BOOT_HOOK_LOG_DIR,
         users_env_name=USERS_ENV_NAME,
+        unit_name=SYSTEMD_UNIT_NAME,
+        docs_url=DEPLOY_DOCS_URL,
     )
 
 
@@ -325,6 +544,12 @@ def build_verify_context(
                 divider="Web tier",
                 heading="Web terminal",
                 probes=web_probes,
+                comment=(
+                    "The landing page is nginx's own file, served before anything asks",
+                    "the caller for a credential. A terminal is the application, which",
+                    "answers an uncredentialed GET / with a 401 — so it is probed at",
+                    f"{TERMINAL_LIVENESS_PATH}, the route its auth gate lets through.",
+                ),
             )
         )
 
@@ -344,6 +569,96 @@ def build_verify_context(
         osprey_version=osprey_version or osprey.__version__,
         groups=groups,
         runs_verify_on_up=_web_terminals(profile) is not None,
+    )
+
+
+def build_systemd_context(
+    profile: dict[str, Any],
+    repo_root: Path,
+    osprey_bin: str | None = None,
+    osprey_version: str | None = None,
+) -> SystemdContext:
+    """Derive the systemd unit's context from a profile and a machine.
+
+    Args:
+        profile: The resolved raw profile dict.
+        repo_root: The deployment repo's root. Resolved to an absolute path,
+            because a unit is started from no directory in particular; a caller
+            emitting a unit for a *different* host passes that host's path,
+            which is absolute already and travels through untouched.
+        osprey_bin: Absolute path to the ``osprey`` executable on the host that
+            will run the unit. Defaults to the one that would answer here,
+            resolved through the same helper the web terminal uses for a
+            stripped ``PATH``.
+        osprey_version: Version for the provenance header; defaults to the
+            installed framework's.
+
+    Returns:
+        The context :data:`SYSTEMD_TEMPLATE` renders against.
+
+    Raises:
+        FileNotFoundError: If no ``osprey_bin`` was given and no ``osprey``
+            executable can be found — a unit naming a command that is not
+            there would fail at boot, where nobody is watching.
+    """
+    return SystemdContext(
+        facility_name=str(profile.get("name", repo_root.name)),
+        osprey_version=osprey_version or osprey.__version__,
+        repo_root=str(repo_root.resolve()),
+        osprey_bin=osprey_bin or resolve_shell_command("osprey"),
+    )
+
+
+def build_boot_hook_context(
+    profile: dict[str, Any],
+    repo_root: Path,
+    osprey_bin: str | None = None,
+    osprey_version: str | None = None,
+    home: Path | None = None,
+) -> BootHookContext:
+    """Derive the boot hook's context from a profile and a machine.
+
+    Takes the same arguments as :func:`build_systemd_context`, and for the same
+    reasons: the hook exists to start the unit that function's template
+    describes, so the two are emitted from one set of host coordinates or they
+    describe two different machines. The home is one more such coordinate.
+
+    Args:
+        profile: The resolved raw profile dict.
+        repo_root: The deployment repo's root. Resolved to an absolute path — a
+            crontab entry is run from the account's home with no context, and
+            the hook waits on this path by name; a caller emitting a hook for a
+            *different* host passes that host's path, which is absolute already
+            and travels through untouched.
+        osprey_bin: Absolute path to the ``osprey`` executable on the host that
+            will run the unit. Defaults to the one that would answer here,
+            resolved through the same helper the web terminal uses for a
+            stripped ``PATH``.
+        osprey_version: Version for the provenance header; defaults to the
+            installed framework's.
+        home: The account's home on the host that will run the unit. Defaults
+            to this machine's, which is the right answer on the machine the
+            verb is meant to be run on.
+
+    Returns:
+        The context :data:`BOOT_HOOK_TEMPLATE` renders against.
+
+    Raises:
+        FileNotFoundError: If no ``osprey_bin`` was given and no ``osprey``
+            executable can be found — a hook waiting for a path that will never
+            exist would time out every boot.
+        RuntimeError: If no ``home`` was given and this machine cannot resolve
+            one (``Path.home()``'s own failure) — a user unit has no account to
+            belong to there.
+    """
+    resolved_root = repo_root.resolve()
+    return BootHookContext(
+        facility_name=str(profile.get("name", repo_root.name)),
+        osprey_version=osprey_version or osprey.__version__,
+        repo_root=str(resolved_root),
+        osprey_bin=osprey_bin or resolve_shell_command("osprey"),
+        home=str(home if home is not None else Path.home()),
+        crontab_lines=boot_hook_crontab_lines(str(resolved_root / BOOT_HOOK_PATH)),
     )
 
 
@@ -403,7 +718,14 @@ def _service_probes(profile: dict[str, Any]) -> tuple[Probe, ...]:
     config = _config_block(profile)
     deployed = _dotted(config, "deployed_services")
     if isinstance(deployed, list) and "openobserve" in deployed:
-        port = _as_port(_dotted(config, "services.openobserve.port"), 5080)
+        # With no port key the store sits at the layout's openobserve slot in
+        # THIS profile's block, so the base is read from the profile rather
+        # than defaulted: a deployment that moved its base has to be probed
+        # inside its own block, not at whatever holds the framework default.
+        port = _as_port(
+            _dotted(config, "services.openobserve.port"),
+            default_port("openobserve", base=_profile_port_base(config)),
+        )
         probes.append(
             Probe(
                 kind="http",
@@ -493,20 +815,46 @@ def _web_terminals(profile: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _web_probes(profile: dict[str, Any]) -> tuple[Probe, ...]:
-    """Probe the nginx landing page and one terminal per roster user."""
+    """Probe the nginx landing page and one terminal per roster user.
+
+    The two halves answer at different paths, and the difference is not
+    cosmetic. The landing page is nginx's own file, served before anything
+    asks the caller for a credential, so ``/`` is exactly what an operator
+    opening the deployment sees. A per-user terminal is the application, and
+    the application now refuses an uncredentialed request to ``/`` with a 401;
+    a probe pointed there would report every healthy terminal as down. Each
+    terminal is probed at its unauthenticated liveness route instead, which
+    is the same route its container healthcheck uses and the only one the
+    app's auth gate lets through without a credential.
+    """
     web = _web_terminals(profile)
     if web is None:
         return ()
 
+    # The landing page's port, resolved the way every other reader of a
+    # deployment resolves it: the profile's `nginx_port` when it sets one, else
+    # the gateway slot of the block the profile's own `deployment.port_base`
+    # names. Re-wrapped into the single rendered-config shape the resolver
+    # takes, the same way the openobserve probe above reaches the base.
+    profile_config = _config_block(profile)
+    port_base = _profile_port_base(profile_config)
     probes = [
         Probe(
             kind="http",
             label="landing page",
-            port=_as_port(web.get("nginx_port"), 9080),
+            port=resolve_nginx_port(
+                {
+                    "deployment": {"port_base": _dotted(profile_config, PORT_BASE_CONFIG_KEY)},
+                    "modules": {"web_terminals": web},
+                }
+            ),
         )
     ]
 
-    base = _as_port(web.get("web_base_port"), 9091)
+    # Absent an authored `web_base_port`, user 0's terminal is the first port
+    # of the panel family in THIS profile's block — the same base the landing
+    # page above was resolved against, so the two never drift apart.
+    base = _as_port(web.get("web_base_port"), default_port("web", base=port_base))
     users = web.get("users")
     for position, entry in enumerate(users if isinstance(users, list) else []):
         if isinstance(entry, str):
@@ -518,7 +866,14 @@ def _web_probes(profile: dict[str, Any]) -> tuple[Probe, ...]:
             continue
         if not name:
             continue
-        probes.append(Probe(kind="http", label=f"terminal ({name})", port=base + index))
+        probes.append(
+            Probe(
+                kind="http",
+                label=f"terminal ({name})",
+                port=base + index,
+                path=TERMINAL_LIVENESS_PATH,
+            )
+        )
 
     return tuple(sorted(probes, key=lambda probe: probe.port))
 
@@ -535,7 +890,8 @@ def _dispatch_probes(profile: dict[str, Any]) -> tuple[Probe, ...]:
     if not isinstance(profile.get("dispatch"), dict):
         return ()
 
-    configured = _dotted(_config_block(profile), "services.event_dispatcher.port")
+    config = _config_block(profile)
+    configured = _dotted(config, "services.event_dispatcher.port")
     if configured is None:
         configured = profile["dispatch"].get("dispatcher_port")
 
@@ -543,7 +899,7 @@ def _dispatch_probes(profile: dict[str, Any]) -> tuple[Probe, ...]:
         Probe(
             kind="http",
             label="dispatcher health",
-            port=_as_port(configured, 8020),
+            port=_as_port(configured, default_port("dispatcher", base=_profile_port_base(config))),
             path="/health",
         ),
     )
@@ -571,8 +927,43 @@ def _dotted(config: dict[str, Any], key: str) -> Any:
     return node
 
 
+def _profile_port_base(config: dict[str, Any]) -> int:
+    """Return the first port of the block this profile's deployment claims.
+
+    Every default port the scaffold emits is derived from the base the profile
+    itself resolved, never from the layout's default base: a deployment that
+    moved its block has to be probed inside that block. A profile's ``config:``
+    overlay is a flat bag of dotted keys rather than a rendered config, so the
+    base is read out of it and re-wrapped into the one shape the resolver
+    takes — which is also what makes an out-of-range base refuse on this path
+    instead of quietly rendering a probe past port 65535.
+
+    Args:
+        config: The profile's ``config:`` overrides, as returned by
+            :func:`_config_block`.
+
+    Returns:
+        The base named by ``deployment.port_base`` in either spelling, or the
+        layout default when the profile names none.
+
+    Raises:
+        ValueError: If the profile names a base whose block cannot be bound.
+    """
+    return resolve_port_base({"deployment": {"port_base": _dotted(config, PORT_BASE_CONFIG_KEY)}})
+
+
 def _as_port(value: Any, default: int) -> int:
-    """Coerce a profile-supplied port, falling back to the framework default."""
+    """Coerce a profile-supplied port, falling back to what the caller derived.
+
+    Args:
+        value: Whatever the profile put where a port belongs.
+        default: The port to use when the profile supplied nothing usable. For
+            a framework service this is the caller's layout lookup at the
+            profile's own base, never a literal.
+
+    Returns:
+        ``value`` as an int, or ``default`` when it is absent or not a number.
+    """
     try:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):

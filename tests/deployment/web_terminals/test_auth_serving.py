@@ -34,6 +34,10 @@ external origin are all read out of ``render_web_terminals()``'s output;
 preflight and ``osprey users passwd`` call) and handed to the container through
 ``--env-file``, matching the rendered ``env_file:``. Only the passwords
 themselves are chosen here, because minting deliberately never returns one.
+The one thing this file must do that compose would otherwise have done is
+*interpolate*: a bare ``docker run`` resolves no ``${...}``, so
+:func:`_resolved_env_flags` replays that substitution against the deployment's
+env chain before either service is started.
 
 PASSWORD MODE ONLY, deliberately. The OIDC handshake is proven in process
 against a real signing provider in ``tests/services/auth_sidecar/test_oidc_flow.py``;
@@ -67,6 +71,7 @@ to that Dockerfile would reach a deployment without a test noticing.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import shutil
 import socket
@@ -74,7 +79,7 @@ import subprocess
 import textwrap
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.metadata import requires as distribution_requires
@@ -90,15 +95,22 @@ from osprey.deployment.web_terminals.artifacts import web_artifacts_dir
 from osprey.deployment.web_terminals.auth_credentials import (
     AUTH_ENV_FILENAME,
     ensure_auth_session_secrets,
+    ensure_terminal_secrets,
     purge_auth_credentials,
     set_auth_password,
+    terminal_secret_var,
 )
 from osprey.deployment.web_terminals.personas import env_var_suffix
 from osprey.deployment.web_terminals.render import render_web_terminals
 from osprey.interfaces._serving import free_port
 from osprey.services.auth_sidecar.passwords import generation_tag, hash_password
 from osprey.services.auth_sidecar.sessions import SESSION_COOKIE_NAME, SessionCodec
-from osprey.utils.dotenv import parse_dotenv_file
+from osprey.utils.dotenv import (
+    ENV_LOCAL_FILENAME,
+    ENV_SHARED_FILENAME,
+    merge_chain,
+    parse_dotenv_file,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SRC_DIR = _REPO_ROOT / "src"
@@ -114,6 +126,21 @@ window without locking out the user every other test logs in as — the throttle
 is per-user and process-local, and the stack is shared across this module."""
 
 _PASSWORDS = {"alice": "alice-pw-correct", "bob": "bob-pw-correct", "carol": "carol-pw-correct"}
+
+_SHARED_PROXY = "http://proxy.invalid:3128"
+"""A site-wide egress proxy, written into ``.env.shared`` by the stack below.
+
+``.env.shared`` is the committed half of the env chain — the file ``osprey
+init`` writes the commented-out ``HTTP_PROXY``/``HTTPS_PROXY``/``NO_PROXY``
+block into, because a proxy is a setting the whole site shares rather than one
+host's secret. The sidecar reaches it through ``${HTTPS_PROXY:-}``
+passthrough, which is worth nothing unless a value living in *that* file
+survives the trip into the container; :func:`_resolved_env_flags` is what
+carries it, and
+:func:`test_sidecar_environment_carries_the_proxy_resolved_from_the_env_chain`
+is what proves it arrived. Unreachable by construction (``.invalid`` is
+reserved): password-mode serving makes no outbound request, so the value is
+only ever read back, never dialled."""
 
 _PACKAGES = (
     "fastapi",
@@ -391,10 +418,6 @@ def _config(nginx_port: int) -> dict[str, Any]:
             "web_terminals": {
                 "enabled": True,
                 "nginx_port": nginx_port,
-                "web_base_port": 9091,
-                "artifact_base_port": 9291,
-                "ariel_base_port": 9391,
-                "lattice_base_port": 9491,
                 "users": list(_USERS),
                 "auth": {"method": "password", "allow_insecure_http": True},
             }
@@ -441,6 +464,74 @@ def _wait_for(url: str, *, names: list[str], what: str, timeout: float = 60.0) -
     raise AssertionError(f"{what} never became ready ({last})\n{logs}")
 
 
+_COMPOSE_INTERPOLATION = re.compile(
+    r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?::-(?P<default>[^}]*))?\}"
+)
+"""The ``${VAR}`` / ``${VAR:-default}`` references compose resolves for itself."""
+
+
+def _resolved_env_flags(service: dict[str, Any], chain_env: Mapping[str, str]) -> list[str]:
+    """A rendered service's ``environment:`` block as ``docker run -e`` flags.
+
+    A **docker-run replay of compose interpolation**, and the one place in this
+    file that performs one. Compose resolves every ``${...}`` in a service
+    definition at container-create time, from the env chain its lifecycle verbs
+    pass as ``--env-file``; a bare ``docker run`` resolves nothing, so an
+    unreplayed entry reaches the container as the literal characters
+    ``${VAR:-}`` and every assertion about that variable is then about a
+    placeholder rather than about the value a deployment would deliver.
+
+    Both interpolating services come through here. nginx carries one
+    ``${OSPREY_TERMINAL_SECRET_<user>:-}`` per roster user; the auth sidecar
+    carries the OIDC egress passthrough (``HTTP_PROXY``, ``HTTPS_PROXY``,
+    ``NO_PROXY``). One resolver for the two, because a second implementation
+    would be a second thing to keep true — and the sidecar's variables were the
+    ones that had no replay at all until this helper covered both.
+
+    Resolution order, matching what compose does with the chain:
+
+    1. the **merged env chain** — ``.env.shared`` under ``.env``, the later file
+       winning (:func:`osprey_connectors.dotenv.merge_chain`, reached here
+       through the ``osprey.utils.dotenv`` re-export shim). Resolving against
+       ``.env`` alone would silently drop every value an operator put in the
+       committed half of the chain, which is exactly where a site-wide proxy
+       lives;
+    2. the entry's own ``:-`` default, when the chain has no non-empty value —
+       compose's ``:-`` fires on unset *and* on empty;
+    3. the empty string, for a reference that declares no default.
+
+    One deliberate divergence: compose would consult the shell environment ahead
+    of the chain, and this replay does not, so the resolved value is a property
+    of the deployment's files alone and a proxy exported on the CI host cannot
+    change what the assertions see.
+
+    :param service: A rendered compose service definition.
+    :param chain_env: The deployment's merged env chain.
+    :return: Alternating ``-e`` / ``NAME=value`` docker-run arguments.
+    :raises AssertionError: If a resolved value still contains a ``$`` — an
+        interpolation shape this replay does not implement (a bare ``$VAR``, a
+        ``$$`` escape, or a nested ``${...}``). ``$`` is the whole class rather
+        than ``${`` alone because production refuses any chain value carrying
+        one (``compose_unsafe_vars_in_chain``), so no legitimate resolved value
+        has one to lose. Failing here is the point: the alternative is a
+        container that reads the placeholder as a literal value and a green test
+        that means nothing.
+    """
+
+    def _substitute(match: re.Match[str]) -> str:
+        return chain_env.get(match["name"], "") or (match["default"] or "")
+
+    flags: list[str] = []
+    for entry in service.get("environment") or []:
+        name, _, raw = entry.partition("=")
+        value = _COMPOSE_INTERPOLATION.sub(_substitute, raw)
+        assert "$" not in value, (
+            f"{name} still carries an unresolved interpolation after the replay: {value!r}"
+        )
+        flags += ["-e", f"{name}={value}"]
+    return flags
+
+
 @contextmanager
 def serving_stack(tmp_path: Path) -> Iterator[Stack]:
     """Bring the rendered perimeter up, and take it down again.
@@ -468,6 +559,27 @@ def serving_stack(tmp_path: Path) -> Iterator[Stack]:
     for user in _USERS:
         set_auth_password(user, _PASSWORDS[user], deployment_root)
 
+    # The per-user operator secret nginx stamps onto every proxied request, minted
+    # into the deploy `.env` by the same preflight function `osprey up` calls — not
+    # hand-rolled, for the same reason the auth secrets above are not. nginx.conf
+    # `include`s one envsubst'd snippet per authenticated location, and nginx
+    # treats a missing include as a hard startup failure, so the container never
+    # becomes ready until these exist and are handed to it (below).
+    ensure_terminal_secrets(deployment_root, _USERS)
+    env_local = parse_dotenv_file(deployment_root / ENV_LOCAL_FILENAME)
+    terminal_secrets = {user: env_local[terminal_secret_var(user)] for user in _USERS}
+
+    # The committed half of the chain, which no credential function writes: a
+    # site-wide proxy is the operator-authored shape `osprey init` documents
+    # there, and it is the value the sidecar's `${HTTPS_PROXY:-}` passthrough
+    # has to survive the trip with. Written before the merge below, because
+    # that merge is what every `${...}` in the rendered stack resolves against.
+    (deployment_root / ENV_SHARED_FILENAME).write_text(f"HTTPS_PROXY={_SHARED_PROXY}\n")
+
+    # This deployment's env chain as compose would read it: `.env.shared` under
+    # `.env`, the local file winning on any key both set.
+    chain_env = merge_chain(deployment_root)
+
     env_auth = parse_dotenv_file(deployment_root / AUTH_ENV_FILENAME)
     session_secret = env_auth["OSPREY_AUTH_SESSION_SECRET"]
     stored_hashes = {
@@ -489,7 +601,7 @@ def serving_stack(tmp_path: Path) -> Iterator[Stack]:
         # fresh port rather than turning a lost race into a red test.
         for attempt in range(3):
             nginx_port = free_port()
-            artifacts = render_web_terminals(_config(nginx_port))
+            artifacts = render_web_terminals(_config(nginx_port), terminal_secrets=terminal_secrets)
             # Lay the rendered artifacts out the way the real writer does —
             # under the repo's build/ zone — while `project` below plays the
             # pinned compose project directory the mount sources resolve
@@ -544,9 +656,13 @@ def serving_stack(tmp_path: Path) -> Iterator[Stack]:
         )
         assert external_origin == f"http://127.0.0.1:{nginx_port}", external_origin
 
-        auth_env: list[str] = []
-        for value in auth_service["environment"]:
-            auth_env += ["-e", value]
+        # The sidecar's environment is mostly literal, but the egress
+        # passthrough (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) is `${VAR:-}`
+        # that compose would resolve from the deploy env chain. Handing those
+        # through verbatim would set the variables to the literal placeholder
+        # inside the container — a proxy URL of `${HTTPS_PROXY:-}`, which is
+        # worse than unset. Same replay as nginx's, same helper.
+        auth_env = _resolved_env_flags(auth_service, chain_env)
         # Kept as an argv the Stack can replay: a credential change obliges a
         # force-recreate, and the recreated container has to be the same one.
         auth_run_argv = [
@@ -570,10 +686,38 @@ def serving_stack(tmp_path: Path) -> Iterator[Stack]:
         auth_started = subprocess.run(auth_run_argv, capture_output=True, text=True, timeout=180)
         assert auth_started.returncode == 0, auth_started.stderr
 
+        # Bind mounts come off the service's `volumes:` as "src:dst[:opts]"
+        # strings; the envsubst output directory comes off its own `tmpfs:` key
+        # as a "<path>[:opts]" string. They become different docker-run flags, so
+        # they are read separately — both from the rendered service rather than
+        # hardcoded, so a stack that stopped declaring either would fail here
+        # exactly as a real `osprey up` would. The tmpfs entry's option string is
+        # replayed verbatim: `mode=0700` is what compose hands the runtime, and
+        # what the runtime hands the kernel.
         nginx_mounts: list[str] = []
         for volume in nginx_service["volumes"]:
             host_side, container_side = volume.split(":", 1)
             nginx_mounts += ["-v", f"{(project / host_side).resolve()}:{container_side}"]
+        nginx_tmpfs: list[str] = []
+        for entry in nginx_service.get("tmpfs") or []:
+            nginx_tmpfs += ["--tmpfs", entry]
+
+        # The rendered compose declares the templates mount and the envsubst
+        # environment on the nginx service, but its per-user secret values are
+        # `${OSPREY_TERMINAL_SECRET_<user>:-}` — resolved by compose from the
+        # deploy env chain, which a bare `docker run` does not do. The replay
+        # does it here (the minted secrets are in that chain), so the
+        # entrypoint envsubsts each snippet with the real secret.
+        nginx_env = _resolved_env_flags(nginx_service, chain_env)
+
+        # The envsubst output directory (NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx/osprey)
+        # must exist and be writable before the base image's entrypoint runs, or
+        # its own guard silently skips the substitution and nginx then dies on the
+        # missing include. Its restrictive mode is carried through from the
+        # rendered `tmpfs:` entry: the substituted snippets hold every roster
+        # user's operator secret, and this container is the real one.
+        assert nginx_tmpfs, "the rendered nginx service declares no envsubst tmpfs"
+
         nginx_started = subprocess.run(
             [
                 "docker",
@@ -584,6 +728,8 @@ def serving_stack(tmp_path: Path) -> Iterator[Stack]:
                 "--network",
                 f"container:{stub_name}",
                 *nginx_mounts,
+                *nginx_tmpfs,
+                *nginx_env,
                 nginx_service["image"],
             ],
             capture_output=True,
@@ -1185,3 +1331,70 @@ def test_login_post_parses_its_form_body_in_the_container(stack: Stack) -> None:
         assert response.status_code == 303, response.text
         assert response.headers["location"] == "/u/alice/"
         assert client.get("/u/alice/", headers=_navigation()).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 10. The docker-run replay of compose interpolation
+# ---------------------------------------------------------------------------
+
+
+def test_sidecar_environment_carries_the_proxy_resolved_from_the_env_chain(stack: Stack) -> None:
+    """A site-wide `HTTPS_PROXY` in `.env.shared` reaches the running sidecar.
+
+    The sidecar's only outbound traffic is the OIDC discovery/token/userinfo
+    fetches, and on a site behind a corporate proxy they fail unless the host's
+    proxy settings are in the container's environment. The compose definition
+    carries them as `${HTTPS_PROXY:-}` — a reference, not a value — so what has
+    to be proven is the whole path: a value an operator wrote in the *committed*
+    half of the env chain, merged the way compose merges it, resolved by
+    :func:`_resolved_env_flags`, and read back out of the process environment of
+    the container that is actually serving. Reading it back with `os.environ`
+    rather than `docker inspect` is deliberate: inspect shows what was
+    requested, `os.environ` is what httpx will read.
+
+    The empty pair matters as much as the set one. `${HTTP_PROXY:-}` with
+    nothing in the chain must arrive as a variable that is SET and empty, which
+    is how a proxy-less scheme is spelled — not as the literal `${HTTP_PROXY:-}`,
+    which httpx would read as a proxy URL and fail every fetch against.
+    """
+    # Arrange
+    probe = (
+        "import json, os; "
+        "print(json.dumps({name: os.environ.get(name) "
+        "for name in ('HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY')}))"
+    )
+
+    # Act
+    result = subprocess.run(
+        ["docker", "exec", stack.auth_container, "python", "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    # Assert
+    assert result.returncode == 0, result.stderr
+    seen = json.loads(result.stdout)
+    assert seen["HTTPS_PROXY"] == _SHARED_PROXY, seen
+    assert seen["HTTP_PROXY"] == "", seen
+    assert seen["NO_PROXY"] == "", seen
+    # And the resolution happened in the replay rather than by accident: the
+    # argv the container was created from carries the value, not the reference.
+    assert f"HTTPS_PROXY={_SHARED_PROXY}" in stack.auth_run_argv, stack.auth_run_argv
+
+
+def test_no_argument_handed_to_docker_run_survives_as_an_interpolation(stack: Stack) -> None:
+    """Nothing in the sidecar's argv still reads `${...}`.
+
+    :func:`_resolved_env_flags` refuses one value at a time; this is the same
+    property over the whole assembled command line, which also covers the
+    arguments that do not come from `environment:` — the mounts, the
+    `--env-file` path and the rendered `command`. A placeholder that reaches
+    `docker run` is not an error there: it becomes a literal value in the
+    container, and every test above it goes green while asserting on a string
+    no deployment would ever have produced. nginx is held to the same rule by
+    the helper itself, on the way to its own `docker run`.
+    """
+    # Assert
+    unresolved = [argument for argument in stack.auth_run_argv if "${" in argument]
+    assert not unresolved, unresolved

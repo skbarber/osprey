@@ -34,28 +34,39 @@ Themes come in **families**. OSPREY ships four:
 
 In the terminal, click the sliders button at the top right to open the
 display menu — it holds the light/dark switch, the Expert/Simple view toggle,
-and the theme family picker. Panels opened as standalone pages show the same
-theme controls inline in their own header, as pictured below. Your choice is
-remembered, and an ``auto`` setting follows your operating system's light/dark
+and the theme family picker, as pictured below. Every panel opened as its own
+page (ARIEL, the workspace, Channel Finder, the lattice dashboard, the
+knowledge panel) has the same button and the same display controls in its
+own header.
+
+A pick made on any of those pages is remembered by your browser and becomes
+your preference for every OSPREY page served from the same address — set a
+theme in ARIEL and the terminal comes up in it the next time you load it.
+Until you pick Light or Dark, pages follow your operating system's light/dark
 preference.
+
+Panels shown inside the terminal are a separate case. The terminal hands each
+one its theme and view in the page address, and an address outranks the
+remembered preference, so an embedded panel always matches the terminal
+around it.
 
 .. grid:: 1 1 2 2
    :gutter: 2
 
    .. grid-item::
 
-      .. image:: /_static/screenshots/theme_switcher_light.png
-         :alt: The header theme switcher in the light Osprey theme
+      .. image:: /_static/screenshots/display_menu_light.png
+         :alt: The open display menu in the light Osprey theme
          :width: 100%
 
    .. grid-item::
 
-      .. image:: /_static/screenshots/theme_switcher_dark.png
-         :alt: The header theme switcher in the dark Osprey theme
+      .. image:: /_static/screenshots/display_menu_dark.png
+         :alt: The open display menu in the dark Osprey theme
          :width: 100%
 
-The header theme switcher, light and dark. Captured with OSPREY
-|captured_theme_switcher|.
+The display menu a standalone panel opens from its header, light and dark.
+Captured with OSPREY |captured_display_menu|.
 
 To set the theme a deployment *starts* in, use ``web.theme`` in ``config.yml``:
 
@@ -112,7 +123,7 @@ panel buttons along the top:
      rail_position: top      # panel buttons along the top
 
 Each user can still override both from the interface: the theme from the
-theme switcher in the header, and the rail position from the panel "+" menu.
+display menu in the header, and the rail position from the panel "+" menu.
 
 Propose a theme
 ---------------

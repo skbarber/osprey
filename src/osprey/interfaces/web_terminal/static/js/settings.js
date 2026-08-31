@@ -2,6 +2,9 @@
 
 import { fetchJSON, apiRequest } from './api.js';
 import { restartTerminal, startTerminal } from './terminal.js';
+import { showSettingsNotice } from './settings-notice.js';
+import { mountOverlay, fadeOutOverlay } from './modal-overlay.js';
+import { scopedStorageKey } from '/design-system/js/storage-scope.js';
 
 /**
  * The config document returned by GET /api/config.
@@ -36,8 +39,12 @@ let agentPanel = null;
 /** @type {DrawerElement|null} */
 let settingsDrawer = null;
 
-// Per-session warning for the settings drawer (resets on server restart)
-const SETTINGS_WARNING_KEY = 'osprey-settings-warning-ack';
+// Per-session warning for the settings drawer (resets on server restart), and
+// per PERSONA: localStorage is origin-scoped, so on a multi-user mount a bare
+// key would let whoever acknowledged the safety warning first wave it away for
+// everyone else on the box. Resolved through scopedStorageKey() at each use —
+// see storage-scope.js.
+const SETTINGS_WARNING_KEY_BASE = 'osprey-settings-warning-ack';
 
 // True from the moment a trigger click starts the gate (health check in
 // flight, or the warning dialog itself is up) until it resolves one way or
@@ -48,7 +55,6 @@ let warningGatePending = false;
 /** @type {Record<string, string[]>} */
 const ENUM_FIELDS = {
   'claude_code.effort': ['low', 'medium', 'high', 'max'],
-  'control_system.write_verification.default_level': ['none', 'callback', 'readback'],
   'approval.default_policy': ['always', 'selective', 'skip'],
   'approval.tools.channel_write': ['always', 'selective', 'skip'],
   'approval.tools.channel_read': ['always', 'selective', 'skip'],
@@ -64,7 +70,6 @@ const ENUM_FIELDS = {
 const BOOLEAN_FIELDS = new Set([
   'approval.enabled',
   'control_system.writes_enabled',
-  'control_system.read_only',
   'ariel.enabled',
   'artifact_server.auto_launch',
   'screen_capture.enabled',
@@ -171,7 +176,7 @@ async function runWarningGate() {
     clearTimeout(timeoutId);
     serverSession = health.session_id ?? null;
     // Already acknowledged this server session — proceed without the dialog.
-    if (serverSession && localStorage.getItem(SETTINGS_WARNING_KEY) === serverSession) {
+    if (serverSession && localStorage.getItem(scopedStorageKey(SETTINGS_WARNING_KEY_BASE)) === serverSession) {
       warningGatePending = false;
       return true;
     }
@@ -230,20 +235,14 @@ function showSettingsWarning(serverSession) {
     `;
 
     overlay.appendChild(dialog);
-    document.body.appendChild(overlay);
-
-    // Animate in
-    requestAnimationFrame(() => overlay.classList.add('visible'));
+    mountOverlay(overlay);
 
     // Unconditional on every dismissal path (Cancel, Proceed, Escape) — leaves
     // no stale `keydown` listener behind and always clears the pending gate.
     const cleanup = () => {
       document.removeEventListener('keydown', onKey);
       warningGatePending = false;
-      overlay.classList.remove('visible');
-      overlay.addEventListener('transitionend', () => overlay.remove(), { once: true });
-      // Fallback removal if transition doesn't fire
-      setTimeout(() => { if (overlay.parentNode) overlay.remove(); }, 300);
+      fadeOutOverlay(overlay);
     };
 
     // Cancel/Escape decline the gate; Proceed acknowledges + accepts. The gate
@@ -257,7 +256,7 @@ function showSettingsWarning(serverSession) {
 
     /** @type {HTMLElement} */ (dialog.querySelector('.settings-warning-proceed')).addEventListener('click', () => {
       if (serverSession) {
-        localStorage.setItem(SETTINGS_WARNING_KEY, serverSession);
+        localStorage.setItem(scopedStorageKey(SETTINGS_WARNING_KEY_BASE), serverSession);
       }
       cleanup();
       resolve(true);
@@ -311,7 +310,7 @@ const FIELD_FLASH_MS = 1600;
  * Routes through openDrawerTab (hence the warning gate). Degrades gracefully
  * — no throw, no highlight — if the gate is declined, the tab is vetoed, or
  * the field never renders.
- * @param {string} dotKey  e.g. 'control_system.write_verification.default_level'
+ * @param {string} dotKey  e.g. 'approval.tools.channel_write'
  * @returns {Promise<void>}
  */
 export async function revealSetting(dotKey) {
@@ -665,12 +664,14 @@ async function applySettings() {
   if (status) status.textContent = 'Saving...';
 
   let configSaved = false;
+  /** @type {any} */
+  let result = null;
   try {
     if (currentMode === 'raw') {
       // Raw mode: send the full YAML text as-is (user is responsible for content)
       const textarea = /** @type {HTMLTextAreaElement|null} */ (document.getElementById('settings-raw-editor'));
       const yamlContent = textarea ? textarea.value : '';
-      await apiRequest('/api/config', {
+      result = await apiRequest('/api/config', {
         method: 'PUT',
         json: { raw: yamlContent },
         errorPrefix: 'Save failed',
@@ -684,13 +685,20 @@ async function applySettings() {
         if (applyBtn) applyBtn.disabled = false;
         return;
       }
-      await apiRequest('/api/config', {
+      result = await apiRequest('/api/config', {
         method: 'PATCH',
         json: { updates },
         errorPrefix: 'Patch failed',
       });
     }
     configSaved = true;
+
+    // A write can succeed and still leave the operator with something they must
+    // know. `detail` is how the server says so -- today, a read-only render zone
+    // where config.yml took the edit but the artifacts derived from it wait for
+    // the container restart. Shown, not awaited: it acknowledges what already
+    // happened, and the terminal restart below must not queue behind a dialog.
+    if (result && typeof result.detail === 'string' && result.detail) showSettingsNotice(result.detail);
 
     isDirty = false;
     updateSaveBar();

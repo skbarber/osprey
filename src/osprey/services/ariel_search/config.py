@@ -9,10 +9,16 @@ import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+from osprey.port_layout import default_port
+from osprey.utils.config_paths import resolve_config_relative_path
 
 from .exceptions import ConfigurationError
 from .models import normalize_search_mode, resolve_implicit_search_mode
+from .vocabulary.loader import load_vocabulary
+from .vocabulary.model import Vocabulary
 
 logger = logging.getLogger("osprey.services.ariel_search.config")
 
@@ -21,14 +27,21 @@ logger = logging.getLogger("osprey.services.ariel_search.config")
 LLM_ENHANCEMENT_MODULES = frozenset({"semantic_processor"})
 
 #: Defaults for the derived DSN, matching what the postgresql compose service
-#: is rendered with when ``services.postgresql`` leaves a field unset.
+#: is rendered with when ``services.postgresql`` leaves a field unset. The port
+#: is not among them: it is the deployment's ``postgres`` layout slot, derived
+#: per call from the base the caller resolved rather than pinned here, because
+#: two deployments on one host publish Postgres on two different host ports.
 _DEFAULT_DB_USERNAME = "ariel"
 _DEFAULT_DB_NAME = "ariel"
-_DEFAULT_DB_PORT = 5432
 #: Matches the ``${ARIEL_DB_PASSWORD:-ariel}`` fallback the compose service
 #: uses, so the agent stays launchable before the first `osprey up`
 #: mints a real password into the project ``.env``.
 _DEFAULT_DB_PASSWORD = "ariel"
+
+#: Dotted prefix of the facility-vocabulary block, so every message this module
+#: raises or reports names the key an operator would edit rather than a bare
+#: field name. Mirrors ``_SETTINGS_PREFIX`` in ``search/qmd.py``.
+_VOCABULARY_PREFIX = "ariel.vocabulary"
 
 #: Tripped the first time a config is parsed that still carries the retired
 #: MCP-only ``ariel.database.connection_string`` alias.  Warning once per
@@ -40,6 +53,8 @@ def resolve_ariel_dsn(
     ariel_section: dict[str, Any],
     services: dict[str, Any] | None = None,
     env: Mapping[str, str] | None = None,
+    *,
+    base: int | None = None,
 ) -> str:
     """Resolve the effective ARIEL database DSN.
 
@@ -72,6 +87,14 @@ def resolve_ariel_dsn(
             ``.env`` instead: run from another directory, the ambient value
             belongs to some other deployment, and using it would either fail
             confusingly or reach a database this call was never pointed at.
+        base: The port base this deployment resolved, from
+            :func:`osprey.port_layout.resolve_port_base`. Only consulted when
+            ``services`` sets no ``port_host``, in which case the derived DSN
+            dials the ``postgres`` slot of *this* deployment's block. ``None``
+            means :data:`~osprey.port_layout.DEFAULT_PORT_BASE`, which is right
+            only for a caller with no config to resolve — a caller holding one
+            passes its base so that a second deployment on the same host is not
+            sent to the first one's database.
 
     Returns:
         The DSN to connect with.
@@ -90,7 +113,7 @@ def resolve_ariel_dsn(
     postgresql = services or {}
     username = postgresql.get("username", _DEFAULT_DB_USERNAME)
     database_name = postgresql.get("database_name", _DEFAULT_DB_NAME)
-    port = postgresql.get("port_host", _DEFAULT_DB_PORT)
+    port = postgresql.get("port_host", default_port("postgres", base=base))
     password = (env if env is not None else os.environ).get(
         "ARIEL_DB_PASSWORD", _DEFAULT_DB_PASSWORD
     )
@@ -267,7 +290,7 @@ class IngestionConfig:
         adapter: Adapter name (e.g., "als_logbook", "generic_json")
         source_url: URL for source system API (optional)
         poll_interval_seconds: Polling interval for incremental ingestion
-        proxy_url: SOCKS proxy URL (e.g., "socks5://localhost:9095")
+        proxy_url: SOCKS proxy URL (e.g., "socks5://localhost:1080")
         verify_ssl: Whether to verify SSL certificates (default: False for internal servers)
         chunk_days: Days per API request for time windowing (default: 365)
         request_timeout_seconds: Timeout for HTTP requests (default: 60)
@@ -329,7 +352,11 @@ class DatabaseConfig:
 
     @classmethod
     def from_dict(
-        cls, data: dict[str, Any], services: dict[str, Any] | None = None
+        cls,
+        data: dict[str, Any],
+        services: dict[str, Any] | None = None,
+        *,
+        base: int | None = None,
     ) -> "DatabaseConfig":
         """Create DatabaseConfig from the ``ariel.database`` mapping.
 
@@ -337,8 +364,11 @@ class DatabaseConfig:
             data: The ``ariel.database`` mapping from config.yml.
             services: The ``services.postgresql`` mapping, used to derive the
                 DSN when ``uri`` is unset. See :func:`resolve_ariel_dsn`.
+            base: The port base this deployment resolved, handed to
+                :func:`resolve_ariel_dsn` so a derived DSN dials this
+                deployment's ``postgres`` slot rather than the default base's.
         """
-        return cls(uri=resolve_ariel_dsn({"database": data}, services))
+        return cls(uri=resolve_ariel_dsn({"database": data}, services, base=base))
 
 
 @dataclass
@@ -357,6 +387,121 @@ class EmbeddingConfig:
         return cls(provider=data.get("provider", "ollama"))
 
 
+def _vocab_bool(data: dict[str, Any], key: str, default: bool) -> bool:
+    """Read one boolean knob from the ``ariel.vocabulary`` block.
+
+    A *present* key of the wrong type is refused rather than defaulted, for the
+    same reason the hybrid module refuses ``rerank: "false"``: silently ignoring
+    it would leave the deployment on the behavior it explicitly asked to leave.
+
+    Args:
+        data: The ``ariel.vocabulary`` mapping.
+        key: Leaf key to read.
+        default: Value to use when the key is absent.
+
+    Returns:
+        The boolean value.
+
+    Raises:
+        ValueError: If the key is present but not a boolean.
+    """
+    value = data.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{_VOCABULARY_PREFIX}.{key} must be a boolean, got {value!r}")
+    return value
+
+
+@dataclass(frozen=True)
+class VocabularyConfig:
+    """The ``ariel.vocabulary`` block: facility shorthand, query-time expansion.
+
+    Attributes:
+        enabled: Whether a vocabulary is configured at all. With it false
+            nothing is loaded and no query is expanded, even when ``path`` names
+            a file that does not exist.
+        path: The ``vocabulary.yml`` to load. A relative value resolves against
+            the directory holding the config file the caller loaded (see
+            :func:`~osprey.utils.config_paths.resolve_config_relative_path`).
+        expand_by_default: Whether a request that names no ``expand_query``
+            preference gets expansion. The per-request argument overrides it.
+        canonical_to_acronym: Whether a canonical phrase also expands to the
+            forms of its ``acronym`` concepts.
+        canonical_to_shorthand: The same gate for ``shorthand`` concepts. Off by
+            default: expanding prose to operator shorthand rarely helps recall.
+        expand_modes: Search modules expansion applies to. ``None`` — the
+            default — means every enabled search module. An explicit list is
+            normalized at parse; :meth:`ARIELConfig.validate` refuses an entry
+            naming a module that is unknown or not enabled.
+    """
+
+    enabled: bool = False
+    path: str | None = None
+    expand_by_default: bool = True
+    canonical_to_acronym: bool = True
+    canonical_to_shorthand: bool = False
+    expand_modes: tuple[str, ...] | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "VocabularyConfig":
+        """Create VocabularyConfig from the ``ariel.vocabulary`` mapping.
+
+        An absent block is the normal case and yields the defaults. Every
+        present key is type-checked and a bad one raises, naming the full dotted
+        key — the callers that must survive a broken config (the web lifespan,
+        ``osprey ariel status``) wrap the whole parse in their own handler and
+        report the message, so refusing here loses nothing and defaulting here
+        would hide a knob that never took effect.
+
+        Args:
+            data: The ``ariel.vocabulary`` mapping from config.yml.
+
+        Returns:
+            VocabularyConfig instance.
+
+        Raises:
+            ValueError: If any present key has the wrong type or shape.
+        """
+        enabled = _vocab_bool(data, "enabled", cls.enabled)
+        expand_by_default = _vocab_bool(data, "expand_by_default", cls.expand_by_default)
+        to_acronym = _vocab_bool(data, "canonical_to_acronym", cls.canonical_to_acronym)
+        to_shorthand = _vocab_bool(data, "canonical_to_shorthand", cls.canonical_to_shorthand)
+
+        path = data.get("path", cls.path)
+        if path is not None and (not isinstance(path, str) or not path.strip()):
+            raise ValueError(
+                f"{_VOCABULARY_PREFIX}.path must be a non-empty string naming a "
+                f"vocabulary file, got {path!r}"
+            )
+
+        expand_modes: tuple[str, ...] | None = None
+        raw_modes = data.get("expand_modes")
+        if raw_modes is not None:
+            if not isinstance(raw_modes, list):
+                raise ValueError(
+                    f"{_VOCABULARY_PREFIX}.expand_modes must be a list of search "
+                    f"mode names, got {raw_modes!r}"
+                )
+            normalized: list[str] = []
+            for entry in raw_modes:
+                try:
+                    normalized.append(normalize_search_mode(entry))
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{_VOCABULARY_PREFIX}.expand_modes entries must be non-empty "
+                        f"search mode names, got {entry!r}"
+                    ) from exc
+            expand_modes = tuple(normalized)
+
+        return cls(
+            enabled=enabled,
+            path=path,
+            expand_by_default=expand_by_default,
+            canonical_to_acronym=to_acronym,
+            canonical_to_shorthand=to_shorthand,
+            expand_modes=expand_modes,
+        )
+
+
 @dataclass
 class ARIELConfig:
     """Root configuration for ARIEL service.
@@ -371,6 +516,17 @@ class ARIELConfig:
             names no mode. Unset resolves to ``hybrid`` where that module is
             enabled and ``keyword`` otherwise; a name that is set but not
             enabled is a config error rather than a silent fallback.
+        vocabulary: The ``ariel.vocabulary`` block.
+        loaded_vocabulary: The vocabulary read at parse time, or None when the
+            block is disabled, names no path, or failed to load.
+        vocabulary_errors: Loader errors, each naming ``ariel.vocabulary.path``
+            and the resolved file. Kept as its OWN field rather than folded into
+            :meth:`validate`'s pre-existing errors because the two mean
+            different things to a surface: a vocabulary error means search
+            cannot honor what the deployment configured, while the pre-existing
+            classes leave a working service.
+        vocabulary_warnings: Loader warnings — a vocabulary that loads but may
+            not behave as its author expects. Never blocks anything.
 
     Documented top-level config keys read at runtime (not dataclass fields):
         entry_url_template: Optional ``str`` template for the canonical logbook
@@ -389,10 +545,19 @@ class ARIELConfig:
     ingestion: IngestionConfig | None = None
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     default_search_mode: str | None = None
+    vocabulary: VocabularyConfig = field(default_factory=VocabularyConfig)
+    loaded_vocabulary: Vocabulary | None = None
+    vocabulary_errors: list[str] = field(default_factory=list)
+    vocabulary_warnings: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(
-        cls, config_dict: dict[str, Any], services: dict[str, Any] | None = None
+        cls,
+        config_dict: dict[str, Any],
+        services: dict[str, Any] | None = None,
+        *,
+        config_dir: Path | None = None,
+        base: int | None = None,
     ) -> "ARIELConfig":
         """Create ARIELConfig from config.yml dictionary.
 
@@ -401,12 +566,25 @@ class ARIELConfig:
             services: The ``services.postgresql`` mapping from config.yml. With
                 ``ariel.database.uri`` unset, the DSN is derived from it — see
                 :func:`resolve_ariel_dsn`.
+            config_dir: Directory holding the config.yml this dictionary came
+                from. A relative ``ariel.vocabulary.path`` resolves against the
+                project root derived from it, so every process reading the
+                same config finds the same file.
+                Keyword-only with a None default: callers that never name a
+                config-relative path are unaffected, and None falls back to the
+                shared helper's own rule.
+            base: The port base this deployment resolved, from
+                :func:`osprey.port_layout.resolve_port_base`. Handed to
+                :func:`resolve_ariel_dsn` for the derived-DSN case; ``None``
+                means the layout's own default base, which is right only when
+                there is no config to resolve one from.
 
         Returns:
             ARIELConfig instance
 
         Raises:
             ConfigurationError: If the deprecated 'pipelines' section is present.
+            ValueError: If the ``vocabulary`` block is malformed.
         """
         if "pipelines" in config_dict:
             raise ConfigurationError(
@@ -417,7 +595,7 @@ class ARIELConfig:
                 config_key="pipelines",
             )
 
-        database = DatabaseConfig.from_dict(config_dict.get("database") or {}, services)
+        database = DatabaseConfig.from_dict(config_dict.get("database") or {}, services, base=base)
 
         search_modules: dict[str, SearchModuleConfig] = {}
         for name, data in config_dict.get("search_modules", {}).items():
@@ -439,6 +617,36 @@ class ARIELConfig:
         if default_search_mode is not None:
             default_search_mode = normalize_search_mode(default_search_mode)
 
+        vocabulary_data = config_dict.get("vocabulary")
+        if vocabulary_data is None:
+            vocabulary = VocabularyConfig()
+        elif isinstance(vocabulary_data, dict):
+            vocabulary = VocabularyConfig.from_dict(vocabulary_data)
+        else:
+            raise ValueError(f"{_VOCABULARY_PREFIX} must be a mapping, got {vocabulary_data!r}")
+
+        # The file is read HERE, once, at config parse — not lazily on the first
+        # search. Every surface that holds a config therefore already knows
+        # whether the vocabulary is usable, and none of them can start searching
+        # unexpanded because a read failed later. A disabled block reads nothing
+        # at all, so a stale `path` left behind by an operator is inert.
+        loaded_vocabulary: Vocabulary | None = None
+        vocabulary_errors: list[str] = []
+        vocabulary_warnings: list[str] = []
+        if vocabulary.enabled and vocabulary.path:
+            resolved = resolve_config_relative_path(vocabulary.path, config_dir)
+            loaded_vocabulary, load_errors, vocabulary_warnings = load_vocabulary(
+                resolved,
+                canonical_to_acronym=vocabulary.canonical_to_acronym,
+                canonical_to_shorthand=vocabulary.canonical_to_shorthand,
+            )
+            # Each stored error names the key AND the file the key resolved to:
+            # a relative path that resolved somewhere unexpected is the most
+            # common cause, and the bare loader message would not show it.
+            vocabulary_errors = [
+                f"{_VOCABULARY_PREFIX}.path: {resolved} — {error}" for error in load_errors
+            ]
+
         return cls(
             database=database,
             search_modules=search_modules,
@@ -446,7 +654,38 @@ class ARIELConfig:
             ingestion=ingestion,
             embedding=embedding,
             default_search_mode=default_search_mode,
+            vocabulary=vocabulary,
+            loaded_vocabulary=loaded_vocabulary,
+            vocabulary_errors=vocabulary_errors,
+            vocabulary_warnings=vocabulary_warnings,
         )
+
+    @property
+    def vocabulary_active(self) -> bool:
+        """Whether a usable vocabulary is loaded and expansion can run.
+
+        Returns:
+            True when the block is enabled, a vocabulary was loaded, and the
+            loader reported no errors.
+        """
+        return (
+            self.vocabulary.enabled
+            and self.loaded_vocabulary is not None
+            and not self.vocabulary_errors
+        )
+
+    def resolve_expand_modes(self) -> tuple[str, ...]:
+        """Name the search modules query expansion applies to.
+
+        Returns:
+            The configured ``expand_modes`` when the deployment set one, else
+            every enabled search module — the documented default of "all enabled
+            modes". :meth:`validate` has already refused a configured entry that
+            names no enabled module.
+        """
+        if self.vocabulary.expand_modes is not None:
+            return self.vocabulary.expand_modes
+        return tuple(self.get_enabled_search_modules())
 
     def resolve_default_search_mode(self) -> str:
         """Name the search module a search runs in when the caller names none.
@@ -540,6 +779,57 @@ class ARIELConfig:
                     "enhancement_modules.text_embedding.models is required "
                     "when text_embedding enhancement is enabled"
                 )
+
+        # Vocabulary. Enabling expansion without naming a file is a deployment
+        # that believes it has expansion and does not; it is refused rather than
+        # treated as "disabled".
+        if self.vocabulary.enabled and not self.vocabulary.path:
+            errors.append(
+                f"{_VOCABULARY_PREFIX}.path is required when {_VOCABULARY_PREFIX}.enabled is true"
+            )
+
+        errors.extend(self.vocabulary_errors)
+
+        if self.vocabulary.expand_modes:
+            enabled_modules = self.get_enabled_search_modules()
+            enabled_text = ", ".join(enabled_modules) or "(none)"
+            for mode in self.vocabulary.expand_modes:
+                if mode not in enabled_modules:
+                    errors.append(
+                        f"{_VOCABULARY_PREFIX}.expand_modes names no enabled search "
+                        f"module: {mode}. Enabled modules: {enabled_text}"
+                    )
+
+        # Each search module's own knobs. The resolver that the search path uses
+        # is the one consulted here, so a malformed knob surfaces at startup and
+        # in `ariel vocab-check` / `ariel status` rather than on the first search
+        # that happens to read it. Imported lazily: the search package
+        # reaches back into this module, and a module-level import would close
+        # that loop. A disabled module is not consulted at all — its settings
+        # block reaches no reader, so refusing it would be refusing dead config.
+        if self.is_search_module_enabled("keyword"):
+            from osprey.services.ariel_search.search.keyword import KeywordSearchSettings
+
+            try:
+                KeywordSearchSettings.from_ariel_config(self)
+            except ValueError as exc:
+                errors.append(str(exc))
+
+        if self.is_search_module_enabled("hybrid"):
+            from osprey.services.ariel_search.search.qmd import HybridSearchSettings
+
+            try:
+                HybridSearchSettings.from_ariel_config(self)
+            except ValueError as exc:
+                errors.append(str(exc))
+
+        if self.is_search_module_enabled("semantic"):
+            from osprey.services.ariel_search.search.semantic import SemanticSearchSettings
+
+            try:
+                SemanticSearchSettings.from_ariel_config(self)
+            except ValueError as exc:
+                errors.append(str(exc))
 
         return errors
 

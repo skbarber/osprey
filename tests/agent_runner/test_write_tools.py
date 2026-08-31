@@ -5,7 +5,7 @@ Covers:
   - Missing file: falls back to _FALLBACK_WRITE_TOOLS.
   - Malformed JSON: falls back without raising.
   - Safety invariant: channel_write is always present even on the loaded path.
-  - Drift guard: canonical _FALLBACK_WRITE_TOOLS in osprey_writes_check.py
+  - Drift guard: canonical FALLBACK_WRITE_TOOLS in osprey_hook_log.py
     must equal the module-level replica in write_tools.py.
 """
 
@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import ast
 import json
-import re
 from pathlib import Path
 
 import osprey
@@ -44,13 +43,11 @@ def _hook_config_dir(tmp_path: Path) -> Path:
 def test_load_write_tools_from_config(tmp_path: Path) -> None:
     """Returns the list verbatim when the config already contains the full floor."""
     hooks = _hook_config_dir(tmp_path)
-    # Includes both canonical floor tools, so nothing is injected and the
-    # configured list (custom tool included) is returned unchanged.
-    expected = [
-        "mcp__controls__channel_write",
-        "mcp__python__execute",
-        "mcp__custom__tool",
-    ]
+    # Includes the whole canonical floor, so nothing is injected and the
+    # configured list (custom tool included) is returned unchanged. Derived
+    # from the floor rather than re-spelled, so growing the floor cannot turn
+    # this into a test of the injection path by accident.
+    expected = [*_FALLBACK_WRITE_TOOLS, "mcp__custom__tool"]
     (hooks / "hook_config.json").write_text(json.dumps({"write_tools": expected}))
 
     result = load_write_tools(tmp_path)
@@ -172,34 +169,34 @@ def test_load_write_tools_floors_entire_canonical_set(tmp_path: Path) -> None:
 
 
 def test_fallback_write_tools_matches_canonical_hook() -> None:
-    """_FALLBACK_WRITE_TOOLS must equal the list in osprey_writes_check.py.
+    """_FALLBACK_WRITE_TOOLS must equal FALLBACK_WRITE_TOOLS in osprey_hook_log.py.
 
     Locates the canonical file relative to the installed osprey package so
     the check works in editable installs and worktrees alike.
     """
     package_root = Path(osprey.__file__).parent
     canonical_path = (
-        package_root / "templates" / "claude_code" / "claude" / "hooks" / "osprey_writes_check.py"
+        package_root / "templates" / "claude_code" / "claude" / "hooks" / "osprey_hook_log.py"
     )
     assert canonical_path.exists(), f"canonical hook file not found: {canonical_path}"
 
     source = canonical_path.read_text()
     tree = ast.parse(source)
 
-    # Walk top-level assignments looking for _FALLBACK_WRITE_TOOLS = [...]
+    # Walk top-level assignments looking for FALLBACK_WRITE_TOOLS = [...]
     canonical_list: list[str] | None = None
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == "_FALLBACK_WRITE_TOOLS"
+            and node.targets[0].id == "FALLBACK_WRITE_TOOLS"
             and isinstance(node.value, ast.List)
         ):
             canonical_list = [elt.value for elt in node.value.elts if isinstance(elt, ast.Constant)]
             break
 
-    assert canonical_list is not None, "_FALLBACK_WRITE_TOOLS not found in osprey_writes_check.py"
+    assert canonical_list is not None, "FALLBACK_WRITE_TOOLS not found in osprey_hook_log.py"
     assert _FALLBACK_WRITE_TOOLS == canonical_list, (
         f"write_tools.py fallback {_FALLBACK_WRITE_TOOLS!r} "
         f"differs from canonical hook {canonical_list!r} — update one to match"
@@ -352,12 +349,11 @@ def test_read_only_blocks_extends_clone_drive(tmp_path: Path) -> None:
         )
 
 
-def test_read_only_blocks_extends_clone_extra_tools(tmp_path: Path) -> None:
-    """The hard-coded ``_EXTRA_SIDE_EFFECT_TOOLS`` (unlisted side-effect tools
-    like the python server's execute_file) must follow an extends clone with
-    the rewritten prefix: the clone launches the SAME tool module, and SDK
-    disallow matching is by exact name, so blocking mcp__python__execute_file
-    does NOT cover mcp__python2__execute_file."""
+def test_read_only_blocks_extends_clone_exec_tools(tmp_path: Path) -> None:
+    """Both python exec tools must follow an extends clone with the rewritten
+    prefix: the clone launches the SAME tool modules, and SDK disallow matching
+    is by exact name, so blocking mcp__python__execute_file does NOT cover
+    mcp__python2__execute_file."""
     (tmp_path / "config.yml").write_text(
         "claude_code:\n  servers:\n    python2:\n      extends: python\n"
     )
@@ -365,8 +361,8 @@ def test_read_only_blocks_extends_clone_extra_tools(tmp_path: Path) -> None:
     result = read_only_disallowed_tools(tmp_path)
 
     assert "mcp__python2__execute" in result  # via the shared classifier (ask)
-    assert "mcp__python2__execute_file" in result  # via the rewritten extras
-    assert "mcp__python__execute_file" in result  # template extras unchanged
+    assert "mcp__python2__execute_file" in result  # same classifier, same ask list
+    assert "mcp__python__execute_file" in result  # template unchanged
 
 
 def test_read_only_extends_override_cannot_narrow(tmp_path: Path) -> None:
@@ -513,15 +509,10 @@ def test_registry_walk_matches_shared_classifier() -> None:
 def test_extends_clone_classifies_like_template(tmp_path: Path) -> None:
     """Drift guard (extends-aware variant of the registry guard): a clone of
     each framework server must land in the read-only disallow set exactly like
-    its template with the mcp__<template>__ prefix rewritten — INCLUDING the
-    template's ``_EXTRA_SIDE_EFFECT_TOOLS`` entries (tools in no permission
-    list, e.g. python's execute_file), which the per-server classifier cannot
-    see. Compares the full production output (read_only_disallowed_tools), not
-    the classifier internals, so a blind spot in either path fails here."""
-    from osprey.agent_runner.write_tools import (
-        _EXTRA_SIDE_EFFECT_TOOLS,
-        _server_side_effect_tools,
-    )
+    its template with the mcp__<template>__ prefix rewritten. Compares the full
+    production output (read_only_disallowed_tools), not the classifier
+    internals, so a blind spot in either path fails here."""
+    from osprey.agent_runner.write_tools import _server_side_effect_tools
     from osprey.registry.mcp import FRAMEWORK_SERVERS, build_extended_server
 
     for template_name, template in FRAMEWORK_SERVERS.items():
@@ -532,9 +523,7 @@ def test_extends_clone_classifies_like_template(tmp_path: Path) -> None:
         assert clone is not None, f"extends of {template_name!r} unexpectedly rejected"
 
         old, new = f"mcp__{template_name}__", f"mcp__{clone_name}__"
-        template_surface = _server_side_effect_tools(template) + [
-            t for t in _EXTRA_SIDE_EFFECT_TOOLS if t.startswith(old)
-        ]
+        template_surface = _server_side_effect_tools(template)
         expected = {new + t[len(old) :] if t.startswith(old) else t for t in template_surface}
 
         (tmp_path / "config.yml").write_text(
@@ -649,26 +638,64 @@ def test_python_server_registers_only_execute_tools_we_block(tmp_path: Path) -> 
 
 def test_builtin_unsafe_tools_cover_interactive_deny_defaults() -> None:
     """Drift guard: every built-in (non-mcp) tool OSPREY denies interactively
-    (settings.json.j2 deny_defaults) must also be in the headless read-only
-    floor — the headless path must never be more permissive than interactive,
-    since its permission/deny layer is inert under bypassPermissions.
-    """
-    package_root = Path(osprey.__file__).parent
-    settings_j2 = package_root / "templates" / "claude_code" / "claude" / "settings.json.j2"
-    assert settings_j2.exists(), f"settings template not found: {settings_j2}"
+    (DENY_DEFAULTS, rendered into settings.json's permissions.deny) must also be
+    in the headless read-only floor — the headless path must never be more
+    permissive than interactive, since its permission/deny layer is inert under
+    bypassPermissions.
 
-    source = settings_j2.read_text()
-    match = re.search(r"set\s+deny_defaults\s*=\s*(\[[^\]]*\])", source)
-    assert match, "deny_defaults list not found in settings.json.j2"
-    deny_defaults = ast.literal_eval(match.group(1))
+    Reads the constant the renderer itself consumes rather than regex-parsing
+    the Jinja source: the template now takes the list from the render context,
+    so a scrape of the .j2 file would guard a copy nothing ships.
+    """
+    from osprey.cli.templates.claude_code import DENY_DEFAULTS
 
     # Built-in tools are the non-mcp__ entries (mcp__ entries are plugin/facility
     # servers, absent from a built project's query path).
-    builtin_denies = [d for d in deny_defaults if not d.startswith("mcp__")]
-    assert builtin_denies, "expected at least one built-in tool in deny_defaults"
+    builtin_denies = [d for d in DENY_DEFAULTS if not d.startswith("mcp__")]
+    assert builtin_denies, "expected at least one built-in tool in DENY_DEFAULTS"
     for tool in builtin_denies:
         assert tool in _BUILTIN_UNSAFE_TOOLS, (
-            f"{tool!r} is denied interactively (settings.json.j2 deny_defaults) but "
-            f"missing from _BUILTIN_UNSAFE_TOOLS — the headless read-only floor would "
-            f"be more permissive than the interactive policy"
+            f"{tool!r} is denied interactively (DENY_DEFAULTS) but missing from "
+            f"_BUILTIN_UNSAFE_TOOLS — the headless read-only floor would be more "
+            f"permissive than the interactive policy"
         )
+
+
+def test_deny_defaults_reaches_the_render_context() -> None:
+    """The constant is only a policy if the template actually receives it.
+
+    settings.json.j2 no longer declares its own deny list, and Jinja renders a
+    missing name as an empty loop — so a context that drops the key yields a
+    settings.json that denies NOTHING, with no error. config_derived_context is
+    the one funnel both render paths pass through, so pinning the key here is
+    what keeps that from happening. Order matters too: the rendered array
+    follows DENY_DEFAULTS, and reordering churns every built project's diff.
+    """
+    from osprey.cli.templates.claude_code import DENY_DEFAULTS, config_derived_context
+
+    ctx = config_derived_context({}, Path(osprey.__file__).parent)
+    assert ctx["deny_defaults"] == list(DENY_DEFAULTS)
+
+
+def test_caller_context_cannot_soften_the_deny_floor(tmp_path: Path) -> None:
+    """A caller-supplied deny_defaults must NOT replace the security floor.
+
+    create_project merges the derived context with setdefault, so a caller's own
+    value wins for every key it carries — correct for project configuration,
+    wrong for this one. While the list lived as a literal inside settings.json.j2
+    no caller could reach it; hoisting it into the render context must not hand
+    that authority over, or `context={"deny_defaults": []}` renders a project
+    whose permissions.deny is empty. Facilities adjust the floor through
+    config.yml's claude_code.permissions instead, which is auditable.
+    """
+    from osprey.cli.templates.claude_code import DENY_DEFAULTS
+    from osprey.cli.templates.manager import TemplateManager
+
+    project_dir = TemplateManager().create_project(
+        project_name="deny-floor-override",
+        output_dir=tmp_path,
+        data_bundle="control_assistant",
+        context={"channel_finder_mode": "hierarchical", "deny_defaults": []},
+    )
+    settings = json.loads((project_dir / ".claude" / "settings.json").read_text())
+    assert settings["permissions"]["deny"] == list(DENY_DEFAULTS)

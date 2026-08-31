@@ -13,10 +13,16 @@ frontend JS nor persists ``localStorage`` across navigations:
     client's stored PTY session id, THEN navigates to the configured landing
     origin;
   * returning to the terminal origin does NOT resume the prior warm PTY —
-    ``localStorage['osprey-pty-session']`` stays empty across the round trip and
-    the client opens a brand-new WebSocket (no ``mode=resume``, no stale
+    this persona's stored pointer stays empty across the round trip and the
+    client opens a brand-new WebSocket (no ``mode=resume``, no stale
     ``session_id``) rather than reconnecting to the old session. This is M2:
     logout is a real station reset, not just a client-side navigation.
+  * the pointer is the PER-PERSONA key. On a multi-user mount every ``/u/<user>/``
+    shares one origin and so one ``localStorage``; the server stamps
+    ``data-osprey-storage-scope`` on ``<html>`` and terminal.js reads, writes
+    and clears ``osprey-pty-session--<user>`` (design_system/storage-scope.js),
+    never the bare shared slot. This is the only multi-user browser suite, so it
+    is also the live proof that the scoped clear is what logout performs.
   * plain ``osprey web`` (no landing_url) omits the logout control entirely.
 
 Scope note — no live model turn. A genuinely live PTY session id is minted by
@@ -45,7 +51,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from tests.interfaces._panel_launch import publish_artifact_url
-from tests.interfaces.conftest import _run_app_server
+from tests.interfaces.conftest import _authorize_browser_context, _run_app_server
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -207,8 +213,15 @@ def test_logout_and_return_starts_fresh_session(tmp_path, monkeypatch, chromium_
         expect(logout).to_be_hidden()
 
         # --- Represent an established (warm) PTY session (see module docstring) ---
-        page.evaluate("(id) => localStorage.setItem('osprey-pty-session', id)", stored_id)
-        captured = page.evaluate("() => localStorage.getItem('osprey-pty-session')")
+        # Seed the key the client actually reads: derived from the scope the
+        # server stamped for this persona, exactly as storage-scope.js derives it.
+        scope = page.evaluate(
+            "() => document.documentElement.getAttribute('data-osprey-storage-scope')"
+        )
+        assert scope == user, f"multi-user page must be stamped with its persona, got {scope!r}"
+        session_key = f"osprey-pty-session--{scope}"
+        page.evaluate("([k, id]) => localStorage.setItem(k, id)", [session_key, stored_id])
+        captured = page.evaluate("(k) => localStorage.getItem(k)", session_key)
         assert captured == stored_id
 
         # Record the auth-sidecar chaining request. This deployment has NO
@@ -226,11 +239,12 @@ def test_logout_and_return_starts_fresh_session(tmp_path, monkeypatch, chromium_
         page.on("request", _record)
 
         # --- Logout: clears the stored pointer, THEN navigates to landing ---
-        # Logout lives in the display menu's session footer; open the menu first.
-        page.click("#display-menu-btn")
-        # The footer names the operator, so they can confirm WHICH terminal they
+        # Logout lives behind the header identity chip — the name in the corner
+        # is what an operator reaches for to leave. Open it first.
+        page.click("#header-identity-trigger")
+        # The menu names the operator, so they can confirm WHICH terminal they
         # are leaving before they leave it.
-        expect(page.locator("#display-menu-card .display-menu-identity-name")).to_have_text(user)
+        expect(page.locator("#header-identity-menu .header-identity-who-name")).to_have_text(user)
         expect(page.locator("#logout-btn")).to_be_visible()
         page.click("#logout-btn")
         page.wait_for_url(lambda u: u.startswith(landing_url))
@@ -253,6 +267,17 @@ def test_logout_and_return_starts_fresh_session(tmp_path, monkeypatch, chromium_
         # back on the terminal origin below.
 
         # --- Return to the terminal origin: a FRESH station, not a resume ---
+        # Logout revoked the browser session server-side and expired its cookie
+        # (``logout_terminal``, routes/websocket.py), which is the point: the
+        # credential must not survive the round trip. So the return visit needs
+        # a NEW one, exactly as a returning operator gets from the perimeter
+        # (nginx + the auth sidecar) before nginx ever proxies them back to this
+        # container. ``chromium_browser``'s seam mints the first session at
+        # ``new_page()`` and cannot re-mint mid-test, so the perimeter's re-issue
+        # is stood in for here. Without it the navigation below is refused 401
+        # and never opens a socket — which would say nothing about resume.
+        _authorize_browser_context(page.context)
+
         with page.expect_websocket() as return_ws:
             page.goto(base_url, wait_until="load")
         fresh_url = return_ws.value.url
@@ -262,7 +287,10 @@ def test_logout_and_return_starts_fresh_session(tmp_path, monkeypatch, chromium_
         assert f"session_id={stored_id}" not in fresh_url
 
         # No re-adoption of the old id: the prior warm PTY is not inherited.
-        assert page.evaluate("() => localStorage.getItem('osprey-pty-session')") != stored_id
+        assert page.evaluate("(k) => localStorage.getItem(k)", session_key) != stored_id
+        # And a scoped page never touches the shared slot — neither the seed nor
+        # the fresh session's confirmation lands under the bare key.
+        assert page.evaluate("() => localStorage.getItem('osprey-pty-session')") is None
 
         page.close()
 
@@ -284,8 +312,8 @@ def test_standalone_has_no_logout_control(tmp_path, monkeypatch, chromium_browse
         page.wait_for_selector(".header-actions", timeout=10_000)
 
         expect(page.locator("#logout-btn")).to_have_count(0)
-        expect(page.locator(".display-menu-identity")).to_have_count(0)
-        # ...and Settings, alone in the footer, is still there.
+        expect(page.locator(".header-identity")).to_have_count(0)
+        # ...and Settings, alone in the display card's footer, is still there.
         expect(page.locator("#display-menu-settings")).to_have_count(1)
 
         page.close()

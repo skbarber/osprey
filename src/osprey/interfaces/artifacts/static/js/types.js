@@ -89,6 +89,11 @@ const TYPE_ICONS = {
   wiki_research: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3h6a4 4 0 014 4v14a3 3 0 00-3-3H2z"/><path d="M22 3h-6a4 4 0 00-4 4v14a3 3 0 013-3h7z"/></svg>',
   mml_research: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>',
   agent_response: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>',
+  // Facility knowledge — a small node graph, shared by the document-bundle and
+  // knowledge-graph agents that both file here.
+  facility_knowledge: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><path d="M12 7v3M11 11l-4.5 6M13 11l4.5 6"/></svg>',
+  // Lattice analysis — a beam envelope, for computed optics results.
+  lattice_analysis: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 12c2.5-7 5-7 7.5 0s5 7 7.5 0"/><path d="M2 12c2.5 7 5 7 7.5 0s5-7 7.5 0"/></svg>',
   user_artifact: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
   diagnostic_report: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M16 4h2a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M9 14l2 2 4-4"/></svg>',
 };
@@ -268,15 +273,38 @@ export function hasTimeseriesData(a) {
 /**
  * URL for "Open in new tab" — uses rendered endpoints for types that
  * browsers can't display natively (markdown, notebook).
+ *
+ * A page opened in its own tab has no hub parent to follow, so a theme id
+ * passed here rides along as `?theme=` (see {@link withTheme}) and the new tab
+ * opens in exactly the theme the operator is looking at.
  * @param {any} a
+ * @param {string|null} [theme] - concrete theme id to carry, if any
  * @returns {string}
  */
-export function openUrl(a) {
+export function openUrl(a, theme) {
   switch (a.artifact_type) {
-    case "markdown": return `/api/markdown/${encodeURIComponent(a.id)}/rendered`;
-    case "notebook": return `/api/notebooks/${encodeURIComponent(a.id)}/rendered`;
-    default:         return fileUrl(a);
+    case "markdown": return withTheme(`/api/markdown/${encodeURIComponent(a.id)}/rendered`, theme);
+    case "notebook": return withTheme(`/api/notebooks/${encodeURIComponent(a.id)}/rendered`, theme);
+    default:         return withTheme(fileUrl(a), theme);
   }
+}
+
+/**
+ * Stamp a concrete theme id onto an artifact-page URL as `?theme=` — the
+ * load-time half of the gallery's theme contract with the pages it embeds or
+ * opens (the same shape the web terminal's `buildEmbedSrc()` uses for its
+ * panels): theme-boot.js honors `?theme=` ahead of storage and the OS, so the
+ * page first-paints in the theme the gallery is showing instead of resolving
+ * one of its own. An empty/`null` theme (theme-manager not initialised yet)
+ * leaves the URL bare.
+ * @param {string} url - a root-relative artifact-page URL
+ * @param {string|null} [theme] - concrete theme id to carry, if any
+ * @returns {string}
+ */
+export function withTheme(url, theme) {
+  if (!theme) return url;
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}theme=${encodeURIComponent(theme)}`;
 }
 
 /**

@@ -6,9 +6,9 @@
  */
 
 import { initTheme } from '/design-system/js/theme-manager.js';
-import { applyEmbedded } from '/design-system/js/frame-params.js';
+import { applyEmbedded, isEmbedded } from '/design-system/js/frame-params.js';
 import { contributeHeader, onHeaderAction } from '/design-system/js/header-contrib.js';
-import '/design-system/js/components/osprey-theme-switcher.js';
+import '/design-system/js/components/osprey-display-menu.js';
 import { fetchJSON, putJSON } from './api.js';
 import { esc, messageOf } from './utils.js';
 import { state } from './state.js';
@@ -16,10 +16,14 @@ import { mountExplore, unmountExplore } from './explore.js';
 import { mountFeedback, unmountFeedback } from './feedback.js';
 import { refreshStatsBadges } from './stats-badges.js';
 
-// Panel embedded in the Web Terminal hub: apply the hub's broadcast theme
-// and follow live changes. theme-boot.js already applied data-theme
-// pre-paint; this call attaches the follower's postMessage listener.
-initTheme({ role: 'follower' });
+// Standalone, this page owns its own theme chrome (the header
+// <osprey-display-menu>), so it runs theme-manager.js in the hub role:
+// persistence, OS auto-follow and ?theme= handling all come with it, and
+// broadcast is a structural no-op on a page with no iframes. Embedded in the
+// Web Terminal hub it is a follower instead: theme-boot.js already applied
+// data-theme pre-paint, and this attaches the postMessage listener for the
+// hub's live broadcasts.
+initTheme({ role: isEmbedded() ? 'follower' : 'hub' });
 
 applyEmbedded();
 
@@ -61,6 +65,7 @@ async function init() {
     state.setPipelineInfo(info.pipeline_type, info.metadata);
     state.availablePipelines = info.available_pipelines || [info.pipeline_type];
     state.dbPath = info.db_path || null;
+    state.setGraphInfo(info.tools, info.graph_store);
     updatePipelineBadge(info.pipeline_type);
     buildPipelineDropdown();
   } catch (e) {
@@ -166,11 +171,18 @@ function contributeViewNav() {
 
 // ---- Pipeline Switcher ----
 
-/** @type {Record<string, string>} */
-const PIPELINE_LABELS = {
+/**
+ * Header badge / switcher labels, one entry per pipeline type the panel serves.
+ * A type with no entry falls back to its raw key upper-cased, so every
+ * paradigm the Explore view mounts belongs here. Exported for the dispatch
+ * contract test (explore-graph.test.mjs).
+ * @type {Record<string, string>}
+ */
+export const PIPELINE_LABELS = {
   hierarchical: 'HIERARCHICAL',
   in_context: 'IN-CONTEXT',
   middle_layer: 'MIDDLE LAYER',
+  graph: 'GRAPH',
 };
 
 /**
@@ -179,7 +191,9 @@ const PIPELINE_LABELS = {
 function updatePipelineBadge(type) {
   const badge = document.getElementById('pipeline-badge');
   if (!badge) return;
-  badge.textContent = (PIPELINE_LABELS[type] || type?.toUpperCase() || '') + ' ▾';
+  // A null type is the unconfigured project; the badge must still carry text,
+  // or the switcher collapses to a zero-size box and vanishes from the layout.
+  badge.textContent = (PIPELINE_LABELS[type] || type?.toUpperCase() || 'NOT CONFIGURED') + ' ▾';
 }
 
 function buildPipelineDropdown() {

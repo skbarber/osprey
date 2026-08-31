@@ -5,7 +5,8 @@ I" but "which roster users has this browser unlocked, and until when". That set
 lives in a single :mod:`itsdangerous`-signed cookie::
 
     {"v": 1, "sid": "<session id>", "iat": <epoch>, "users": {
-        "alice": {"exp": <epoch>, "tag": "0123456789abcdef"}
+        "alice": {"exp": <epoch>, "tag": "0123456789abcdef", "sub": "",
+                  "role": "", "source": ""}
     }}
 
 **Signed, not encrypted.** Anyone holding the cookie can read the payload; they
@@ -16,7 +17,32 @@ one-way digest the verify endpoint recomputes from the current stored hash so a
 rotated password invalidates that user's sessions without server-side state.
 OIDC entries carry no tag (there is no stored hash), which is why
 :func:`~osprey.services.auth_sidecar.passwords.verify_generation_tag` refuses an
-empty tag: a password-mode session must never authorise without one.
+empty tag: a password-mode session must never authorise without one. They carry
+the provider's subject instead — an opaque account identifier, not a
+credential — so a later request can tell which provider account is behind an
+unlocked user without re-contacting the provider.
+
+Both entries also carry the ``"role"`` the deployment resolved for that user —
+the name of an entry in ``modules.web_terminals.authorization.roles``, not a
+privilege in itself. It is authorization *input*, so its empty default is the
+deny-safe one: an entry naming no role names no privileges, and nothing
+downstream may substitute a default for it. The ``"source"`` beside it names
+where that role came from — the roster or an OIDC claim — and is provenance
+only: it qualifies the role for a reader without changing what the role
+grants, and an entry naming no role names no source either.
+
+The ``"sub"``, ``"role"`` and ``"source"`` keys are read with defaults rather
+than being made mandatory, and none of them was added with a
+:data:`PAYLOAD_VERSION` bump: a cookie minted before any of them existed still
+decodes, with an empty subject, no role and no provenance for it.
+
+**A value that cannot cross the nginx boundary is never stored.** The subject,
+the role and its source all leave as HTTP headers (see
+:mod:`~osprey.services.auth_sidecar.identity_headers`), so all three are checked
+against :func:`~osprey.services.auth_sidecar.identity_headers.is_header_safe`
+here — on the way in, where a caller can still be told it is wrong, and again on
+the way out, so a cookie could never hand the verify route a value its response
+cannot carry.
 
 **The codec only signs and verifies.** Cookie attributes — ``SameSite=Lax``,
 ``HttpOnly`` always, ``Secure`` under TLS — are the caller's to set on the
@@ -47,6 +73,7 @@ from typing import Any
 from itsdangerous import BadSignature, URLSafeSerializer
 
 from .exceptions import InvalidSessionError
+from .identity_headers import is_header_safe
 
 __all__ = [
     "PAYLOAD_VERSION",
@@ -94,11 +121,28 @@ class UnlockedUser:
         generation_tag: The credential-generation tag from
             :func:`~osprey.services.auth_sidecar.passwords.generation_tag`, or
             ``""`` for an OIDC entry, which has no stored hash behind it.
+        oidc_subject: The ``sub`` claim of the OIDC provider that unlocked this
+            entry, or ``""`` in password mode and for any session minted before
+            the subject was carried. An opaque account identifier, never a
+            credential — the cookie is signed, not encrypted.
+        role: The authorization role this user holds, or ``""`` for none. The
+            deny-safe default: an empty role is forwarded as no role header at
+            all, which every consumer reads as "no privileges". Never a
+            privilege itself — it names a role the deployment declared, which is
+            what turns it into one.
+        role_source: Where :attr:`role` came from — the roster's ``role:`` entry
+            or an OIDC role claim — or ``""`` for none, which is what an entry
+            holding no role carries and what any session minted before
+            provenance travelled carries. Provenance only: it says where a
+            privilege came from, never that one is held.
     """
 
     username: str
     expires_at: float
     generation_tag: str = ""
+    oidc_subject: str = ""
+    role: str = ""
+    role_source: str = ""
 
     def is_expired(self, now: float) -> bool:
         """Whether this entry has reached its expiry at ``now``."""
@@ -165,27 +209,61 @@ class SessionState:
         return tuple(user.username for user in self.users if not user.is_expired(now))
 
     def with_user(
-        self, username: str, *, expires_at: float, generation_tag: str = ""
+        self,
+        username: str,
+        *,
+        expires_at: float,
+        generation_tag: str = "",
+        oidc_subject: str = "",
+        role: str = "",
+        role_source: str = "",
     ) -> SessionState:
         """Return this state with ``username`` unlocked until ``expires_at``.
 
-        Re-adding a user replaces that entry in place — a fresh login refreshes
-        the expiry and the tag without disturbing the order of the others.
+        Re-adding a user replaces that entry in place — a fresh login restates
+        the expiry, the tag, the subject, the role and where that role came from
+        without disturbing the order of the others. Replacement is wholesale, not
+        a merge: a login that omits the role clears the one the previous login
+        carried along with its source, exactly as it already does for the tag and
+        the subject. That is the safe direction: a role kept across a login that
+        no longer grants it would outlive the authorization that put it there.
 
         Args:
             username: The roster user being unlocked.
             expires_at: Absolute epoch seconds at which the entry lapses.
             generation_tag: The credential-generation tag in password mode;
                 omitted for OIDC.
+            oidc_subject: The provider's ``sub`` claim in OIDC mode; omitted in
+                password mode, which has no provider account behind it.
+            role: The authorization role this login resolved, or ``""`` for
+                none.
+            role_source: Where that role came from, or ``""`` for none — which
+                is what a login resolving no role passes.
 
         Raises:
-            ValueError: If ``username`` is empty.
+            ValueError: If ``username`` is empty, or if the subject, the role or
+                its source could not be carried in an identity header. The
+                caller is refusing a login at that point, not repairing a
+                value: a substitute identity would authorize the wrong thing,
+                and a silently dropped role would authorize *something* under
+                a privilege nobody granted.
         """
         if not username:
             raise ValueError("username must not be empty")
+        if oidc_subject and not is_header_safe(oidc_subject):
+            raise ValueError("oidc subject cannot be carried in an identity header")
+        if role and not is_header_safe(role):
+            raise ValueError("role cannot be carried in an identity header")
+        if role_source and not is_header_safe(role_source):
+            raise ValueError("role source cannot be carried in an identity header")
 
         entry = UnlockedUser(
-            username=username, expires_at=float(expires_at), generation_tag=generation_tag
+            username=username,
+            expires_at=float(expires_at),
+            generation_tag=generation_tag,
+            oidc_subject=oidc_subject,
+            role=role,
+            role_source=role_source,
         )
         if self.entry(username) is None:
             return replace(self, users=(*self.users, entry))
@@ -287,7 +365,13 @@ class SessionCodec:
             "sid": state.session_id,
             "iat": state.issued_at,
             "users": {
-                user.username: {"exp": user.expires_at, "tag": user.generation_tag}
+                user.username: {
+                    "exp": user.expires_at,
+                    "tag": user.generation_tag,
+                    "sub": user.oidc_subject,
+                    "role": user.role,
+                    "source": user.role_source,
+                }
                 for user in state.users
             },
         }
@@ -349,6 +433,17 @@ class SessionCodec:
     def _decode_users(raw_users: Any) -> tuple[UnlockedUser, ...]:
         """Read the unlocked-user map out of a verified payload.
 
+        ``tag``, ``sub``, ``role`` and ``source`` all default to ``""`` when
+        absent, so a cookie minted before any of those keys existed decodes at
+        the current payload version instead of signing that browser out.
+
+        A subject, role or role source that could not be carried in an identity
+        header invalidates the whole cookie. Only this sidecar can have signed
+        it, and :meth:`SessionState.with_user` refuses to store such a value —
+        so a cookie carrying one is not a session to salvage, and refusing it
+        here is what keeps the verify route's answer a plain 401 rather than an
+        encoding failure on the hot path.
+
         Raises:
             InvalidSessionError: If the map or any entry is malformed.
         """
@@ -366,11 +461,39 @@ class SessionCodec:
             tag = entry.get("tag", "")
             if not isinstance(tag, str):
                 raise InvalidSessionError(f"session entry for {username!r} has a non-string tag")
+            subject = entry.get("sub", "")
+            if not isinstance(subject, str):
+                raise InvalidSessionError(
+                    f"session entry for {username!r} has a non-string subject"
+                )
+            if subject and not is_header_safe(subject):
+                raise InvalidSessionError(
+                    f"session entry for {username!r} carries an uncarryable subject"
+                )
+            role = entry.get("role", "")
+            if not isinstance(role, str):
+                raise InvalidSessionError(f"session entry for {username!r} has a non-string role")
+            if role and not is_header_safe(role):
+                raise InvalidSessionError(
+                    f"session entry for {username!r} carries an uncarryable role"
+                )
+            role_source = entry.get("source", "")
+            if not isinstance(role_source, str):
+                raise InvalidSessionError(
+                    f"session entry for {username!r} has a non-string role source"
+                )
+            if role_source and not is_header_safe(role_source):
+                raise InvalidSessionError(
+                    f"session entry for {username!r} carries an uncarryable role source"
+                )
             users.append(
                 UnlockedUser(
                     username=username,
                     expires_at=_as_epoch(entry.get("exp"), f"users[{username}].exp"),
                     generation_tag=tag,
+                    oidc_subject=subject,
+                    role=role,
+                    role_source=role_source,
                 )
             )
         return tuple(users)

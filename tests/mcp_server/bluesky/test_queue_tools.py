@@ -52,16 +52,24 @@ def _reset_bluesky_context():
     reset_server_context()
 
 
-def _configure(tmp_path, monkeypatch, *, writes: bool | None, token: str | None) -> None:
+def _configure(
+    tmp_path,
+    monkeypatch,
+    *,
+    writes: bool | None,
+    token: str | None,
+    control_system: dict | None = None,
+) -> None:
     """Put the process in a deployment posture: writes on/off, token set/unset.
 
     ``writes=None`` writes no config.yml at all — the fail-closed case.
+    ``control_system`` writes that whole section instead of the deployment-wide
+    flag alone, which is how a per-connector-type posture is staged.
     """
     monkeypatch.chdir(tmp_path)
-    if writes is not None:
-        (tmp_path / "config.yml").write_text(
-            yaml.dump({"control_system": {"writes_enabled": writes}})
-        )
+    section = control_system if control_system is not None else {"writes_enabled": writes}
+    if control_system is not None or writes is not None:
+        (tmp_path / "config.yml").write_text(yaml.dump({"control_system": section}))
     if token is None:
         monkeypatch.delenv("BLUESKY_LAUNCH_TOKEN", raising=False)
     else:
@@ -252,13 +260,19 @@ async def test_queue_add_withholds_the_token_when_writes_are_disabled(tmp_path, 
     manager's live state) permits it only while the queue is idle and refuses
     it the moment the queue is draining. Asserting on the absent header pins
     the mechanism; a status-code assertion would not.
+
+    The add SUCCEEDING is half the contract and is asserted too: an unarmed
+    lane that could no longer compose a queue would have turned the
+    compose-while-unarmed guarantee into a refusal nobody asked for.
     """
     _configure(tmp_path, monkeypatch, writes=False, token=_TOKEN)
-    with patch(f"{_MOD}._http_post_json", return_value=(200, {"run_id": "r1"})) as m:
+    body = {"run_id": "r1", "revision": 3, "item": {"item_uid": "u1"}}
+    with patch(f"{_MOD}._http_post_json", return_value=(200, body)) as m:
         with patch(f"{_MOD}.notify_agent_activity_async"):
-            await _add_fn()(draft_revision=3)
+            result = await _add_fn()(draft_revision=3)
 
     assert m.call_args.kwargs["headers"] is None
+    assert extract_response_dict(result)["run_id"] == "r1"
 
 
 async def test_queue_add_missing_config_fails_closed_and_withholds_the_token(tmp_path, monkeypatch):
@@ -326,13 +340,93 @@ async def test_queue_add_armed_refusal_names_the_kill_switch_when_writes_are_off
         "the queue is running, so adding an item requires the launch token",
         manager_state="executing_queue",
     )
+    with patch(f"{_MOD}._http_post_json", return_value=(403, body)) as m:
+        with assert_raises_error(error_type="launch_token_required") as ctx:
+            await _add_fn()(draft_revision=7)
+
+    # The other half of the compose-while-unarmed contract: the same tokenless
+    # request that an idle queue accepts is what a draining queue refuses.
+    assert m.call_args.kwargs["headers"] is None
+    envelope = ctx["envelope"]
+    assert envelope["details"]["code"] == "launch_token_required"
+    assert envelope["details"]["manager_state"] == "executing_queue"
+    assert any("writes_enabled" in s for s in envelope["suggestions"])
+
+
+async def test_queue_add_names_the_bound_lanes_own_posture_key_in_the_withheld_hint(
+    tmp_path, monkeypatch
+):
+    """The hint names the key that would arm THIS lane's machine, not the global one.
+
+    A deployment that resolves its live target to a connector type has a
+    per-type key to point at, and pointing at the deployment-wide one instead
+    would tell an operator to arm every target in order to run a plan on one.
+    """
+    _configure(
+        tmp_path,
+        monkeypatch,
+        writes=None,
+        token=_TOKEN,
+        control_system={
+            "type": "epics",
+            "writes_enabled": False,
+            "connector": {"epics": {"gateways": {"read_only": {"host": "gw-ro"}}}},
+        },
+    )
+    body = _refusal(
+        "launch_token_required",
+        "the queue is running, so adding an item requires the launch token",
+        manager_state="executing_queue",
+    )
     with patch(f"{_MOD}._http_post_json", return_value=(403, body)):
         with assert_raises_error(error_type="launch_token_required") as ctx:
             await _add_fn()(draft_revision=7)
 
-    envelope = ctx["envelope"]
-    assert envelope["details"]["code"] == "launch_token_required"
-    assert any("writes_enabled" in s for s in envelope["suggestions"])
+    suggestions = ctx["envelope"]["suggestions"]
+    assert any("control_system.connector.epics.writes_enabled" in s for s in suggestions)
+    assert any("'bluesky'" in s and "'live'" in s for s in suggestions)
+
+
+async def test_queue_add_still_composes_in_a_readonly_session(tmp_path, monkeypatch):
+    """A read-only run withholds the token; it does not stop a queue being built.
+
+    The deployment is fully armed here, so the only thing keeping the token off
+    this request is the sandbox posture — and composing onto an idle queue moves
+    nothing, so it must still succeed.
+    """
+    _armed(tmp_path, monkeypatch)
+    monkeypatch.setenv("OSPREY_EXECUTION_MODE", "readonly")
+    body = {"run_id": "r1", "revision": 3, "item": {"item_uid": "u1"}}
+    with patch(f"{_MOD}._http_post_json", return_value=(200, body)) as m:
+        with patch(f"{_MOD}.notify_agent_activity_async"):
+            result = await _add_fn()(draft_revision=3)
+
+    assert m.call_args.kwargs["headers"] is None
+    assert extract_response_dict(result)["run_id"] == "r1"
+
+
+async def test_queue_add_readonly_refusal_names_the_sandbox_posture_not_a_config_key(
+    tmp_path, monkeypatch
+):
+    """A read-only session must not be told to edit a key that already says true.
+
+    Writes ARE armed in this deployment, so the config-key hint would send an
+    operator to change something that was never what withheld the token.
+    """
+    _armed(tmp_path, monkeypatch)
+    monkeypatch.setenv("OSPREY_EXECUTION_MODE", "readonly")
+    body = _refusal(
+        "launch_token_required",
+        "the queue is running, so adding an item requires the launch token",
+        manager_state="executing_queue",
+    )
+    with patch(f"{_MOD}._http_post_json", return_value=(403, body)):
+        with assert_raises_error(error_type="launch_token_required") as ctx:
+            await _add_fn()(draft_revision=7)
+
+    suggestions = ctx["envelope"]["suggestions"]
+    assert any("OSPREY_EXECUTION_MODE=readonly" in s for s in suggestions)
+    assert all("profile.yml" not in s for s in suggestions)
 
 
 async def test_queue_add_writes_enabled_refusal_does_not_blame_the_kill_switch(
@@ -395,6 +489,31 @@ async def test_queue_add_unknown_device_points_at_the_device_list(tmp_path, monk
     assert envelope["details"]["available_devices"] == ["BPM1", "COR1"]
     assert any("list_devices" in s for s in envelope["suggestions"])
     assert not any("get_draft" in s for s in envelope["suggestions"])
+
+
+async def test_queue_add_unknown_device_relays_a_capped_device_list(tmp_path, monkeypatch):
+    """A worker whose namespace exceeds one page sends a count and a URL instead
+    of the names. Both must survive into details untouched — the agent pages the
+    names with list_devices, so the hint points there either way."""
+    _armed(tmp_path, monkeypatch)
+    body = _refusal(
+        "unknown_device",
+        "plan 'grid_scan' referenced device 'COR9', which this worker did not build; "
+        "available devices: ['BPM1', 'BPM2', 'COR1'] (+2 more; full list via GET /devices)",
+        plan="grid_scan",
+        devices=["COR9"],
+        available_count=5,
+        available_devices_url="/devices",
+    )
+    with patch(f"{_MOD}._http_post_json", return_value=(400, body)):
+        with assert_raises_error(error_type="unknown_device") as ctx:
+            await _add_fn()(draft_revision=7)
+
+    details = ctx["envelope"]["details"]
+    assert details["available_count"] == 5
+    assert details["available_devices_url"] == "/devices"
+    assert "available_devices" not in details
+    assert any("list_devices" in s for s in ctx["envelope"]["suggestions"])
 
 
 @pytest.mark.parametrize("code", ["session_plan_unvalidated", "session_plan_not_in_namespace"])
@@ -715,8 +834,76 @@ def test_every_refusal_code_this_module_handles_is_documented_for_the_agent():
             queue.queue_add,
             queue.queue_start,
             queue.queue_stop,
+            queue.queue_remove,
             stop.stop_run,
         )
     )
     undocumented = [code for code in queue._REFUSAL_HINTS if code not in docs]
     assert not undocumented, f"refusal codes handled but never explained: {undocumented}"
+
+
+# =========================================================================
+# queue_remove — drop one pending item; the interrupted-item way out
+# =========================================================================
+
+
+def _remove_fn():
+    return get_tool_fn(queue.queue_remove)
+
+
+async def test_queue_remove_deletes_the_item_and_relays_the_body(tmp_path, monkeypatch):
+    _armed(tmp_path, monkeypatch)
+    body = {"removed": True, "item": {"item_uid": "u1", "name": "hysteresis_loop"}}
+    with patch(f"{_MOD}._http_delete_json", return_value=(200, body)) as m:
+        result = await _remove_fn()("u1")
+
+    assert m.call_args.args[0] == "/queue/items/u1"
+    # Omitted lane means the ACTIVE lane, exactly like every other queue read.
+    assert m.call_args.kwargs["lane"] is None
+    assert extract_response_dict(result) == body
+
+
+async def test_queue_remove_passes_the_named_lane_through(tmp_path, monkeypatch):
+    _armed(tmp_path, monkeypatch)
+    body = {"removed": True, "item": None}
+    with patch(f"{_MOD}._http_delete_json", return_value=(200, body)) as m:
+        await _remove_fn()("u1", lane="bluesky2")
+
+    assert m.call_args.kwargs["lane"] == "bluesky2"
+
+
+async def test_queue_remove_url_encodes_the_uid(tmp_path, monkeypatch):
+    """A uid is manager-minted and opaque — path-encode it, never trust it."""
+    _armed(tmp_path, monkeypatch)
+    with patch(f"{_MOD}._http_delete_json", return_value=(200, {"removed": True})) as m:
+        await _remove_fn()("a/b c")
+
+    assert m.call_args.args[0] == "/queue/items/a%2Fb%20c"
+
+
+async def test_queue_remove_relays_the_bridge_refusal_code_and_detail(tmp_path, monkeypatch):
+    """An unknown uid is the manager's refusal, relayed verbatim — the queue is
+    unchanged and the hint sends the agent back to queue_list."""
+    _armed(tmp_path, monkeypatch)
+    body = _refusal("queue_request_rejected", "Item 'nope' is not in the queue.")
+    with patch(f"{_MOD}._http_delete_json", return_value=(409, body)):
+        with assert_raises_error(error_type="queue_request_rejected") as ctx:
+            await _remove_fn()("nope")
+
+    envelope = ctx["envelope"]
+    assert envelope["error_message"] == "Item 'nope' is not in the queue."
+    assert envelope["details"]["code"] == "queue_request_rejected"
+
+
+async def test_queue_remove_is_ungated_by_writes_and_token(tmp_path, monkeypatch):
+    """Removal must keep working with writes disabled and no token — it is the
+    sole way past the interrupted-item start refusal, so gating it would trap a
+    wedged queue exactly when the kill switch is on."""
+    _configure(tmp_path, monkeypatch, writes=False, token=None)
+    body = {"removed": True, "item": None}
+    with patch(f"{_MOD}._http_delete_json", return_value=(200, body)) as m:
+        result = await _remove_fn()("u1")
+
+    assert extract_response_dict(result) == body
+    # No launch token header on a removal — there is nothing to arm.
+    assert "headers" not in m.call_args.kwargs

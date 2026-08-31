@@ -9,22 +9,33 @@ import pytest
 
 from osprey.deployment.web_terminals.personas import (
     EVENTS_PANEL_ID,
+    UnresolvedRoleError,
+    bluesky_server_enabled,
+    config_archiver_password_env,
     config_declares_panel,
     config_needs_ariel_password,
     config_needs_dispatcher_token,
+    config_needs_graphdb_password,
     config_needs_launch_token,
+    config_needs_launch_token_for,
+    effective_persona,
     entry_requires_login,
     env_var_suffix,
     env_var_suffix_collisions,
     freeze_user_indices,
+    lane_control_target,
     normalize_users,
+    personas_needing_archiver_password,
     personas_needing_ariel_password,
     personas_needing_dispatcher_token,
-    personas_needing_launch_token,
+    personas_needing_graphdb_password,
+    personas_needing_launch_token_by_lane,
     personas_not_denying_bash,
+    resolve_authorization_roles,
     resolve_personas,
     settings_json_denies_bash,
 )
+from osprey.registry.mcp import FRAMEWORK_SERVERS
 
 
 def test_normalize_users_bare_strings_indexed_by_position() -> None:
@@ -230,6 +241,32 @@ def test_freeze_user_indices_keeps_the_persona_normalize_users_drops() -> None:
     # Assert
     assert result == [{"name": "alice", "index": 0, "persona": "readonly"}]
     assert normalize_users(users_raw) == [{"name": "alice", "index": 0}]
+
+
+def test_freeze_user_indices_keeps_a_survivors_role() -> None:
+    """`role:` is the OTHER binding whose loss is a silent privilege change.
+
+    It reaches a persona through `modules.web_terminals.authorization` instead of
+    pinning one directly, but `effective_persona` resolves an entry through both,
+    so a survivor written back without its `role:` re-resolves onto
+    `default_persona` exactly as one written back without its `persona:` does.
+    The persona half has had its own test since this function existed; this is
+    the half that did not — and it reaches the write-back by the other route,
+    carried through the projection rather than re-attached from the authored
+    entry, so the persona test does not cover it.
+    """
+    # Arrange
+    users_raw = [
+        {"name": "alice", "index": 0, "role": "operator"},
+        {"name": "bob", "index": 1, "role": "expert"},
+    ]
+
+    # Act
+    result = freeze_user_indices(users_raw)
+
+    # Assert
+    assert [entry.get("role") for entry in result] == ["operator", "expert"]
+    assert result == users_raw
 
 
 def test_freeze_user_indices_freezes_bare_string_positions() -> None:
@@ -499,9 +536,10 @@ def test_resolve_personas_non_default_persona_registry_mode_suffixes_image() -> 
     ]
 
 
-def test_resolve_personas_local_mode_suffixes_every_persona_including_default() -> None:
-    """Local mode builds `<persona.project>-<persona>:local` for every persona —
-    unlike registry mode, the default persona is not special-cased on the image."""
+def test_resolve_personas_local_mode_tags_every_persona_by_render_including_default() -> None:
+    """Local mode builds `<persona.project>:local` for every persona — the tag
+    names the render alone, and unlike registry mode, the default persona is
+    not special-cased on the image."""
     # Arrange
     web_terminals = {
         "users": ["alice", {"name": "gmartino", "index": 1, "persona": "gui"}],
@@ -519,13 +557,34 @@ def test_resolve_personas_local_mode_suffixes_every_persona_including_default() 
     # Assert
     images = {entry["name"]: entry["image"] for entry in result}
     assert images == {
-        "alice": "als-assistant-cli:local",
-        "gmartino": "als-gui-assistant-gui:local",
+        "alice": "als-assistant:local",
+        "gmartino": "als-gui-assistant:local",
     }
     # Default persona's container dir follows its own catalog project, like every
     # other persona — no facility-prefix special case (here `als-assistant`).
     default_entry = next(entry for entry in result if entry["name"] == "alice")
     assert default_entry["container_project_dir"] == "/app/als-assistant"
+
+
+def test_resolve_personas_local_mode_entry_without_project_keeps_suffixed_tag() -> None:
+    """A catalog entry with no `project` of its own resolves onto the facility
+    default project, whose `<default>-<persona>:local` suffix is what keeps the
+    tag disjoint from the dispatch worker's `<project>:local` image — a render
+    of its own is what earns a persona the unsuffixed tag."""
+    # Arrange
+    web_terminals = {
+        "users": [{"name": "alice", "index": 0, "persona": "bare"}],
+        "default_persona": "bare",
+        "image_source": "local",
+        "personas": {"bare": {"project_path": "profiles/bare"}},
+    }
+
+    # Act
+    result = resolve_personas(web_terminals, _REGISTRY, "als")
+
+    # Assert
+    assert result[0]["image"] == "als-assistant-bare:local"
+    assert result[0]["project"] == "als-assistant"
 
 
 def test_resolve_personas_entry_without_persona_key_inherits_default_persona() -> None:
@@ -1485,8 +1544,8 @@ def test_personas_needing_ariel_password_skips_unrendered_persona_projects(tmp_p
 # `BLUESKY_LAUNCH_TOKEN` arms a queue start, so it is gated on the intersection
 # of the two things that make arming meaningful: writes actually enabled, and
 # the bluesky MCP server (the token's consumer -- not the panel) actually run.
-# The two reads are asymmetric on purpose: `writes_enabled` must be explicitly
-# true, while the server's `enabled` override defaults to on when absent.
+# Both reads deny on absence: `writes_enabled` must be explicitly true, and the
+# server's `enabled` key is an override over a registry default that is off.
 # ---------------------------------------------------------------------------
 
 
@@ -1500,17 +1559,45 @@ def _launch_config(writes_enabled: Any = "absent", bluesky_enabled: Any = "absen
     return config
 
 
+def test_bluesky_server_enabled_reads_the_override_tri_state() -> None:
+    """`claude_code.servers.bluesky.enabled` is an override: explicit `true` runs the
+    server, explicit `false` switches it off, and absence leaves the registry default,
+    which for the opt-in bluesky server is off."""
+    # Assert
+    assert bluesky_server_enabled(_launch_config(bluesky_enabled=True)) is True
+    assert bluesky_server_enabled(_launch_config(bluesky_enabled=False)) is False
+    assert bluesky_server_enabled(_launch_config()) is False
+
+
+def test_bluesky_server_enabled_absent_key_matches_the_registry_default() -> None:
+    """The absent-key answer is the registry's own `default_enabled`, not a second
+    copy of it: the render obeys the registry, so a hand-written default here could
+    drift away from the server this project actually runs."""
+    # Assert
+    assert bluesky_server_enabled(_launch_config()) is FRAMEWORK_SERVERS["bluesky"].default_enabled
+
+
+def test_bluesky_server_enabled_reads_non_dict_sections_defensively() -> None:
+    """A config with no `claude_code` section at all, or a non-dict one, answers with
+    the default rather than raising."""
+    # Assert
+    assert bluesky_server_enabled({}) is False
+    assert bluesky_server_enabled(None) is False
+    assert bluesky_server_enabled({"claude_code": "on"}) is False
+
+
 def test_config_needs_launch_token_requires_writes_and_the_bluesky_server() -> None:
     """Both halves of the capability present -- the readwrite tier."""
     # Assert
     assert config_needs_launch_token(_launch_config(True, True)) is True
 
 
-def test_config_needs_launch_token_defaults_the_bluesky_server_to_enabled() -> None:
-    """`claude_code.servers.bluesky.enabled` is an override over an already-enabled
-    default, so its absence must not deny the token."""
+def test_config_needs_launch_token_denies_when_the_bluesky_server_is_absent() -> None:
+    """The bluesky server is opt-in in the registry, so an absent `enabled` override
+    means it does not run here -- and a token for a server that never starts arms
+    nothing while still handing the agent a live credential."""
     # Assert
-    assert config_needs_launch_token(_launch_config(writes_enabled=True)) is True
+    assert config_needs_launch_token(_launch_config(writes_enabled=True)) is False
 
 
 def test_config_needs_launch_token_denies_when_the_bluesky_server_is_off() -> None:
@@ -1585,10 +1672,10 @@ def test_personas_needing_launch_token_selects_only_the_readwrite_persona(tmp_pa
     )
 
     # Act
-    result = personas_needing_launch_token(config, tmp_path)
+    result = personas_needing_launch_token_by_lane(config, tmp_path)
 
     # Assert
-    assert result == {"readwrite"}
+    assert result == {"bluesky": {"readwrite"}}
 
 
 def test_personas_needing_launch_token_skips_unrendered_persona_projects(tmp_path) -> None:
@@ -1601,7 +1688,349 @@ def test_personas_needing_launch_token_skips_unrendered_persona_projects(tmp_pat
     )
 
     # Act / Assert
-    assert personas_needing_launch_token(config, tmp_path) == set()
+    assert personas_needing_launch_token_by_lane(config, tmp_path) == {}
+
+
+# ---------------------------------------------------------------------------
+# Per-lane launch-token entitlement
+#
+# A plan lane is bound at render time to ONE control target, so the posture
+# that decides whether its token may be issued is that target's -- not the
+# deployment's. The case the whole axis exists for: a deployment whose baseline
+# is a live machine arms writes on its virtual-accelerator lane alone, and lane
+# 1 (the live one) must stay disarmed while it does.
+# ---------------------------------------------------------------------------
+
+#: A live-baseline project that arms writes on the VA connector only, and
+#: renders the VA second lane. Lane 1 has no `target:` of its own, so it takes
+#: the deployment baseline, which here is `live`.
+_VA_ARMED_LIVE_DEPLOYMENT: dict = {
+    "control_system": {
+        "type": "epics",
+        "writes_enabled": False,
+        "connector": {"epics": {}, "virtual_accelerator": {"writes_enabled": True}},
+    },
+    "services": {"bluesky_va": {"target": "va", "port": 10081}},
+    "claude_code": {"servers": {"bluesky": {"enabled": True}}},
+}
+
+#: A VA-baseline project with a single lane: lane 1 declares no target and so
+#: serves `va`, the only target this deployment has.
+_VA_BASELINE_DEPLOYMENT: dict = {
+    "control_system": {
+        "type": "virtual_accelerator",
+        "connector": {"virtual_accelerator": {"writes_enabled": True}},
+    },
+    "claude_code": {"servers": {"bluesky": {"enabled": True}}},
+}
+
+
+def test_lane_control_target_falls_back_to_the_baseline_for_lane_one() -> None:
+    """Lane 1 on a single-lane deployment has never carried a `target:` key -- it
+    serves the only target the deployment has -- so it reads the baseline."""
+    # Assert
+    assert lane_control_target(_VA_ARMED_LIVE_DEPLOYMENT, "bluesky") == "live"
+    assert lane_control_target(_VA_BASELINE_DEPLOYMENT, "bluesky") == "va"
+
+
+def test_lane_control_target_reads_a_second_lanes_declared_target() -> None:
+    """A second lane's rendered block states the target it drives."""
+    # Assert
+    assert lane_control_target(_VA_ARMED_LIVE_DEPLOYMENT, "bluesky_va") == "va"
+
+
+def test_lane_control_target_falls_back_to_the_target_the_lane_key_names() -> None:
+    """A lane is named for the target it serves, so a block that wrote no
+    `target:` is still unambiguous -- the key itself answers."""
+    # Arrange
+    config = {"services": {"bluesky_va": {"port": 10081}, "bluesky_live": {"port": 10082}}}
+
+    # Assert
+    assert lane_control_target(config, "bluesky_va") == "va"
+    assert lane_control_target(config, "bluesky_live") == "live"
+
+
+def test_config_needs_launch_token_for_arms_only_the_lane_whose_target_allows_writes() -> None:
+    """The feature in one assertion: writes are armed for `va` and nowhere else, so
+    the VA lane's token may be issued and lane 1's -- which drives the live machine
+    -- may not."""
+    # Assert
+    assert config_needs_launch_token_for(_VA_ARMED_LIVE_DEPLOYMENT, "bluesky_va") is True
+    assert config_needs_launch_token_for(_VA_ARMED_LIVE_DEPLOYMENT, "bluesky") is False
+
+
+def test_config_needs_launch_token_for_denies_a_lane_this_render_does_not_carry() -> None:
+    """An undeclared second lane has no bridge to arm. The live lane is absent from
+    this render even though the deployment's baseline IS live, so it entitles
+    nothing."""
+    # Assert
+    assert config_needs_launch_token_for(_VA_ARMED_LIVE_DEPLOYMENT, "bluesky_live") is False
+
+
+def test_config_needs_launch_token_for_denies_every_lane_for_the_readonly_tier() -> None:
+    """The read-only tier disarms writes at every level, so no lane it renders can
+    issue a token -- the tier boundary the whole grant rests on."""
+    # Arrange
+    config = {
+        "control_system": {
+            "type": "epics",
+            "writes_enabled": False,
+            "connector": {"epics": {"writes_enabled": False}, "virtual_accelerator": {}},
+        },
+        "services": {"bluesky_va": {"target": "va", "port": 10081}},
+        "claude_code": {"servers": {"bluesky": {"enabled": True}}},
+    }
+
+    # Assert
+    assert config_needs_launch_token_for(config, "bluesky") is False
+    assert config_needs_launch_token_for(config, "bluesky_va") is False
+
+
+def test_config_needs_launch_token_for_denies_every_lane_when_the_server_is_off() -> None:
+    """A token for a server that never starts arms nothing while still handing the
+    agent a live credential -- true of every lane, however armed its target is."""
+    # Arrange
+    config = {
+        **_VA_ARMED_LIVE_DEPLOYMENT,
+        "claude_code": {"servers": {"bluesky": {"enabled": False}}},
+    }
+
+    # Assert
+    assert config_needs_launch_token_for(config, "bluesky") is False
+    assert config_needs_launch_token_for(config, "bluesky_va") is False
+
+
+def test_config_needs_launch_token_is_the_lane_one_case() -> None:
+    """The pre-lane predicate is this one asked about lane 1, so a deployment that
+    arms only its VA lane does not satisfy it."""
+    # Assert
+    assert config_needs_launch_token(_VA_ARMED_LIVE_DEPLOYMENT) is False
+    assert config_needs_launch_token(_VA_BASELINE_DEPLOYMENT) is True
+
+
+def test_personas_needing_launch_token_by_lane_grants_only_the_armed_lane(tmp_path) -> None:
+    """The producer in roster form: the persona holds the VA lane's token and not
+    lane 1's, and lane 1 is ABSENT from the map rather than present and empty --
+    the deployment renders no such grant at all."""
+    # Arrange
+    config = _catalog_config(
+        {
+            "va_operator": {
+                "project": "va",
+                "project_path": _write_persona_project_config(
+                    tmp_path, "va", _VA_ARMED_LIVE_DEPLOYMENT
+                ),
+            }
+        },
+        [{"name": "alice", "index": 0, "persona": "va_operator"}],
+    )
+
+    # Act
+    result = personas_needing_launch_token_by_lane(config, tmp_path)
+
+    # Assert
+    assert result == {"bluesky_va": {"va_operator"}}
+
+
+def test_personas_needing_launch_token_by_lane_grants_lane_one_on_a_va_baseline(
+    tmp_path,
+) -> None:
+    """A single-lane VA deployment arms lane 1: its lane declares no target, so lane
+    1 drives `va`, and that is the target the config arms."""
+    # Arrange
+    config = _catalog_config(
+        {
+            "va_only": {
+                "project": "vaonly",
+                "project_path": _write_persona_project_config(
+                    tmp_path, "vaonly", _VA_BASELINE_DEPLOYMENT
+                ),
+            }
+        },
+        [{"name": "alice", "index": 0, "persona": "va_only"}],
+    )
+
+    # Act
+    result = personas_needing_launch_token_by_lane(config, tmp_path)
+
+    # Assert
+    assert result == {"bluesky": {"va_only"}}
+
+
+def test_personas_needing_launch_token_by_lane_is_empty_for_the_readonly_tier(tmp_path) -> None:
+    """A roster of read-only personas entitles nothing on any lane, so the map is
+    empty rather than carrying a lane with no personas in it."""
+    # Arrange
+    config = _catalog_config(
+        {
+            "readonly": {
+                "project": "ro",
+                "project_path": _write_persona_project_config(
+                    tmp_path,
+                    "ro",
+                    {
+                        "control_system": {
+                            "type": "epics",
+                            "writes_enabled": False,
+                            "connector": {"epics": {}, "virtual_accelerator": {}},
+                        },
+                        "services": {"bluesky_va": {"target": "va", "port": 10081}},
+                        "claude_code": {"servers": {"bluesky": {"enabled": True}}},
+                    },
+                ),
+            }
+        },
+        [{"name": "bob", "index": 0, "persona": "readonly"}],
+    )
+
+    # Act / Assert
+    assert personas_needing_launch_token_by_lane(config, tmp_path) == {}
+
+
+# ---------------------------------------------------------------------------
+# services.graphdb + the graph server -> per-user Neo4j password
+#
+# `GRAPHDB_PASSWORD` is the graph store's ONLY credential, and Neo4j's one
+# account is write-capable, so the read-only tier gets it too: read-only-ness
+# lives in the `graph` MCP server's read transactions, not in the password. That
+# is why this predicate never reads `writes_enabled` -- the read-only operator
+# terminal is precisely the tier graph search is meant to serve. What it does
+# read is the two keys that decide whether there is a store to dial and a server
+# to dial it: the `services.graphdb` block (present-and-resolvable), and the
+# graph server's `enabled` override (an override, so absence means enabled).
+# ---------------------------------------------------------------------------
+
+
+def test_config_needs_graphdb_password_reads_the_services_block() -> None:
+    """The `services.graphdb` block IS the entitlement, exactly as the `ariel:`
+    section is for the Postgres password. A fully-defaulted empty block still
+    configures a store, so it entitles."""
+    # Assert
+    assert config_needs_graphdb_password({"services": {"graphdb": {}}}) is True
+    assert config_needs_graphdb_password({"services": {"graphdb": {"port_host": 7688}}}) is True
+    assert config_needs_graphdb_password({}) is False
+
+
+def test_config_needs_graphdb_password_denies_a_block_less_config() -> None:
+    """A bare `graphdb:` key parses as None and configures no store, and non-dict
+    sections are read defensively rather than raising."""
+    # Assert
+    assert config_needs_graphdb_password({"services": {"graphdb": None}}) is False
+    assert config_needs_graphdb_password({"services": {}}) is False
+    assert config_needs_graphdb_password({"services": "graphdb"}) is False
+    assert config_needs_graphdb_password(None) is False
+
+
+def test_config_needs_graphdb_password_denies_a_malformed_block() -> None:
+    """A block this deployment could never reach entitles nothing. Refusing instead
+    would turn a typo in one persona's config.yml into a failed render of the whole
+    roster."""
+    # Assert
+    assert config_needs_graphdb_password({"services": {"graphdb": {"port_host": "abc"}}}) is False
+
+
+def test_config_needs_graphdb_password_denies_when_the_graph_server_is_off() -> None:
+    """A configured store with no server to query it has no consumer."""
+    # Arrange
+    config = {
+        "services": {"graphdb": {}},
+        "claude_code": {"servers": {"graph": {"enabled": False}}},
+    }
+
+    # Assert
+    assert config_needs_graphdb_password(config) is False
+
+
+def test_config_needs_graphdb_password_defaults_the_graph_server_to_enabled() -> None:
+    """`claude_code.servers.graph.enabled` is an override over an already-enabled
+    default, so its absence must not deny the password."""
+    # Assert
+    assert (
+        config_needs_graphdb_password(
+            {"services": {"graphdb": {}}, "claude_code": {"servers": {"graph": {"enabled": True}}}}
+        )
+        is True
+    )
+    assert (
+        config_needs_graphdb_password(
+            {"services": {"graphdb": {}}, "claude_code": {"servers": {"controls": {}}}}
+        )
+        is True
+    )
+
+
+def test_config_needs_graphdb_password_ignores_the_write_switch() -> None:
+    """The read-only tier searches the graph too. Gating this on `writes_enabled`
+    -- as the launch token is gated -- would leave the read-only operator terminal
+    unable to reach the store at all."""
+    # Arrange
+    config = {"services": {"graphdb": {}}, "control_system": {"writes_enabled": False}}
+
+    # Assert
+    assert config_needs_graphdb_password(config) is True
+
+
+def test_personas_needing_graphdb_password_spans_both_tiers(tmp_path) -> None:
+    """Unlike the launch token, this entitlement set deliberately includes the
+    read-only persona: the store has one account, and the read guarantee is the
+    graph server's, not the credential's. A persona configuring no store is still
+    excluded."""
+    # Arrange
+    catalog = {
+        "readwrite": {
+            "project": "rw",
+            "project_path": _write_persona_project_config(
+                tmp_path,
+                "rw",
+                {
+                    "control_system": {"writes_enabled": True},
+                    "services": {"graphdb": {"port_host": 7687}},
+                },
+            ),
+        },
+        "readonly": {
+            "project": "ro",
+            "project_path": _write_persona_project_config(
+                tmp_path,
+                "ro",
+                {
+                    "control_system": {"writes_enabled": False},
+                    "services": {"graphdb": {"port_host": 7687}},
+                },
+            ),
+        },
+        "logbook": {
+            "project": "lb",
+            "project_path": _write_persona_project_config(tmp_path, "lb", {"services": {}}),
+        },
+    }
+    config = _catalog_config(
+        catalog,
+        [
+            {"name": "alice", "index": 0, "persona": "readwrite"},
+            {"name": "bob", "index": 1, "persona": "readonly"},
+            {"name": "carol", "index": 2, "persona": "logbook"},
+        ],
+    )
+
+    # Act
+    result = personas_needing_graphdb_password(config, tmp_path)
+
+    # Assert
+    assert result == {"readwrite", "readonly"}
+
+
+def test_personas_needing_graphdb_password_skips_unrendered_persona_projects(tmp_path) -> None:
+    """A persona whose project isn't on disk contributes nothing: a credential is
+    never granted on a guess."""
+    # Arrange
+    config = _catalog_config(
+        {"ghost": {"project": "ghost", "project_path": "../never-rendered"}},
+        [{"name": "alice", "index": 0, "persona": "ghost"}],
+    )
+
+    # Act / Assert
+    assert personas_needing_graphdb_password(config, tmp_path) == set()
 
 
 # ---------------------------------------------------------------------------
@@ -1869,3 +2298,364 @@ def test_settings_json_denies_bash_reads_an_artifact_written_with_a_bom(tmp_path
 
     # Act / Assert
     assert settings_json_denies_bash(tmp_path / "bommed") is True
+
+
+# ---------------------------------------------------------------------------
+# Archiver connector -> per-user store password
+#
+# The archiver connector authenticates with the variable its own config block
+# names (`archiver.<type>.password_env`); `osprey up` mints it into the deploy
+# `.env` for a store the project deploys. `.env.users` excludes service tokens
+# by design and cannot say "the personas whose archiver reads this", so the
+# grant is per-user, and it carries the configured NAME because the block may
+# point at a facility-run store under any variable.
+# ---------------------------------------------------------------------------
+
+_MONGO_ARCHIVER = {
+    "type": "mongodb_archiver",
+    "mongodb_archiver": {"host": "localhost", "password_env": "MONGO_ROOT_PASSWORD"},
+}
+
+
+def test_config_archiver_password_env_reads_the_selected_connector_block() -> None:
+    """The variable named by the SELECTED connector's block is the entitlement."""
+    assert config_archiver_password_env({"archiver": _MONGO_ARCHIVER}) == "MONGO_ROOT_PASSWORD"
+
+
+def test_config_archiver_password_env_ignores_an_unselected_connector_block() -> None:
+    """The shipped config carries a `mongodb_archiver:` block under `type: mock_archiver`;
+    a block the selected type never reads entitles nothing."""
+    archiver = {**_MONGO_ARCHIVER, "type": "mock_archiver"}
+
+    assert config_archiver_password_env({"archiver": archiver}) is None
+
+
+def test_config_archiver_password_env_follows_any_connector_that_names_one() -> None:
+    """The key, not the connector name, is what is read: a future connector with a
+    `password_env` is granted exactly like MongoDB's."""
+    archiver = {"type": "facility_db", "facility_db": {"password_env": "FACILITY_DB_PW"}}
+
+    assert config_archiver_password_env({"archiver": archiver}) == "FACILITY_DB_PW"
+
+
+@pytest.mark.parametrize(
+    "missing", [{}, {"archiver": None}, {"archiver": {"type": "mock_archiver"}}]
+)
+def test_config_archiver_password_env_is_none_without_a_named_variable(missing: dict) -> None:
+    assert config_archiver_password_env(missing) is None
+
+
+@pytest.mark.parametrize("blank", ["", "   ", None, 7])
+def test_config_archiver_password_env_treats_a_blank_name_as_unset(blank: Any) -> None:
+    archiver = {"type": "mongodb_archiver", "mongodb_archiver": {"password_env": blank}}
+
+    assert config_archiver_password_env({"archiver": archiver}) is None
+
+
+@pytest.mark.parametrize("bad", ["MONGO PASSWORD", "1PASS", "PW=x", "${PW}", "pw-name"])
+def test_config_archiver_password_env_refuses_a_name_compose_cannot_carry(bad: str) -> None:
+    """The name is emitted into a compose `environment:` line verbatim, so anything
+    that is not a plain identifier is refused here rather than rendered broken."""
+    archiver = {"type": "mongodb_archiver", "mongodb_archiver": {"password_env": bad}}
+
+    with pytest.raises(ValueError, match="password_env"):
+        config_archiver_password_env({"archiver": archiver})
+
+
+def test_personas_needing_archiver_password_maps_each_persona_to_its_variable(tmp_path) -> None:
+    """The grant is a persona -> variable-name map, so two personas reading two
+    different stores each get their own line and a persona with no archiver gets none."""
+    # Arrange
+    catalog = {
+        "readwrite": {
+            "project": "rw",
+            "project_path": _write_persona_project_config(
+                tmp_path, "rw", {"archiver": _MONGO_ARCHIVER}
+            ),
+        },
+        "facility": {
+            "project": "fac",
+            "project_path": _write_persona_project_config(
+                tmp_path,
+                "fac",
+                {"archiver": {"type": "other_db", "other_db": {"password_env": "OTHER_DB_PW"}}},
+            ),
+        },
+        "readonly": {
+            "project": "ro",
+            "project_path": _write_persona_project_config(
+                tmp_path, "ro", {"archiver": {"type": "mock_archiver"}}
+            ),
+        },
+    }
+    config = _catalog_config(
+        catalog,
+        [
+            {"name": "alice", "index": 0, "persona": "readwrite"},
+            {"name": "bob", "index": 1, "persona": "readonly"},
+            {"name": "carol", "index": 2, "persona": "facility"},
+        ],
+    )
+
+    # Act
+    result = personas_needing_archiver_password(config, tmp_path)
+
+    # Assert
+    assert result == {"readwrite": "MONGO_ROOT_PASSWORD", "facility": "OTHER_DB_PW"}
+
+
+def test_personas_needing_archiver_password_skips_unrendered_persona_projects(tmp_path) -> None:
+    """A persona whose project isn't on disk contributes nothing: a credential is
+    never granted on a guess."""
+    config = _catalog_config(
+        {"ghost": {"project": "ghost", "project_path": "../never-rendered"}},
+        [{"name": "alice", "index": 0, "persona": "ghost"}],
+    )
+
+    assert personas_needing_archiver_password(config, tmp_path) == {}
+
+
+# ---------------------------------------------------------------------------
+# effective_persona: the one roster-entry -> persona answer (Task 4.2)
+#
+# Every raw-roster read that needs a resolved persona routes through this
+# helper, so a `role:` binding and a `persona:` pin cannot be answered
+# differently by two surfaces. The cases below pin the helper itself; the
+# per-site wiring is pinned underneath them.
+# ---------------------------------------------------------------------------
+
+#: The role table as `resolve_authorization_roles` hands it over.
+_ROLES = {"operator": "console", "expert": "physicist"}
+
+
+def test_effective_persona_without_a_role_prefers_the_entrys_own_pin() -> None:
+    """An entry carrying no `role` resolves exactly as it did before roles
+    existed — which is what keeps every pre-roles deployment byte-identical."""
+    # Arrange
+    entry = {"name": "alice", "index": 0, "persona": "gui"}
+
+    # Act / Assert
+    assert effective_persona(entry, _ROLES, "cli") == "gui"
+
+
+def test_effective_persona_without_a_role_or_pin_falls_back_to_the_default() -> None:
+    """The pre-roles resolution order, unchanged."""
+    # Assert
+    assert effective_persona({"name": "alice"}, _ROLES, "cli") == "cli"
+
+
+def test_effective_persona_with_no_persona_system_in_effect_is_none() -> None:
+    """No pin, no role, no default: every config predating persona catalogs."""
+    # Assert
+    assert effective_persona({"name": "alice"}, {}, None) is None
+
+
+def test_effective_persona_resolves_a_role_through_the_authorization_table() -> None:
+    """The whole point: a role names the catalog persona its entries run as, and
+    it outranks the deployment default the entry would otherwise have taken."""
+    # Arrange
+    entry = {"name": "alice", "index": 0, "role": "expert"}
+
+    # Act / Assert
+    assert effective_persona(entry, _ROLES, "cli") == "physicist"
+
+
+def test_effective_persona_raises_on_a_role_that_is_not_declared() -> None:
+    """THE binding contract: never fall back to the default persona for a role
+    the table does not answer. Falling back would let `--no-lint` swap a
+    privilege set silently — the operator wrote a role, the deploy ran something
+    else, and nothing said so."""
+    # Act / Assert
+    with pytest.raises(UnresolvedRoleError) as excinfo:
+        effective_persona({"name": "alice", "role": "admin"}, _ROLES, "cli")
+
+    # Assert: the message names the offender AND what was declared, so the
+    # operator can see the typo without opening the config.
+    message = str(excinfo.value)
+    assert "'admin'" in message
+    assert "'operator'" in message and "'expert'" in message
+    assert "default persona" in message
+
+
+def test_effective_persona_raises_on_an_entry_carrying_both_a_persona_and_a_role() -> None:
+    """Both bind the same slot, so which one governs is unwritten. Refusing the
+    ambiguity beats inventing a precedence nobody wrote down."""
+    # Act / Assert
+    with pytest.raises(UnresolvedRoleError) as excinfo:
+        effective_persona({"name": "alice", "persona": "gui", "role": "operator"}, _ROLES, "cli")
+
+    # Assert
+    assert "'gui'" in str(excinfo.value) and "'operator'" in str(excinfo.value)
+
+
+def test_effective_persona_refuses_a_persona_and_role_pair_that_agree_today() -> None:
+    """Refused even when the two name the same persona: the ambiguity is about
+    which mechanism governs TOMORROW — a later edit to the role's persona would
+    silently not reach this entry."""
+    # Act / Assert
+    with pytest.raises(UnresolvedRoleError):
+        effective_persona(
+            {"name": "alice", "persona": "console", "role": "operator"}, _ROLES, "cli"
+        )
+
+
+def test_effective_persona_lenient_degrades_an_undeclared_role_to_the_pre_roles_answer() -> None:
+    """The reporting surfaces (lint's roster walks, the profile card) must show
+    every finding rather than die on the first bad entry; each pairs this
+    degrade with an ERROR of its own."""
+    # Assert
+    assert (
+        effective_persona({"name": "alice", "role": "admin"}, _ROLES, "cli", strict=False) == "cli"
+    )
+
+
+def test_effective_persona_lenient_degrades_a_conflicting_entry_to_its_pin() -> None:
+    """Same reason, and to the same answer the entry had before roles existed."""
+    # Assert
+    assert (
+        effective_persona(
+            {"name": "alice", "persona": "gui", "role": "operator"}, _ROLES, "cli", strict=False
+        )
+        == "gui"
+    )
+
+
+def test_effective_persona_reads_a_non_mapping_entry_defensively() -> None:
+    """A bare-string roster entry names no persona of its own, so it runs the
+    default — the same defensive read the rest of this module uses."""
+    # Assert
+    assert effective_persona("alice", _ROLES, "cli") == "cli"
+
+
+def test_effective_persona_ignores_an_empty_string_role() -> None:
+    """`normalize_users` drops an empty `role` before anything downstream reads
+    one; the helper agrees, so a raw-roster read cannot disagree with a
+    normalized one."""
+    # Assert
+    assert effective_persona({"name": "alice", "role": ""}, _ROLES, "cli") == "cli"
+
+
+def test_resolve_authorization_roles_reads_the_one_parser() -> None:
+    """The accessor is a view onto `_authorization_context`, not a second parse."""
+    # Arrange
+    web_terminals = {
+        "authorization": {"roles": {"operator": {"persona": "console"}}},
+    }
+
+    # Act / Assert
+    assert resolve_authorization_roles(web_terminals) == {"operator": "console"}
+    assert resolve_authorization_roles({}) == {}
+
+
+def test_resolve_authorization_roles_propagates_an_incoherent_stanza() -> None:
+    """A role naming no persona is the parser's refusal, not a second opinion."""
+    # Act / Assert
+    with pytest.raises(ValueError):
+        resolve_authorization_roles({"authorization": {"roles": {"operator": {}}}})
+
+
+# ---------------------------------------------------------------------------
+# Site wiring: resolve_personas
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_personas_role_only_entry_resolves_like_the_equivalent_pin() -> None:
+    """A role-only roster and the `persona:`-pinned roster it stands for resolve
+    to the same entry, field for field — the property every downstream artifact
+    (compose service, volume, image tag) inherits."""
+    # Arrange
+    catalog = {
+        "cli": {"project": "als-assistant", "project_path": "profiles/cli"},
+        "gui": {"project": "als-gui-assistant", "project_path": "profiles/gui"},
+    }
+    by_role = {
+        "users": [{"name": "gmartino", "index": 0, "role": "operator"}],
+        "default_persona": "cli",
+        "personas": catalog,
+        "authorization": {"roles": {"operator": {"persona": "gui"}}},
+    }
+    by_pin = {
+        "users": [{"name": "gmartino", "index": 0, "persona": "gui"}],
+        "default_persona": "cli",
+        "personas": catalog,
+    }
+
+    # Act / Assert
+    assert resolve_personas(by_role, _REGISTRY, "als") == resolve_personas(by_pin, _REGISTRY, "als")
+    assert resolve_personas(by_role, _REGISTRY, "als")[0]["persona"] == "gui"
+
+
+def test_resolve_personas_strict_refuses_an_undeclared_role() -> None:
+    """The render path fails closed rather than substituting `default_persona`."""
+    # Arrange
+    web_terminals = {
+        "users": [{"name": "alice", "index": 0, "role": "admin"}],
+        "default_persona": "cli",
+        "personas": {"cli": {"project": "als-assistant", "project_path": "profiles/cli"}},
+        "authorization": {"roles": {"operator": {"persona": "cli"}}},
+    }
+
+    # Act / Assert
+    with pytest.raises(UnresolvedRoleError):
+        resolve_personas(web_terminals, _REGISTRY, "als")
+
+
+def test_resolve_personas_lenient_degrades_an_undeclared_role() -> None:
+    """Lifecycle verbs and lint resolve the same roster leniently: a stale role
+    never blocks `osprey down`, and lint reports it as its own finding."""
+    # Arrange
+    web_terminals = {
+        "users": [{"name": "alice", "index": 0, "role": "admin"}],
+        "default_persona": "cli",
+        "personas": {"cli": {"project": "als-assistant", "project_path": "profiles/cli"}},
+        "authorization": {"roles": {"operator": {"persona": "cli"}}},
+    }
+
+    # Act
+    result = resolve_personas(web_terminals, _REGISTRY, "als", strict=False)
+
+    # Assert
+    assert result[0]["persona"] == "cli"
+
+
+def test_resolve_personas_strict_refuses_an_incoherent_authorization_stanza() -> None:
+    """A roster is never resolved against a role table that was never built."""
+    # Arrange
+    web_terminals = {
+        "users": [{"name": "alice", "index": 0}],
+        "default_persona": "cli",
+        "personas": {"cli": {"project": "als-assistant", "project_path": "profiles/cli"}},
+        "authorization": {"roles": {"operator": {}}},
+    }
+
+    # Act / Assert
+    with pytest.raises(ValueError):
+        resolve_personas(web_terminals, _REGISTRY, "als")
+
+
+# ---------------------------------------------------------------------------
+# Site wiring: _referenced_personas (the entitlement / post-removal walk)
+# ---------------------------------------------------------------------------
+
+
+def test_role_bound_persona_counts_as_referenced_for_entitlements(tmp_path) -> None:
+    """`_referenced_personas` stands behind every per-persona credential grant
+    and behind lifecycle's post-removal privilege check. A persona reached
+    through a role must count exactly as a pinned one does — otherwise a
+    role-only roster silently loses its credentials."""
+    # Arrange
+    catalog = {
+        "readwrite": {
+            "project": "rw",
+            "project_path": _write_persona_project_config(
+                tmp_path, "rw", {"ariel": {"search_modules": {"keyword": {"enabled": True}}}}
+            ),
+        },
+    }
+    config = _catalog_config(catalog, [{"name": "alice", "index": 0, "role": "expert"}])
+    config["modules"]["web_terminals"]["authorization"] = {
+        "roles": {"expert": {"persona": "readwrite"}}
+    }
+
+    # Act / Assert
+    assert personas_needing_ariel_password(config, tmp_path) == {"readwrite"}

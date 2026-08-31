@@ -14,7 +14,7 @@ and ``create_dashboard`` tools, which are on the settings allow-list
 (auto-approved). The sandboxing makes that auto-approval genuinely safe.
 
 All visualization output goes through ``save_artifact()`` in user code,
-which writes to a manifest file collected by ``_collect_artifacts()``.
+which writes to a manifest file collected by ``collect_artifacts()``.
 There is no auto-capture of matplotlib figures or stdout markers.
 """
 
@@ -31,7 +31,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from osprey.mcp_server.sandbox_env import scrub_sensitive_env
+from osprey.mcp_server.sandbox_env import scrub_sandbox_child_env
+from osprey.services.python_executor.execution.fs_guard import (
+    SANDBOX_PATCH_TARGETS,
+    SANDBOX_WRITE_MODES_ONLY_TARGETS,
+    render_fs_guard,
+)
+from osprey.stores.artifact_manifest import SAVE_ARTIFACT_SOURCE, collect_artifacts
 
 logger = logging.getLogger("osprey.mcp_server.workspace.execution.sandbox_executor")
 
@@ -242,7 +248,12 @@ def _create_sandbox_wrapper(
     """Generate a wrapped script with filesystem sandboxing and output capture.
 
     The wrapper:
-      - Sandboxes ``open()`` to only allow workspace and execution folder access
+      - Installs the shared allowlist filesystem guard
+        (:func:`~osprey.services.python_executor.execution.fs_guard.render_fs_guard`
+        with ``default_deny=True``): reads of the Python environment and the
+        project tree are allowed, reads and writes under the execution folder,
+        workspace, tempdir and the HOME cache dirs are allowed, everything else
+        raises ``PermissionError``
       - Injects ``save_artifact()`` for subprocess artifact creation
       - Captures stdout/stderr via StringIO
       - Writes ``execution_metadata.json`` for the caller to read
@@ -251,12 +262,28 @@ def _create_sandbox_wrapper(
     user code. There is no auto-capture of matplotlib figures.
     """
     exec_folder_str = str(execution_folder)
-    workspace_str = str(workspace_root)
-    # Required, with no parent-of-workspace-root fallback: that rule resolves to
-    # `<repo>/var` under the four-zone layout, and a default here would let a
-    # caller that forgot to resolve the root get the wrong answer silently
-    # rather than a TypeError.
-    project_root_str = str(project_root)
+
+    # Allowlist posture: only what a root names is reachable. ``read_roots``
+    # carries the project tree (readable data files, refused writes);
+    # ``permitted_roots`` carries the two zones sandboxed code may write.
+    # ``io.open`` is patched for write modes ONLY, which closes
+    # ``Path.write_text`` while leaving every pathlib *read* exactly as it is.
+    fs_guard = render_fs_guard(
+        default_deny=True,
+        permitted_roots=(execution_folder.resolve(), workspace_root.resolve()),
+        protected_roots=(),
+        # ``project_root`` is required, with no parent-of-workspace-root
+        # fallback: that rule resolves to `<repo>/var` under the four-zone
+        # layout, and a default here would let a caller that forgot to resolve
+        # the root get the wrong answer silently rather than a TypeError.
+        read_roots=(project_root.resolve(),),
+        # Read-only access to the Python environment is always allowed — this
+        # covers site-packages, stdlib, and data files some packages install
+        # into the venv's share/ directory (e.g. xyzservices used by bokeh).
+        bypass_prefixes=("site-packages", "lib/python", sys.prefix),
+        patch_targets=SANDBOX_PATCH_TARGETS,
+        write_modes_only_targets=SANDBOX_WRITE_MODES_ONLY_TARGETS,
+    )
 
     return f'''\
 import sys
@@ -264,65 +291,30 @@ import json
 import os
 import time
 import traceback
-import builtins
 from pathlib import Path
 from io import StringIO
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
-# Filesystem sandbox: restrict open() to workspace + execution folder
+# Filesystem sandbox: allowlist guard, rendered by fs_guard.render_fs_guard
 # ---------------------------------------------------------------------------
-_original_open = builtins.open
-_ALLOWED_ROOTS = [
-    Path(r"{exec_folder_str}").resolve(),
-    Path(r"{workspace_str}").resolve(),
-]
-# Project root — read-only access for data files (machine_data/, etc.)
-_PROJECT_ROOT = Path(r"{project_root_str}").resolve()
-_ALLOWED_ROOTS.append(_PROJECT_ROOT)
-# Also allow tempfile directory
+{fs_guard}
+# TMPDIR and HOME describe the *child's* environment, which the parent that
+# rendered the guard does not necessarily share, so these two roots are
+# resolved here rather than baked in above. They are read before any user code
+# runs, so nothing the sandbox exists to contain can steer them. The four HOME
+# cache dirs are appended unconditionally: matplotlib creates them on a
+# first-run HOME, and a root that only counted once it already existed made
+# the very first render the one that got refused.
 import tempfile as _tempfile
-_ALLOWED_ROOTS.append(Path(_tempfile.gettempdir()).resolve())
-# Allow matplotlib/fontconfig cache dirs (read-only config under HOME)
-_home = Path.home()
-for _cfg_dir in [_home / ".matplotlib", _home / ".config", _home / ".cache", _home / ".local"]:
-    if _cfg_dir.exists():
-        _ALLOWED_ROOTS.append(_cfg_dir.resolve())
 
-
-def _sandboxed_open(file, mode="r", *args, **kwargs):
-    """open() replacement that restricts file access to allowed directories."""
-    path = Path(file).resolve()
-    # Read-only access to Python environment is always allowed — this covers
-    # site-packages, stdlib, and data files some packages install into
-    # the venv's share/ directory (e.g., xyzservices used by bokeh).
-    path_str = str(path)
-    if ("site-packages" in path_str or "lib/python" in path_str
-            or path_str.startswith(sys.prefix)):
-        return _original_open(file, mode, *args, **kwargs)
-    # Check against allowed roots
-    for root in _ALLOWED_ROOTS:
-        try:
-            path.relative_to(root)
-            # Project root is read-only — block writes outside workspace
-            if root == _PROJECT_ROOT and mode not in ("r", "rb"):
-                _ws = Path(r"{workspace_str}").resolve()
-                try:
-                    path.relative_to(_ws)
-                except ValueError:
-                    raise PermissionError(
-                        f"Sandbox: write denied for '{{path}}'. "
-                        f"Writes are only allowed in the workspace directory."
-                    )
-            return _original_open(file, mode, *args, **kwargs)
-        except ValueError:
-            continue
-    raise PermissionError(
-        f"Sandbox: access denied for '{{path}}'. "
-        f"Only workspace and execution directories are allowed."
-    )
-
-builtins.open = _sandboxed_open
+_OSPREY_FS_PERMITTED = _OSPREY_FS_PERMITTED + (
+    str(Path(_tempfile.gettempdir()).resolve()),
+    *(
+        str((Path.home() / _cache_dir).resolve())
+        for _cache_dir in (".matplotlib", ".config", ".cache", ".local")
+    ),
+)
 
 # ---------------------------------------------------------------------------
 # Execution directory setup
@@ -330,182 +322,7 @@ builtins.open = _sandboxed_open
 _execution_dir = Path(r"{exec_folder_str}")
 _execution_dir.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# save_artifact() injection
-# ---------------------------------------------------------------------------
-def save_artifact(obj, title="Untitled", description="", artifact_type=None, category=""):
-    """Save an object as a gallery artifact.
-
-    Supported types:
-      - plotly Figure -> interactive HTML
-      - matplotlib Figure -> PNG image
-      - pandas DataFrame -> HTML table
-      - str -> markdown or HTML (auto-detected)
-      - dict / list -> JSON
-      - bytes -> binary file
-      - numpy ndarray -> .npy file
-
-    Args:
-        obj: The object to save.
-        title: Human-readable title shown in the gallery.
-        description: Optional longer description.
-        artifact_type: Override the auto-detected type.
-        category: Optional category key for gallery grouping.
-    """
-    import json as _json
-    import uuid as _uuid
-    from pathlib import Path as _Path
-
-    artifacts_dir = _execution_dir / "artifacts"
-    artifacts_dir.mkdir(exist_ok=True)
-
-    art_id = _uuid.uuid4().hex[:12]
-
-    # Slugify title for filename
-    _slug = title.lower().strip()
-    _slug = "".join(c if c.isalnum() or c in (" ", "-", "_") else "" for c in _slug)
-    _slug = _slug.replace(" ", "_")[:60] or "artifact"
-
-    # Smart type detection and serialization
-    content = None
-    detected_type = None
-    filename = None
-    mime_type = None
-
-    # Plotly Figure
-    try:
-        import plotly.graph_objects as _go
-        if isinstance(obj, _go.Figure):
-            content = obj.to_html(include_plotlyjs=False, full_html=True).encode()
-            detected_type = "plot_html"
-            filename = f"{{art_id}}_{{_slug}}.html"
-            mime_type = "text/html"
-    except ImportError:
-        pass
-
-    # Bokeh Model (layout, figure, widget, etc.)
-    if content is None:
-        try:
-            import bokeh.model as _bmodel
-            if isinstance(obj, _bmodel.Model):
-                from bokeh.embed import file_html
-                from bokeh.resources import INLINE as _INLINE
-                content = file_html(obj, resources=_INLINE, title=title).encode()
-                detected_type = "dashboard_html"
-                filename = f"{{art_id}}_{{_slug}}.html"
-                mime_type = "text/html"
-        except ImportError:
-            pass
-
-    # Matplotlib Figure
-    if content is None:
-        try:
-            import matplotlib.figure as _mfig
-            if isinstance(obj, _mfig.Figure):
-                import io as _io
-                _buf = _io.BytesIO()
-                obj.savefig(_buf, format="png", dpi=150, bbox_inches="tight")
-                _buf.seek(0)
-                content = _buf.read()
-                detected_type = "plot_png"
-                filename = f"{{art_id}}_{{_slug}}.png"
-                mime_type = "image/png"
-        except ImportError:
-            pass
-
-    # Pandas DataFrame
-    if content is None:
-        try:
-            import pandas as _pd
-            if isinstance(obj, _pd.DataFrame):
-                content = obj.to_html(classes="artifact-table", border=0).encode()
-                detected_type = "table_html"
-                filename = f"{{art_id}}_{{_slug}}.html"
-                mime_type = "text/html"
-        except ImportError:
-            pass
-
-    # str
-    if content is None and isinstance(obj, str):
-        if obj.lstrip().startswith(("<", "<!")) and "</" in obj:
-            content = obj.encode()
-            detected_type = "html"
-            filename = f"{{art_id}}_{{_slug}}.html"
-            mime_type = "text/html"
-        else:
-            content = obj.encode()
-            detected_type = "markdown"
-            filename = f"{{art_id}}_{{_slug}}.md"
-            mime_type = "text/markdown"
-
-    # dict / list
-    if content is None and isinstance(obj, (dict, list)):
-        content = _json.dumps(obj, indent=2, default=str).encode()
-        detected_type = "json"
-        filename = f"{{art_id}}_{{_slug}}.json"
-        mime_type = "application/json"
-
-    # bytes
-    if content is None and isinstance(obj, bytes):
-        content = obj
-        detected_type = "binary"
-        filename = f"{{art_id}}_{{_slug}}.bin"
-        mime_type = "application/octet-stream"
-
-    # numpy ndarray -- last of the type branches so every type already handled
-    # above keeps its exact sniffing order. Object dtypes are left out:
-    # np.save cannot write them without pickle, so they keep falling through
-    # to the repr() fallback.
-    if content is None:
-        try:
-            import numpy as _np
-            if isinstance(obj, _np.ndarray) and not obj.dtype.hasobject:
-                import io as _nio
-                _nbuf = _nio.BytesIO()
-                _np.save(_nbuf, obj, allow_pickle=False)
-                content = _nbuf.getvalue()
-                detected_type = "file"
-                filename = f"{{art_id}}_{{_slug}}.npy"
-                mime_type = "application/octet-stream"
-        except ImportError:
-            pass
-
-    # Fallback: repr as text
-    if content is None:
-        content = repr(obj).encode()
-        detected_type = "text"
-        filename = f"{{art_id}}_{{_slug}}.txt"
-        mime_type = "text/plain"
-
-    final_type = artifact_type or detected_type
-
-    # Write artifact file
-    artifact_path = artifacts_dir / filename
-    artifact_path.write_bytes(content)
-
-    # Update manifest
-    manifest_path = artifacts_dir / "manifest.json"
-    if manifest_path.exists():
-        manifest = _json.loads(manifest_path.read_text())
-    else:
-        manifest = []
-
-    entry = {{
-        "id": art_id,
-        "filename": filename,
-        "title": title,
-        "description": description,
-        "artifact_type": final_type,
-        "mime_type": mime_type,
-        "size_bytes": len(content),
-    }}
-    if category:
-        entry["category"] = category
-    manifest.append(entry)
-    manifest_path.write_text(_json.dumps(manifest, indent=2))
-
-    print(f"Artifact saved: {{title}} ({{final_type}}, {{len(content)}} bytes)")
-
+{SAVE_ARTIFACT_SOURCE}
 
 # ---------------------------------------------------------------------------
 # Execution metadata
@@ -559,8 +376,8 @@ finally:
     except Exception:
         pass
 
-    # Restore open
-    builtins.open = _original_open
+    # Restore every filesystem entry point the guard rebound
+    _restore_patched_targets()
 '''
 
 
@@ -600,38 +417,6 @@ def _read_execution_metadata(execution_folder: Path) -> dict | None:
         except Exception:
             logger.debug("Failed to read execution metadata", exc_info=True)
     return None
-
-
-def _collect_artifacts(execution_folder: Path) -> list[dict]:
-    """Collect artifacts saved by save_artifact() inside the subprocess."""
-    manifest_path = execution_folder / "artifacts" / "manifest.json"
-    if not manifest_path.exists():
-        return []
-
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception:
-        logger.debug("Failed to read artifact manifest", exc_info=True)
-        return []
-
-    artifacts = []
-    for entry in manifest:
-        file_path = execution_folder / "artifacts" / entry["filename"]
-        if file_path.exists():
-            art = {
-                "path": file_path,
-                "title": entry.get("title", "Untitled"),
-                "description": entry.get("description", ""),
-                "artifact_type": entry.get("artifact_type", "file"),
-                "mime_type": entry.get("mime_type", "application/octet-stream"),
-            }
-            if entry.get("category"):
-                art["category"] = entry["category"]
-            artifacts.append(art)
-        else:
-            logger.debug("Artifact file missing: %s", file_path)
-
-    return artifacts
 
 
 # ---------------------------------------------------------------------------
@@ -694,7 +479,12 @@ async def execute_sandbox_code(
     script_path.write_text(wrapped_code, encoding="utf-8")
 
     start_time = time.time()
-    sandbox_env = scrub_sensitive_env(os.environ.copy())
+    # The same environment the python-executor sandbox gets, built by the same
+    # shared helper: the credential scrub plus the web-terminal address book and
+    # the navigation-only perimeter stamp. This child renders visualizations and
+    # has no more business resolving a terminal URL — or reading the deny-list it
+    # is not the one enforcing — than the general-purpose sandbox does.
+    sandbox_env = scrub_sandbox_child_env(os.environ)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -724,7 +514,7 @@ async def execute_sandbox_code(
 
     # 4. Read results
     metadata = _read_execution_metadata(execution_folder)
-    artifacts = _collect_artifacts(execution_folder)
+    artifacts = collect_artifacts(execution_folder)
 
     if metadata:
         final_stdout = metadata.get("stdout", stdout_text)

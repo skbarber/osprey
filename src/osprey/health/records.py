@@ -57,7 +57,9 @@ CONFIG_DEPENDENT = frozenset(
         "model_chat",
         "ariel",
         "channel_finder",
+        "graphdb",
         "web_panels",
+        "reach",
     }
 )
 
@@ -233,7 +235,8 @@ def build_records(
 
     Args:
         project_path: The deployment REPO ROOT, for the things that belong to
-            it: the ``.env``, ``project_root``-relative paths, the disk.
+            it: the ``.env``, ``project_root``-relative paths, the disk, and a
+            ``health.plugins`` entry that names a ``.py`` file relatively.
         render_path: The directory holding the rendered ``config.yml`` — the
             build zone — for the build-owned paths that config states relative
             to itself (the channel database).
@@ -255,16 +258,23 @@ def build_records(
             continue
 
         factory = get_core_category_factory(name)
-        if name == "file_system":
-            # Repo-root things: the `.env`, a `registry_path` the config states
-            # relative to project_root, the disk the deployment lives on.
+        # Three categories take a `cwd`, and the anchor follows the ZONE the
+        # material they look for lives in — not a house style. Getting it wrong
+        # is silent: the check reports a present file as missing.
+        if name in ("file_system", "systemd_unit"):
+            # Repo-root things. `file_system`: the `.env`, a `registry_path` the
+            # config states relative to project_root, the disk the deployment
+            # lives on. `systemd_unit`: `osprey scaffold systemd` writes
+            # `osprey.service` beside the profile, in the tracked source zone —
+            # it is not build output, so the render zone would never hold it and
+            # the row would skip on every deployment that has one.
             func = factory(expanded, context=None, cwd=project_path)
         elif name == "channel_finder":
             # NOT the repo root. A channel database is build-owned output, and
             # the rendered config states its path relative to the config's own
             # directory (`<repo>/build`), so anchoring it on the repo root looks
             # one zone too high and reports a present database as missing. The
-            # two categories take DIFFERENT anchors on purpose.
+            # three categories do not all take the same anchor on purpose.
             func = factory(expanded, context=None, cwd=render_path)
         else:
             func = factory(expanded, context=None)
@@ -276,7 +286,10 @@ def build_records(
         from osprey.health.plugins import load_plugin_categories
 
         records.extend(settings.categories.values())
-        plugin_result = load_plugin_categories(settings)
+        # The repo root, like every other project-relative path: a `.py` plugin
+        # entry names a file the deployment keeps beside its profile, not one
+        # under the render zone the build re-creates.
+        plugin_result = load_plugin_categories(settings, project_root=project_path)
         records.extend(plugin_result.categories.values())
         extra_rows = plugin_result.errors
 

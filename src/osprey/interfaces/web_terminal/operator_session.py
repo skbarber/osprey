@@ -11,11 +11,15 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from osprey.agent_runner.clean_env import build_clean_env
 from osprey.agent_runner.sdk_context import build_system_prompt
+from osprey.audit.posture import OSPREY_AGENT_DATA_ROOT
+from osprey.interfaces.web_auth import PANEL_TOKEN_ENV, get_web_credentials
 from osprey.interfaces.web_terminal.chat_session_pool import ChatSessionPool
 from osprey.utils.config import get_facility_timezone
 
@@ -51,8 +55,200 @@ except ImportError:
     ClaudeSDKError = Exception  # type: ignore[assignment,misc]
     CLIConnectionError = Exception  # type: ignore[assignment,misc]
 
+
+#: Env marker naming *where* the child's posture decision came from, and the
+#: posture-store key it was made under. The pair is what the audit envelope
+#: records as ``posture_source`` and ``session``; a child that finds neither
+#: was not spawned by a posture-aware surface at all and reports ``process``.
+POSTURE_SOURCE_ENV = "OSPREY_POSTURE_SOURCE"
+POSTURE_SESSION_ENV = "OSPREY_POSTURE_SESSION"
+
+#: The two sources a *spawning* surface can claim. ``live`` is a session key
+#: the posture store keeps answering for after the child is up (the chat pool's
+#: ``chat_id``, a PTY pool key); ``spawn`` is a key minted for one child and
+#: addressable by nobody, so its posture is whatever was true at spawn.
+POSTURE_SOURCE_SPAWN = "spawn"
+POSTURE_SOURCE_LIVE = "live"
+
+#: The closed set the envelope accepts. ``app`` is stamped by the HTTP layer
+#: and ``process`` is what a child with no marker at all reports; neither is
+#: reachable from this seam, but validating against the whole set here keeps a
+#: typo from reaching an audit record as a source nothing can interpret.
+_POSTURE_SOURCES = frozenset({POSTURE_SOURCE_SPAWN, POSTURE_SOURCE_LIVE, "app", "process"})
+
+
+def resolve_agent_data_root(app: Any = None) -> str:
+    """The agent-data root this server resolved, for the child's env stamp.
+
+    One derivation for both spawn sites — this module already owns the posture
+    markers they share, and a second copy of the resolution is exactly how two
+    sites come to disagree. It answers the SHARED root (never
+    ``resolve_agent_data_root`` from the workspace module, which appends
+    ``sessions/<OSPREY_SESSION_ID>``): the control-target state file and the
+    session-posture store both span sessions, and a reader outside the
+    session's environment could not reproduce a session-scoped path.
+
+    The stamp exists because everything below the spawn re-derives this
+    directory today — the controls server through config, the stdlib-only hooks
+    through a repo-root guess and the literal ``var/agent_data`` — and those
+    derivations disagree the moment a deployment moves ``agent_data.base_dir``.
+    Handing the child the answer makes it authoritative for every one of them.
+
+    A config load can fail transiently, and the pair must be stamped whole or
+    not at all, so a failure falls back to the same place the posture store's
+    own resolution does (``app.state.workspace_dir``, then the process CWD)
+    rather than leaving the child a session key with no anchor. Every reader
+    prefers this value, so writer and readers stay on ONE directory even when
+    it is the fallback one.
+
+    Args:
+        app: The FastAPI app, consulted only for the fallback. Optional: the
+            primary resolution reads config and needs nothing from the server.
+
+    Returns:
+        An absolute path as a string, ready to be stamped into a child env.
+    """
+    try:
+        from osprey_connectors.workspace import resolve_shared_data_root
+
+        return str(resolve_shared_data_root())
+    except Exception:  # noqa: BLE001 — a spawn must not fail on a config load
+        state = getattr(app, "state", None)
+        fallback = getattr(state, "workspace_dir", None) or Path.cwd()
+        logger.warning(
+            "Could not resolve the shared agent-data root for the session stamp; "
+            "falling back to %s",
+            fallback,
+            exc_info=True,
+        )
+        return str(Path(fallback))
+
+
+def build_operator_child_env(
+    project_cwd: str | None,
+    session_key: str | None = None,
+    app: Any = None,
+    *,
+    posture_source: str = POSTURE_SOURCE_LIVE,
+) -> dict[str, str]:
+    """Build the environment for an SDK-backed operator or chat session.
+
+    Both surfaces that run an :class:`OperatorSession` — the ``/ws/operator``
+    websocket and the ``POST /api/chat`` endpoint — call this instead of
+    :func:`~osprey.agent_runner.clean_env.build_clean_env` directly, so the two
+    cannot drift on what the agent child is allowed to hold.
+
+    On top of the clean base it re-adds exactly one credential: the **panel
+    token**. That is deliberate re-introduction, the SDK counterpart of what
+    :func:`osprey.cli.chat_cmd.chat` does for the PTY-less ``osprey chat``
+    child and what
+    :func:`osprey.interfaces.web_terminal.routes.websocket._build_extra_env`
+    does for the PTY child. The token is the weak, panel-tier-only credential
+    (see :data:`osprey.interfaces.web_auth.PANEL_TIER_ROUTES`); without it the
+    MCP panel tools and the SessionStart/UserPromptSubmit/approval hooks the
+    agent spawns send no bearer at all and are answered 401, which is how the
+    panel tier came to be dead on the default ``osprey web`` launch.
+
+    The **operator secret** is emphatically not re-added, and nothing here
+    reads it. Note what that means on this path: the SDK builds the child's
+    environment as ``{**os.environ, **options.env}``, so a name this function
+    omits is inherited from ``os.environ`` anyway — the operator secret is kept
+    from the child by :func:`osprey.interfaces.web_auth.close_env_carriers`
+    having removed it from ``os.environ`` at app construction, not by its
+    absence here.
+
+    It does **not** carry the session's write posture into the child: that
+    posture is per control target, lives in the posture store, and is read
+    live at every write-time gate, so a narrowing applies to a chat already
+    mid-conversation. A deployment-wide readonly marker still reaches the
+    child exactly as it always has, through ``build_clean_env``'s copy of
+    ``os.environ``; nothing here sets or removes one.
+
+    What it stamps instead is the **audit pair** that tells the child where to
+    read that store: ``OSPREY_POSTURE_SOURCE`` (this call site's
+    *posture_source*) and ``OSPREY_POSTURE_SESSION`` (*session_key*). Two rules
+    matter:
+
+    * The pair is set **unconditionally** whenever there is a session key —
+      a ``writes`` session exports both markers, as does a key the store has
+      never held. They say *which* key a reader must look up and *who*
+      spawned the child, and a session that was checked and came back
+      ``writes`` is a different audit fact from one nobody ever asked about.
+    * ``posture_source`` is passed in, never worked out here. It cannot be
+      derived from the posture: ``writes`` and never-stored are the same
+      value, and the source is a property of the *call site*, not of the
+      answer the store gave. Every in-tree caller names it explicitly.
+
+    Stamped in the same breath, and for the same reason it must not be stamped
+    separately, is :data:`~osprey.audit.posture.OSPREY_AGENT_DATA_ROOT` —
+    :func:`resolve_agent_data_root`'s answer. A session key tells a reader
+    *whose* posture applies; the root tells it which directory holds the
+    answer. The two are one fact split in half, so they are set together or
+    not at all, and a test pins that.
+
+    Keeping the stamps here — instead of handing each call site a rule to
+    compose — is what stops the two SDK surfaces drifting on what a child is
+    told about its own posture, which is the same reason this function exists
+    at all.
+
+    Args:
+        project_cwd: The project directory the session runs in, forwarded to
+            :func:`~osprey.agent_runner.clean_env.build_clean_env` so
+            ``OSPREY_CONFIG`` is resolved from it.
+        session_key: The identity this session is pooled under — the chat
+            pool's ``chat_id`` for ``POST /api/chat``, the minted
+            ``operator-<hex8>`` key for ``/ws/operator``. It is the key the
+            posture store is read under. Omitted, the child gets the render's
+            baseline environment and no marker is added — nothing names a
+            session for a reader to look up.
+        app: The FastAPI app whose agent-data root the child is pointed at
+            (:func:`resolve_agent_data_root`). Stamped alongside *session_key*;
+            without an app the root falls back to the deployment derivation.
+        posture_source: Which surface is spawning this child, from
+            :data:`_POSTURE_SOURCES`. ``POST /api/chat`` passes
+            :data:`POSTURE_SOURCE_LIVE` for a ``chat_id`` the posture surface
+            can address, and ``process`` for one it cannot (a caller-chosen id
+            outside the bare-UUID grammar, which no store will ever answer
+            for); ``/ws/operator``
+            passes :data:`POSTURE_SOURCE_SPAWN` (its ``operator-<hex8>`` key is
+            minted per connection and the posture route, which requires a
+            session UUID, can never address it). Defaults to ``live``, the
+            shape of a key the store keeps answering for — but every call site
+            in this tree states its own, and a test pins that.
+
+    Returns:
+        A fresh env dict for ``ClaudeAgentOptions.env``.
+
+    Raises:
+        ValueError: If *posture_source* is outside the envelope's closed set.
+    """
+    if posture_source not in _POSTURE_SOURCES:
+        raise ValueError(
+            f"posture_source must be one of {sorted(_POSTURE_SOURCES)}, got {posture_source!r}"
+        )
+
+    env = build_clean_env(project_cwd=project_cwd)
+    env[PANEL_TOKEN_ENV] = get_web_credentials().panel_token
+
+    # The audit pair, stamped after the strip (build_clean_env would drop it)
+    # and outside the sandbox branch below — see the rules in the docstring.
+    # The agent-data root travels WITH the session key, never without it: the
+    # key names whose posture applies and the root names the directory the
+    # answer is read out of, and a child holding one but not the other would
+    # look for its session's state in a directory it had to guess.
+    if session_key:
+        env[POSTURE_SOURCE_ENV] = posture_source
+        env[POSTURE_SESSION_ENV] = session_key
+        env[OSPREY_AGENT_DATA_ROOT] = resolve_agent_data_root(app)
+
+    return env
+
+
 # Pattern for MCP tool name prefixes: mcp__<server>__<tool>
-_MCP_PREFIX_RE = re.compile(r"^mcp__[^_]+__")
+# Non-greedy so the FIRST ``__`` after the server name ends the prefix — a
+# server name may itself contain single underscores (osprey_workspace,
+# osprey_facility_knowledge, or any facility-declared server named that way).
+_MCP_PREFIX_RE = re.compile(r"^mcp__.+?__")
 
 # Bound (seconds) for draining an interrupted turn toward its terminal message
 # before the reader is hard-cancelled. Enforced inside OperatorSession.cancel().
@@ -581,12 +777,32 @@ class OperatorRegistry:
     # ---- Chat pool facade (Simple-mode; see ChatSessionPool) ---- #
 
     async def get_or_create_chat_session(
-        self, chat_id: str, cwd: str, env: dict[str, str] | None = None
+        self,
+        chat_id: str,
+        cwd: str,
+        env: dict[str, str] | Callable[[], dict[str, str] | None] | None = None,
     ) -> tuple[OperatorSession, bool]:
+        """Pass-through to :meth:`ChatSessionPool.get_or_create`.
+
+        *env* may be a mapping or a zero-arg builder; the builder form is what
+        keeps a caller's environment read atomic with the pool's registration
+        of the creation (``routes/chat.py`` relies on it for the runtime
+        posture).
+        """
         return await self.chats.get_or_create(chat_id, cwd, env)
 
     def get_chat_session(self, chat_id: str) -> OperatorSession | None:
         return self.chats.get(chat_id)
+
+    def has_chat_key(self, chat_id: str) -> bool:
+        """Pass-through to :meth:`ChatSessionPool.has_key`.
+
+        The *addressability* question, as opposed to the "what did we
+        terminate" question :meth:`get_chat_session` answers: this one also
+        says yes while a creation is still inside ``start()``, which is the
+        window a posture flip has to be able to name.
+        """
+        return self.chats.has_key(chat_id)
 
     async def terminate_chat_session(self, chat_id: str) -> None:
         await self.chats.terminate(chat_id)

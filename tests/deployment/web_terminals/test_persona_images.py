@@ -109,9 +109,14 @@ def test_build_persona_images_builds_each_referenced_persona_once(
         },
     }
     resolved_users = [
-        {"name": "alice", "persona": "ops", "project": "ops-app"},
-        {"name": "bob", "persona": "ops", "project": "ops-app"},  # shares ops -- must not rebuild
-        {"name": "carol", "persona": "sci", "project": "sci-app"},
+        {"name": "alice", "persona": "ops", "project": "ops-app", "image": "ops-app:local"},
+        {
+            "name": "bob",
+            "persona": "ops",
+            "project": "ops-app",
+            "image": "ops-app:local",
+        },  # shares ops -- must not rebuild
+        {"name": "carol", "persona": "sci", "project": "sci-app", "image": "sci-app:local"},
     ]
 
     monkeypatch.setattr(persona_images, "get_runtime_command", lambda config: ["docker", "compose"])
@@ -122,8 +127,8 @@ def test_build_persona_images_builds_each_referenced_persona_once(
 
     assert len(calls) == 2  # one build per DISTINCT persona, not per user
 
-    ops_cmd = next(c for c in calls if "ops-app-ops:local" in c)
-    sci_cmd = next(c for c in calls if "sci-app-sci:local" in c)
+    ops_cmd = next(c for c in calls if "ops-app:local" in c)
+    sci_cmd = next(c for c in calls if "sci-app:local" in c)
 
     # The context is the persona's CONTAINER repo, not its flat host render:
     # the render records this machine's project_root, so an image built from it
@@ -140,6 +145,42 @@ def test_build_persona_images_builds_each_referenced_persona_once(
 
     assert "com.osprey.project=myfacility" in sci_cmd
     assert str(persona_images._persona_image_context(sci_path)) == sci_cmd[-1]
+
+
+def test_build_persona_images_builds_a_shared_render_once(
+    monkeypatch, tmp_path, _no_dev_wheel_staging
+):
+    """Two personas resolving to one image (same catalog `project` and
+    `project_path` — one render deliberately serving both) build that image
+    once, not once per persona: same tag, same content, second build wasted."""
+    shared_path = _make_persona_project(tmp_path, "shared-app")
+
+    config = {
+        "project_name": "myfacility",
+        "modules": {
+            "web_terminals": {
+                "image_source": "local",
+                "default_persona": "ops",
+                "personas": {
+                    "ops": {"project": "shared-app", "project_path": shared_path},
+                    "sci": {"project": "shared-app", "project_path": shared_path},
+                },
+            }
+        },
+    }
+    resolved_users = [
+        {"name": "alice", "persona": "ops", "project": "shared-app", "image": "shared-app:local"},
+        {"name": "bob", "persona": "sci", "project": "shared-app", "image": "shared-app:local"},
+    ]
+
+    monkeypatch.setattr(persona_images, "get_runtime_command", lambda config: ["docker"])
+    calls = []
+    monkeypatch.setattr(persona_images, "run_captured", lambda cmd, **k: calls.append(cmd))
+
+    persona_images.build_persona_images(config, resolved_users, False, {})
+
+    assert len(calls) == 1
+    assert "shared-app:local" in calls[0]
 
 
 def test_build_persona_images_never_builds_zero_migration_entries(
@@ -183,7 +224,9 @@ def test_build_persona_images_includes_cli_version_from_persona_config(
             }
         },
     }
-    resolved_users = [{"name": "alice", "persona": "ops", "project": "ops-app"}]
+    resolved_users = [
+        {"name": "alice", "persona": "ops", "project": "ops-app", "image": "ops-app:local"}
+    ]
 
     monkeypatch.setattr(persona_images, "get_runtime_command", lambda config: ["docker", "compose"])
     calls = []
@@ -212,7 +255,9 @@ def test_build_persona_images_omits_cli_version_when_unset_in_persona_config(
             }
         },
     }
-    resolved_users = [{"name": "alice", "persona": "ops", "project": "ops-app"}]
+    resolved_users = [
+        {"name": "alice", "persona": "ops", "project": "ops-app", "image": "ops-app:local"}
+    ]
 
     monkeypatch.setattr(persona_images, "get_runtime_command", lambda config: ["docker", "compose"])
     calls = []
@@ -246,7 +291,9 @@ def test_build_persona_images_never_reads_facility_cli_version(
             }
         },
     }
-    resolved_users = [{"name": "alice", "persona": "ops", "project": "ops-app"}]
+    resolved_users = [
+        {"name": "alice", "persona": "ops", "project": "ops-app", "image": "ops-app:local"}
+    ]
 
     monkeypatch.setattr(persona_images, "get_runtime_command", lambda config: ["docker", "compose"])
     calls = []
@@ -274,7 +321,9 @@ def test_build_persona_images_dev_mode_adds_osprey_dev_build_arg(
             }
         },
     }
-    resolved_users = [{"name": "alice", "persona": "ops", "project": "ops-app"}]
+    resolved_users = [
+        {"name": "alice", "persona": "ops", "project": "ops-app", "image": "ops-app:local"}
+    ]
 
     monkeypatch.setattr(persona_images, "get_runtime_command", lambda config: ["docker", "compose"])
     calls = []
@@ -302,7 +351,9 @@ def test_build_persona_images_dev_mode_omits_osprey_dev_when_staging_fails(monke
             }
         },
     }
-    resolved_users = [{"name": "alice", "persona": "ops", "project": "ops-app"}]
+    resolved_users = [
+        {"name": "alice", "persona": "ops", "project": "ops-app", "image": "ops-app:local"}
+    ]
 
     monkeypatch.setattr(
         persona_images, "_copy_local_framework_for_override", lambda project_root: False
@@ -331,7 +382,9 @@ def test_build_persona_images_non_dev_omits_osprey_dev_build_arg(
             }
         },
     }
-    resolved_users = [{"name": "alice", "persona": "ops", "project": "ops-app"}]
+    resolved_users = [
+        {"name": "alice", "persona": "ops", "project": "ops-app", "image": "ops-app:local"}
+    ]
 
     monkeypatch.setattr(persona_images, "get_runtime_command", lambda config: ["docker", "compose"])
     calls = []
@@ -355,7 +408,9 @@ def test_build_persona_images_dev_mode_stages_and_cleans_wheel(monkeypatch, tmp_
             }
         },
     }
-    resolved_users = [{"name": "alice", "persona": "ops", "project": "ops-app"}]
+    resolved_users = [
+        {"name": "alice", "persona": "ops", "project": "ops-app", "image": "ops-app:local"}
+    ]
 
     def _fake_stage(project_root):
         (Path(project_root) / "osprey_framework-0.0.0-py3-none-any.whl").write_text("wheel")
@@ -393,7 +448,9 @@ def test_build_persona_images_dev_mode_cleans_staged_artifacts_on_build_failure(
             }
         },
     }
-    resolved_users = [{"name": "alice", "persona": "ops", "project": "ops-app"}]
+    resolved_users = [
+        {"name": "alice", "persona": "ops", "project": "ops-app", "image": "ops-app:local"}
+    ]
 
     def _fake_stage(project_root):
         (Path(project_root) / "osprey_framework-0.0.0-py3-none-any.whl").write_text("wheel")
@@ -495,11 +552,15 @@ def _render(repo: Path, name: str = "ops-app", *, complete: bool = True) -> Path
     return project
 
 
-def _persona_config(repo: Path, **persona_overrides):
+def _persona_config(repo: Path, deployed_services=("openobserve",), **persona_overrides):
     """A local-mode config whose single persona 'ops' renders to build/ops-app.
 
     Defaults to the ``build_profile`` ``osprey init`` emits; pass
     ``build_profile=None`` to drop it, or another value to exercise a rejection.
+
+    Deploys the telemetry store by default — the shipped shape, and the only
+    one in which a start issues the ingest token itself. Pass an empty
+    ``deployed_services`` for a config pointed at somebody else's store.
     """
     persona = {
         "project": "ops-app",
@@ -508,17 +569,20 @@ def _persona_config(repo: Path, **persona_overrides):
     }
     persona.update(persona_overrides)
     return {
+        "deployed_services": list(deployed_services),
         "modules": {
             "web_terminals": {
                 "image_source": "local",
                 "default_persona": "ops",
                 "personas": {"ops": persona},
             }
-        }
+        },
     }
 
 
-_PERSONA_USERS = [{"name": "alice", "index": 0, "persona": "ops", "project": "ops-app"}]
+_PERSONA_USERS = [
+    {"name": "alice", "index": 0, "persona": "ops", "project": "ops-app", "image": "ops-app:local"}
+]
 
 
 @pytest.fixture
@@ -637,10 +701,13 @@ def test_partial_render_raises(tmp_path, calls):
     assert calls == []
 
 
-def test_existing_render_with_unservable_model_raises(tmp_path, calls):
-    """A persona render whose config names a model its provider cannot serve
-    must fail the deploy here, with the path and a remedy — not boot a
-    web-terminal container that crash-loops behind the reverse proxy (502)."""
+def test_existing_render_with_free_form_model_passes(tmp_path, calls):
+    """A persona render naming a model outside the provider's tier map deploys.
+
+    The resolver passes such an ID through verbatim (the operator is trusted
+    to name a model the provider serves), so the startup-parity check must not
+    refuse it either — the terminal would boot with ANTHROPIC_MODEL set to
+    exactly that ID."""
     repo = _repo(tmp_path, "ops")
     project_path = _render(repo)
     (project_path / "config.yml").write_text(
@@ -651,11 +718,7 @@ def test_existing_render_with_unservable_model_raises(tmp_path, calls):
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="neither a model tier nor a model ID") as excinfo:
-        persona_images.verify_persona_renders(_persona_config(repo), _PERSONA_USERS, repo_root=repo)
-
-    assert str(project_path) in str(excinfo.value)
-    assert "osprey build" in str(excinfo.value)  # remedy: fix the profile, rebuild
+    persona_images.verify_persona_renders(_persona_config(repo), _PERSONA_USERS, repo_root=repo)
     assert calls == []
 
 
@@ -755,16 +818,150 @@ def test_a_blank_observability_credential_names_the_config_keys(tmp_path, calls)
     assert calls == []
 
 
+def test_a_store_issued_credential_absent_before_the_first_start_is_accepted(
+    tmp_path, calls, monkeypatch, caplog
+):
+    """The deadlock this carve-out exists to prevent.
+
+    The shipped telemetry blocks authenticate as the store's ingest service
+    account, whose token the STORE issues -- and `osprey up` harvests it at the
+    openobserve staging step, which runs AFTER this gate. Refusing here would
+    abort every first start for the absence of a value only that aborted start
+    could have produced, with a remedy ("set it in .env") no operator can
+    carry out.
+    """
+    monkeypatch.delenv("ZO_INGEST_SA_TOKEN", raising=False)
+    repo = _repo(tmp_path, "ops")
+    _telemetry_render(
+        repo,
+        "    openobserve:\n"
+        "      user: ${ZO_INGEST_USER_EMAIL:-ingest@example.com}\n"
+        "      password: ${ZO_INGEST_SA_TOKEN}\n",
+    )
+
+    with caplog.at_level("WARNING"):
+        persona_images.verify_persona_renders(_persona_config(repo), _PERSONA_USERS, repo_root=repo)
+
+    # Not silent: the operator is told the value is coming and that there is
+    # nothing to do, which is a different statement from "all resolved".
+    assert "ZO_INGEST_SA_TOKEN" in caplog.text
+    assert "Nothing to set by hand." in caplog.text
+    assert calls == []
+
+
+def test_the_carve_out_reads_the_store_issued_registry_not_a_local_list(tmp_path):
+    """Stated against the registry so a var added there is covered here on the
+    same commit, and so this test fails rather than passing vacuously if the
+    registry is ever emptied."""
+    from osprey.deployment.container_lifecycle import _STORE_ISSUED_VARS
+
+    deploys_them = {"deployed_services": [v.service for v in _STORE_ISSUED_VARS.values()]}
+
+    assert "ZO_INGEST_SA_TOKEN" in _STORE_ISSUED_VARS
+    assert persona_images._all_store_issued(sorted(_STORE_ISSUED_VARS), deploys_them)
+    assert not persona_images._all_store_issued(["NOT_A_STORE_ISSUED_VAR"], deploys_them)
+
+
+def test_the_carve_out_needs_the_deploy_to_actually_run_the_store(tmp_path):
+    """Registered as store-issued is not enough: a deploy that does not run the
+    store issues nothing, so the same variable is an operator requirement there."""
+    from osprey.deployment.container_lifecycle import _STORE_ISSUED_VARS
+
+    assert not persona_images._all_store_issued(
+        sorted(_STORE_ISSUED_VARS),
+        {"deployed_services": []},
+    )
+
+
+def test_an_external_store_refuses_the_unresolved_ingest_token(tmp_path, calls, monkeypatch):
+    """The refusal an external-store deploy must keep.
+
+    Nothing in a deploy that does not run OpenObserve provisions the ingest
+    token -- `_stage_openobserve_identity` is a no-op there -- so deferring it
+    would build persona images whose telemetry password stays the literal
+    `${ZO_INGEST_SA_TOKEN}`, under a warning telling the operator there was
+    nothing to set. The variable is named, and so is the fact that no start
+    will produce it.
+    """
+    monkeypatch.delenv("ZO_INGEST_SA_TOKEN", raising=False)
+    repo = _repo(tmp_path, "ops")
+    _telemetry_render(
+        repo,
+        "    openobserve:\n"
+        "      user: ${ZO_INGEST_USER_EMAIL:-ingest@example.com}\n"
+        "      password: ${ZO_INGEST_SA_TOKEN}\n",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        persona_images.verify_persona_renders(
+            _persona_config(repo, deployed_services=()), _PERSONA_USERS, repo_root=repo
+        )
+
+    message = str(excinfo.value)
+    assert "ZO_INGEST_SA_TOKEN" in message
+    assert str(repo / ".env") in message
+    assert "does not run the observability store itself" in message
+    # The store-deploying deploy's remedy would send this operator to run a
+    # start that provisions nothing.
+    assert "`osprey up` mints" not in message
+    assert calls == []
+
+
+def test_a_mixed_set_of_unresolved_credentials_still_refuses(tmp_path, calls, monkeypatch):
+    """Fail-closed, all-or-nothing: one name an operator does have to supply and
+    the refusal stands for the whole set.
+
+    A mixed report told "nothing to do here" would leave the operator to
+    discover the real gap from a container that failed to authenticate.
+    """
+    monkeypatch.delenv("ZO_INGEST_SA_TOKEN", raising=False)
+    monkeypatch.delenv("OBSERVABILITY_USER", raising=False)
+    repo = _repo(tmp_path, "ops")
+    _telemetry_render(
+        repo,
+        "    openobserve:\n"
+        "      user: ${OBSERVABILITY_USER}\n"
+        "      password: ${ZO_INGEST_SA_TOKEN}\n",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        persona_images.verify_persona_renders(_persona_config(repo), _PERSONA_USERS, repo_root=repo)
+
+    assert "OBSERVABILITY_USER" in str(excinfo.value)
+    assert calls == []
+
+
+def test_the_messages_own_placeholder_token_is_not_reported_as_a_variable(tmp_path):
+    """The credential error's prose carries a literal ``${VAR}`` of its own.
+
+    Left in, it reads as a variable named VAR that the operator is told to set,
+    and -- since this carve-out is all-or-nothing -- it would also veto every
+    store-issued deferral by never being store-issued itself.
+    """
+    message = (
+        "openobserve.password still contains an unresolved '${VAR}': "
+        "'${ZO_INGEST_SA_TOKEN}'. The referenced environment variable is unset."
+    )
+
+    assert persona_images._unresolved_placeholder_names(message) == ["ZO_INGEST_SA_TOKEN"]
+
+
 def test_an_unservable_model_still_gets_the_model_remedy(tmp_path, calls):
     """The converse, and the reason arm order matters: the credential arm sits
-    ahead of the general one and must not swallow a genuine model failure."""
+    ahead of the general one and must not swallow a genuine model failure.
+
+    The one model failure left (free-form IDs now pass through) is a custom
+    provider with no models map and no default model to fall back on."""
     repo = _repo(tmp_path, "ops")
     project_path = _render(repo)
     (project_path / "config.yml").write_text(
         "project_name: ops-app\n"
+        "api:\n"
+        "  providers:\n"
+        "    my-gateway:\n"
+        "      base_url: https://gw.example.org/v1\n"
         "claude_code:\n"
-        "  provider: anthropic\n"
-        "  default_model: anthropic/claude-opus\n"
+        "  provider: my-gateway\n"
         "  telemetry:\n"
         "    enabled: true\n"
         "    backend: openobserve\n"

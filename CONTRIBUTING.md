@@ -2,7 +2,7 @@
 
 Thank you for your interest in contributing to Osprey! 🎉
 
-This document provides a quick start guide. For comprehensive contribution guidelines, please visit our **[full Contributing Guide in the documentation](https://als-apg.github.io/osprey/contributing/)**.
+This document provides a quick start guide. For comprehensive contribution guidelines, please visit our **[full Contributing Guide in the documentation](https://als-apg.github.io/osprey/contributing/)**. That site documents the most recent release; if you are working against `main`, read the **[development docs for `main`](https://als-apg.github.io/osprey/latest/)** instead, which carry a development banner.
 
 ## Quick Start
 
@@ -50,6 +50,12 @@ ruff check src/ tests/
 ruff format --check src/ tests/
 ```
 
+**Changelog.** If your change touches `src/` or `packages/`, add a fragment — a
+small file such as `changelog.d/1234.fixed.md` describing the change for users.
+CI checks for it; see [`changelog.d/README.md`](changelog.d/README.md). Don't
+add entries to `CHANGELOG.md` by hand — fragments are folded in when a release
+is cut.
+
 ### 5. Submit Pull Request
 
 - Push your branch to GitHub
@@ -67,7 +73,7 @@ uv run osprey skills install osprey-contribute
 
 It walks you through branching, commits, push, PR, and CI iteration following
 the conventions on this page — including the protected-branch reality on
-`main` (no direct pushes; eight required CI checks; linear history). Once
+`main` (no direct pushes; required CI checks that admins cannot bypass). Once
 installed, just open Claude Code in the repo and describe what you want to
 contribute; the skill picks up wherever you are in the journey.
 

@@ -84,56 +84,120 @@
 
 /* ---- Display menu (the header sliders button) ----
 
-   Every display preference — Appearance (light/dark), View (Expert/Simple),
-   Theme family — plus the System Settings row collapses behind one round
-   button; clicking it opens a popover card (display-menu.js). It carries
-   FADERS, deliberately not a gear: in this shell the gear is the settings
-   drawer's own glyph (drawer header + the System Settings row that opens it),
-   so reusing it here would make one icon mean two things. The stroke is the
-   active theme's accent token, so the control still quietly reflects
-   whatever skin is on — the job the old filled dot used to do. */
-.display-menu {
-  position: relative;
-  display: flex;
-  flex-shrink: 0;
-}
+   The popover itself is the shared <osprey-display-menu> component
+   (design_system/static/js/components/osprey-display-menu.js), which injects
+   its own token-only skin for the trigger, the card, the three preference
+   rows and the Settings entry. What is left here is the hub's own projected
+   chrome: the Log out button the hub declares inside the tag and the
+   component moves into the card's action row. Scoped under the tag name,
+   like the component's own rules, so nothing here can reach another
+   popover's `.display-menu-*` vocabulary. */
 
-.display-menu-trigger {
-  width: 28px;
-  height: 28px;
+/* Same box as the component's Settings entry (flex: 1 rather than a 2-column
+   grid, so with logout absent — a single-user deployment, or one with no
+   landing_url to return to — Settings fills the row by itself). */
+osprey-display-menu .display-menu-logout {
   display: flex;
+  flex: 1;
   align-items: center;
   justify-content: center;
-  padding: 0;
-  color: var(--color-accent);
+  gap: var(--space-2);
+  min-width: 0;
+  padding: 6px 10px;
+  font-family: var(--font-display);
+  font-size: var(--text-base);
+  color: var(--text-secondary);
   background: var(--bg-panel);
   border: 1px solid var(--border-default);
-  border-radius: var(--radius-full);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--wt-transition-fast), border-color var(--wt-transition-fast),
+    background var(--wt-transition-fast);
+}
+
+/* Logout hovers to the error colour, not the accent: it is the one control in
+   this card that ends the session rather than adjusting it. */
+osprey-display-menu .display-menu-logout:hover {
+  color: var(--color-error);
+  border-color: var(--color-error);
+  background: var(--bg-elevated);
+}
+
+/* app.js locks the button (`disabled` + `aria-busy`) for the whole in-flight
+   logout and never resets it — every path out of that handler navigates away. */
+osprey-display-menu .display-menu-logout[aria-busy="true"] {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+osprey-display-menu .display-menu-settings-icon,
+osprey-display-menu .display-menu-logout-icon {
+  font-size: var(--text-md);
+  line-height: var(--leading-none);
+}
+
+@keyframes header-identity-menu-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* ---- Header identity menu ----
+ *
+ * The deployment chip in the header is the trigger for a small session popover
+ * (who you are, Log out). Operators read the name in the corner as "who am I"
+ * and reach for it to leave, so leaving lives behind it rather than inside the
+ * display card. Anchored LEFT, unlike the display card: it hangs under a
+ * header-left chip, not a header-right action. */
+.header-identity {
+  position: relative;
+  display: flex;
+  min-width: 0;
+}
+
+/* Keeps `.header-deployment`'s type and its leading separator dot, so a
+   deployment that gained a menu did not visibly gain a widget. The affordance
+   is the caret plus hover/focus, not a box drawn around the name. */
+.header-identity-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 2px var(--space-2);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius-lg);
   cursor: pointer;
   transition: color var(--wt-transition-fast), border-color var(--wt-transition-fast),
     background var(--wt-transition-fast);
 }
 
-/* `currentColor` on the SVG, so the stroke follows the button's own color
-   transition rather than needing a second rule per state. */
-.display-menu-trigger-icon {
-  display: block;
-}
-
-.display-menu-trigger:hover,
-.display-menu-trigger[aria-expanded="true"] {
-  color: var(--color-accent-light);
+.header-identity-trigger:hover,
+.header-identity-trigger[aria-expanded="true"] {
+  color: var(--text-primary);
   border-color: var(--border-accent);
   background: var(--bg-elevated);
 }
 
-/* The popover card: drops below the dot, right-aligned to it. */
-.display-menu-card {
+.header-identity-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.header-identity-caret {
+  flex-shrink: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-none);
+  color: var(--text-muted);
+}
+
+.header-identity-menu {
   display: none;
   position: absolute;
   top: calc(100% + var(--space-2));
-  right: 0;
-  min-width: 230px;
+  left: 0;
+  min-width: 220px;
   padding: var(--space-3);
   flex-direction: column;
   gap: var(--space-3);
@@ -141,157 +205,30 @@
   border: 1px solid var(--border-default);
   border-radius: var(--radius-xl);
   box-shadow: var(--shadow-dropdown);
-  z-index: var(--z-dropdown);
+  /* One step above --z-dropdown, unlike the display card. Anchoring LEFT puts
+     this menu over the same column as the one-time `.rail-hint` callout, which
+     is also --z-dropdown and sits later in the DOM (.shell-body) — so at equal
+     z-index the hint wins and swallows the click on Log out. Header chrome
+     outranks a body-level callout. */
+  z-index: var(--z-sticky);
 }
 
-.display-menu-card.open {
+.header-identity-menu.open {
   display: flex;
-  animation: display-menu-in var(--wt-transition-fast);
+  animation: header-identity-menu-in var(--wt-transition-fast);
 }
 
-@keyframes display-menu-in {
-  from { opacity: 0; transform: translateY(-4px); }
-  to { opacity: 1; transform: none; }
-}
-
-.display-menu-row {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-}
-
-.display-menu-heading {
-  font-family: var(--font-display);
-  font-size: var(--text-sm);
-  font-weight: var(--weight-semibold);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-muted);
-}
-
-/* Two-option segmented control with a sliding thumb (the ::before). The
-   thumb spans one cell of the 2-column grid; the active side is expressed as
-   a translateX so a pick glides rather than jumps. */
-.display-menu-seg {
-  position: relative;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  padding: 3px;
-  background: var(--bg-panel);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg);
-}
-
-.display-menu-seg::before {
-  content: '';
-  position: absolute;
-  top: 3px;
-  bottom: 3px;
-  left: 3px;
-  width: calc(50% - 3px);
-  background: var(--bg-elevated);
-  border-radius: var(--radius-md);
-  transition: transform var(--wt-transition-normal);
-}
-
-/* View thumb: CSS-driven off html[data-ui-mode], so it is correct pre-paint
-   and tracks live flips with no JS sync (segments are expert, then simple). */
-html[data-ui-mode="simple"] #mode-toggle::before {
-  transform: translateX(100%);
-}
-
-/* Appearance thumb: display-menu.js mirrors the resolved light/dark mode
-   into data-active (options are light, then dark). */
-.display-menu-appearance[data-active="dark"]::before {
-  transform: translateX(100%);
-}
-
-.display-seg-option {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-1);
-  padding: 5px 10px;
-  font-family: var(--font-display);
-  font-size: var(--text-base);
-  font-weight: var(--weight-regular);
-  color: var(--text-secondary);
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: color var(--wt-transition-fast);
-}
-
-.display-seg-option:hover {
-  color: var(--text-primary);
-}
-
-html[data-ui-mode="expert"] .mode-segment[data-mode="expert"],
-html[data-ui-mode="simple"] .mode-segment[data-mode="simple"],
-.display-menu-appearance[data-active="light"] .display-seg-option[data-appearance="light"],
-.display-menu-appearance[data-active="dark"] .display-seg-option[data-appearance="dark"] {
-  color: var(--text-primary);
-  font-weight: var(--weight-medium);
-}
-
-.display-seg-icon,
-.mode-segment-icon {
-  font-size: var(--text-md);
-  line-height: var(--leading-none);
-}
-
-/* Theme family pills (one per THEMES family, built by display-menu.js). */
-.display-menu-families {
+.header-identity-who {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-1);
-}
-
-.display-family-pill {
-  padding: 4px 10px;
-  font-family: var(--font-display);
-  font-size: var(--text-base);
-  color: var(--text-secondary);
-  background: transparent;
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-full);
-  cursor: pointer;
-  transition: color var(--wt-transition-fast), border-color var(--wt-transition-fast),
-    background var(--wt-transition-fast);
-}
-
-.display-family-pill:hover {
-  color: var(--text-primary);
-  border-color: var(--border-accent);
-}
-
-.display-family-pill.active {
-  color: var(--text-primary);
-  border-color: var(--color-accent);
-  background: var(--accent-tint-06);
-}
-
-/* ---- Session footer (identity + the two actions) ----
-
-   The card's last block: who you are, then Settings and Log out side by side.
-   A hairline splits it from the preference rows so it reads as action rather
-   than a fourth preference. Both actions are present in BOTH ui modes — the
-   settings drawer's own warning gate, not the ui mode, is what guards expert
-   configuration. */
-.display-menu-identity {
-  display: flex;
   align-items: baseline;
   gap: var(--space-2);
   min-width: 0;
-  padding-top: var(--space-2);
-  border-top: 1px solid var(--border-default);
 }
 
 /* The initial disc. Carries the accent so the line reads as "you" at a glance
    without needing an avatar image the framework has no way to source. */
-.display-menu-identity-avatar {
+.header-identity-avatar {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -310,7 +247,7 @@ html[data-ui-mode="simple"] .mode-segment[data-mode="simple"],
 
 /* The name wins the row when both it and the deployment are too long for it:
    `alice` is what identifies the session, the deployment only qualifies it. */
-.display-menu-identity-name {
+.header-identity-who-name {
   flex-shrink: 0;
   max-width: 60%;
   font-family: var(--font-display);
@@ -322,7 +259,44 @@ html[data-ui-mode="simple"] .mode-segment[data-mode="simple"],
   text-overflow: ellipsis;
 }
 
-.display-menu-identity-sub {
+/* The session's role, as a small pill beside the name: it qualifies the
+   name the way a badge does, and must not compete with it. */
+.header-identity-who-role {
+  flex-shrink: 0;
+  align-self: center;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 0 var(--space-2);
+  font-family: var(--font-display);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  line-height: var(--leading-relaxed);
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+  white-space: nowrap;
+}
+
+/* Where the role came from, subordinate to the pill it qualifies: the
+   who-line's own idiom for a qualifier — muted, small, introduced by a '·' —
+   rather than a second pill competing with the first. */
+.header-identity-who-role-source {
+  flex-shrink: 0;
+  font-family: var(--font-display);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.header-identity-who-role-source::before {
+  content: '·';
+  margin-right: var(--space-1);
+}
+
+.header-identity-who-sub {
   min-width: 0;
   font-family: var(--font-display);
   font-size: var(--text-sm);
@@ -332,37 +306,16 @@ html[data-ui-mode="simple"] .mode-segment[data-mode="simple"],
   text-overflow: ellipsis;
 }
 
-.display-menu-identity-sub::before {
+.header-identity-who-sub::before {
   content: '·';
   margin-right: var(--space-1);
 }
 
-/* The hairline opens the footer, so it belongs to whichever element starts it:
-   the identity line on a multi-user terminal, the action row on a single-user
-   one (which renders no identity and no logout). */
-.display-menu-actions {
+.header-identity-logout {
   display: flex;
-  gap: var(--space-2);
-  padding-top: var(--space-2);
-  border-top: 1px solid var(--border-default);
-}
-
-.display-menu-identity + .display-menu-actions {
-  padding-top: 0;
-  border-top: none;
-}
-
-/* `flex: 1` rather than a 2-column grid: with logout absent — a single-user
-   deployment, or one with no landing_url to return to — Settings fills the row
-   by itself instead of sitting in half of it. */
-.display-menu-settings,
-.display-menu-logout {
-  display: flex;
-  flex: 1;
   align-items: center;
   justify-content: center;
   gap: var(--space-2);
-  min-width: 0;
   padding: 7px 10px;
   font-family: var(--font-display);
   font-size: var(--text-base);
@@ -376,37 +329,706 @@ html[data-ui-mode="simple"] .mode-segment[data-mode="simple"],
     background var(--wt-transition-fast);
 }
 
-.display-menu-settings:hover,
-.display-menu-settings.active {
-  color: var(--text-primary);
-  border-color: var(--border-accent);
-  background: var(--bg-elevated);
-}
-
-/* Logout hovers to the error colour, not the accent: it is the one control in
-   this card that ends the session rather than adjusting it. */
-.display-menu-logout:hover {
+/* Hovers to the error colour, not the accent: it is the one control in this
+   menu that ends the session rather than describing it. */
+.header-identity-logout:hover {
   color: var(--color-error);
   border-color: var(--color-error);
   background: var(--bg-elevated);
 }
 
-/* app.js locks the button (`disabled` + `aria-busy`) for the whole in-flight
-   logout and never resets it — every path out of that handler navigates away. */
-.display-menu-logout[aria-busy="true"] {
-  cursor: progress;
-  opacity: 0.6;
-}
-
-.display-menu-settings-icon,
-.display-menu-logout-icon {
+.header-identity-logout-icon {
   font-size: var(--text-md);
   line-height: var(--leading-none);
 }
 
+/* app.js locks the button (`disabled` + `aria-busy`) for the whole in-flight
+   logout and never resets it — every path out of that handler navigates away. */
+.header-identity-logout[aria-busy="true"] {
+  cursor: progress;
+  opacity: 0.6;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .display-menu-card.open { animation: none; }
-  .display-menu-seg::before { transition: none; }
+  .header-identity-menu.open { animation: none; }
+}
+
+/* ---- Control-target chip + its popover ----
+
+   The one chip in the header that answers "if the agent writes now, where does
+   it land, and will it be refused?". Geometry and tone are the command-palette
+   trigger's, so it reads as a peer of the other header actions rather than as a
+   banner; the state it carries is what makes it worth looking at.
+
+   Everything is keyed off four data attributes the chip module sets —
+   `data-target-kind` (live | standin | va | simulated), `data-state`
+   (writes | sandbox | read-only), `data-enforceable`, `data-pending` — so no
+   colour name and no state word lives in the JS.
+
+   The popover is the identity menu's idiom (absolute, anchored under its
+   trigger, --z-sticky, a 120ms fade), turned into a table of the targets this
+   session may sit on. */
+
+/* Positioning context for the popover: the chip and its menu travel together
+   inside the header action cluster. */
+.ctc-anchor {
+  position: relative;
+  display: flex;
+}
+
+.ctc-anchor[hidden] {
+  display: none;
+}
+
+.control-target-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 28px;
+  padding: 0 9px 0 10px;
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  font-weight: var(--weight-regular);
+  color: var(--text-secondary);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--wt-transition-fast), border-color var(--wt-transition-fast),
+    background var(--wt-transition-fast);
+}
+
+/* `display: inline-flex` above outranks the user-agent [hidden] rule, so the
+   hidden state (no session yet, or a deployment with nothing to say) needs
+   saying explicitly — the same trap `.status-item[hidden]` in files.css
+   documents. */
+.control-target-chip[hidden] {
+  display: none;
+}
+
+.control-target-chip:hover,
+.control-target-chip[aria-expanded="true"] {
+  color: var(--text-primary);
+  border-color: var(--border-accent);
+  background: var(--bg-elevated);
+}
+
+/* The one loud cell in the whole matrix: the facility's own machine, with this
+   session able to write to it. Nothing else tints the border — a sandboxed
+   real machine is a safe state and must not shout, or the one state that
+   should stops being distinguishable. */
+.control-target-chip[data-target-kind="live"][data-state="writes"] {
+  border-color: var(--error-tint-40);
+}
+
+.control-target-chip[data-target-kind="live"][data-state="writes"]:hover,
+.control-target-chip[data-target-kind="live"][data-state="writes"][aria-expanded="true"] {
+  border-color: var(--color-error);
+  background: var(--error-tint-08);
+}
+
+/* Nothing behind the chip can enforce what it says (posture store unavailable,
+   no session-owned record, a deployment-wide readonly run): it stays the
+   readout, and stays clickable, but drops out of the foreground. */
+.control-target-chip[data-enforceable="false"] {
+  opacity: 0.72;
+}
+
+/* The machine's name — the kind's own word (Real machine, Rehearsal,
+   Simulator, Demo) or the deployment's configured display name. A configured
+   name is free text, so the chip caps it with an ellipsis rather than letting
+   one long name push the header's other actions off screen; the full name
+   stays on the chip's title. */
+.ctc-short {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: var(--weight-medium);
+  letter-spacing: 0.04em;
+  color: var(--text-primary);
+}
+
+/* A simulator is the unremarkable case: it drops to the secondary weight so
+   the eye skips it, exactly as the popover's own row label does. */
+.control-target-chip[data-target-kind="simulated"] .ctc-short {
+  color: var(--text-secondary);
+  font-weight: var(--weight-regular);
+}
+
+.ctc-sep {
+  color: var(--text-muted);
+}
+
+.ctc-state {
+  color: var(--text-secondary);
+}
+
+/* Sandbox is the state an operator chose and can lift; it earns the warning
+   colour on the word, not on the border. */
+.control-target-chip[data-state="sandbox"] .ctc-state {
+  color: var(--color-warning);
+}
+
+.control-target-chip[data-state="read-only"] .ctc-state {
+  color: var(--text-muted);
+}
+
+.control-target-chip[data-pending="true"] .ctc-state {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.ctc-caret {
+  flex-shrink: 0;
+  margin-left: 1px;
+  font-size: var(--text-sm);
+  line-height: var(--leading-none);
+  color: var(--text-muted);
+}
+
+/* ---- The dot ----
+
+   Two channels, read together: colour is the consequence of a write landing
+   here, shape is who is holding writes back. Filled = nobody, the agent can
+   write. Half = the operator sandboxed it for this session, and one click in
+   the popover lifts it. Hollow = the deployment never armed this target, so
+   there is nothing to lift from here.
+
+   The words beside the dot say the same thing, so colour is a second channel
+   rather than the only one. */
+.ctc-dot {
+  --dot: var(--text-muted);
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  background: var(--dot);
+  border: 1.5px solid var(--dot);
+  border-radius: var(--radius-full);
+}
+
+/* Shape. The attribute may sit on the dot itself (a standalone dot) or on the
+   chip or row that owns it, so both spellings resolve. */
+[data-state="sandbox"] > .ctc-dot,
+.ctc-dot[data-state="sandbox"] {
+  background: linear-gradient(90deg, var(--dot) 50%, transparent 50%);
+}
+
+[data-state="read-only"] > .ctc-dot,
+.ctc-dot[data-state="read-only"] {
+  background: transparent;
+}
+
+/* Colour. A stand-in soft-IOC is a real machine for this purpose — an operator
+   drives it the way they drive the facility's own — so it shares `live`'s
+   palette rather than getting a third one that would invite reading it as a
+   second simulator. */
+[data-target-kind="live"][data-state="writes"] > .ctc-dot,
+[data-target-kind="standin"][data-state="writes"] > .ctc-dot {
+  --dot: var(--color-error);
+}
+
+[data-target-kind="live"][data-state="sandbox"] > .ctc-dot,
+[data-target-kind="standin"][data-state="sandbox"] > .ctc-dot {
+  --dot: var(--color-warning);
+}
+
+[data-target-kind="va"][data-state="writes"] > .ctc-dot {
+  --dot: var(--color-success);
+}
+
+/* Stand-in with writes armed: an outline, not a fill. It is a real machine —
+   the colour says so — but it is not the facility's own, and the open centre
+   is what separates the two at a glance in a header the eye only skims. */
+[data-target-kind="standin"][data-state="writes"] > .ctc-dot {
+  background: transparent;
+  border-width: 2px;
+}
+
+/* A switch request is out: the dot breathes until the answer lands. Motion is
+   the only channel free here — colour and shape are both already spoken for —
+   and it is dropped entirely for a viewer who asked for no motion, where the
+   italic `switching…` word carries it alone. */
+[data-pending="true"] > .ctc-dot {
+  animation: ctc-breathe 1.2s ease-in-out infinite; /* hygiene-allow-scale: a breathing cycle is a perception constant, not a UI timing step — the emitted duration scale stops well short of it */
+}
+
+@keyframes ctc-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@keyframes ctc-menu-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-pending="true"] > .ctc-dot { animation: none; }
+  .ctc-popover.open { animation: none; }
+}
+
+/* ---- The popover ----
+
+   Right-anchored, unlike the identity menu: it hangs under a header-right
+   action. Same --z-sticky reasoning as that menu — header chrome outranks a
+   body-level callout — and the confirm overlay sits a full layer above it
+   (--z-modal, at the bottom of this file), so a confirm never hides the rows
+   it is about and the popover can stay open beneath it. */
+.ctc-popover {
+  display: none;
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  right: 0;
+  width: 500px;
+  padding: var(--space-3);
+  flex-direction: column;
+  gap: var(--space-2);
+  font-family: var(--font-display);
+  font-size: var(--text-md);
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-dropdown);
+  z-index: var(--z-sticky);
+}
+
+.ctc-popover.open {
+  display: flex;
+  animation: ctc-menu-in var(--wt-transition-fast);
+}
+
+/* The one abnormal banner across the top. Absent in the plain case — absence
+   is the good news — and worded in control-target-facts.js, whose bannerNote
+   picks the widest abnormal fact about the session. */
+.ctc-banner {
+  padding: 6px 8px;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  border-radius: var(--radius-sm);
+}
+
+.ctc-banner[data-tone="warn"] {
+  color: var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 10%, transparent);
+}
+
+.ctc-banner[data-tone="error"] {
+  color: var(--color-error);
+  background: var(--error-tint-08);
+}
+
+/* ---- The card: the machine the agent stands on ----
+
+   "Where am I" is the first thing read, so it is not the middle row of an
+   equal list: it is a card, with the name, the consequence line, the write
+   state, and the one verb that changes it. The accent tint is the same one
+   the old active row wore — quiet, not a warning. */
+.ctc-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  row-gap: 3px;
+  column-gap: 10px;
+  align-items: center;
+  padding: 9px 10px 10px;
+  background: var(--accent-tint-04);
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-md);
+}
+
+.ctc-card-eyebrow {
+  grid-column: 1 / -1;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--color-accent-light);
+}
+
+.ctc-card-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  color: var(--text-primary);
+}
+
+.ctc-card-title .ctc-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ctc-card-verb {
+  grid-column: 2;
+  grid-row: 2;
+}
+
+.ctc-card > .ctc-desc,
+.ctc-card-state,
+.ctc-card > .ctc-outcome {
+  grid-column: 1 / -1;
+}
+
+/* The consequence line under a name: what writing to this machine does.
+   Wording in control-target-facts.js (KIND_DESCRIPTORS); the live machine's
+   line carries the error tone because it is the one sentence in the popover
+   that names hardware moving. */
+.ctc-desc {
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ctc-desc[data-tone="hazard"] {
+  color: var(--color-error);
+}
+
+.ctc-card-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+/* The state phrase: on takes the colour of what a write here would mean (the
+   error tone on a real machine, success on a simulator), off is the warning
+   the operator can lift, locked stays muted — no gesture here moves it. */
+.ctc-card[data-real="true"] .ctc-state-phrase[data-state="writes"] {
+  color: var(--color-error);
+}
+
+.ctc-card[data-real="false"] .ctc-state-phrase[data-state="writes"] {
+  color: var(--color-success);
+}
+
+.ctc-state-phrase[data-state="sandbox"] {
+  color: var(--color-warning);
+}
+
+.ctc-state-phrase[data-state="read-only"] {
+  color: var(--text-muted);
+}
+
+.ctc-state-note {
+  color: var(--text-muted);
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
+
+/* The reachability exception. "Connected" is never rendered — the only
+   reachability fact that changes a decision is that a machine is not
+   answering, and the measured detail stays on the title. */
+.ctc-reach-word {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.ctc-reach-word[data-state="down"] {
+  color: var(--color-error);
+}
+
+.ctc-reach-word[data-state="stale"] {
+  color: var(--color-warning);
+}
+
+/* ---- The other machines ----
+
+   Four columns owned by the list, subgridded per row so the pills and verbs
+   line up as columns: who it is and what writing there means, the state pill,
+   the verb that changes it, and Switch to. */
+.ctc-list-title {
+  padding: 2px 2px 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+}
+
+.ctc-rows {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content max-content max-content;
+  column-gap: 8px;
+}
+
+.ctc-row {
+  display: grid;
+  grid-template-columns: subgrid;
+  grid-column: 1 / -1;
+  align-items: center;
+  min-height: 40px;
+  padding: 4px 2px;
+  border-bottom: 1px solid var(--border-default);
+}
+
+.ctc-row:last-child {
+  border-bottom: 0;
+}
+
+.ctc-ident {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.ctc-name-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ctc-name {
+  color: var(--text-primary);
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A simulator is the unremarkable case: it drops to the secondary weight so
+   the eye skips it, exactly as the chip's short label does. */
+.ctc-row[data-target-kind="va"] .ctc-name,
+.ctc-row[data-target-kind="simulated"] .ctc-name {
+  color: var(--text-secondary);
+  font-weight: var(--weight-regular);
+}
+
+/* The state pill: the same colour map as the card's state phrase. */
+.ctc-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border-radius: var(--radius-full);
+  white-space: nowrap;
+}
+
+.ctc-row[data-real="true"] .ctc-pill[data-state="writes"] {
+  color: var(--color-error);
+  background: var(--error-tint-10);
+}
+
+.ctc-row[data-real="false"] .ctc-pill[data-state="writes"] {
+  color: var(--color-success);
+  background: var(--success-tint-08);
+}
+
+.ctc-pill[data-state="sandbox"] {
+  color: var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 10%, transparent);
+}
+
+.ctc-pill[data-state="read-only"] {
+  color: var(--text-muted);
+  background: var(--neutral-tint-06);
+}
+
+/* ---- Verbs ----
+
+   Named for their outcome, so the asymmetry — off applies on click, on
+   confirms first — is visible before the click. Locked, the verb stays on
+   screen, disabled, with the reason on hover: the gap where the control would
+   be is explained rather than merely empty. */
+.ctc-verb,
+.ctc-card-verb {
+  height: 22px;
+  padding: 0 10px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--wt-transition-fast), border-color var(--wt-transition-fast),
+    background var(--wt-transition-fast);
+}
+
+/* Row verbs are quiet — the pill beside them already carries the state. */
+.ctc-verb {
+  color: var(--text-muted);
+  border-color: transparent;
+  padding: 0 4px;
+}
+
+.ctc-verb:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+
+/* The card's verb is the popover's one prominent control. Off hovers to the
+   warning it applies; on hovers to the error tone the confirm will carry. */
+.ctc-card-verb {
+  color: var(--text-secondary);
+}
+
+.ctc-card-verb[data-direction="off"]:hover:not(:disabled) {
+  color: var(--color-warning);
+  border-color: var(--color-warning);
+}
+
+.ctc-card-verb[data-direction="on"],
+.ctc-verb[data-direction="on"]:not(:disabled) {
+  color: var(--color-error);
+}
+
+.ctc-card-verb[data-direction="on"]:hover:not(:disabled) {
+  border-color: var(--error-tint-40);
+  background: var(--error-tint-08);
+}
+
+.ctc-verb:disabled,
+.ctc-card-verb:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* What the last switch or write-state request on this row did. */
+.ctc-outcome {
+  margin-top: 2px;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.ctc-outcome[data-status="pending"] {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.ctc-outcome[data-status="success"] {
+  color: var(--color-success);
+}
+
+.ctc-outcome[data-status="refused"],
+.ctc-outcome[data-status="expired"] {
+  color: var(--color-error);
+}
+
+.ctc-outcome[data-status="realign"] {
+  color: var(--color-warning);
+}
+
+/* ---- Switch (column 4) ----
+
+   Either the button or, where a switch cannot be offered, the tool's own
+   refusal in the operator phrase — so the gap where the action would be is
+   explained rather than merely empty, and never in a vocabulary only the
+   tool speaks. */
+.ctc-action {
+  min-width: 64px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.ctc-switch {
+  height: 22px;
+  padding: 0 10px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: color var(--wt-transition-fast), border-color var(--wt-transition-fast),
+    background var(--wt-transition-fast);
+}
+
+.ctc-switch:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--border-accent);
+  background: var(--accent-tint-08);
+}
+
+/* Switching onto a real machine hovers to the error tone: the confirm that
+   follows is the safety gesture, and the button that opens it should already
+   look like the one that does. */
+.ctc-row[data-real="true"] .ctc-switch:hover:not(:disabled) {
+  border-color: var(--error-tint-40);
+  background: var(--error-tint-08);
+}
+
+/* Deliberately quiet, `not set up` above all: on a stock deployment the live
+   machine is unauthored on purpose — authoring it is the go-live edit — and
+   an error tone here would flag a healthy render as broken. */
+.ctc-reason {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+}
+
+.ctc-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 6px 2px 0;
+  border-top: 1px solid var(--border-default);
+}
+
+/* The one-gesture narrowing: it only ever removes reach, so it applies on
+   click without a confirm, and it hovers warning rather than error. */
+.ctc-all-off {
+  height: 22px;
+  padding: 0 10px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.ctc-all-off:hover:not(:disabled) {
+  color: var(--color-warning);
+  border-color: var(--color-warning);
+}
+
+.ctc-all-off:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* The popover's scope, said once. Everything above is per session and per
+   machine; the deployment's own config is not reachable from here. */
+.ctc-foot-note {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  text-align: right;
 }
 
 /* ---- Simple-mode shell density (frame 2b) ----
@@ -648,6 +1270,90 @@ html[data-ui-mode="simple"] .session-selector {
 .panel-add-btn[aria-expanded="true"] {
   color: var(--color-accent-light);
   background: var(--bg-elevated);
+}
+
+/* ---- Utility cluster (Documentation + Feedback, far end of the rail) ---- */
+
+/* The rail's non-panel controls. `margin-top: auto` eats the column's free
+   space, which pins the pair to the very bottom and leaves the entries + "+"
+   as one block at the top — .panel-rail has no flex:1, so without this the
+   cluster would ride directly under the "+" and read as two more panel
+   tabs. The rule above the pair is what says "different kind of thing"; it is
+   inset to the 62px cell width so it lines up with the cells rather than the
+   74px column. */
+.panel-utility {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-1);
+  flex-shrink: 0;
+  width: 62px;
+  margin-top: auto;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-default);
+}
+
+/* Same 62x52 cell as .panel-add-btn above — the cluster is a different GROUP,
+   not a different size. The icon + label stack is .panel-rail-button's, for
+   the same reason: an unlabelled mark makes the operator hover to find out
+   what it opens, and the cluster's separateness is already carried by the
+   rule above it and the muted color. `text-decoration: none` is for the
+   anchor half. */
+.panel-utility-btn {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  width: 62px;
+  height: 52px;
+  padding: 0;
+  color: var(--text-muted);
+  text-decoration: none;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  transition: color var(--wt-transition-fast), background var(--wt-transition-fast);
+}
+
+/* The UA's `[hidden] { display: none }` is a bare attribute selector and loses
+   to the class rule above, so a docs anchor hidden by rail-utility.js (no
+   web.docs_url configured) would keep painting without this. */
+.panel-utility-btn[hidden] {
+  display: none;
+}
+
+.panel-utility-btn:hover,
+.panel-utility-btn:focus-visible {
+  color: var(--color-accent-light);
+  background: var(--bg-elevated);
+}
+
+.panel-utility-icon {
+  display: inline-flex;
+}
+
+.panel-utility-icon svg {
+  width: 18px;
+  height: 18px;
+  display: block;
+}
+
+/* Reads as .panel-rail-label so the cluster is the same kind of cell, with one
+   deliberate difference: the built-in panel labels arrive already upper-cased
+   from BUILTIN_PANEL_LABELS, while these are authored in sentence case (the
+   accessible name should read as words), so the casing happens here. */
+.panel-utility-label {
+  font-size: var(--text-xs);
+  line-height: var(--leading-none);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: -0.01em;
+  text-transform: uppercase;
+  box-sizing: border-box;
 }
 
 /* The popover opens to the RIGHT of the rail (the "+" sits in a narrow left
@@ -934,6 +1640,41 @@ html[data-rail-position="top"] .panel-add-btn {
 html[data-rail-position="top"] .panel-add-menu {
   top: calc(100% + 8px);
   left: 0;
+}
+
+/* The utility cluster turns the same corner: the far end of the column is the
+   far RIGHT of the strip, and the separating rule turns from a top border into
+   a left one. `margin-left: auto` does the pinning — .panel-rail still has no
+   flex:1, it just overflows horizontally now. */
+html[data-rail-position="top"] .panel-utility {
+  flex-direction: row;
+  width: auto;
+  height: 100%;
+  margin-top: 0;
+  margin-left: auto;
+  padding-top: 0;
+  padding-left: var(--space-2);
+  border-top: none;
+  border-left: 1px solid var(--border-default);
+}
+
+/* The strip is 40px tall and deliberately does not clip, so an un-overridden
+   52px cell would hang over the workspace below it. The stack turns the same
+   corner the panel entries do — icon beside label in a width-auto pill, so
+   the label has somewhere to go that a fixed 40px cell would not give it. */
+html[data-rail-position="top"] .panel-utility-btn {
+  flex-direction: row;
+  gap: 6px;
+  width: auto;
+  height: 100%;
+  padding: 0 14px;
+  border-radius: 0;
+}
+
+/* Old header-tab typography, matching the panel pills to its left. */
+html[data-rail-position="top"] .panel-utility-label {
+  font-size: var(--text-lg);
+  font-family: var(--font-display);
 }
 
 /* ---- One-time rail hint ---- */
@@ -1283,4 +2024,172 @@ html[data-ui-mode="simple"] #terminal-container {
 @keyframes ledPulse {
   0%, 100% { box-shadow: 0 0 3px currentColor; }
   50% { box-shadow: 0 0 8px currentColor; }
+}
+
+/* ---- Control-target confirm dialog ----
+   The confirm raised over the control-target popover (control-target-popover.js)
+   before a posture change or a target switch. Mounted on document.body through
+   modal-overlay.js; the class names are `posture-modal*` for continuity with the
+   dialog this feature inherited them from. */
+
+/* The confirm dialog. Same geometry and motion as the settings drawer's
+   warning dialog, in this feature's own neutral tone: a posture switch is a
+   deliberate operator action, not an error. */
+
+.posture-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--overlay-black-70);
+  /* A full layer above --z-sticky, where the control-target popover lives: the
+     confirm is raised BY that popover and must mount over it, and the popover
+     deliberately stays open underneath so an operator changing several rows
+     never has to reopen it. Ties with the command palette and the feedback
+     dialog, which is harmless — only one of the three is ever open. */
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity var(--duration-base) ease;
+}
+
+.posture-modal-overlay.visible {
+  opacity: 1;
+}
+
+.posture-modal {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-dialog);
+  max-width: 460px;
+  width: 90vw;
+  padding: var(--space-5);
+  transform: scale(0.95);
+  transition: transform var(--duration-base) ease;
+}
+
+.posture-modal-overlay.visible .posture-modal {
+  transform: scale(1);
+}
+
+.posture-modal-title {
+  font-family: var(--font-display);
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+  margin-bottom: var(--space-3);
+}
+
+.posture-modal-body {
+  font-family: var(--font-mono);
+  font-size: var(--text-base);
+  line-height: var(--leading-loose);
+  color: var(--text-secondary);
+  margin-bottom: 20px;
+}
+
+.posture-modal-body p {
+  margin: 8px 0;
+}
+
+.posture-modal-body strong {
+  color: var(--text-primary);
+}
+
+/* The server's own refusal text (403 render-has-no-writes, 409 unknown
+   session). Lives inside the dialog because that is where the operator is
+   looking when it arrives. */
+.posture-modal-error {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--color-error);
+  background: var(--error-tint-15);
+  border: 1px solid var(--error-tint-40);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin-bottom: var(--space-3);
+}
+
+/* The one sentence that makes a confirm about the facility's own machine
+   different from every other confirm: arming writes there, or switching onto
+   it with writes already armed, means the next write moves hardware. Same box
+   as the error notice above — it is the same kind of thing to read before
+   clicking — but it sits under the body rather than above it, because it
+   qualifies what the operator is about to do rather than reporting what
+   already failed. */
+.posture-modal-live {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--color-error);
+  background: var(--error-tint-15);
+  border: 1px solid var(--error-tint-40);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin: 10px 0 0;
+}
+
+.posture-modal-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.posture-modal-cancel,
+.posture-modal-confirm {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-radius: var(--radius-sm);
+  padding: 6px 14px;
+  cursor: pointer;
+  transition: all var(--wt-transition-fast);
+}
+
+.posture-modal-cancel {
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border-default);
+}
+
+.posture-modal-cancel:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+
+.posture-modal-confirm {
+  color: var(--text-primary);
+  background: var(--accent-tint-08);
+  border: 1px solid var(--border-accent);
+}
+
+.posture-modal-confirm:hover:not(:disabled) {
+  background: var(--accent-tint-12);
+  border-color: var(--color-accent);
+}
+
+/* The confirm button takes the error tone only when the thing being confirmed
+   reaches the facility's own machine — the same single-loud-cell rule the chip
+   follows, so the colour still means one thing across the whole feature. */
+.posture-modal-confirm[data-live="true"] {
+  background: var(--error-tint-15);
+  border-color: var(--error-tint-40);
+}
+
+.posture-modal-confirm[data-live="true"]:hover:not(:disabled) {
+  background: var(--error-tint-25);
+  border-color: var(--color-error);
+}
+
+.posture-modal-cancel:disabled,
+.posture-modal-confirm:disabled {
+  cursor: progress;
+  opacity: 0.6;
 }

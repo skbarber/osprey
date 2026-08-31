@@ -1,13 +1,19 @@
 """Tests for the fail-OPEN startup assertion.
 
 `app.py`'s `_lifespan` hook refuses to start *writable* against an unreadable
-limits source: it raises IFF ALL of `control_system.writes_enabled` is true,
-`control_system.limits_checking.enabled` is true, AND the limits database at
-`control_system.limits_checking.database_path` is missing, unreadable, or
-unparseable. Every other combination starts normally — most importantly,
-writes disabled must start read-only REGARDLESS of limits readability, and
-must never even probe the database. See `_assert_limits_readable_if_writable`'s
-docstring in `validation.py` for the full condition and rationale.
+limits source: it raises IFF ALL of writes are armed for the target THIS LANE
+serves, `control_system.limits_checking.enabled` is true, AND the limits
+database at `control_system.limits_checking.database_path` is missing,
+unreadable, or unparseable. Every other combination starts normally — most
+importantly, writes disabled must start read-only REGARDLESS of limits
+readability, and must never even probe the database. See
+`_assert_limits_readable_if_writable`'s docstring in `validation.py` for the
+full condition and rationale.
+
+The posture is per connector type, so which lane the container is
+(`OSPREY_BLUESKY_LANE`) decides the answer: on a deployment that arms only its
+virtual accelerator, the `va` lane must refuse and the `live` lane of the same
+config must start.
 
 The guard runs on EVERY startup, not only when some wiring flag is set: the
 posture it refuses is a property of the project config, so a deployment that
@@ -24,8 +30,13 @@ Exercised here:
   configured at all.
 - writes_enabled=False -> starts read-only even with a missing database, and
   the probe (`LimitsValidator._load_limits_database`) is never called.
-- The refusal message names the failing config keys but never leaks the
-  database file's contents.
+- A mixed per-type config -> the armed lane refuses and the unarmed lane of
+  the same config starts; a read-only run needs no database at all.
+- The refusal message names the resolved per-type posture key and the lane it
+  refused for, but never leaks the database file's contents.
+- The other boot-time refusal in the same hook: a `BLUESKY_DEVICE_PAGE_SIZE`
+  that is not a whole number >= 1 fails the start rather than the first
+  request.
 """
 
 from __future__ import annotations
@@ -33,17 +44,20 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
+from osprey.services.bluesky_bridge import queue
 from osprey.services.bluesky_bridge.app import app, set_queue_backend
 
-_SUBSTRATE_ENV = "BLUESKY_EPICS_SUBSTRATE"
-_SETPOINTS_ENV = "BLUESKY_EPICS_SETPOINTS"
-_READBACKS_ENV = "BLUESKY_EPICS_READBACKS"
+_DEVICES_FILE_ENV = "BLUESKY_DEVICES_FILE"
 _TILED_URI_ENV = "BLUESKY_TILED_URI"
 _TILED_API_KEY_ENV = "BLUESKY_TILED_API_KEY"
+_LANE_ENV = "OSPREY_BLUESKY_LANE"
+_EXECUTION_MODE_ENV = "OSPREY_EXECUTION_MODE"
+_DEVICE_PAGE_SIZE_ENV = "BLUESKY_DEVICE_PAGE_SIZE"
 
 
 class _InertBackend:
@@ -63,16 +77,17 @@ class _InertBackend:
 def _isolated_state(monkeypatch: pytest.MonkeyPatch):
     """Every test starts from a clean env and an inert, pre-injected backend.
 
-    The substrate/Tiled variables are cleared rather than set: the guard is no
+    The device-file/Tiled variables are cleared rather than set: the guard is no
     longer reached through any of them, and leaving one set from the ambient
     environment would only obscure that.
     """
     for var in (
-        _SUBSTRATE_ENV,
-        _SETPOINTS_ENV,
-        _READBACKS_ENV,
+        _DEVICES_FILE_ENV,
         _TILED_URI_ENV,
         _TILED_API_KEY_ENV,
+        _LANE_ENV,
+        _EXECUTION_MODE_ENV,
+        _DEVICE_PAGE_SIZE_ENV,
     ):
         monkeypatch.delenv(var, raising=False)
     set_queue_backend(_InertBackend())
@@ -83,12 +98,28 @@ def _isolated_state(monkeypatch: pytest.MonkeyPatch):
 def _patch_config(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    writes_enabled: bool,
+    writes_enabled: bool | None = None,
+    section: dict[str, Any] | None = None,
+    lane_targets: dict[str, str] | None = None,
     limits_enabled: bool | None = None,
     db_path: str | None = None,
     project_root: str | None = None,
 ) -> None:
-    """Patch `osprey.utils.config.get_config_value` for the three keys the guard reads.
+    """Patch `osprey.utils.config.get_config_value` for the keys the guard reads.
+
+    Write posture is per connector type, so the guard reads the whole
+    `control_system` SECTION rather than a dotted `writes_enabled` key, plus
+    the `services.<lane>.target` its lane declares. Pass `writes_enabled` for
+    a deployment whose only posture is the deployment-wide key; pass `section`
+    (and `lane_targets`) for a config that arms one connector type and not
+    another.
+
+    Limits checking is per connector type too, and the guard reads it out of
+    the same SECTION, so `limits_enabled` is folded into the section's
+    `limits_checking` block rather than answered behind a dotted key. The copy
+    is what keeps a module-level section constant (`_MIXED_SECTION`) from
+    carrying one test's posture into the next. Only `database_path` stays
+    deployment-wide, since the deployment mounts one limits database.
 
     `_assert_limits_readable_if_writable` does its own
     `from osprey.utils.config import get_config_value` inside the function
@@ -97,16 +128,27 @@ def _patch_config(
     `test_epics_gateway_selection.py` uses for `EPICSConnector.connect` —
     takes effect on the next call.
     """
+    control_system: dict[str, Any] = (
+        {"writes_enabled": writes_enabled} if section is None else dict(section)
+    )
+    if limits_enabled is not None:
+        control_system["limits_checking"] = {
+            **control_system.get("limits_checking", {}),
+            "enabled": limits_enabled,
+        }
+    targets = lane_targets or {}
 
     def fake_get_config_value(key: str, default=None):
-        if key == "control_system.writes_enabled":
-            return writes_enabled
-        if key == "control_system.limits_checking.enabled":
-            return limits_enabled if limits_enabled is not None else default
+        if key == "control_system":
+            return control_system
+        if key == "control_system.type":
+            return control_system.get("type", default)
         if key == "control_system.limits_checking.database_path":
             return db_path if db_path is not None else default
         if key == "project_root":
             return project_root if project_root is not None else default
+        if key.startswith("services.") and key.endswith(".target"):
+            return targets.get(key.split(".")[1], default)
         return default
 
     monkeypatch.setattr("osprey.utils.config.get_config_value", fake_get_config_value)
@@ -116,6 +158,25 @@ def _valid_limits_db(tmp_path: Path) -> Path:
     db = tmp_path / "channel_limits.json"
     db.write_text(json.dumps({"TEST:COR:01:SP": {"min_value": 0.0, "max_value": 10.0}}))
     return db
+
+
+def _spy_on_limits_probe(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every `LimitsValidator._load_limits_database` call, still doing it.
+
+    The returned list staying empty is the assertion that a non-writable
+    posture never even reached for the database.
+    """
+    from osprey.connectors.control_system.limits_validator import LimitsValidator
+
+    probe_calls: list[str] = []
+    original_load = LimitsValidator._load_limits_database
+
+    def spy(db_path: str):
+        probe_calls.append(db_path)
+        return original_load(db_path)
+
+    monkeypatch.setattr(LimitsValidator, "_load_limits_database", staticmethod(spy))
+    return probe_calls
 
 
 # =========================================================================
@@ -141,15 +202,16 @@ def test_writable_with_missing_limits_db_refuses_startup(
 def test_guard_runs_with_no_bluesky_env_set_at_all(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The guard is unconditional, not gated on any wiring flag.
+    """The guard is unconditional, not gated on any device-wiring flag.
 
-    It used to live inside the EPICS-substrate runner branch, so a deployment
-    that never set `BLUESKY_EPICS_SUBSTRATE` was never checked — a writable
-    project with an unreadable limits database came up clean. The autouse
-    fixture clears every one of those variables, so this test failing means the
-    guard has been re-gated on something.
+    It once lived inside the device-substrate runner branch, so a deployment
+    that wired up no devices — today, one that never sets
+    `BLUESKY_DEVICES_FILE` — was never checked, and a writable project with an
+    unreadable limits database came up clean. The autouse fixture clears every
+    wiring variable, so this test failing means the guard has been re-gated on
+    something.
     """
-    for var in (_SUBSTRATE_ENV, _SETPOINTS_ENV, _READBACKS_ENV, _TILED_URI_ENV):
+    for var in (_DEVICES_FILE_ENV, _TILED_URI_ENV):
         assert var not in os.environ
 
     missing = tmp_path / "does_not_exist.json"
@@ -226,6 +288,37 @@ def test_writable_with_relative_db_path_resolves_via_config_file_dir(
         assert resp.status_code == 200
 
 
+def test_writable_with_an_unreadable_limits_leaf_refuses_startup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A leaf that is present but not a literal boolean is a startup refusal.
+
+    The connector and the hook would refuse every write from the same posture;
+    the gate turns that into a refusal at startup naming the line to fix,
+    rather than a lane that starts writable and then denies everything.
+    """
+    # Arrange
+    _patch_config(
+        monkeypatch,
+        section={"type": "epics", "writes_enabled": True, "limits_checking": {"enabled": "true"}},
+        db_path=str(_valid_limits_db(tmp_path)),
+    )
+    probe_calls = _spy_on_limits_probe(monkeypatch)
+
+    # Act
+    with pytest.raises(RuntimeError) as excinfo:
+        with TestClient(app):
+            pass
+
+    # Assert
+    message = str(excinfo.value)
+    assert "control_system.limits_checking.enabled" in message
+    # An ABSENT deployment-wide leaf is unset, not unreadable, so it is not named.
+    assert "control_system.limits_checking.allow_unlisted_channels" not in message
+    assert "literal true or false" in message
+    assert probe_calls == []
+
+
 def test_writable_with_limits_checking_disabled_starts_without_db(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -244,16 +337,7 @@ def test_writes_disabled_starts_readonly_even_with_missing_db(
     missing = tmp_path / "does_not_exist.json"
     _patch_config(monkeypatch, writes_enabled=False, limits_enabled=True, db_path=str(missing))
 
-    from osprey.connectors.control_system.limits_validator import LimitsValidator
-
-    probe_calls: list[str] = []
-    original_load = LimitsValidator._load_limits_database
-
-    def spy(db_path: str):
-        probe_calls.append(db_path)
-        return original_load(db_path)
-
-    monkeypatch.setattr(LimitsValidator, "_load_limits_database", staticmethod(spy))
+    probe_calls = _spy_on_limits_probe(monkeypatch)
 
     with TestClient(app) as client:
         resp = client.get("/health")
@@ -281,3 +365,145 @@ def test_refusal_message_never_leaks_db_contents(
             pass
 
     assert "SECRET_MARKER_VALUE_DO_NOT_LEAK" not in str(excinfo.value)
+
+
+# =========================================================================
+# The posture checked is THIS LANE's, not the deployment's
+# =========================================================================
+
+#: A live-baseline deployment that arms writes on its virtual accelerator only:
+#: the deployment-wide key is false, and the only `writes_enabled: true` in the
+#: config sits under the `virtual_accelerator` connector block. A bridge lane
+#: serving `va` is therefore writable while one serving `live` is not.
+_MIXED_SECTION: dict[str, Any] = {
+    "type": "epics",
+    "writes_enabled": False,
+    "connector": {
+        "epics": {"gateway_address": "epics-gateway.example"},
+        "virtual_accelerator": {"writes_enabled": True},
+    },
+}
+
+_VA_LANE = "bluesky_va"
+_LIVE_LANE = "bluesky_live"
+_MIXED_LANE_TARGETS = {_VA_LANE: "va", _LIVE_LANE: "live"}
+
+
+def test_va_lane_requires_limits_db_when_only_the_va_block_is_armed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The armed lane refuses, even though `control_system.writes_enabled` is false."""
+    # Arrange
+    monkeypatch.setenv(_LANE_ENV, _VA_LANE)
+    missing = tmp_path / "does_not_exist.json"
+    _patch_config(
+        monkeypatch,
+        section=_MIXED_SECTION,
+        lane_targets=_MIXED_LANE_TARGETS,
+        limits_enabled=True,
+        db_path=str(missing),
+    )
+
+    # Act
+    with pytest.raises(RuntimeError) as excinfo:
+        with TestClient(app):
+            pass
+
+    # Assert
+    message = str(excinfo.value)
+    assert "control_system.connector.virtual_accelerator.writes_enabled" in message
+    assert f"lane {_VA_LANE} serves target va" in message
+
+
+def test_live_lane_does_not_require_limits_db_when_its_block_is_unarmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The unarmed lane of the same config starts, and never probes the database."""
+    # Arrange
+    monkeypatch.setenv(_LANE_ENV, _LIVE_LANE)
+    missing = tmp_path / "does_not_exist.json"
+    _patch_config(
+        monkeypatch,
+        section=_MIXED_SECTION,
+        lane_targets=_MIXED_LANE_TARGETS,
+        limits_enabled=True,
+        db_path=str(missing),
+    )
+    probe_calls = _spy_on_limits_probe(monkeypatch)
+
+    # Act
+    with TestClient(app) as client:
+        resp = client.get("/health")
+
+    # Assert
+    assert resp.status_code == 200
+    assert probe_calls == []
+
+
+def test_readonly_run_never_requires_the_limits_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A read-only run cannot write, so the armed lane needs no database either."""
+    # Arrange
+    monkeypatch.setenv(_LANE_ENV, _VA_LANE)
+    monkeypatch.setenv(_EXECUTION_MODE_ENV, "readonly")
+    missing = tmp_path / "does_not_exist.json"
+    _patch_config(
+        monkeypatch,
+        section=_MIXED_SECTION,
+        lane_targets=_MIXED_LANE_TARGETS,
+        limits_enabled=True,
+        db_path=str(missing),
+    )
+    probe_calls = _spy_on_limits_probe(monkeypatch)
+
+    # Act
+    with TestClient(app) as client:
+        resp = client.get("/health")
+
+    # Assert
+    assert resp.status_code == 200
+    assert probe_calls == []
+
+
+# =========================================================================
+# The device page size is parsed at boot, not at the first request
+# =========================================================================
+
+
+@pytest.mark.parametrize("bad_value", ["abc", "0", "-1"])
+def test_malformed_device_page_size_refuses_startup(
+    monkeypatch: pytest.MonkeyPatch, bad_value: str
+) -> None:
+    """A page size that is not a whole number >= 1 fails the boot.
+
+    Read-only posture, so the limits guard passes and the only thing left that
+    can refuse the lifespan is the page-size parse.
+    """
+    # Arrange
+    _patch_config(monkeypatch, writes_enabled=False)
+    monkeypatch.setenv(_DEVICE_PAGE_SIZE_ENV, bad_value)
+
+    # Act
+    with pytest.raises(ValueError) as excinfo:
+        with TestClient(app):
+            pass
+
+    # Assert
+    message = str(excinfo.value)
+    assert _DEVICE_PAGE_SIZE_ENV in message
+    assert bad_value in message
+
+
+def test_device_page_size_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset is the overwhelmingly common case, and it is not an error."""
+    monkeypatch.delenv(_DEVICE_PAGE_SIZE_ENV, raising=False)
+
+    assert queue.device_page_size() == 500
+
+
+def test_device_page_size_reads_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The value is read from `os.environ` on each call, never cached."""
+    monkeypatch.setenv(_DEVICE_PAGE_SIZE_ENV, "200")
+
+    assert queue.device_page_size() == 200

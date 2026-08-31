@@ -1,7 +1,10 @@
 """Per-persona local image builds for multi-user web-terminal deployments.
 
-``image_source: local`` deploys build one ``<project>-<persona>:local`` image
-per referenced persona before any compose invocation. Each of those builds needs
+``image_source: local`` deploys build one ``<project>:local`` image per
+referenced persona render before any compose invocation (the tag names the
+persona's rendered project — see
+:func:`osprey.deployment.web_terminals.personas.resolve_personas` for the
+naming rules, including the legacy suffixed fallback). Each of those builds needs
 a rendered persona project as its context, and ``osprey build`` is what writes
 one: :func:`verify_persona_renders` checks that every referenced persona has
 one and refuses the start when it does not. Nothing here renders — a start runs
@@ -28,6 +31,7 @@ from osprey.deployment.compose_generator import (
 )
 from osprey.deployment.runtime_helper import get_runtime_command
 from osprey.deployment.subprocess_capture import run_captured
+from osprey.deployment.web_terminals.env_production import deploy_issued_credential_vars
 from osprey.deployment.web_terminals.personas import effective_image_source
 from osprey.deployment.wheel_build import _staged_dev_artifact_paths
 from osprey.utils.config import ConfigBuilder
@@ -43,6 +47,43 @@ logger = get_logger("deployment.lifecycle")
 #: literal ``${VAR}`` it refused to encode, which is the only place the name of
 #: the variable an operator has to set is available to this module.
 _PLACEHOLDER_NAME_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}")
+
+#: The credential check's own prose ``still contains an unresolved '${VAR}'``,
+#: where ``VAR`` is boilerplate rather than a variable anyone can set. Stripped
+#: before :data:`_PLACEHOLDER_NAME_RE` runs, or every such message reports a
+#: variable literally named ``VAR`` beside the real one — which read as an
+#: instruction to set it, and now would also decide the store-issued carve-out
+#: below on a name that is not a credential at all.
+_PLACEHOLDER_BOILERPLATE_RE = re.compile(r"unresolved '\$\{VAR\}'")
+
+
+def _unresolved_placeholder_names(message: str) -> list[str]:
+    """Every env-var name an unresolved-credential message actually names."""
+    return sorted(set(_PLACEHOLDER_NAME_RE.findall(_PLACEHOLDER_BOILERPLATE_RE.sub("", message))))
+
+
+def _all_store_issued(names: list[str], config: dict) -> bool:
+    """Whether every one of ``names`` is a credential THIS deploy issues itself.
+
+    Answered by :func:`osprey.deployment.web_terminals.env_production.deploy_issued_credential_vars`
+    rather than restated here, so this carve-out and the missing-variable gate
+    read one definition — including its ``deployed_services`` half. A config
+    pointed at a telemetry store somebody else runs provisions nothing, so its
+    unresolved ingest token is a secret only the operator can supply and the
+    refusal below stands: deferring it there would let a deploy ship agents
+    whose telemetry password is a literal ``${VAR}``, under a warning saying
+    there was nothing to set.
+
+    All-or-nothing on purpose. For the deploys that DO issue these, no operator
+    can supply them — the store mints them, and `osprey up` harvests them after
+    the preflights — so an unresolved one is a sequencing fact, not a
+    misconfiguration. Any OTHER unresolved name in the same error is a real
+    missing secret, and the honest report for a mixed set is the refusal that
+    names all of them: an operator told "nothing to do here" who then has to
+    discover the other half from a container that failed to authenticate is
+    worse off than one handed the whole list at once.
+    """
+    return set(names) <= deploy_issued_credential_vars(config)
 
 
 def _persona_image_context(project_path: str | Path) -> Path:
@@ -110,12 +151,11 @@ def _resolve_persona_claude_cli_version(project_path: str) -> str | None:
 def _persona_image_build_cmd(
     runtime: str,
     context: str,
-    project: str,
-    persona: str,
+    image_tag: str,
     project_label: str,
     dev_mode: bool = False,
 ) -> list[str]:
-    """Construct the ``<runtime> build`` argv that produces ``<project>-<persona>:local``.
+    """Construct the ``<runtime> build`` argv that produces *image_tag*.
 
     Mirrors :func:`_project_image_build_cmd`'s argv shape (same
     ``OSPREY_PIP_SPEC`` build-arg, same runtime/tag/``-f``/context layout)
@@ -128,10 +168,10 @@ def _persona_image_build_cmd(
     :param runtime: Base container command (``docker`` or ``podman``).
     :param context: The persona's image build context — its container repo,
         :func:`_persona_image_context` of the rendered project.
-    :param project: The persona catalog entry's resolved ``project`` name
-        (tag prefix, matching :func:`osprey.deployment.web_terminals.personas.resolve_personas`'s
-        ``<project>-<persona>:local`` naming).
-    :param persona: The persona catalog key (tag suffix).
+    :param image_tag: The tag to build, exactly as
+        :func:`osprey.deployment.web_terminals.personas.resolve_personas`
+        resolved it into the entry's ``image`` — the single derivation site
+        for persona tag naming, never recomputed here.
     :param dev_mode: Whether ``--dev`` was passed (adds an ``OSPREY_DEV=1``
         build-arg, mirroring :func:`_project_image_build_cmd`'s dev path).
     :param project_label: THIS DEPLOYMENT's project name
@@ -154,7 +194,7 @@ def _persona_image_build_cmd(
         runtime,
         "build",
         "-t",
-        f"{project}-{persona}:local",
+        image_tag,
         "-f",
         os.path.join(render, "Dockerfile"),
         "--label",
@@ -198,10 +238,12 @@ def _referenced_personas(config: dict, resolved_users: list[dict]) -> list[dict[
     :param config: Raw deploy config (read for ``modules.web_terminals.personas``).
     :param resolved_users: :func:`osprey.deployment.web_terminals.personas.resolve_personas`'s
         output.
-    :return: One ``{"persona", "project", "project_path", "build_profile"}``
-        dict per distinct referenced persona, in first-seen order
+    :return: One ``{"persona", "project", "project_path", "build_profile",
+        "image"}`` dict per distinct referenced persona, in first-seen order
         (``build_profile`` is the catalog entry's value, or ``""`` when it has
-        none or a non-string one).
+        none or a non-string one; ``image`` is the tag ``resolve_personas``
+        resolved for the entry — the single derivation site, carried through
+        rather than recomputed).
     """
     web_terminals = (config.get("modules") or {}).get("web_terminals") or {}
     personas_raw = web_terminals.get("personas")
@@ -229,10 +271,11 @@ def _referenced_personas(config: dict, resolved_users: list[dict]) -> list[dict[
             continue
         seen.add(persona_name)
         # Trust resolve_personas' contract that every resolved entry carries a
-        # non-empty "project" — no persona_name fallback here, which would
-        # silently diverge from the tag resolve_personas itself resolved
-        # (<project>-<persona>:local) if that contract were ever violated.
+        # non-empty "project" and "image" — no fallback derivation here, which
+        # would silently diverge from the tag resolve_personas itself resolved
+        # if that contract were ever violated.
         project = cast(str, entry.get("project"))
+        image = cast(str, entry.get("image"))
         # The delta this entry says its project was rendered from; carried here
         # so verify_persona_renders need not re-walk the catalog to explain an
         # absent one. Normalized to "" when absent or non-str, which that caller
@@ -244,6 +287,7 @@ def _referenced_personas(config: dict, resolved_users: list[dict]) -> list[dict[
                 "project": project,
                 "project_path": project_path,
                 "build_profile": build_profile if isinstance(build_profile, str) else "",
+                "image": image,
             }
         )
     return referenced
@@ -474,7 +518,9 @@ def _resolve_persona_profile(build_profile: str, persona_name: str, profile_root
     return candidate
 
 
-def _check_existing_render(persona_name: str, project_path: Path, repo_root: Path) -> None:
+def _check_existing_render(
+    persona_name: str, project_path: Path, repo_root: Path, config: dict
+) -> None:
     """Accept a persona's rendered project, or say why it is unusable.
 
     The render is ``osprey build``'s and the start is only reading it, so this
@@ -510,10 +556,21 @@ def _check_existing_render(persona_name: str, project_path: Path, repo_root: Pat
     handed the wrong one of those goes and changes something that was never
     wrong.
 
+    One class of unresolved credential is NOT a refusal: the ones this deploy
+    issues itself (:func:`_all_store_issued`). The shipped telemetry blocks
+    authenticate as the store's ingest service account, whose token the store
+    mints and ``osprey up`` harvests — after this gate, since the store has to
+    be running first. That holds only for a deploy that RUNS the store, which
+    is why ``config`` is read here; see :func:`_all_store_issued` for why the
+    carve-out is both deployed-services-gated and all-or-nothing.
+
     Args:
         persona_name: The persona whose render is being checked.
         project_path: Its rendered project directory under ``build/``.
         repo_root: The deployment repo — the zone holding ``.env``.
+        config: Raw deploy config — read for ``deployed_services`` alone, to
+            tell a credential this start will provision from one only the
+            operator can supply.
 
     Raises:
         ValueError: Naming the persona, the directory, and the way out.
@@ -549,7 +606,29 @@ def _check_existing_render(persona_name: str, project_path: Path, repo_root: Pat
         # the credential failures land here — an unusable endpoint stays a
         # general telemetry misconfiguration and keeps the broad frame.
         env_path = repo_root / ENV_LOCAL_FILENAME
-        names = sorted(set(_PLACEHOLDER_NAME_RE.findall(str(e))))
+        names = _unresolved_placeholder_names(str(e))
+        if names and _all_store_issued(names, config):
+            # Not a refusal: every unresolved name here is a credential THIS
+            # DEPLOY issues, and it issues them later in the same start than
+            # this gate runs (`_stage_openobserve_identity`, after the
+            # preflights). Refusing would abort every first `osprey up` for the
+            # absence of a value only that aborted start could have produced.
+            # Deliberately not silent, and deliberately all-or-nothing: one
+            # name an operator does have to supply and the refusal below
+            # stands, unchanged, for the whole set.
+            logger.warning(
+                "Persona %r render at %s names %s, which is not set yet: %s. "
+                "This deploy issues that credential itself when it starts the "
+                "telemetry store, so the value lands in %s later in this same "
+                "start and the agent picks it up when it spawns. Nothing to "
+                "set by hand.",
+                persona_name,
+                project_path,
+                ", ".join(names),
+                e,
+                env_path,
+            )
+            return
         if names:
             # Names only, never values: a placeholder is unresolved precisely
             # because nothing on this host holds the value to print.
@@ -560,14 +639,30 @@ def _check_existing_render(persona_name: str, project_path: Path, repo_root: Pat
                 "Give the telemetry block's openobserve.user and "
                 f"openobserve.password real values, via {env_path} — "
             )
+        # Which sentence closes this depends on whether the deploy runs the
+        # store: "start it and the value appears" is true only where a start
+        # provisions something, and reads as an instruction to retry on a
+        # config pointed at somebody else's store — where retrying forever
+        # changes nothing.
+        if deploy_issued_credential_vars(config):
+            closing = (
+                "Note that `osprey up` mints the observability store's own "
+                "ZO_ROOT_USER_PASSWORD into that file when it starts the "
+                "store, so a deployment that has never been started will not "
+                "have one there yet."
+            )
+        else:
+            closing = (
+                "This deployment does not run the observability store itself, "
+                "so no start of it will ever issue these credentials — they "
+                "come from whoever operates that store, and the value has to "
+                "be put in that file by hand."
+            )
         raise ValueError(
             f"Persona {persona_name!r} render at {project_path} names "
             f"observability credentials this deployment cannot resolve:\n  {e}\n"
             f"{remedy}then re-render with `osprey build`. The model "
-            "configuration is not what is wrong here. Note that `osprey up` "
-            "mints the observability store's own ZO_ROOT_USER_PASSWORD into "
-            "that file when it starts the store, so a deployment that has "
-            "never been started will not have one there yet."
+            f"configuration is not what is wrong here. {closing}"
         ) from e
     except ValueError as e:
         raise ValueError(
@@ -636,7 +731,7 @@ def verify_persona_renders(
         project_path = Path(unit["project_path"])
 
         if project_path.exists():
-            _check_existing_render(persona_name, project_path, repo_root)
+            _check_existing_render(persona_name, project_path, repo_root, config)
             continue
 
         build_profile = unit["build_profile"]
@@ -670,7 +765,7 @@ def verify_persona_renders(
 def build_persona_images(
     config: dict, resolved_users: list[dict], dev_mode: bool, env: dict
 ) -> None:
-    """Build every REFERENCED persona's ``<project>-<persona>:local`` image (local mode only).
+    """Build every REFERENCED persona's ``<project>:local`` image (local mode only).
 
     Generalizes :func:`_build_project_image`'s local-build pattern (build
     context + ``-f`` Dockerfile + ``OSPREY_PIP_SPEC`` build-arg + dev-wheel
@@ -679,8 +774,11 @@ def build_persona_images(
     :func:`_referenced_personas` finds in ``resolved_users``, even when
     several users share it. :func:`_build_project_image` itself is untouched:
     the dispatch worker's ``<project>:local`` image is a different tag,
-    disjoint from every ``<persona.project>-<persona>:local`` tag this
-    function produces, and is built independently.
+    disjoint from every persona tag this function produces — a disjointness
+    the ``persona_project_shadows_worker_image`` lint rule enforces now that
+    persona tags carry no ``-<persona>`` suffix of their own (the legacy
+    no-``project`` fallback keeps its suffix and stays disjoint by
+    construction) — and is built independently.
 
     No-op when ``modules.web_terminals.image_source`` is not ``"local"``
     (the default, ``"registry"``): a registry-mode deploy pulls every
@@ -739,9 +837,19 @@ def build_persona_images(
     # The deployment repo whose var/logs/ takes each build's spooled output.
     repo_root = resolve_repo_root(config)
 
+    # Personas sharing one render (same catalog `project` AND `project_path`)
+    # resolve to the same tag and the same content — one build serves them all.
+    built_tags: set[str] = set()
+
     for unit in referenced:
         persona_name = unit["persona"]
-        project = unit["project"]
+        if unit["image"] in built_tags:
+            logger.debug(
+                "Persona %r shares the already-built image %r; skipping its build.",
+                persona_name,
+                unit["image"],
+            )
+            continue
         # The container repo the build renders for this persona — NOT the flat
         # host render the catalog names. See _persona_image_context.
         context = str(_persona_image_context(unit["project_path"]))
@@ -766,15 +874,14 @@ def build_persona_images(
                 )
 
         try:
+            image_tag = unit["image"]
             cmd = _persona_image_build_cmd(
                 runtime,
                 context,
-                project,
-                persona_name,
+                image_tag,
                 project_label,
                 dev_mode and wheel_staged,
             )
-            image_tag = f"{project}-{persona_name}:local"
             # No "building X:" announcement: the live build region carries the
             # progress while it runs, and the step line below reports the
             # finished image.
@@ -792,7 +899,7 @@ def build_persona_images(
                 run_captured(
                     cmd,
                     env=env,
-                    spool_name=f"build-persona-{project}-{persona_name}",
+                    spool_name=f"build-persona-{image_tag.split(':', 1)[0]}",
                     repo_root=repo_root,
                     on_line=report,
                 )
@@ -800,6 +907,7 @@ def build_persona_images(
             # local-mode deploy, and the only progress an operator gets while
             # a handful of multi-minute builds run one after another.
             _report_step(f"persona image {image_tag}")
+            built_tags.add(image_tag)
         finally:
             # Remove BOTH staged artifacts (wheel + requirements manifest) so
             # neither can poison a later non-dev build in this context.

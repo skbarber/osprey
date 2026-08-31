@@ -43,13 +43,46 @@ def _build_mock_registry():
     )
     semantic_mod.get_parameter_descriptors = None  # type: ignore[attr-defined]
 
-    registry.list_ariel_search_modules.return_value = ["keyword", "semantic"]
+    # Registered but left disabled by the shared fixture config, so it stays out
+    # of every existing test's capabilities; the hybrid tests enable it locally.
+    hybrid_mod = types.ModuleType("hybrid")
+    hybrid_mod.get_tool_descriptor = lambda: SearchToolDescriptor(  # type: ignore[attr-defined]
+        name="hybrid_search",
+        description="Hybrid retrieval with optional reranking",
+        search_mode="hybrid",
+        args_schema=MagicMock(),
+        execute=AsyncMock(),
+        format_result=MagicMock(),
+    )
+    hybrid_mod.get_parameter_descriptors = None  # type: ignore[attr-defined]
+
+    registry.list_ariel_search_modules.return_value = ["keyword", "semantic", "hybrid"]
     registry.get_ariel_search_module.side_effect = lambda n: {
         "keyword": keyword_mod,
         "semantic": semantic_mod,
+        "hybrid": hybrid_mod,
     }.get(n)
 
     return registry
+
+
+def _enable_hybrid(service) -> None:
+    """Give the mock service a config in which the hybrid module is enabled.
+
+    Applied per test rather than in the shared ``mock_ariel_service`` fixture,
+    whose config several other tests assert against verbatim.
+    """
+    service.config = ARIELConfig.from_dict(
+        {
+            "database": {"uri": "postgresql://localhost:5432/test"},
+            "search_modules": {
+                "keyword": {"enabled": True},
+                "semantic": {"enabled": True, "model": "test-model"},
+                "hybrid": {"enabled": True},
+            },
+            "default_search_mode": "keyword",
+        }
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -700,9 +733,347 @@ def test_search_honors_configured_default_mode(client, mock_ariel_service):
     assert mock_ariel_service.search.call_args.kwargs["mode"] == "semantic"
 
 
+@pytest.mark.parametrize("value", ["yes", "false", 1, 0, 1.0, []])
+def test_search_hybrid_rejects_non_boolean_rerank(client, mock_ariel_service, value):
+    """A non-boolean ``rerank`` override is a 400, not a truthiness accident.
+
+    The panel sends the toggle's boolean, but a hand-written caller can send
+    ``"false"`` -- which is truthy everywhere downstream and would silently run
+    the slow reranked path the caller asked to skip.
+    """
+    _enable_hybrid(mock_ariel_service)
+
+    response = client.post(
+        "/api/search",
+        json={
+            "query": "test",
+            "mode": "hybrid",
+            "max_results": 10,
+            "advanced_params": {"rerank": value},
+        },
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "rerank must be a boolean" in detail
+    assert repr(value) in detail
+    mock_ariel_service.search.assert_not_called()
+
+
+@pytest.mark.parametrize("value", [0, -1, "40", 12.5, True])
+def test_search_hybrid_rejects_bad_candidate_limit(client, mock_ariel_service, value):
+    """``candidate_limit`` must be a positive int -- booleans and zero included."""
+    _enable_hybrid(mock_ariel_service)
+
+    response = client.post(
+        "/api/search",
+        json={
+            "query": "test",
+            "mode": "hybrid",
+            "max_results": 10,
+            "advanced_params": {"candidate_limit": value},
+        },
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "candidate_limit must be a positive integer" in detail
+    assert repr(value) in detail
+    mock_ariel_service.search.assert_not_called()
+
+
+def test_search_hybrid_forwards_valid_overrides_verbatim(client, mock_ariel_service):
+    """Well-formed overrides reach the service untouched -- ``False`` included.
+
+    ``rerank: false`` is the whole point of the override, so it must survive as
+    the boolean ``False`` rather than being dropped as falsy.
+    """
+    _enable_hybrid(mock_ariel_service)
+
+    response = client.post(
+        "/api/search",
+        json={
+            "query": "test",
+            "mode": "hybrid",
+            "max_results": 10,
+            "advanced_params": {"rerank": False, "candidate_limit": 12},
+        },
+    )
+
+    assert response.status_code == 200
+    call_kwargs = mock_ariel_service.search.call_args.kwargs
+    assert call_kwargs["mode"] == "hybrid"
+    assert call_kwargs["advanced_params"]["rerank"] is False
+    assert call_kwargs["advanced_params"]["candidate_limit"] == 12
+
+
+def test_search_hybrid_without_overrides_is_accepted(client, mock_ariel_service):
+    """Absent keys mean "use the configured default" and are not rejected."""
+    _enable_hybrid(mock_ariel_service)
+
+    response = client.post(
+        "/api/search",
+        json={"query": "test", "mode": "hybrid", "max_results": 10},
+    )
+
+    assert response.status_code == 200
+    assert mock_ariel_service.search.call_args.kwargs["mode"] == "hybrid"
+
+
+def test_search_hybrid_accepts_explicit_null_overrides(client, mock_ariel_service):
+    """An explicit ``null`` says "no override" just as an absent key does."""
+    _enable_hybrid(mock_ariel_service)
+
+    response = client.post(
+        "/api/search",
+        json={
+            "query": "test",
+            "mode": "hybrid",
+            "max_results": 10,
+            "advanced_params": {"rerank": None, "candidate_limit": None},
+        },
+    )
+
+    assert response.status_code == 200
+    call_kwargs = mock_ariel_service.search.call_args.kwargs
+    assert call_kwargs["advanced_params"]["rerank"] is None
+    assert call_kwargs["advanced_params"]["candidate_limit"] is None
+
+
+@pytest.mark.parametrize("mode", ["keyword", "semantic"])
+def test_search_non_hybrid_modes_ignore_hybrid_overrides(client, mock_ariel_service, mode):
+    """The check is hybrid-only: other modes never see these keys as theirs.
+
+    ``rerank`` and ``candidate_limit`` are hybrid's parameter names. Another
+    module is free to give them any meaning, so validating them everywhere
+    would reject requests this route has no business judging.
+    """
+    _enable_hybrid(mock_ariel_service)
+
+    response = client.post(
+        "/api/search",
+        json={
+            "query": "test",
+            "mode": mode,
+            "max_results": 10,
+            "advanced_params": {"rerank": "yes", "candidate_limit": 0},
+        },
+    )
+
+    assert response.status_code == 200
+    call_kwargs = mock_ariel_service.search.call_args.kwargs
+    assert call_kwargs["advanced_params"]["rerank"] == "yes"
+    assert call_kwargs["advanced_params"]["candidate_limit"] == 0
+
+
+def test_search_hybrid_leaves_expand_query_alone(client, mock_ariel_service):
+    """Only the two hybrid keys are judged; ``expand_query`` passes through."""
+    _enable_hybrid(mock_ariel_service)
+
+    response = client.post(
+        "/api/search",
+        json={
+            "query": "test",
+            "mode": "hybrid",
+            "max_results": 10,
+            "advanced_params": {"expand_query": "yes", "rerank": True},
+        },
+    )
+
+    assert response.status_code == 200
+    assert mock_ariel_service.search.call_args.kwargs["advanced_params"]["expand_query"] == "yes"
+
+
 def test_capabilities_advertises_default_mode(client, mock_ariel_service):
     """The capabilities payload carries the mode the UI should open on."""
     response = client.get("/api/capabilities")
 
     assert response.status_code == 200
     assert response.json()["default_mode"] == "keyword"
+
+
+def test_put_config_backs_up_into_the_state_zone(client, tmp_path):
+    """ARIEL's config save copies the old file into the agent-data state zone.
+
+    Not beside ``config.yml``. That file lives in the render, which the container
+    split makes root-owned: creating a *new* file next to it needs write
+    permission on the render directory that the admin image will not have, and
+    the backup runs before a byte of the save is written -- so the old sibling
+    scheme would have turned every ARIEL config save in that image into a 500.
+    Anchored on the directory the route already resolves its config path in.
+    """
+    from osprey.utils.config_writer import config_backup_path
+
+    config_path = tmp_path / "config.yml"
+    original = "project_name: original\n"
+    config_path.write_text(original)
+    client.app.state.config_path = config_path
+
+    response = client.put("/api/config", json={"content": "project_name: updated\n"})
+
+    assert response.status_code == 200
+    assert config_path.read_text() == "project_name: updated\n"
+
+    backup = config_backup_path(config_path)
+    assert backup.read_text() == original
+    assert backup.parent.name == "config-backups"
+    # The point of the move: nothing new lands next to the config itself.
+    assert not (tmp_path / "config.yml.bak").exists()
+    assert [f.name for f in tmp_path.iterdir() if f.suffix == ".bak"] == []
+
+
+def test_put_config_backup_follows_a_relocated_agent_data_root(client, tmp_path):
+    """The zone is read from the config being written, never assumed.
+
+    Resolved from the *pre-write* file, which is the only reading that makes
+    sense: the backup is a copy of what is there now, so it belongs in the zone
+    that config names now.
+
+    The saved document carries ``agent_data`` through unchanged, because it has
+    to: ``agent_data.*`` is in the protected set, so a body that dropped it
+    would be refused before the backup ran and this would stop being a test of
+    where the backup lands.
+    """
+    from osprey.utils.config_writer import config_backup_path
+
+    relocated = tmp_path / "elsewhere" / "state"
+    config_path = tmp_path / "config.yml"
+    original = f"agent_data:\n  base_dir: {relocated}\nproject_name: original\n"
+    config_path.write_text(original)
+    expected = config_backup_path(config_path)
+    assert expected == relocated / "config-backups" / "config.yml.bak"
+    client.app.state.config_path = config_path
+
+    response = client.put(
+        "/api/config",
+        json={"content": original.replace("project_name: original", "project_name: updated")},
+    )
+
+    assert response.status_code == 200
+    assert expected.read_text() == original
+    assert not (tmp_path / "var").exists()
+
+
+# --------------------------------------------------------------------------
+# PUT /api/config and the protected set
+#
+# ARIEL's Raw YAML save replaces the whole document, so it is the widest write
+# surface onto the file that carries the write gate, the approval gate and the
+# paths the safety layers derive their zones from. It is gated exactly the way
+# the Web Terminal's ``PUT /api/config`` is -- same protected set, same 403,
+# same ``http_config`` audit record -- because the protected set is
+# consulted by *every* framework writer, not just the terminal's.
+# --------------------------------------------------------------------------
+
+_PROTECTED_DOC = (
+    "agent_data:\n"
+    "  base_dir: {state}\n"
+    "control_system:\n"
+    "  writes_enabled: false\n"
+    "project_name: original\n"
+)
+
+
+@pytest.fixture
+def audit_zone(tmp_path, monkeypatch):
+    """Redirect the audit zone. ``writer.audit_dir`` is the ledger's one seam."""
+    from osprey.audit import writer
+
+    zone = tmp_path / "audit-zone" / "var" / "audit"
+    monkeypatch.setattr(writer, "audit_dir", lambda: zone)
+    return zone
+
+
+def _audit_records(zone):
+    import json
+
+    from osprey.audit.protected import SURFACE_HTTP_CONFIG
+    from osprey.utils.identity import acting_identity
+
+    path = zone / acting_identity() / f"{SURFACE_HTTP_CONFIG}.jsonl"
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+@pytest.fixture
+def gated_config(client, tmp_path):
+    """A config.yml carrying protected keys, wired into the ARIEL app state."""
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(_PROTECTED_DOC.format(state=tmp_path / "state"))
+    client.app.state.config_path = config_path
+    return config_path
+
+
+def test_put_config_refuses_a_removed_protected_key(client, gated_config, audit_zone):
+    """Dropping ``agent_data`` on the way past is a protected-key change, not a save."""
+    before = gated_config.read_bytes()
+
+    response = client.put(
+        "/api/config",
+        json={"content": "control_system:\n  writes_enabled: false\nproject_name: updated\n"},
+    )
+
+    assert response.status_code == 403
+    detail = response.json()["detail"]
+    assert "agent_data.base_dir" in detail
+    assert "config.yml is unchanged" in detail
+    # The operator is pointed at the channel that *can* carry the change.
+    assert "`config:` block" in detail
+    # Byte-identical: no write, and no backup either -- a backup is a copy of a
+    # file this request may turn out not to be allowed to replace.
+    assert gated_config.read_bytes() == before
+    assert not (gated_config.parent / "state").exists()
+
+    records = _audit_records(audit_zone)
+    assert len(records) == 1
+    assert records[0]["surface"] == "http_config"
+    assert "target=config.yml" in records[0]["detail"]
+    assert records[0]["subject"] == "agent_data.base_dir"
+    assert records[0]["reason"] == "protected_key"
+
+
+def test_put_config_refuses_a_changed_protected_value(client, gated_config, audit_zone):
+    """Flipping the write gate through the YAML editor is the write that must not land."""
+    before = gated_config.read_bytes()
+    flipped = _PROTECTED_DOC.format(state=gated_config.parent / "state").replace(
+        "writes_enabled: false", "writes_enabled: true"
+    )
+
+    response = client.put("/api/config", json={"content": flipped})
+
+    assert response.status_code == 403
+    assert "control_system.writes_enabled" in response.json()["detail"]
+    assert gated_config.read_bytes() == before
+
+    records = _audit_records(audit_zone)
+    assert [r["subject"] for r in records] == ["control_system.writes_enabled"]
+
+
+def test_put_config_refusal_leaks_no_value(client, gated_config, audit_zone):
+    """Config values are secrets; a refusal reports the key, never the value."""
+    import json as _j
+
+    sentinel = "qqzzSENTINELvalue77"
+    planted = _PROTECTED_DOC.format(state=sentinel)
+
+    response = client.put("/api/config", json={"content": planted})
+
+    assert response.status_code == 403
+    assert sentinel not in response.text
+    assert sentinel not in _j.dumps(_audit_records(audit_zone))
+
+
+def test_put_config_allows_an_unprotected_edit(client, gated_config, audit_zone):
+    """An edit that leaves every protected key alone still saves, and still backs up."""
+    from osprey.utils.config_writer import config_backup_path
+
+    before = gated_config.read_text()
+    updated = before.replace("project_name: original", "project_name: updated")
+
+    response = client.put("/api/config", json={"content": updated})
+
+    assert response.status_code == 200
+    assert gated_config.read_text() == updated
+    assert config_backup_path(gated_config).read_text() == before
+    assert _audit_records(audit_zone) == []

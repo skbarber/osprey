@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from jinja2 import Environment, FileSystemLoader, select_autoescape
+from jinja2 import Environment, FileSystemLoader, TemplateRuntimeError, select_autoescape
 
 from osprey.build.build_tiers import (
     VALID_CHANNEL_FINDER_MODES,
@@ -17,12 +17,45 @@ from osprey.build.build_tiers import (
 from osprey.cli.templates import claude_code, manifest, scaffolding
 from osprey.cli.templates._rendering import render_template as _render_template
 from osprey.errors import BuildProfileError
+from osprey.port_layout import DEFAULT_PORT_BASE, layout_ports
 from osprey.profiles.web_panels import BUILTIN_PANELS
 from osprey.utils.config import resolve_env_vars
 from osprey.utils.facility import resolve_facility_name
 from osprey.utils.workspace import repo_root_for_config
 
 logger = logging.getLogger("osprey.cli.templates")
+
+
+def _enable_flags(channel_finder_mode: str) -> dict[str, bool]:
+    """One ``enable_<paradigm>`` template flag per registered paradigm.
+
+    Derived by iterating
+    :data:`osprey.build.build_tiers.VALID_CHANNEL_FINDER_MODES`, so a paradigm
+    added to the registry gets its render flag without an edit here. An
+    unregistered mode leaves every flag off; callers reject it before this
+    point.
+
+    ``enable_graph`` is derived like the rest and read by nothing. The graph
+    paradigm has no config block for a template to gate: ``pipeline_mode:
+    graph`` plus the ``services.graphdb`` declaration is its whole
+    configuration. Keeping the flag derived rather than special-casing it out
+    holds this set to the registry, and
+    ``tests/templates/test_control_assistant_config.py`` pins both halves —
+    the flag is emitted, and no template under ``src/osprey/templates``
+    mentions it.
+    """
+    return {f"enable_{mode}": channel_finder_mode == mode for mode in VALID_CHANNEL_FINDER_MODES}
+
+
+def _fail(message: str) -> None:
+    """Abort the render from inside a template.
+
+    Registered as the ``fail`` global on the manager's Jinja environment so a
+    template can refuse a case it has no branch for — ``{% else %}{{ fail(...)
+    }}`` at the end of a chain — instead of quietly emitting nothing. Jinja
+    otherwise has no way for a template to stop a render.
+    """
+    raise TemplateRuntimeError(message)
 
 
 class TemplateManager:
@@ -49,6 +82,7 @@ class TemplateManager:
             autoescape=select_autoescape(["html", "xml"]),
             keep_trailing_newline=True,
         )
+        self.jinja_env.globals["fail"] = _fail
 
     def _get_template_root(self) -> Path:
         """Get path to osprey templates directory.
@@ -193,105 +227,11 @@ class TemplateManager:
         if not project_dir.exists():
             project_dir.mkdir(parents=True)
 
-        # 3. Prepare template context
-        package_name = project_name.replace("-", "_").lower()
-        class_name = self._generate_class_name(package_name)
-
-        # Detect current Python environment
-        import sys
-
-        current_python = sys.executable
-
-        # Fall back to preset profile artifacts when the caller didn't pass any.
-        # An explicit empty dict from `osprey build` means the
-        # profile deliberately selects nothing, and must not be overridden.
-        if artifacts is None:
-            tmpl_manifest = manifest.load_template_manifest(self.template_root, data_bundle)
-            if tmpl_manifest:
-                artifacts = tmpl_manifest.get("artifacts", {})
-
-        # Derive feature flags from artifact selections.
-        selected_hooks = (artifacts or {}).get("hooks", [])
-        selected_web_panels = (artifacts or {}).get("web_panels", [])
-
-        ctx = {
-            "project_name": project_name,
-            "package_name": package_name,
-            "app_display_name": project_name,  # Used in templates for display/documentation
-            "app_class_name": class_name,  # Used in templates for class names
-            "registry_class_name": class_name,  # Backward compatibility
-            "project_description": f"{project_name} - Osprey Agent Application",
-            "framework_version": manifest.get_framework_version(),
-            "project_root": str(project_dir.absolute()),
-            "venv_path": "${LOCAL_PYTHON_VENV}",
-            "current_python_env": current_python,  # Default; overridden by caller context
-            "template_name": data_bundle,  # Make bundle name available in config.yml
-            "data_bundle": data_bundle,
-            "selected_hooks": selected_hooks,
-            "selected_web_panels": selected_web_panels,
-            # Enable-able builtin panel registry (single source of truth in
-            # osprey.profiles.web_panels). Templates derive their enable list
-            # from this so it can't drift from the real registry. sorted() for
-            # deterministic rendered output.
-            "builtin_panels": sorted(BUILTIN_PANELS),
-            # No `env` key: the render reads nothing from `os.environ`, and
-            # writes no `.env` at all — the deployment's one secret store is the
-            # repo-root `.env`, outside this tree.
-            # Provider API-key env vars, derived from the provider registry
-            # (single source of truth in osprey.models.provider_registry) so
-            # env.example.j2 can't drift from the real provider list.
-            # Ordered list of {"provider", "var"} dicts; key-less providers
-            # (ollama, vllm, …) are excluded.
-            "provider_api_keys": scaffolding.provider_api_key_entries(),
-            # The subset of the above this profile actually uses. Empty here so
-            # a caller with no profile still renders the whole list uncommented;
-            # `osprey init` fills it in and the rest drop below a divider.
-            "active_provider_vars": [],
-            # Deploy-minted service credentials, derived from the map the
-            # deploy path mints from, so .env.example documents every one of
-            # them. Ordered list of {"var", "services", "note"} dicts.
-            "service_token_vars": scaffolding.service_token_var_entries(),
-            # The build profile's `env:` block, documented in .env.example.
-            # Defaulted here so a caller that has no profile (programmatic
-            # create_project) still renders the file.
-            "env_required": [],
-            "env_defaults": {},
-            **(context or {}),
-        }
-
-        # Derive channel finder configuration when the channel-finder agent
-        # is selected (either explicitly via build profile artifacts, or via
-        # the preset-profile fallback above for programmatic callers).
-        _profile_agents = (artifacts or {}).get("agents", [])
-        if "channel-finder" in _profile_agents:
-            channel_finder_mode = ctx.get("channel_finder_mode")
-            if channel_finder_mode is None:
-                raise BuildProfileError(
-                    "channel_finder_mode is required when the channel-finder agent "
-                    "is selected. Pin it in your profile "
-                    "(e.g. `channel_finder_mode: hierarchical`) or pass "
-                    "`--set channel_finder_mode=<paradigm>` to `osprey build`."
-                )
-            if channel_finder_mode not in VALID_CHANNEL_FINDER_MODES:
-                raise BuildProfileError(
-                    f"channel_finder_mode must be one of {VALID_CHANNEL_FINDER_MODES} "
-                    f"(got {channel_finder_mode!r})"
-                )
-            from osprey.registry.mcp import CHANNEL_FINDER_TOOLS_BY_PIPELINE
-
-            ctx.update(
-                {
-                    "channel_finder_mode": channel_finder_mode,
-                    "enable_in_context": channel_finder_mode == "in_context",
-                    "enable_hierarchical": channel_finder_mode == "hierarchical",
-                    "enable_middle_layer": channel_finder_mode == "middle_layer",
-                    "default_pipeline": channel_finder_mode,
-                    "channel_finder_pipeline": channel_finder_mode,
-                    "channel_finder_tools": list(
-                        CHANNEL_FINDER_TOOLS_BY_PIPELINE.get(channel_finder_mode, [])
-                    ),
-                }
-            )
+        # 3. Prepare template context. The artifact fallback is resolved into
+        # the local so the manifest-output filtering below reads the same
+        # effective selection the context was built from.
+        artifacts = self._effective_artifacts(data_bundle, artifacts)
+        ctx = self._project_context(project_name, project_dir, data_bundle, context, artifacts)
 
         # 4. Create project structure
         scaffolding.create_project_structure(
@@ -336,7 +276,7 @@ class TemplateManager:
         scaffolding.copy_template_data(
             self.template_root,
             project_dir,
-            package_name,
+            ctx["package_name"],
             data_bundle,
             ctx,
             jinja_env=self.jinja_env,
@@ -406,10 +346,15 @@ class TemplateManager:
             ctx["facility_permissions"] = cc_config.get("permissions", {})
             # Model provider resolution for init-time rendering
             from osprey.build.claude_code_resolver import ClaudeCodeModelResolver
+            from osprey.build.claude_code_telemetry import openobserve_published_port
 
             api_providers = rendered_config.get("api", {}).get("providers", {})
             try:
-                model_spec = ClaudeCodeModelResolver.resolve(cc_config, api_providers)
+                model_spec = ClaudeCodeModelResolver.resolve(
+                    cc_config,
+                    api_providers,
+                    openobserve_port=openobserve_published_port(rendered_config),
+                )
             except ValueError:
                 model_spec = None
             ctx["claude_code_model_spec"] = model_spec
@@ -447,15 +392,39 @@ class TemplateManager:
         for key, value in claude_code.config_derived_context(rendered_config, project_dir).items():
             ctx.setdefault(key, value)
 
+        # ...except the deny floor, which is NOT the caller's to soften. Every
+        # other key above is project configuration a caller may legitimately
+        # pre-empt; this one is the security floor settings.json renders into
+        # permissions.deny (Bash and Edit among them). While it was a literal
+        # inside settings.json.j2 no caller could reach it at all, and hoisting
+        # it into the context must not quietly hand over that authority: under
+        # setdefault a caller passing deny_defaults=[] would render a project
+        # that denies nothing. Facilities widen or narrow the floor through
+        # config.yml's claude_code.permissions (deny / remove_deny), which the
+        # template applies on top of this list -- that is the supported route,
+        # and it is auditable in the profile. Assigned, not setdefault, so the
+        # framework wins; the build's own path (build_claude_code_context) gets
+        # the same precedence from its ctx.update.
+        ctx["deny_defaults"] = list(claude_code.DENY_DEFAULTS)
+
         claude_code.apply_textbooks_root(ctx, project_dir)
 
         # Resolve servers and agents via the data-driven registry.
-        from osprey.registry.mcp import resolve_agents, resolve_servers
+        from osprey.registry.mcp import mixed_read_write_tools, resolve_agents, resolve_servers
 
         ctx["servers"] = resolve_servers(cc_cfg, ctx)
         ctx["agents"] = resolve_agents(cc_cfg, ctx, project_dir, ctx["servers"])
         ctx["enabled_servers"] = {s["name"] for s in ctx["servers"] if s["enabled"]}
         ctx["enabled_agents"] = {a["name"] for a in ctx["agents"] if a["enabled"]}
+        # The render's read/write-MIXED tools, exactly as build_claude_code_context
+        # computes them for the regen path. Both paths render hook_config.json, and
+        # only the regen path runs that function: without this line a freshly BUILT
+        # project shipped an empty mixed list beside a populated write-tool list,
+        # while a rebuild of the same config shipped the real one. The consequence
+        # is fail-closed (the middleware clamps python execute as if pure-write),
+        # which is why nothing surfaced it — the Jinja environment is not strict, so
+        # the difference is one safety file quietly saying "nothing is exempt".
+        ctx["mixed_read_write_tools"] = mixed_read_write_tools(ctx["servers"])
 
         # Resolve allowed outputs from THIS render's effective artifact selection —
         # `artifacts` above, already the caller's own selection where it supplied
@@ -487,6 +456,194 @@ class TemplateManager:
         )
 
         return project_dir
+
+    def render_config(
+        self,
+        project_name: str,
+        project_dir: Path,
+        output_path: Path,
+        data_bundle: str = "control_assistant",
+        context: dict[str, Any] | None = None,
+        artifacts: dict[str, list[str]] | None = None,
+    ) -> None:
+        """Render only the ``config.yml`` that :meth:`create_project` would.
+
+        Same template, same context — what the project says it deploys and
+        where, without the rest of the render. ``osprey build`` uses it to
+        read what an app template deploys at its defaults: the hosting
+        deployment an attached profile built alone is told about.
+
+        Args:
+            project_name: Name of the project the context is built for.
+            project_dir: Where the project would render (``project_root``
+                in the context).
+            output_path: Where the rendered ``config.yml`` is written.
+            data_bundle: Data bundle (app template) to render.
+            context: Additional template context variables.
+            artifacts: Profile-driven artifact selection, as for
+                :meth:`create_project`.
+
+        Raises:
+            ValueError: If the data bundle does not exist or renders no
+                ``config.yml``.
+        """
+        bundle_dir = self.template_root / "apps" / data_bundle
+        if not bundle_dir.is_dir():
+            raise ValueError(
+                f"Template '{data_bundle}' not found. "
+                f"Available templates: {', '.join(self.list_app_templates())}"
+            )
+        artifacts = self._effective_artifacts(data_bundle, artifacts)
+        ctx = self._project_context(project_name, project_dir, data_bundle, context, artifacts)
+        scaffolding.render_project_config(
+            self.template_root, self.jinja_env, output_path, data_bundle, ctx
+        )
+
+    def _effective_artifacts(
+        self, data_bundle: str, artifacts: dict[str, list[str]] | None
+    ) -> dict[str, list[str]] | None:
+        """The artifact selection a render of *data_bundle* is made with.
+
+        The caller's own selection where it supplied one — an explicit empty
+        dict from ``osprey build`` means the profile deliberately selects
+        nothing, and must not be overridden — and the data bundle's manifest
+        otherwise. Every public entry point resolves this into its local
+        before building the context, because the same value gates the
+        manifest-output filtering after the render.
+        """
+        if artifacts is not None:
+            return artifacts
+        tmpl_manifest = manifest.load_template_manifest(self.template_root, data_bundle)
+        if tmpl_manifest:
+            return tmpl_manifest.get("artifacts", {})
+        return None
+
+    def _project_context(
+        self,
+        project_name: str,
+        project_dir: Path,
+        data_bundle: str,
+        context: dict[str, Any] | None,
+        artifacts: dict[str, list[str]] | None,
+    ) -> dict[str, Any]:
+        """The template context a project render of *data_bundle* is made with.
+
+        The defaults every template may read, the caller's *context* over
+        them, the ``osprey_ports`` table derived from whichever ``port_base``
+        survives that merge, and the channel-finder flags derived from the
+        artifact selection.
+
+        Raises:
+            BuildProfileError: If the channel-finder agent is selected with no
+                valid ``channel_finder_mode``.
+            ValueError: If the caller's ``port_base`` is outside the range a
+                thousand-port block can start at.
+        """
+        package_name = project_name.replace("-", "_").lower()
+        class_name = self._generate_class_name(package_name)
+
+        # Detect current Python environment
+        import sys
+
+        current_python = sys.executable
+
+        # Callers resolve the manifest fallback (_effective_artifacts) before
+        # calling; *artifacts* here is already the effective selection.
+
+        # Derive feature flags from artifact selections.
+        selected_hooks = (artifacts or {}).get("hooks", [])
+        selected_web_panels = (artifacts or {}).get("web_panels", [])
+
+        ctx = {
+            "project_name": project_name,
+            "package_name": package_name,
+            "app_display_name": project_name,  # Used in templates for display/documentation
+            "app_class_name": class_name,  # Used in templates for class names
+            "registry_class_name": class_name,  # Backward compatibility
+            "project_description": f"{project_name} - Osprey Agent Application",
+            "framework_version": manifest.get_framework_version(),
+            "project_root": str(project_dir.absolute()),
+            "venv_path": "${LOCAL_PYTHON_VENV}",
+            "current_python_env": current_python,  # Default; overridden by caller context
+            "template_name": data_bundle,  # Make bundle name available in config.yml
+            "data_bundle": data_bundle,
+            "selected_hooks": selected_hooks,
+            "selected_web_panels": selected_web_panels,
+            # Enable-able builtin panel registry (single source of truth in
+            # osprey.profiles.web_panels). Templates derive their enable list
+            # from this so it can't drift from the real registry. sorted() for
+            # deterministic rendered output.
+            "builtin_panels": sorted(BUILTIN_PANELS),
+            # No `env` key: the render reads nothing from `os.environ`, and
+            # writes no `.env` at all — the deployment's one secret store is the
+            # repo-root `.env`, outside this tree.
+            # Provider API-key env vars, derived from the provider registry
+            # (single source of truth in osprey.models.provider_registry) so
+            # env.example.j2 can't drift from the real provider list.
+            # Ordered list of {"provider", "var"} dicts; key-less providers
+            # (ollama, vllm, …) are excluded.
+            "provider_api_keys": scaffolding.provider_api_key_entries(),
+            # The subset of the above this profile actually uses. Empty here so
+            # a caller with no profile still renders the whole list uncommented;
+            # `osprey init` fills it in and the rest drop below a divider.
+            "active_provider_vars": [],
+            # Deploy-minted service credentials, derived from the map the
+            # deploy path mints from, so .env.example documents every one of
+            # them. Ordered list of {"var", "services", "note"} dicts.
+            "service_token_vars": scaffolding.service_token_var_entries(),
+            # The build profile's `env:` block, documented in .env.example.
+            # Defaulted here so a caller that has no profile (programmatic
+            # create_project) still renders the file.
+            "env_required": [],
+            "env_defaults": {},
+            # First port of this deployment's thousand-port block. The default
+            # is right only for a caller that has no config to resolve one
+            # from; `osprey build` resolves `deployment.port_base` off the
+            # profile and hands the answer down in *context*, which overrides
+            # this on the merge below.
+            "port_base": DEFAULT_PORT_BASE,
+            **(context or {}),
+        }
+
+        # The one place a template's ports are derived. Every framework host
+        # port a template writes is `osprey_ports.<slot>`, computed here from
+        # the base the caller resolved — so a template never spells a port
+        # literal and never re-derives a base of its own.
+        ctx["osprey_ports"] = layout_ports(ctx.get("port_base", DEFAULT_PORT_BASE))
+
+        # Derive channel finder configuration when the channel-finder agent
+        # is selected (either explicitly via build profile artifacts, or via
+        # the preset-profile fallback above for programmatic callers).
+        _profile_agents = (artifacts or {}).get("agents", [])
+        if "channel-finder" in _profile_agents:
+            channel_finder_mode = ctx.get("channel_finder_mode")
+            if channel_finder_mode is None:
+                raise BuildProfileError(
+                    "channel_finder_mode is required when the channel-finder agent "
+                    "is selected. Pin it in your profile "
+                    "(e.g. `channel_finder_mode: hierarchical`) or pass "
+                    "`--set channel_finder_mode=<paradigm>` to `osprey build`."
+                )
+            if channel_finder_mode not in VALID_CHANNEL_FINDER_MODES:
+                raise BuildProfileError(
+                    f"channel_finder_mode must be one of {VALID_CHANNEL_FINDER_MODES} "
+                    f"(got {channel_finder_mode!r})"
+                )
+            from osprey.registry.mcp import CHANNEL_FINDER_TOOLS_BY_PIPELINE
+
+            ctx.update(
+                {
+                    "channel_finder_mode": channel_finder_mode,
+                    **_enable_flags(channel_finder_mode),
+                    "default_pipeline": channel_finder_mode,
+                    "channel_finder_pipeline": channel_finder_mode,
+                    "channel_finder_tools": list(
+                        CHANNEL_FINDER_TOOLS_BY_PIPELINE.get(channel_finder_mode, [])
+                    ),
+                }
+            )
+
+        return ctx
 
     def regenerate_claude_code(
         self,

@@ -255,6 +255,15 @@ def captured_web_runs(monkeypatch, tmp_path):
     its own rendering is covered by ``tests/deployment/web_terminals/``, not
     here — but still records that it was called with the config.
 
+    The post-up host-reachability probe answers ``True``, i.e. this deploy's
+    landing page is reachable — the ordinary outcome, and the only one these
+    tests are about. Left real it would open a socket to the deployment's real
+    gateway port five times over ten seconds and then, finding nothing, ask
+    Docker Desktop about host networking and bounce the stack, putting three
+    host-inspection commands into ``calls`` that no test here is asserting
+    about. Its unreachable and self-heal branches are covered directly in
+    ``tests/deployment/web_terminals/test_postup_hooks.py``.
+
     Defaults to registry mode (no ``image_source`` key), so a
     ``.env.users`` marker is pre-written to ``tmp_path``:
     ``ensure_env_production``'s registry-mode branch only exists-checks (see
@@ -280,6 +289,10 @@ def captured_web_runs(monkeypatch, tmp_path):
     monkeypatch.setattr(container_lifecycle, "verify_runtime_is_running", lambda config: (True, ""))
     monkeypatch.setattr(provision, "get_runtime_command", lambda config: ["docker", "compose"])
     monkeypatch.setattr(postup_hooks, "get_runtime_command", lambda config: ["docker", "compose"])
+    monkeypatch.setattr(postup_hooks, "_host_port_answers", lambda url, attempts, delay: True)
+    monkeypatch.setattr(
+        container_lifecycle, "get_runtime_command", lambda config: ["docker", "compose"]
+    )
 
     def _fake_write_artifacts(config, dest_dir="."):
         written.append(config)
@@ -480,6 +493,10 @@ def captured_combined_runs(monkeypatch, tmp_path):
     monkeypatch.setattr(container_lifecycle, "verify_runtime_is_running", lambda config: (True, ""))
     monkeypatch.setattr(provision, "get_runtime_command", lambda config: ["docker", "compose"])
     monkeypatch.setattr(postup_hooks, "get_runtime_command", lambda config: ["docker", "compose"])
+    monkeypatch.setattr(postup_hooks, "_host_port_answers", lambda url, attempts, delay: True)
+    monkeypatch.setattr(
+        container_lifecycle, "get_runtime_command", lambda config: ["docker", "compose"]
+    )
     monkeypatch.setattr(provision, "write_web_terminal_artifacts", lambda config, dest_dir=".": [])
 
     def _fake_build(config, dev_mode, env, build_context=None):
@@ -629,6 +646,10 @@ def test_web_deploy_callsenable_linger_in_post_up_hook(monkeypatch, tmp_path):
     monkeypatch.setattr(container_lifecycle, "verify_runtime_is_running", lambda config: (True, ""))
     monkeypatch.setattr(provision, "get_runtime_command", lambda config: ["podman", "compose"])
     monkeypatch.setattr(postup_hooks, "get_runtime_command", lambda config: ["podman", "compose"])
+    monkeypatch.setattr(postup_hooks, "_host_port_answers", lambda url, attempts, delay: True)
+    monkeypatch.setattr(
+        container_lifecycle, "get_runtime_command", lambda config: ["podman", "compose"]
+    )
     monkeypatch.setattr(provision, "write_web_terminal_artifacts", lambda config, dest_dir=".": [])
     monkeypatch.setattr(
         container_lifecycle.subprocess,
@@ -702,6 +723,10 @@ def _mode_wiring_collab(monkeypatch, tmp_path):
     monkeypatch.setattr(container_lifecycle, "verify_runtime_is_running", lambda config: (True, ""))
     monkeypatch.setattr(provision, "get_runtime_command", lambda config: ["docker", "compose"])
     monkeypatch.setattr(postup_hooks, "get_runtime_command", lambda config: ["docker", "compose"])
+    monkeypatch.setattr(postup_hooks, "_host_port_answers", lambda url, attempts, delay: True)
+    monkeypatch.setattr(
+        container_lifecycle, "get_runtime_command", lambda config: ["docker", "compose"]
+    )
     monkeypatch.setattr(provision, "write_web_terminal_artifacts", lambda config, dest_dir=".": [])
     # The persona-render check is a separate concern with its own dedicated
     # tests below; keep it inert here so the mode-wiring tests exercise only the
@@ -1456,6 +1481,9 @@ def test_rebuild_deployment_reconciles_web_terminals_stack(monkeypatch, tmp_path
     monkeypatch.setattr(container_lifecycle, "clean_deployment", lambda *a, **k: None)
     monkeypatch.setattr(provision, "get_runtime_command", lambda config: ["docker", "compose"])
     monkeypatch.setattr(postup_hooks, "get_runtime_command", lambda config: ["docker", "compose"])
+    monkeypatch.setattr(
+        container_lifecycle, "get_runtime_command", lambda config: ["docker", "compose"]
+    )
     monkeypatch.setattr(provision, "write_web_terminal_artifacts", lambda config, dest_dir=".": [])
     calls: list = []
 
@@ -1590,6 +1618,9 @@ def test_web_services_dev_mode_splits_build_from_up(monkeypatch, tmp_path):
     monkeypatch.setattr(provision, "run_verify_script", lambda *a, **k: None)
     monkeypatch.setattr(provision, "get_runtime_command", lambda config: ["docker", "compose"])
     monkeypatch.setattr(postup_hooks, "get_runtime_command", lambda config: ["docker", "compose"])
+    monkeypatch.setattr(
+        container_lifecycle, "get_runtime_command", lambda config: ["docker", "compose"]
+    )
     runs: list = []
 
     def _fake_run(cmd, env=None, **k):
@@ -1854,7 +1885,7 @@ def test_deploy_up_prints_endpoint_summary_on_web_path(_wiring_calls, monkeypatc
         container_lifecycle,
         "prepare_compose_files",
         lambda *a, **k: (
-            {"modules": {"web_terminals": {"enabled": True, "nginx_port": 9080}}},
+            {"modules": {"web_terminals": {"enabled": True}}},
             ["docker-compose.yml"],
         ),
     )
@@ -2111,8 +2142,10 @@ class TestResolvePrebuiltImages:
 # ---------------------------------------------------------------------------
 
 
-def _dev_deploy_cmds(monkeypatch, tmp_path, config_extra: dict | None = None) -> list[list[str]]:
-    """Every argv a ``--dev`` deploy runs down the plain (no web) path."""
+def _dev_deploy_cmds(
+    monkeypatch, tmp_path, config_extra: dict | None = None, dev_mode: bool = True
+) -> list[list[str]]:
+    """Every argv a deploy runs down the plain (no web) path, ``--dev`` by default."""
     cmds: list[list[str]] = []
     config = {"deployed_services": ["event_dispatcher"], **(config_extra or {})}
 
@@ -2142,7 +2175,7 @@ def _dev_deploy_cmds(monkeypatch, tmp_path, config_extra: dict | None = None) ->
         _fake_popen(lambda cmd, env: cmds.append(list(cmd))),
     )
 
-    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True, dev_mode=True)
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=True, dev_mode=dev_mode)
     return cmds
 
 
@@ -2232,6 +2265,236 @@ def test_the_web_terminals_path_builds_when_the_switch_is_off(
     assert len(_compose_builds(cmds)) == 1
     assert "built service images" in steps
     assert "skipped image build (prebuilt images)" not in steps
+
+
+def test_a_non_dev_up_omits_no_build_unless_the_images_are_prebuilt(monkeypatch, tmp_path):
+    """The baseline the non-dev half of the switch has to leave alone.
+
+    A non-dev deploy has no build step of its own, and a build-only service
+    with no published upstream tag reaches its image solely through compose's
+    implicit build-on-up. Suppressing that unconditionally would break every
+    ordinary deploy.
+    """
+    monkeypatch.delenv("OSPREY_PREBUILT_IMAGES", raising=False)
+
+    cmds = _dev_deploy_cmds(monkeypatch, tmp_path, dev_mode=False)
+
+    up = next(cmd for cmd in cmds if "up" in cmd)
+    assert "--no-build" not in up
+
+
+def test_the_switch_adds_no_build_to_a_non_dev_up(monkeypatch, tmp_path):
+    """A pull-only mirror deploy must fail on a missing image, not build one.
+
+    Non-dev keeps no build step to skip, so compose's implicit build-on-up is
+    the whole of what the switch has to suppress here: without ``--no-build``
+    a tag the mirror never delivered would be answered by a locally-tagged
+    impostor built from the template's ``build:`` block.
+    """
+    monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "1")
+
+    cmds = _dev_deploy_cmds(monkeypatch, tmp_path, dev_mode=False)
+
+    up = next(cmd for cmd in cmds if "up" in cmd)
+    assert "--no-build" in up
+    assert "--build" not in up
+
+
+def test_the_config_key_adds_no_build_to_a_non_dev_up_too(monkeypatch, tmp_path):
+    monkeypatch.delenv("OSPREY_PREBUILT_IMAGES", raising=False)
+
+    cmds = _dev_deploy_cmds(monkeypatch, tmp_path, {"prebuilt_images": True}, dev_mode=False)
+
+    up = next(cmd for cmd in cmds if "up" in cmd)
+    assert "--no-build" in up
+
+
+def test_env_off_restores_the_implicit_build_a_prebuilt_config_would_have_suppressed(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "false")
+
+    cmds = _dev_deploy_cmds(monkeypatch, tmp_path, {"prebuilt_images": True}, dev_mode=False)
+
+    up = next(cmd for cmd in cmds if "up" in cmd)
+    assert "--no-build" not in up
+
+
+def test_the_web_terminals_services_up_gets_no_build_in_non_dev_too(
+    captured_combined_runs, monkeypatch, tmp_path
+):
+    """The second implicit-build site, wired for the same reason as the first.
+
+    A web-terminals host reaches its backend services through this invocation
+    and never through the plain path, so a switch wired only there would look
+    correct in tests and still build an impostor on the deployment it was
+    written for. The web-terminal stack's own ``up`` is untouched: its images
+    are registry-hosted and it has no ``build:`` block to suppress.
+    """
+    steps: list[str] = []
+    monkeypatch.setattr(provision, "_report_step", steps.append)
+    monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "1")
+
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=False)
+
+    cmds = [c["cmd"] for c in captured_combined_runs["calls"] if "up" in c["cmd"]]
+    services_up = next(c for c in cmds if _addresses(c, "docker-compose.yml"))
+    web_up = next(c for c in cmds if _addresses(c, "docker-compose.web.yml"))
+    assert "--no-build" in services_up
+    assert "--no-build" not in web_up
+    # Non-dev has no build step to report skipping — that line stays dev-only.
+    assert "skipped image build (prebuilt images)" not in steps
+
+
+def test_the_web_terminals_services_up_omits_no_build_when_prebuilt_is_off(
+    captured_combined_runs, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "off")
+
+    container_lifecycle.deploy_up(str(tmp_path / "config.yml"), detached=False)
+
+    cmds = [c["cmd"] for c in captured_combined_runs["calls"] if "up" in c["cmd"]]
+    services_up = next(c for c in cmds if _addresses(c, "docker-compose.yml"))
+    assert "--no-build" not in services_up
+
+
+# ---------------------------------------------------------------------------
+# The prebuilt-images switch at the PROJECT image build
+# ---------------------------------------------------------------------------
+# The dispatch worker's image has no compose `build:` block, so it is built by
+# `_build_project_image` — a `<runtime> build` of this repo, outside every
+# compose invocation the switch was originally wired into. A prebuilt host runs
+# that build with no build tooling; worse, under an `images.registry` the tag it
+# builds is the registry-qualified one, so a host that PULLED the worker image
+# would have it overwritten by a local rebuild wearing the same name.
+
+_WORKER_CONFIG = {"project_name": "myfacility", "deployed_services": ["dispatch_worker"]}
+_MIRRORED_WORKER_CONFIG = {
+    "project_name": "myfacility",
+    "deployed_services": ["dispatch_worker"],
+    "images": {"registry": "registry.example.org/physics", "tag": "2026.6.2"},
+}
+
+
+def _project_image_build_calls(monkeypatch, tmp_path, config, *, dev_mode=False):
+    """Every argv ``_build_project_image`` runs, plus the steps it reported."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(container_lifecycle, "get_runtime_command", lambda config: ["docker"])
+    cmds: list[list[str]] = []
+    monkeypatch.setattr(
+        container_lifecycle,
+        "run_captured",
+        lambda cmd, **kwargs: cmds.append(list(cmd)) or _FakeCompletedProcess(),
+    )
+    steps: list[str] = []
+    monkeypatch.setattr(container_lifecycle, "_report_step", steps.append)
+    monkeypatch.setattr(container_lifecycle, "_report_group", lambda name: None)
+
+    container_lifecycle._build_project_image(config, dev_mode=dev_mode, env={})
+    return cmds, steps
+
+
+def test_the_project_image_is_built_when_the_switch_is_off(monkeypatch, tmp_path):
+    """The baseline the switch has to leave alone."""
+    monkeypatch.delenv("OSPREY_PREBUILT_IMAGES", raising=False)
+
+    cmds, _steps = _project_image_build_calls(monkeypatch, tmp_path, _WORKER_CONFIG)
+
+    assert len(cmds) == 1 and cmds[0][:2] == ["docker", "build"]
+
+
+def test_the_switch_removes_the_project_image_build(monkeypatch, tmp_path):
+    """A host that cannot build must not be handed a `docker build` anyway."""
+    monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "1")
+
+    cmds, steps = _project_image_build_calls(monkeypatch, tmp_path, _WORKER_CONFIG)
+
+    assert cmds == []
+    assert "skipped image build (prebuilt images)" in steps
+
+
+def test_the_config_key_removes_the_project_image_build_too(monkeypatch, tmp_path):
+    """The switch is a property of the deployment as well as of the shell."""
+    monkeypatch.delenv("OSPREY_PREBUILT_IMAGES", raising=False)
+
+    cmds, steps = _project_image_build_calls(
+        monkeypatch, tmp_path, {**_WORKER_CONFIG, "prebuilt_images": True}
+    )
+
+    assert cmds == []
+    assert "skipped image build (prebuilt images)" in steps
+
+
+def test_a_pulled_registry_image_is_never_rebuilt_over(monkeypatch, tmp_path):
+    """The failure the switch prevents on a host that CAN build.
+
+    With an ``images.registry`` axis the project image's tag is the registry
+    reference the deploy pulled. Building it locally does not merely waste
+    minutes — it replaces the published image with a locally assembled one
+    carrying the same name, and nothing downstream can tell the two apart.
+    """
+    monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "yes")
+
+    cmds, _steps = _project_image_build_calls(monkeypatch, tmp_path, _MIRRORED_WORKER_CONFIG)
+
+    assert cmds == []
+
+
+def test_env_off_restores_the_project_image_build_a_prebuilt_config_would_have_skipped(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "false")
+
+    cmds, _steps = _project_image_build_calls(
+        monkeypatch, tmp_path, {**_WORKER_CONFIG, "prebuilt_images": True}
+    )
+
+    assert len(cmds) == 1
+
+
+def test_a_dev_run_on_a_prebuilt_host_builds_no_project_image_either(monkeypatch, tmp_path):
+    """``--dev`` is the mode that stages a wheel and builds — and the one a
+    build-tool-less host cannot run at all."""
+    monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "1")
+
+    cmds, _steps = _project_image_build_calls(monkeypatch, tmp_path, _WORKER_CONFIG, dev_mode=True)
+
+    assert cmds == []
+
+
+def test_the_skip_line_is_only_reported_where_a_build_was_actually_taken_away(
+    monkeypatch, tmp_path
+):
+    """A deployment without the worker had no project image build to skip."""
+    monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "1")
+
+    cmds, steps = _project_image_build_calls(
+        monkeypatch, tmp_path, {"project_name": "myfacility", "deployed_services": ["mongodb"]}
+    )
+
+    assert cmds == []
+    assert steps == []
+
+
+def test_the_switch_answers_the_build_target_question_too(monkeypatch):
+    """`_project_image_build_target` is what the preflight probe reads.
+
+    It reports the unreleased-pin refusal as a DEFINITE one — a fact about a
+    build that is going to happen. On a prebuilt host no build happens, so a
+    refusal there would send the operator to fix something that never runs.
+    """
+    monkeypatch.delenv("OSPREY_PIP_SPEC", raising=False)
+    monkeypatch.setattr("osprey.version.is_release", lambda: False)
+    monkeypatch.setattr("osprey.version.get_release_version", lambda: "2026.6.2")
+    monkeypatch.setattr("osprey.version.get_running_version", lambda: "2026.6.2.post783+g83fda5e60")
+
+    monkeypatch.delenv("OSPREY_PREBUILT_IMAGES", raising=False)
+    assert container_lifecycle._project_image_build_target(_WORKER_CONFIG, {}) is not None
+    assert container_lifecycle._unreleased_pin_problem(_WORKER_CONFIG, {}, dev_mode=False)
+
+    monkeypatch.setenv("OSPREY_PREBUILT_IMAGES", "1")
+    assert container_lifecycle._project_image_build_target(_WORKER_CONFIG, {}) is None
+    assert container_lifecycle._unreleased_pin_problem(_WORKER_CONFIG, {}, dev_mode=False) is None
 
 
 # ---------------------------------------------------------------------------
@@ -2345,7 +2608,7 @@ def staged_archiver(monkeypatch, tmp_path):
     monkeypatch.setattr(
         container_lifecycle,
         "_archiver_seed_inputs",
-        lambda config, project_dir: ([{"address": "SR:BPM1:X"}], None, {}),
+        lambda config, project_dir: ([{"address": "SR:BPM1:X"}], None, {}, None, None),
     )
     monkeypatch.setattr(
         container_lifecycle,
@@ -2694,7 +2957,7 @@ def test_seed_inputs_read_the_manifest_the_project_env_names(tmp_path):
     )
     (tmp_path / ".env").write_text("VA_CHANNELS_FILE=channel_manifest.json\n")
 
-    channels, engine, boot_values = container_lifecycle._archiver_seed_inputs({}, tmp_path)
+    channels, engine, boot_values, _, _ = container_lifecycle._archiver_seed_inputs({}, tmp_path)
 
     assert [c["address"] for c in channels] == ["SR:BPM1:X"]
     # No machine model in this project: every channel is procedural, which is a
@@ -2935,17 +3198,17 @@ def test_the_auth_grace_sits_between_the_healthcheck_and_the_reachability_budget
 
 
 # ---------------------------------------------------------------------------
-# The shared half of the env chain, at the deploy path's other two read sites
+# The shared half of the env chain, at the store preflight's read site
 # ---------------------------------------------------------------------------
 # The deployment's environment is a two-file chain at the repo root —
 # ``.env.shared`` (committed defaults) below ``.env`` (host-local secrets).
-# Neither of the two provisioners below opens the first of those files: both
-# call ``parse_dotenv_file(env_path)``, which names the LOCAL one, and read
+# The preflight below never opens the first of those files: it calls
+# ``parse_dotenv_file(env_path)``, which names the LOCAL one, and reads
 # ``os.environ`` for everything else. So a value living only in the shared half
-# reaches them by one indirect route — the CLI entry point loads the whole chain
+# reaches it by one indirect route — the CLI entry point loads the whole chain
 # over ``os.environ`` before any deploy code runs.
 #
-# Each site gets both cells: the value in the shared file alone, and the same
+# The site gets both cells: the value in the shared file alone, and the same
 # value once that entry-point load has happened. The pair is the measurement.
 # What it records is pinned as observed, including where the observation is that
 # the shared half is not seen at all.
@@ -3080,72 +3343,167 @@ def test_the_same_shared_only_credential_is_refused_after_the_entry_point_chain_
     assert VOLUME_BORN_WITH not in message
 
 
-#: A minimal machine whose channel names yield one corrector pair and one BPM —
-#: the least the substrate derivation accepts.
-_SUBSTRATE_LIMITS = {
-    "SR:MAG:HCM:01:CURRENT:SP": {"min": -10, "max": 10},
-    "SR:MAG:HCM:01:CURRENT:RB": {"min": -10, "max": 10},
-    "SR:DIAG:BPM:01:POSITION:X": {"min": -5, "max": 5},
-    "SR:DIAG:BPM:01:POSITION:Y": {"min": -5, "max": 5},
+# ---------------------------------------------------------------------------
+# The Python prediction of the worker's image vs. the rendered compose default
+#
+# Two derivations of one fact. `_worker_image_target` answers, before compose
+# has been written, which image the worker will run — and that answer is what
+# decides whether `osprey up` builds the project image at all. The rendered
+# document decides what the worker ACTUALLY runs. A disagreement between them
+# is silent in both directions: a build for a tag nothing references, or a
+# reference to a tag nothing built.
+#
+# So the two are asserted equal here rather than by reading the code, across
+# both image axes (unset and set) and each worker-config shape that reaches a
+# different layer of the fallback chain. The value is also pinned literally in
+# each case: parity alone would still hold if BOTH sides ignored the axes.
+# ---------------------------------------------------------------------------
+
+#: The axis variables, cleared before every parity case — an exported
+#: ``OSPREY_IMAGE_TAG`` in the developer's shell otherwise reaches both sides.
+_IMAGE_AXIS_VARS = ("OSPREY_IMAGE_REGISTRY", "OSPREY_IMAGE_TAG")
+
+#: A complete image reference a profile pinned itself. No axis may edit it:
+#: naming an image outright names a whole coordinate, registry included.
+_PINNED_WORKER_IMAGE = "ghcr.io/vendor/prebuilt-worker:4.2"
+
+
+def _parity_config(worker_cfg: dict | None) -> dict:
+    """A deploy config whose only variable is the ``dispatch_worker`` block."""
+    return {
+        "project_name": "parity-proj",
+        "project_root": "/r/parity-proj",
+        "services": {"dispatch_worker": worker_cfg},
+        "deployed_services": ["dispatch_worker"],
+        "system": {"timezone": "UTC"},
+    }
+
+
+def _rendered_worker_image(config: dict) -> str:
+    """The image the worker's compose service renders, minus the compose layer.
+
+    Rendered through an Environment rooted at the packaged templates directory
+    because the template imports the shared network-axis macros, and an import
+    needs a loader. The ``${OSPREY_WORKER_IMAGE:-...}`` wrapper is stripped: it
+    is the compose-time layer, which ``_worker_image_target`` reads from its
+    ``env`` argument rather than from the document.
+    """
+    from importlib import resources
+
+    import yaml
+    from jinja2 import Environment, FileSystemLoader
+
+    from osprey.deployment.compose_generator import _inject_project_metadata
+
+    templates_root = resources.files("osprey").joinpath("templates")
+    jinja_env = Environment(loader=FileSystemLoader(str(templates_root)), autoescape=False)
+    template = jinja_env.get_template("services/dispatch_worker/docker-compose.yml.j2")
+    rendered = yaml.safe_load(template.render(**_inject_project_metadata(config)))
+
+    image = rendered["services"]["dispatch-worker-1"]["image"]
+    prefix = "${OSPREY_WORKER_IMAGE:-"
+    assert image.startswith(prefix) and image.endswith("}"), image
+    return image[len(prefix) : -1]
+
+
+_AXES_UNSET: dict[str, str] = {}
+_AXES_SET = {
+    "OSPREY_IMAGE_REGISTRY": "registry.example.org/beam",
+    "OSPREY_IMAGE_TAG": "2026.08.19",
 }
 
-_SUBSTRATE_CONFIG = {
-    "deployed_services": ["bluesky", "virtual_accelerator"],
-    "control_system": {"type": "virtual_accelerator"},
-}
+#: Each axis setting with the project image it must produce.
+_AXIS_CASES = [
+    pytest.param(_AXES_UNSET, "parity-proj:local", id="axes-unset"),
+    pytest.param(_AXES_SET, "registry.example.org/beam/parity-proj:2026.08.19", id="axes-set"),
+]
+
+#: The same settings alone, for the outcomes no axis may change.
+_AXIS_ENV_CASES = [
+    pytest.param(_AXES_UNSET, id="axes-unset"),
+    pytest.param(_AXES_SET, id="axes-set"),
+]
 
 
-@pytest.fixture
-def substrate_project(monkeypatch, tmp_path):
-    """A built project the substrate derivation can read devices out of."""
-    for var in ("BLUESKY_EPICS_SUBSTRATE", "BLUESKY_EPICS_SETPOINTS", "BLUESKY_EPICS_READBACKS"):
+def _set_image_axes(monkeypatch, axes: dict[str, str]) -> None:
+    """Put the process env in exactly the axis state a case describes."""
+    for var in _IMAGE_AXIS_VARS:
         monkeypatch.delenv(var, raising=False)
-    (tmp_path / "data").mkdir()
-    (tmp_path / "data" / "channel_limits.json").write_text(
-        json.dumps(_SUBSTRATE_LIMITS), encoding="utf-8"
-    )
-    return tmp_path / ".env"
+    for var, value in axes.items():
+        monkeypatch.setenv(var, value)
 
 
-def _dotenv(path: Path) -> dict:
-    from osprey.utils.dotenv import parse_dotenv_file
-
-    return parse_dotenv_file(path) if path.is_file() else {}
-
-
-def test_a_substrate_var_only_the_shared_half_sets_is_derived_over(substrate_project, tmp_path):
-    """The "already set is left untouched" promise is scoped to the local file.
-
-    The docstring's promise is "in the process env or an existing ``.env``",
-    and that is literally what the code checks — so a device list an operator
-    committed to ``.env.shared`` is not seen, a derived one is appended to
-    ``.env``, and the appended line outranks the committed one in the chain.
-    The operator's setting is still in the file they put it in, and no longer
-    the value the bridge resolves.
-    """
-    _write_shared_half(tmp_path, "BLUESKY_EPICS_SETPOINTS=shared-half-device-list\n")
-
-    container_lifecycle._ensure_bluesky_substrate_env(_SUBSTRATE_CONFIG, env_path=substrate_project)
-
-    local = _dotenv(substrate_project)
-    assert local["BLUESKY_EPICS_SETPOINTS"], "the shared-only value did not reach the predicate"
-    assert local["BLUESKY_EPICS_SETPOINTS"] != "shared-half-device-list"
+_WORKER_CFG_CASES = [
+    # A `dispatch_worker:` mapping — _inject_project_metadata's setdefault
+    # supplies the image, so the template's own default never fires.
+    pytest.param({}, False, id="worker-block-present"),
+    # A null `dispatch_worker:` key (legal YAML). The setdefault's isinstance
+    # guard skips it, exposing the template-level `default(osprey_images.worker)`.
+    pytest.param(None, False, id="null-worker-key"),
+    # A profile that pinned its own image: layer 2 wins on both sides.
+    pytest.param({"image": _PINNED_WORKER_IMAGE}, True, id="per-service-override"),
+]
 
 
-def test_the_same_substrate_var_is_left_alone_after_the_entry_point_chain_load(
-    substrate_project, monkeypatch, tmp_path
+@pytest.mark.parametrize("axes, axis_image", _AXIS_CASES)
+@pytest.mark.parametrize("worker_cfg, pinned", _WORKER_CFG_CASES)
+def test_worker_image_target_parity_with_rendered_worker_default(
+    monkeypatch, axes, axis_image, worker_cfg, pinned
 ):
-    """The route again: the process-env mirror is what preserves the setting.
+    """``_worker_image_target`` predicts exactly what the worker service renders."""
+    _set_image_axes(monkeypatch, axes)
 
-    With the chain loaded, the committed device list is in ``os.environ``, the
-    ``k not in os.environ`` guard holds, and only the keys the operator did not
-    set are appended.
+    config = _parity_config(worker_cfg)
+    expected = _PINNED_WORKER_IMAGE if pinned else axis_image
+
+    predicted = container_lifecycle._worker_image_target(config, env={})
+    assert predicted == _rendered_worker_image(config), (
+        "the Python prediction and the rendered compose default must be the "
+        "same image — they are one fact derived twice"
+    )
+    assert predicted == expected
+
+
+@pytest.mark.parametrize("axes, axis_image", _AXIS_CASES)
+def test_project_image_build_target_parity_with_rendered_worker_default(
+    monkeypatch, axes, axis_image
+):
+    """What ``osprey up`` builds is the tag the worker service references.
+
+    The build target is the same prediction seen from the other end: with
+    nothing pinned, the image the host builds and tags has to be the one the
+    rendered document names, or the worker starts against a tag that exists
+    nowhere. Asserted for the build command's own ``-t`` too — the target is
+    only a claim until the argv carries it.
     """
-    _write_shared_half(tmp_path, "BLUESKY_EPICS_SETPOINTS=shared-half-device-list\n")
+    _set_image_axes(monkeypatch, axes)
 
-    _load_the_entry_point_chain(monkeypatch, tmp_path)
-    container_lifecycle._ensure_bluesky_substrate_env(_SUBSTRATE_CONFIG, env_path=substrate_project)
+    config = _parity_config({})
 
-    local = _dotenv(substrate_project)
-    assert "BLUESKY_EPICS_SETPOINTS" not in local
-    assert local.get("BLUESKY_EPICS_READBACKS")
+    build_target = container_lifecycle._project_image_build_target(config, env={})
+    assert build_target == _rendered_worker_image(config)
+    assert build_target == axis_image
+
+    cmd = container_lifecycle._project_image_build_cmd(config, "docker", "/proj")
+    assert cmd[cmd.index("-t") + 1] == build_target
+
+
+@pytest.mark.parametrize("axes", _AXIS_ENV_CASES)
+def test_a_pinned_worker_image_builds_nothing_under_either_axis(monkeypatch, axes):
+    """The build gate reads the prediction, so a pin skips the build, axes or not.
+
+    A profile that pinned its worker image wants a prebuilt one; the axes must
+    not turn that into a build of an image the worker will never run.
+    """
+    _set_image_axes(monkeypatch, axes)
+
+    pinned = _parity_config({"image": _PINNED_WORKER_IMAGE})
+    assert container_lifecycle._project_image_build_target(pinned, env={}) is None
+
+    override = _parity_config({})
+    assert (
+        container_lifecycle._project_image_build_target(
+            override, env={"OSPREY_WORKER_IMAGE": _PINNED_WORKER_IMAGE}
+        )
+        is None
+    )

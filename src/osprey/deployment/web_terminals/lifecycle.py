@@ -60,8 +60,8 @@ from any directory.
 
 Image-scoping boundary (applies only to :func:`nuke_stack`'s persona-image
 teardown): unlike containers and volumes, image tags are host-global — two
-OSPREY deployments that happen to use identically-named personas would build
-identically-named ``<persona.project>-<persona>:local`` tags. There is no
+OSPREY deployments that happen to use identically-named persona renders would
+build identically-named ``<persona.project>:local`` tags. There is no
 label-filtered *listing* equivalent to ``ps -a``/``volume ls`` for this (image
 tags aren't compose-project-scoped), so each candidate tag is instead
 individually verified with ``image inspect`` against its own
@@ -95,6 +95,7 @@ from osprey.deployment.runtime_helper import (
 )
 from osprey.deployment.web_terminals.artifacts import (
     check_bash_launch_token_conflict,
+    check_open_mode_requirements,
     write_web_terminal_artifacts,
 )
 from osprey.deployment.web_terminals.auth_credentials import (
@@ -178,7 +179,9 @@ def decommission_user(
        not as the render-facing projection: writing the projection would strip
        each survivor's ``persona:`` key, and a roster with no ``persona:`` keys
        re-resolves every survivor onto ``default_persona`` — a silent privilege
-       change on the next render, in the direction of the default.
+       change on the next render, in the direction of the default. ``role:``
+       is the other key with that consequence and is written back for the
+       same reason.
     4. Re-render the web-terminal artifacts from the updated config, so the
        deployed nginx route/compose service/landing card for the user disappear.
     5. Force-remove the user's exact-named container.
@@ -242,16 +245,19 @@ def decommission_user(
     # The probe roster is the POST-removal one, which is what preserves the
     # escape hatch: decommissioning the offending persona's last user drops it
     # from the referenced set, so that removal still succeeds.
-    check_bash_launch_token_conflict(
-        {
-            **config,
-            "modules": {
-                **as_dict(config.get("modules")),
-                "web_terminals": {**web_terminals, "users": remaining},
-            },
+    post_removal_config = {
+        **config,
+        "modules": {
+            **as_dict(config.get("modules")),
+            "web_terminals": {**web_terminals, "users": remaining},
         },
-        repo_root,
-    )
+    }
+    check_bash_launch_token_conflict(post_removal_config, repo_root)
+    # The open-mode gate on the same roster, for the same reason and with the
+    # same escape hatch: removing the last user of a persona that can reach the
+    # host network drops it from the referenced set, and that removal is the
+    # remediation which needs no image rebuild.
+    check_open_mode_requirements(post_removal_config, repo_root)
 
     # Roster edit + artifact re-render happen before container/volume removal:
     # they are recoverable by re-running `osprey up`, unlike volume removal.
@@ -440,7 +446,7 @@ def nuke_stack(config_path: str | Path, *, assume_yes: bool = False) -> None:
     scoping boundary this relies on).
 
     Image removal is deliberately the least trusting step: image tags
-    (``<persona.project>-<persona>:local``) are host-global, not scoped to this
+    (``<persona.project>:local``) are host-global, not scoped to this
     project the way ``com.docker.compose.project``-labeled containers/volumes
     are, so a same-named tag could belong to an entirely different deployment.
     Every candidate tag is therefore ``image inspect``-verified against its own
@@ -527,13 +533,13 @@ def nuke_stack(config_path: str | Path, *, assume_yes: bool = False) -> None:
             candidate_images.append(image)
 
     # The auth sidecar's own locally-built tag, on exactly the terms that
-    # produced it: authentication on AND local mode AND no auth.image pinning an
+    # produced it: a sidecar method AND local mode AND no auth.image pinning an
     # external image (see provision.build_auth_sidecar_image). It is a candidate
     # like any persona tag — the same com.osprey.project label verification
     # below decides whether it is really ours, since image tags are host-global.
     auth_ctx = _auth_tls_context(web_terminals)
     if (
-        auth_ctx["auth_method"] != "none"
+        auth_ctx["sidecar_active"]
         and effective_image_source(web_terminals) == "local"
         and not auth_ctx["auth_image"]
     ):
@@ -663,7 +669,7 @@ def _reconcile_auth_after_user_removal(
             users whose credentials survive.
     """
     web_terminals = as_dict(as_dict(config.get("modules")).get("web_terminals"))
-    if _auth_tls_context(web_terminals)["auth_method"] == "none":
+    if not _auth_tls_context(web_terminals)["sidecar_active"]:
         return
 
     # Deferred import for the same reason rotate_user_password defers it: a
@@ -903,11 +909,13 @@ def rotate_user_password(config_path: str | Path, user: str, password: str) -> N
 
     # Read through the same parser the render and the deploy preflight use, so
     # the three can never disagree about what this deployment's `auth` means.
-    auth_method = _auth_tls_context(web_terminals)["auth_method"]
-    if auth_method == "none":
+    auth_ctx = _auth_tls_context(web_terminals)
+    auth_method = auth_ctx["auth_method"]
+    if not auth_ctx["walled"]:
         raise ValueError(
-            "modules.web_terminals.auth.method is 'none', so this deployment has no "
-            "login passwords to change. Enable authentication first; nothing was modified."
+            f"modules.web_terminals.auth.method is {auth_method!r}, which puts no login "
+            "wall in front of the terminals, so this deployment has no login passwords "
+            "to change. Set auth.method: password first; nothing was modified."
         )
     if auth_method != "password":
         raise ValueError(
@@ -1287,7 +1295,7 @@ def remove_image(
 
     Args:
         runtime: Runtime binary, e.g. ``"docker"`` or ``"podman"``.
-        tag: Exact image tag, e.g. ``"<persona.project>-<persona>:local"``.
+        tag: Exact image tag, e.g. ``"<persona.project>:local"``.
             Never a glob or label selector.
         env: Environment for the subprocess call. Defaults to inheriting the
             parent process environment.

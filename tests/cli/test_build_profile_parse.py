@@ -8,8 +8,9 @@ profile author reads which key to fix out of the message itself. Covered here:
 an ``mcp_servers:`` entry that is not a mapping, an ``mcp_servers:`` entry that
 declares neither transport (``command`` nor ``url``), both halves of the
 ``services:`` loop (the non-mapping raise and the ``ServiceDef`` it builds from
-a valid mapping), and the non-mapping guards on the optional ``bluesky:`` and
-``virtual_accelerator:`` blocks.
+a valid mapping), the non-mapping guards on the optional ``bluesky:`` and
+``virtual_accelerator:`` blocks, and the ``virtual_accelerator:`` block's closed
+key set and ``live_standin`` typing.
 
 Complements the block-scoped suites that exercise the *accepted* shapes:
 ``test_bluesky_service_registration.py`` for ``bluesky:`` field defaults and
@@ -181,3 +182,119 @@ def test_virtual_accelerator_not_a_mapping_raises() -> None:
     """A non-mapping 'virtual_accelerator' block raises during parsing."""
     with pytest.raises(BuildProfileError, match="Profile 'virtual_accelerator' must be a mapping"):
         _parse_profile({"name": "x", "virtual_accelerator": "not-a-mapping"})
+
+
+def test_virtual_accelerator_unknown_key_raises_with_suggestion() -> None:
+    """A misspelled VA subkey is named, corrected and rejected rather than dropped."""
+    with pytest.raises(
+        BuildProfileError,
+        match=r"Unknown virtual_accelerator key\(s\): 'live_standing' "
+        r"\(did you mean 'live_standin'\?\)",
+    ):
+        _parse_profile({"name": "x", "virtual_accelerator": {"live_standing": 5074}})
+
+
+def test_virtual_accelerator_live_standin_parses() -> None:
+    """A live_standin port lands on the parsed VAConfig."""
+    profile = _parse_profile({"name": "x", "virtual_accelerator": {"live_standin": 5074}})
+    assert profile.virtual_accelerator is not None
+    assert profile.virtual_accelerator.live_standin == 5074
+
+
+def test_virtual_accelerator_without_live_standin_parses_to_none() -> None:
+    """Omitting live_standin leaves the deployment with no stand-in lane."""
+    profile = _parse_profile({"name": "x", "virtual_accelerator": {"port": 5064}})
+    assert profile.virtual_accelerator is not None
+    assert profile.virtual_accelerator.live_standin is None
+
+
+def test_virtual_accelerator_live_standin_must_be_true_or_an_int() -> None:
+    """A value that is neither `true` nor an integer raises at parse time."""
+    with pytest.raises(
+        BuildProfileError,
+        match="virtual_accelerator.live_standin must be `true`.*"
+        r"or a Channel Access port number \(got '5074'\)",
+    ):
+        _parse_profile({"name": "x", "virtual_accelerator": {"live_standin": "5074"}})
+
+
+def test_virtual_accelerator_live_standin_true_takes_the_layout_slot() -> None:
+    """`live_standin: true` asks for the stand-in without naming a number.
+
+    The number it gets is the layout's ``va_standin`` slot at the layout's own
+    base, since this profile configures no ``deployment.port_base``.
+    """
+    profile = _parse_profile({"name": "x", "virtual_accelerator": {"live_standin": True}})
+    assert profile.virtual_accelerator is not None
+    assert profile.virtual_accelerator.live_standin == 10090
+
+
+def test_virtual_accelerator_live_standin_true_follows_the_profiles_port_base() -> None:
+    """The slot is taken on the base the profile itself resolved, not the default."""
+    profile = _parse_profile(
+        {
+            "name": "x",
+            "config": {"deployment.port_base": 20000},
+            "virtual_accelerator": {"live_standin": True},
+        }
+    )
+    assert profile.virtual_accelerator is not None
+    assert profile.virtual_accelerator.live_standin == 20090
+
+
+def test_virtual_accelerator_live_standin_true_reads_a_nested_port_base() -> None:
+    """A nested `deployment:` subtree in `config:` moves the slot the same way."""
+    profile = _parse_profile(
+        {
+            "name": "x",
+            "config": {"deployment": {"port_base": 20000}},
+            "virtual_accelerator": {"live_standin": True},
+        }
+    )
+    assert profile.virtual_accelerator is not None
+    assert profile.virtual_accelerator.live_standin == 20090
+
+
+def test_virtual_accelerator_live_standin_false_is_refused() -> None:
+    """`false` is not a second spelling for absence — omitting the key is."""
+    with pytest.raises(
+        BuildProfileError,
+        match="virtual_accelerator.live_standin: false is not a way to switch",
+    ):
+        _parse_profile({"name": "x", "virtual_accelerator": {"live_standin": False}})
+
+
+def test_virtual_accelerator_live_standin_true_refuses_an_impossible_port_base() -> None:
+    """A base whose block could not exist is refused, not silently defaulted."""
+    with pytest.raises(ValueError, match="deployment.port_base is 1000"):
+        _parse_profile(
+            {
+                "name": "x",
+                "config": {"deployment.port_base": 1000},
+                "virtual_accelerator": {"live_standin": True},
+            }
+        )
+
+
+def test_dispatch_ports_default_to_the_layout_slots() -> None:
+    """A dispatch block that names no ports lands on the layout's own slots.
+
+    10010/10011 are the `dispatcher` slot and the first index of the `worker`
+    band at the layout's own base — the ports a deployment that configures no
+    `deployment.port_base` publishes. The stride defaults to the layout's own
+    spacing of one.
+    """
+    profile = _parse_profile({"name": "x", "dispatch": {"triggers": "t.yml"}})
+    assert profile.dispatch is not None
+    assert profile.dispatch.dispatcher_port == 10010
+    assert profile.dispatch.worker_port_base == 10011
+    assert profile.dispatch.worker_port_stride == 1
+
+
+def test_dispatch_worker_port_stride_is_a_recognised_key() -> None:
+    """A profile may widen the worker spacing, and the value parses through."""
+    profile = _parse_profile(
+        {"name": "x", "dispatch": {"triggers": "t.yml", "worker_port_stride": 10}}
+    )
+    assert profile.dispatch is not None
+    assert profile.dispatch.worker_port_stride == 10

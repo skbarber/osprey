@@ -36,6 +36,7 @@ import { buildRegistry } from './palette-registry.js';
 import { fetchJSON } from './api.js';
 import { fuzzyMatch } from '/design-system/js/fuzzy.js';
 import { el } from '/design-system/js/dom.js';
+import { scopedStorageKey } from '/design-system/js/storage-scope.js';
 
 /** @typedef {import('./palette-registry.js').Item} Item */
 
@@ -76,8 +77,11 @@ import { el } from '/design-system/js/dom.js';
 /** Fixed outer group order — matches the registry and the stylesheet. */
 const GROUP_ORDER = /** @type {const} */ (['Settings', 'Panels', 'Layouts', 'Actions']);
 
-/** localStorage key + cap for the most-recently-executed item keys. */
-const RECENT_STORAGE_KEY = 'osprey-palette-recent-v1';
+/** localStorage key base + cap for the most-recently-executed item keys. The
+ *  list is per persona: localStorage is origin-scoped, so on a multi-user mount
+ *  a bare key would show every operator whatever the last one ran. Resolved
+ *  through scopedStorageKey() at each use — see storage-scope.js. */
+const RECENT_STORAGE_KEY_BASE = 'osprey-palette-recent-v1'; // gitleaks:allow - a localStorage key name, not a secret
 const RECENT_LIMIT = 5;
 
 /** Namespace prefix keeping a Recent row's nav key distinct from its original. */
@@ -132,7 +136,7 @@ function itemKey(/** @type {NavItem} */ item) {
 function readRecent() {
   let raw = null;
   try {
-    raw = localStorage.getItem(RECENT_STORAGE_KEY);
+    raw = localStorage.getItem(scopedStorageKey(RECENT_STORAGE_KEY_BASE));
   } catch {
     return [];
   }
@@ -155,7 +159,7 @@ function readRecent() {
 function recordRecent(key) {
   const next = [key, ...readRecent().filter((k) => k !== key)].slice(0, RECENT_LIMIT);
   try {
-    localStorage.setItem(RECENT_STORAGE_KEY, JSON.stringify(next));
+    localStorage.setItem(scopedStorageKey(RECENT_STORAGE_KEY_BASE), JSON.stringify(next));
   } catch { /* storage blocked — Recent stays empty, execution is unaffected */ }
 }
 
@@ -467,11 +471,31 @@ function onKeydown(e) {
 }
 
 /**
+ * Whether this open can reach the settings surface at all.
+ *
+ * The Settings group is a row per config dot-key whose only verb is
+ * `revealSetting` (it opens the drawer's Config tab and jumps to the field),
+ * so the caller withholds that dep where the deployment gated the Config tab
+ * off — `web.config_panel.enabled`, which also makes `/api/config` answer 403.
+ * Without it there is no group to build and nothing to read for.
+ *
+ * @returns {boolean}
+ */
+function settingsReachable() {
+  return typeof currentDeps.revealSetting === 'function';
+}
+
+/**
  * Kick off the config fetch concurrently with the open. On resolve/reject it
  * rebuilds the registry and re-renders against the CURRENT query, but only if
  * this is still the newest fetch and the palette is still open.
  */
 function startConfigFetch() {
+  // Nothing to read for. openPalette has already seeded the settled empty
+  // snapshot; firing the request anyway would fail with a 403 on a deployment
+  // that gated the Config surface off and leave a permanent "Settings
+  // unavailable" row — an outage report for a surface deliberately withdrawn.
+  if (!settingsReachable()) return;
   const token = ++fetchSeq;
   Promise.resolve()
     .then(() => fetchConfigFn())
@@ -510,7 +534,10 @@ export function openPalette(deps) {
     ? currentDeps.fetchConfig
     : defaultFetchConfig;
   previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  configState = { state: 'loading' };
+  // 'loading' is a promise that a read is in flight. Where the Settings group
+  // has nowhere to land (no `revealSetting` — see startConfigFetch) no read
+  // fires, so seeding 'loading' would paint a spinner row nothing ever clears.
+  configState = settingsReachable() ? { state: 'loading' } : { state: 'ok', sections: {} };
   currentQuery = '';
   activeKey = null;
   opened = true;

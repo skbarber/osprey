@@ -7,12 +7,13 @@ through the queue (``PATCH /draft`` -> ``POST /queue/items`` -> token-gated
 ``POST /queue/start``), restarts ONLY the bridge container, and reads the same
 run back through the same agent-facing endpoint (``GET /runs/{run_id}/data``).
 
-The Virtual Accelerator is not incidental here. Plans execute in the
-queueserver worker against real devices, so the ONLY connector that can produce
-a run with data is one that can actually move something -- which is also why the
-shipped ``control-assistant`` preset now defaults ``control_system.type`` to
-``virtual_accelerator``. The mock connector would give a browse-only deployment
-that refuses the enqueue outright, and there would be nothing to round-trip.
+The soft IOC is not incidental here. Plans execute in the queueserver worker
+against real devices, so the ONLY connector that can produce a run with data is
+one that can actually move something -- which is also why the shipped
+``control-assistant`` preset baselines ``control_system.type`` on its live
+stand-in, a soft IOC the deployment runs for itself. The mock connector would
+give a browse-only deployment that refuses the enqueue outright, and there
+would be nothing to round-trip.
 
 The live-row buffer is in-process: it dies with the bridge. So after the restart
 the only thing that can make this read return anything is the durable Tiled
@@ -73,7 +74,7 @@ from typing import Any
 import pytest
 
 from osprey.deployment.compose_generator import resolve_project_name
-from tests.e2e import _queue_drive
+from tests.e2e import _orm_stack, _queue_drive
 from tests.e2e._deploy_diagnostics import queue_stack_logs
 from tests.e2e._volumes import remove_project_volumes
 
@@ -199,8 +200,8 @@ def deployed_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Deploye
     # convention as tests/e2e/_orm_stack.py).
     #
     # control_system.type is deliberately NOT set: the shipped preset already
-    # defaults to virtual_accelerator, which is the connector this proof needs,
-    # and pinning it here would hide a regression in that default.
+    # baselines on the live stand-in, an executable connector this proof can
+    # run on, and pinning it here would hide a regression in that baseline.
     override_path = base / "override.yml"
     override_path.write_text(
         "dispatch: null\n"
@@ -236,6 +237,12 @@ def deployed_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Deploye
             f"bluesky.tiled_port={TILED_PORT}",
             "--set",
             f"virtual_accelerator.port={VA_CA_PORT}",
+            # This module's own thousand-port block (see
+            # test_dispatch_deploy.py's 20700 note): everything not pinned
+            # explicitly follows it instead of landing on a real deployment's
+            # default 10000 block.
+            "--set",
+            "port_base=21600",
         ],
         cwd=base,
         timeout=BUILD_TIMEOUT_SEC,
@@ -256,7 +263,10 @@ def deployed_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Deploye
             f"osprey build failed (rc={build.returncode}):\n"
             f"--- stdout ---\n{build.stdout}\n--- stderr ---\n{build.stderr}"
         )
-    _seed_repo_env(repo)
+    # The repo root's `.env` — the deployment's whole secret store, and the file
+    # `osprey up` refuses to start without. The plan devices are not among what
+    # `up` appends here: they reach the worker as the device file the build staged.
+    _orm_stack.seed_repo_env(repo)
 
     # Force a fresh --dev build so the deployed bridge container runs CURRENT
     # source (osprey up does not pass --build to compose, so it would
@@ -300,24 +310,22 @@ def deployed_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Deploye
                 f"{exc}\n{queue_stack_logs(resolve_project_name({'project_name': PROJECT_NAME}))}"
             )
 
-        # Device names come from the .env `osprey up` itself wrote
-        # (_ensure_bluesky_substrate_env derives them from the render's own
-        # channel_limits.json) -- never a hardcoded facility channel, and never a
+        # Device names come from the device file the BUILD staged and the worker
+        # mounts -- this lane authors none of its own, so what is read back here
+        # is the turn-key derivation from the deployment's own
+        # channel_limits.json: never a hardcoded facility channel, and never a
         # second copy of that derivation living in this test.
-        correctors = _parse_setpoints(_env_value(repo, "BLUESKY_EPICS_SETPOINTS"))
-        bpms = _parse_readbacks(_env_value(repo, "BLUESKY_EPICS_READBACKS"))
-        assert correctors and bpms, "up wired no plan devices into the repo's .env"
+        correctors, bpms = _orm_stack.staged_devices(repo)
+        assert correctors and bpms, "the build staged no plan devices for the worker"
 
         yield DeployedStack(
             repo=repo,
             correctors=correctors,
             bpms=bpms,
-            # The render's copy, not the source one the operator edits: it is the
-            # file the deployed containers get, and the bounds below have to be
-            # the bounds the bridge enforces.
-            limits=json.loads(
-                (repo / "build" / "data" / "channel_limits.json").read_text(encoding="utf-8")
-            ),
+            # The repo's own copy, which the build copies into build/data
+            # verbatim: same bytes the deployed containers get, so the bounds
+            # below are the bounds the bridge enforces.
+            limits=json.loads((repo / "data" / "channel_limits.json").read_text(encoding="utf-8")),
             token=_env_value(repo, "BLUESKY_LAUNCH_TOKEN"),
         )
     finally:
@@ -331,22 +339,6 @@ def deployed_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Deploye
         remove_project_volumes(resolve_project_name({"project_name": PROJECT_NAME}))
 
 
-def _seed_repo_env(repo: Path) -> None:
-    """Give the repo the ``.env`` ``osprey up`` refuses to start without.
-
-    The repo root's ``.env`` is the deployment's whole secret store and the file
-    every compose invocation is pointed at, so ``up`` aborts when it is absent.
-    ``osprey init`` writes one only when the shell exports a key for the
-    profile's provider, which this lane does not need — this is the ``cp
-    .env.example .env`` the CLI itself recommends, done for the operator. The
-    substrate values ``up`` mints (launch token, plan devices) are appended to
-    whatever is here.
-    """
-    env_path = repo / ".env"
-    if not env_path.exists():
-        shutil.copy(repo / ".env.example", env_path)
-
-
 def _env_value(repo: Path, key: str) -> str:
     from osprey.utils.dotenv import parse_dotenv_file
 
@@ -355,29 +347,6 @@ def _env_value(repo: Path, key: str) -> str:
     value = parse_dotenv_file(env_path).get(key)
     assert value, f"{key} missing/empty in the deployment repo's .env"
     return value
-
-
-def _parse_setpoints(value: str) -> dict[str, tuple[str, str]]:
-    """Parse ``BLUESKY_EPICS_SETPOINTS`` (``name=SP|RB,...``) back into a mapping."""
-    out: dict[str, tuple[str, str]] = {}
-    for chunk in value.split(","):
-        if not chunk.strip():
-            continue
-        name, _, spec = chunk.partition("=")
-        sp, _, rb = spec.partition("|")
-        out[name.strip()] = (sp.strip(), rb.strip())
-    return out
-
-
-def _parse_readbacks(value: str) -> dict[str, str]:
-    """Parse ``BLUESKY_EPICS_READBACKS`` (``name=RB,...``) back into a mapping."""
-    out: dict[str, str] = {}
-    for chunk in value.split(","):
-        if not chunk.strip():
-            continue
-        name, _, rb = chunk.partition("=")
-        out[name.strip()] = rb.strip()
-    return out
 
 
 def _wait_for_health(url: str, timeout: float) -> None:

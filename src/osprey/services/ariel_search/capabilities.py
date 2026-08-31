@@ -6,6 +6,7 @@ available search modes and their tunable parameters.
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING, Any
 
 from osprey.services.ariel_search.search.base import ParameterDescriptor
@@ -63,6 +64,36 @@ SHARED_PARAMETERS = [
 ]
 
 
+def shared_parameters(config: ARIELConfig) -> list[ParameterDescriptor]:
+    """Return the shared parameter descriptors for this configuration.
+
+    The five filter/limit descriptors are always present. ``expand_query`` is
+    appended only when a vocabulary is configured — a facility that ships no
+    vocabulary gets no toggle to click and no capability entry to explain.
+
+    Args:
+        config: ARIEL configuration.
+
+    Returns:
+        The shared descriptors, in advertised order.
+    """
+    parameters = [*SHARED_PARAMETERS]
+    if config.vocabulary.enabled:
+        parameters.append(
+            ParameterDescriptor(
+                name="expand_query",
+                label="Expand vocabulary",
+                description=(
+                    "Expand facility shorthand and acronyms using the configured vocabulary"
+                ),
+                param_type="bool",
+                default=config.vocabulary.expand_by_default,
+                section="General",
+            )
+        )
+    return parameters
+
+
 def get_capabilities(config: ARIELConfig) -> dict[str, Any]:
     """Build the capabilities response for the frontend.
 
@@ -80,6 +111,7 @@ def get_capabilities(config: ARIELConfig) -> dict[str, Any]:
             },
             "default_mode": "hybrid",
             "shared_parameters": [...],
+            "vocabulary": {"enabled": ..., "concepts": ..., "expand_by_default": ...},
         }
     """
     categories: dict[str, dict[str, Any]] = {
@@ -88,10 +120,16 @@ def get_capabilities(config: ARIELConfig) -> dict[str, Any]:
 
     _add_search_modules(config, categories)
 
+    enabled = bool(config.vocabulary.enabled)
     return {
         "categories": categories,
         "default_mode": config.resolve_default_search_mode(),
-        "shared_parameters": [p.to_dict() for p in SHARED_PARAMETERS],
+        "shared_parameters": [p.to_dict() for p in shared_parameters(config)],
+        "vocabulary": {
+            "enabled": enabled,
+            "concepts": config.loaded_vocabulary.concept_count if config.loaded_vocabulary else 0,
+            "expand_by_default": config.vocabulary.expand_by_default if enabled else False,
+        },
     }
 
 
@@ -113,7 +151,21 @@ def _add_search_modules(
         parameters: list[dict[str, Any]] = []
         get_params = getattr(module, "get_parameter_descriptors", None)
         if get_params:
-            parameters = [p.to_dict() for p in get_params()]
+            # Some modules derive their defaults from the deployment's config
+            # (the built-ins report the operator's own ``rerank`` and
+            # ``similarity_threshold``, not the shipped ones); others are fixed.
+            # Passing ``config`` only when the signature names it keeps the "add
+            # a module, get a UI knob for free" contract intact -- a facility's
+            # third-party module stays a zero-argument function and is never
+            # forced to grow a parameter it has no use for. A callable whose
+            # signature cannot be read at all is treated as zero-argument, the
+            # older and safer of the two shapes.
+            try:
+                accepts_config = "config" in inspect.signature(get_params).parameters
+            except (TypeError, ValueError):
+                accepts_config = False
+            descriptors = get_params(config) if accepts_config else get_params()
+            parameters = [p.to_dict() for p in descriptors]
         categories["direct"]["modes"].append(
             {
                 "name": name,
@@ -124,4 +176,4 @@ def _add_search_modules(
         )
 
 
-__all__ = ["SHARED_PARAMETERS", "get_capabilities"]
+__all__ = ["SHARED_PARAMETERS", "get_capabilities", "shared_parameters"]

@@ -11,7 +11,7 @@ Config shape, as it appears in a project's ``config.yml``::
     services:
       qmd:
         path: ./services/qmd
-        port: 8180
+        port: 10060                          # the qmd slot at the default base
         interval: 30
         models_dir: /srv/osprey/qmd-models   # optional; see below
 
@@ -48,14 +48,26 @@ from pathlib import Path
 from typing import Any
 
 from osprey.deployment.errors import DeploymentPreconditionError
+from osprey.port_layout import default_port, resolve_port_base
 
-#: Host port the sidecar publishes. Deliberately NOT qmd's own default of
-#: 8181: the daemon binds loopback only (``listen(port, "localhost")``,
-#: hardcoded, no ``--host`` flag), so the container's entrypoint runs qmd on the
-#: internal 8181 and fronts it with a forwarder that owns the routable port.
-#: Keeping the two numbers distinct means "8181" always names the private
-#: daemon and this port always names the endpoint clients talk to.
-DEFAULT_PORT = 8180
+#: Key of the sidecar's block under ``services:`` — also its compose service
+#: name and its ``deployed_services`` entry. Spelled once so the build-time
+#: validator that asks "is there a block to dial" reads the same key the
+#: resolver below does.
+QMD_SERVICE_NAME = "qmd"
+
+#: Host port the sidecar publishes **at the layout's default base** — the value
+#: for a caller with no config to resolve a base from. A caller holding one
+#: resolves the slot at *its* base instead; :func:`resolve_qmd_service_config`
+#: does exactly that, and this constant is only the dataclass field's default.
+#:
+#: Deliberately NOT qmd's own default of 8181: the daemon binds loopback only
+#: (``listen(port, "localhost")``, hardcoded, no ``--host`` flag), so the
+#: container's entrypoint runs qmd on the internal 8181 and fronts it with a
+#: forwarder that owns the routable port. Keeping the two numbers distinct means
+#: "8181" always names the private daemon and this port always names the
+#: endpoint clients talk to.
+DEFAULT_PORT = default_port(QMD_SERVICE_NAME)
 
 #: Interface every deployed service publishes on when ``deployment`` is absent.
 #: Matches the ``| default('127.0.0.1')`` the service compose templates spell.
@@ -76,11 +88,11 @@ DEFAULT_INTERVAL_SECONDS = 30
 
 #: Config key an operator edits to move the published host port. Spelled once
 #: so the deploy-time port-conflict remedy and the schema cannot drift apart.
-PORT_CONFIG_KEY = "services.qmd.port"
+PORT_CONFIG_KEY = f"services.{QMD_SERVICE_NAME}.port"
 
 #: Config key naming a host directory of pre-staged GGUF model files. Spelled
 #: once so the schema, the deploy-time preflight and its refusal text agree.
-MODELS_DIR_CONFIG_KEY = "services.qmd.models_dir"
+MODELS_DIR_CONFIG_KEY = f"services.{QMD_SERVICE_NAME}.models_dir"
 
 #: The exact filenames the three models must carry, in the order the sidecar
 #: loads them: embedding, reranker, query expansion.
@@ -162,11 +174,17 @@ def resolve_qmd_service_config(config: Mapping[str, Any] | None) -> QMDServiceCo
     services = config.get("services")
     if not isinstance(services, Mapping):
         return None
-    block = services.get("qmd")
+    block = services.get(QMD_SERVICE_NAME)
     if not isinstance(block, Mapping):
         return None
     return QMDServiceConfig(
-        port=_positive_int(block.get("port"), DEFAULT_PORT, PORT_CONFIG_KEY),
+        # The base this config resolved, not the layout's default: a second
+        # deployment on the same host publishes its sidecar in its own block.
+        port=_positive_int(
+            block.get("port"),
+            default_port(QMD_SERVICE_NAME, base=resolve_port_base(config)),
+            PORT_CONFIG_KEY,
+        ),
         bind_address=resolve_bind_address(config),
         interval_seconds=_positive_int(
             block.get("interval"), DEFAULT_INTERVAL_SECONDS, "services.qmd.interval"
@@ -279,7 +297,7 @@ def _models_staging_remedy(directory: Path) -> str:
         "`hf_<org>_<basename>` form above — the download names differ — then re-run\n"
         "the deploy.\n"
         f"To go back to build-time downloads, remove {MODELS_DIR_CONFIG_KEY} from "
-        "config.yml."
+        "under `config:` in profile.yml and run `osprey build`."
     )
 
 

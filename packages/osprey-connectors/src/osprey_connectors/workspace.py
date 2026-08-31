@@ -30,6 +30,18 @@ STATE_DIR_NAME = "var"
 #: disagree about where it is.
 IMAGE_DIR_NAME = ".image"
 
+#: Reserved runtime-output directory directly under a repo's ``data/`` tree:
+#: ``data/.runtime/``. The one place ``osprey up`` may write inside the
+#: otherwise build-owned data tree — today the per-lane Bluesky CURVE
+#: certificate sets, ``data/.runtime/<lane>_curve/``. The build treats it as
+#: not existing: the profile-material fold never hashes it (a successful start
+#: must not mark its own build OUT OF DATE and strand the scaffolded boot
+#: unit at the drift gate, #716) and the data copy never stages it (secrets
+#: must not land in ``build/`` or in images). Spelled here beside the zone
+#: names because the writer lives in ``deployment/`` and the fold in ``cli/``,
+#: and the two must agree on these exact bytes.
+RUNTIME_DATA_DIR_NAME = ".runtime"
+
 #: The rendered config, relative to the repo root. It is an *output*: the source
 #: of truth is ``profile.yml`` at the repo root, and this file is what a build
 #: derives from it. Every producer and consumer of that path spells it through
@@ -42,13 +54,20 @@ RENDERED_CONFIG_RELPATH = f"{BUILD_DIR_NAME}/config.yml"
 #: does not offer.
 DEFAULT_AGENT_DATA_BASE_DIR = f"{STATE_DIR_NAME}/agent_data"
 
+#: The safety audit log, relative to the repo root: what the agent was asked to
+#: do and what it did. Durable like the agent-data root beside it, and kept by
+#: ``osprey reset`` unless ``--purge-audit`` is passed. Named here rather than
+#: spelled at each end because the directory the reset command promises to keep
+#: has to be the directory the refusal recorder writes into.
+AUDIT_DIR_RELPATH = f"{STATE_DIR_NAME}/audit"
+
 #: The two directories that make up the state zone, created empty and otherwise
 #: the agent's to write. Both ``osprey init`` and ``osprey build`` guarantee they
 #: exist — a fresh clone carries no git-ignored directory, so whichever command
 #: runs first has to make them, and a repo that was reset must end up looking
 #: like one that was freshly cloned. Spelled once for exactly that reason: two
 #: commands agreeing by coincidence is how a reset and a clone start to differ.
-STATE_ZONE_DIRS: tuple[str, ...] = (DEFAULT_AGENT_DATA_BASE_DIR, f"{STATE_DIR_NAME}/audit")
+STATE_ZONE_DIRS: tuple[str, ...] = (DEFAULT_AGENT_DATA_BASE_DIR, AUDIT_DIR_RELPATH)
 
 #: Subdirectory of the agent-data root holding the simulation's mutable
 #: ``active_scenarios`` state file.

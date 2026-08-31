@@ -9,17 +9,26 @@
 # Project identity
 project_name: "{{ project_name }}"
 
-# Facility identity — one block, two keys:
-#   name   — display name woven into the agent prompts (CLAUDE.md, subagents)
-#            and the web-terminal landing page. Preferred spelling, and it
-#            wins over a top-level `facility_name`, which is honored as a
-#            fallback; with neither set, the project name is used.
-#   prefix — short abbreviation the deployed web stack uses for container
-#            names (`<prefix>-nginx`, `<prefix>-web-<user>`); must be a
-#            non-empty valid Docker name start ([a-zA-Z0-9]).
-# facility:
-#   name: "Example Research Facility"
-#   prefix: ex
+# Facility identity — one block, three keys:
+#   name     — display name woven into the agent prompts (CLAUDE.md, subagents)
+#              and the web-terminal landing page. Preferred spelling, and it
+#              wins over a top-level `facility_name`, which is honored as a
+#              fallback; with neither set, the project name is used.
+#   prefix   — short abbreviation the deployed web stack uses for container
+#              names (`<prefix>-nginx`, `<prefix>-web-<user>`); must be a
+#              non-empty valid Docker name start ([a-zA-Z0-9]).
+#   ontology — path, relative to the project root, to this facility's compiled
+#              ontology table: the JSON `osprey knowledge compile-ontology`
+#              writes. It is the one source for the device vocabulary the
+#              channel-finder subagent's terminology table renders, so pointing
+#              it at your own table is how that table learns your words. Drop
+#              the key and the subagent is told plainly that no vocabulary was
+#              declared, which is better than shipping somebody else's; point
+#              it at a file that is not there and the build stops and says so.
+facility:
+  # name: "Example Research Facility"
+  # prefix: ex
+  ontology: data/facility_ontology.json
 
 build_dir: ./build
 
@@ -183,7 +192,7 @@ services:
     # container and the agent's ARIEL DSN — which is derived from the keys in
     # this block rather than written out, so this is the single source of
     # truth for both. Mirrors the openobserve credentials convention.
-    port_host: 5432
+    port_host: {{ osprey_ports.postgres }}
 
   # Local telemetry backend for the OSPREY agent — a single-binary OTLP
   # logs/metrics store (see docs/how-to/monitor-agent.rst). This reference
@@ -193,7 +202,7 @@ services:
   # copy. `osprey up` mints a strong ZO_ROOT_USER_PASSWORD into .env.
   openobserve:
     path: ./services/openobserve
-    port: 5080          # Host port for the OpenObserve UI + OTLP ingest
+    port: {{ osprey_ports.openobserve }}         # Host port for the OpenObserve UI + OTLP ingest
     retention_days: 14  # Growth bound: drop telemetry older than N days. A named
                         # volume has no hard size cap, so age-based retention is
                         # the "size" knob (min 3; OpenObserve default is ~10y).
@@ -218,7 +227,7 @@ services:
   # search reports itself down.
   qmd:
     path: ./services/qmd
-    port: 8180      # Host port clients talk to. Deliberately NOT qmd's own
+    port: {{ osprey_ports.qmd }}     # Host port clients talk to. Deliberately NOT qmd's own
                     # 8181: the daemon binds IPv6 loopback only, hardcoded, so
                     # the container runs it on an internal 8181 and fronts it
                     # with a forwarder that owns this port.
@@ -236,11 +245,90 @@ services:
                     # Raise it on a large corpus, where a no-op sweep is not
                     # free.
 
+  # Graph store — a Neo4j container holding a DISPOSABLE mirror of an
+  # RDF/Turtle corpus. The TTL on disk stays the source of truth and
+  # `osprey knowledge seed-graph` rebuilds the graph from it, so losing this
+  # container's volume costs a re-seed, not data. It answers the multi-hop
+  # relationship questions keyword and semantic search cannot: what a channel
+  # belongs to, what a subsystem contains, what depends on what.
+  #
+  # Deployed by default, and this block is what makes that legal: a `graphdb`
+  # entry in `deployed_services` without it is refused before compose runs —
+  # nothing else says which ports to publish. Comment out both or neither.
+  #
+  # No password key here, deliberately. The container reads GRAPHDB_PASSWORD
+  # from the project .env, which `osprey up` mints when it is unset; a password
+  # written into this file would be read by nobody and would silently lose to
+  # the minted value. Same convention as `postgresql:` above.
+  #
+  # EXTERNAL STORE: to talk to a graph store this deployment does not run, add
+  # an explicit `uri:` (e.g. bolt://graph.example.org:7687) plus an optional
+  # `username:` (default neo4j) here, and leave `graphdb` OUT of
+  # `deployed_services`. Nothing is minted on that path — set GRAPHDB_PASSWORD
+  # in the project .env yourself, or the store refuses the connection.
+  graphdb:
+    path: ./services/graphdb
+    image: neo4j:5.26-community  # Pinned to the 5.26 LTS line: neosemantics
+                                 # (n10s), the plugin that imports the RDF, has
+                                 # no manifest entry for anything newer. Repoint
+                                 # it at a mirror or a pre-baked image on an
+                                 # air-gapped host.
+    port_host: {{ osprey_ports.graphdb_bolt }}      # Bolt — the only protocol the neo4j driver speaks,
+                          # so this is what the seeder and the agent dial.
+    http_port_host: {{ osprey_ports.graphdb_http }} # HTTP — the Neo4j Browser an operator opens, and the
+                          # endpoint the container healthcheck probes.
+                          # `osprey health` does NOT use this port: it dials the
+                          # store over bolt on port_host (or an explicit `uri`),
+                          # which is what its remedies name. Both ports publish
+                          # on the project-wide `deployment.bind_address`
+                          # (default 127.0.0.1); no per-service bind_address.
+    ttl_path: ./data/demo_machine.ttl
+                          # Corpus to seed the store from, resolved against this
+                          # file's directory — the render — unlike
+                          # `facility_knowledge.bundle_path` and every other
+                          # config-relative path, which resolve against the
+                          # project root: the store is seeded from the `data/`
+                          # the build assembled here. This one is the
+                          # demo machine — the same devices and channels the
+                          # channel database in `data/` describes, rebuilt as a
+                          # graph, so the agent's graph answers and its channel
+                          # search agree. Regenerate it after editing the
+                          # channel database with:
+                          #   osprey knowledge build-ttl data/demo_machine.ttl
+                          # (in a four-zone repo the render under build/ is
+                          # disposable — regenerate into your profile's data
+                          # tree and rebuild). A build profile that ships its
+                          # own `data:` tree replaces this directory wholesale,
+                          # so it must set this key in its `config:` overlay.
+                          # Point this key at your own TTL to seed that
+                          # instead, or comment it out to bring the store up
+                          # bootstrapped but empty.
+    # JVM memory. Neo4j sizes nothing automatically inside a container — left
+    # unset it reads the HOST's memory and picks numbers the container's own
+    # limit will not honour — so all three are spelled out. Budget roughly
+    # heap_max_size + pagecache_size + ~0.5G of JVM overhead. These values run
+    # the shipped corpus comfortably; a substantially larger graph wants more.
+    heap_initial_size: 512m   # Heap the server starts with
+    heap_max_size: 1G         # Ceiling the heap may grow to
+    pagecache_size: 512m      # Off-heap cache for graph data and indexes,
+                              # separate from the heap and NOT taken out of it
+    # Query bounds, read by the agent's `read_cypher` tool. Both cap a SINGLE
+    # question rather than the store: the timeout is handed to the server,
+    # which cancels the transaction itself, and the row cap decides how much of
+    # a broad match comes back. Raising them spends the agent's context window,
+    # not the store's memory — a few thousand rows crowd out the conversation
+    # long before they trouble Neo4j.
+    query_timeout_s: 15   # Server-side transaction timeout for one agent
+                          # query, in seconds.
+    query_max_rows: 200   # Rows returned per query before truncation; the tool
+                          # says when it cut.
+
 # Services to deploy with `osprey up`
 deployed_services:
   - postgresql
   - openobserve
   - qmd             # Comment out together with the `qmd:` block above.
+  - graphdb         # Comment out together with the `graphdb:` block above.
 {% else %}
 # Attached project (deploy_services: false): this project connects to a
 # services stack another OSPREY project deployed on the same host, so it
@@ -307,7 +395,7 @@ control_system:
   #     Channel Access. Requires the VA service running first — add
   #     virtual_accelerator to deployed_services and run `osprey up`
   #     (see the "Use the Virtual Accelerator" how-to in the OSPREY docs).
-  #   - epics: Production EPICS control system (ALS values below)
+  #   - epics: Production EPICS control system (authored below at go-live)
   type: mock  # <-- Change to 'virtual_accelerator' or 'epics' for other modes
 
   # Write Access Control - Master safety switch for hardware control
@@ -317,6 +405,14 @@ control_system:
                         # trust the value on this line, never the comment beside it.
                         # For production: carefully review hardware implications before enabling
                         # If disabled, ALL writes are blocked (non-configurable hard error)
+  # Write posture is per connector type, and this key is what a type inherits
+  # when its own block says nothing about itself. Each block under `connector:`
+  # below may state its own `writes_enabled` instead — the commented lines there
+  # show the shape — so a deployment whose real machine is a live one can arm
+  # writes on the virtual accelerator alone and leave the machine read-only.
+  # A type that states its own posture never falls back to this key.
+  # Only a literal `true` arms writes at either level: the quoted string "true"
+  # and 1 are not it, and leave writes off.
 
   # Additional tools blocked by the writes kill switch. Framework servers'
   # write-gated tools are added automatically; list custom server tools here so
@@ -325,34 +421,20 @@ control_system:
   # write_tools:
   #   - "mcp__my_server__dangerous_write"
 
+  # Operator-facing names for the control targets, shown on the web terminal's
+  # control-target chip. Defaults come from what each target is — real machine
+  # "Real machine" ("Demo" on a simulated connector), stand-in "Rehearsal",
+  # virtual accelerator "Simulator". Uncomment to rename any of them.
+  # target_display_names:
+  #   live: "Real machine"
+  #   standin: "Rehearsal"
+  #   va: "Simulator"
+
   # Runtime Channel Limits Checking
   limits_checking:
     enabled: true
     database_path: "data/channel_limits.json"
-    allow_unlisted_channels: true  # Permissive mode for tutorial
-
-  # Write Verification Configuration
-  # How the connector confirms a write took effect. The level below applies only when
-  # the caller does not name one: osprey.runtime.write_channel scripts and direct
-  # connector calls. The channel_write MCP tool, multi-channel writes, and Bluesky
-  # device writes pass an explicit level ("callback"); for those, only a per-channel
-  # "verification" entry in channel_limits.json changes the level, and only on
-  # single-channel tool writes.
-  # A failed verification is not a hard stop. The channel_write MCP tool reports it in
-  # its result (verification.verified: false); osprey.runtime.write_channel discards it
-  # (a readback mismatch is logged at debug level only); only write_channel_checked
-  # raises (plans, which write through the Bluesky bridge's connector-backed
-  # devices). A write the CA layer could not deliver at all - for example a PV that
-  # never connects - is different: it sets success: false, which does raise from
-  # osprey.runtime.write_channel and shows up as a failed write in the MCP tool.
-  write_verification:
-    default_level: callback  # Options: none, callback, readback
-                            # - none: Fast write, no verification (off, on the paths above)
-                            # - callback: Control system confirms processing (e.g., EPICS IOC callback)
-                            # - readback: Full verification with readback comparison
-    default_tolerance_percent: 0.1  # Default tolerance: 0.1% (one per mil)
-                                    # Only used for "readback" verification level
-                                    # Can be overridden per-channel in channel_limits.json
+    allow_unlisted_channels: true  # false refuses any channel the database does not list
 
   # Channel-read response size
   # Array channels (waveforms, camera frames) can be far larger than an agent's
@@ -389,7 +471,7 @@ control_system:
   #   - Security: Direct library calls (epics.caput, tango.DeviceProxy, etc.) - bypasses safety
   #   - Future: Other control systems (LabVIEW, custom) - comprehensive detection
   #
-  # This ensures LLM-generated code cannot bypass connector safety features (limits, verification)
+  # This ensures LLM-generated code cannot bypass connector safety features (limits, write confirmation)
   # by directly importing control system libraries.
   #
   # Advanced: Extend patterns for custom control system libraries (rarely needed)
@@ -448,21 +530,50 @@ control_system:
     # deployed soft-IOC's port is a one-place edit. Set `port:` on a gateway
     # only to reach a VA this project does not deploy — one on another host,
     # or a container published on a host port different from the one it
-    # serves on.
+    # serves on. The example below reads {{ osprey_ports.va_standin + 1 }}, not
+    # {{ osprey_ports.va_standin }}, on purpose: the shipped build-profile
+    # example puts the live stand-in VA on {{ osprey_ports.va_standin }}
+    # (`virtual_accelerator.live_standin`), the first port of this deployment's
+    # VA band, so the example here names the next one up — a port no OSPREY
+    # service claims unless a second stand-in is deployed.
     virtual_accelerator:
       timeout: 5.0
       simulation_file: data/simulation/machine.json
+      # Write posture for the simulator alone. Uncomment to arm writes here
+      # while `control_system.writes_enabled` above stays false and keeps the
+      # live machine read-only. The shipped `control-assistant-va-readwrite`
+      # persona is exactly this pair of keys.
+      # writes_enabled: true
+      # Limits-checking posture for this connector type alone. A block here
+      # overrides the deployment-wide `limits_checking` block above as a whole
+      # (both leaves required) - database_path stays deployment-wide.
+      # limits_checking:
+      #   enabled: true
+      #   allow_unlisted_channels: true
+      # Channel the target switch reads to prove this target is reachable
+      # before making it active. A target with no probe_channel is never
+      # switched to. This one is served by the simulation machine model above.
+      probe_channel: SR:VAC:GAUGE:SR01:PRESSURE:RB
       gateways:
         read_only:
           address: localhost
-          # port: 5074
+          # port: {{ osprey_ports.va_standin + 1 }}
           use_name_server: true
         write_access:
           address: localhost
-          # port: 5074
+          # port: {{ osprey_ports.va_standin + 1 }}
           use_name_server: true
 
-    # EPICS connector (production mode) — ALS production values.
+    # EPICS connector (production mode) — ships unconfigured on purpose.
+    #
+    # Nothing here names a machine: a facility's gateways cannot be guessed,
+    # and shipping someone else's would make a stock deployment's `live` target
+    # look ready while pointing at hardware you never configured. Authoring
+    # this block is the go-live edit — uncomment `gateways` (and `probe_channel`
+    # below) with your facility's values, and set
+    # `control_system.target_switch.live_gateway_acknowledged` further down to
+    # confirm them. Until then the live target shows as not configured, which
+    # is the truthful state of a fresh deployment.
     #
     # PVAccess (PVA) read routing: addresses matching any glob in `pva_channels`
     # are read through the p4p client — the transport NTNDArray camera frames
@@ -484,6 +595,21 @@ control_system:
     # on its local subnet.
     epics:
       timeout: 5.0
+      # Write posture for the live machine. Stating it here pins it: a type that
+      # carries its own posture never falls back to the deployment-wide key, so
+      # `false` holds even if a profile or an overlay turns that key on.
+      # writes_enabled: false
+      # Limits-checking posture for the live machine. A block here overrides
+      # the deployment-wide `limits_checking` block above as a whole (both
+      # leaves required) - database_path stays deployment-wide.
+      # limits_checking:
+      #   enabled: true
+      #   allow_unlisted_channels: false
+      # Channel the target switch reads to prove the live machine is reachable
+      # before making it active. Facility-specific, so nothing is shipped set:
+      # while it is unset this target is never switched to (the deployment
+      # baseline still connects normally).
+      # probe_channel: SR:BEAM:CURRENT
       # pva_channels:
       #   - "*:IMAGE*"
       #   - "*:ARRAY*"
@@ -491,18 +617,33 @@ control_system:
       #   address: your-pva-gateway.example.com  # Replace with your PVA gateway
       #   port: 5075
       #   use_name_server: false  # Set true for SSH tunnels
-      gateways:
-        read_only:
-          address: cagw-alsdmz.als.lbl.gov
-          port: 5064
-          # use_name_server: Set to true for SSH tunnels (uses EPICS_CA_NAME_SERVERS)
-          #                 Set to false for direct gateway (uses EPICS_CA_ADDR_LIST)
-          #                 Defaults to false. Can be overridden via environment variable.
-          use_name_server: false
-        write_access:
-          address: cagw-alsdmz.als.lbl.gov
-          port: 5084
-          use_name_server: false
+      # use_name_server: Set to true for SSH tunnels (uses EPICS_CA_NAME_SERVERS)
+      #                  Set to false for direct gateway (uses EPICS_CA_ADDR_LIST)
+      #                  Defaults to false. Can be overridden via environment variable.
+      # gateways:
+      #   read_only:
+      #     address: your-ca-gateway.example.com
+      #     port: 5064
+      #     use_name_server: false
+      #   write_access:
+      #     address: your-ca-gateway.example.com
+      #     port: 5084
+      #     use_name_server: false
+
+  # Control-System Target Switch (Layer 2)
+  # Bounds how a running session moves between the connector targets above.
+  #
+  # The `live_gateway_acknowledged` key below is the operator acknowledgment for
+  # the live machine. Set it to your own live gateway's hostname to confirm the
+  # `epics` gateways above really are your facility's. While it is unset a
+  # session may not switch TO the live target; returning to it when it is this
+  # deployment's baseline is always allowed.
+  target_switch:
+    drain_timeout_s: 5      # Seconds in-flight operations get to finish on the
+                            # old target before it is torn down regardless
+    probe_interval_s: 30    # Seconds between background reachability probes of
+                            # every target's gateways
+    # live_gateway_acknowledged: your-ca-gateway.example.com
 
 # Archiver Configuration
 archiver:
@@ -524,6 +665,11 @@ archiver:
   # arrives as an `archiver.type` override at build time.
   type: mock_archiver  # <-- 'epics_archiver' for production
 
+  # When a read names no bin size, the bin is chosen from the time span so a
+  # continuously archived channel returns about this many points (1 s bins up
+  # to ~2.8 h, ~53 min bins for a year). The agent is told which bin was used.
+  auto_bin_points: 10000
+
   # Mock archiver (development mode) — synthesizes history from the same
   # simulation machine model as the control-system connector above, so live
   # reads and archiver data stay consistent. The machine file is derived from
@@ -540,13 +686,20 @@ archiver:
   # mock_archiver:
   #   simulation_file: data/simulation/machine.json
 
-  # EPICS Archiver Appliance (production mode)
-  epics_archiver:
-    url: https://archiver.als.lbl.gov:8443
-    timeout: 60              # Timeout for archiver requests in seconds
+  # EPICS Archiver Appliance (production mode) — ships unconfigured on purpose.
+  #
+  # Nothing here names an appliance: a facility's archiver cannot be guessed,
+  # and shipping someone else's URL would make a flip to `type: epics_archiver`
+  # look ready while reading history from a machine you never configured.
+  # Authoring this block travels with that flip — uncomment it with your
+  # facility's values. Until then the connector refuses to start without a
+  # `url`, which is the truthful state of a fresh deployment.
+  # epics_archiver:
+  #   url: https://your-archiver.example.com:8443
+  #   timeout: 60            # Timeout for archiver requests in seconds
 
   # MongoDB archiver. Its client ships with OSPREY, so there is nothing extra to
-  # install. Every key here except port and timeout is required; the connector raises on
+  # install. Every key here except timeout is required; the connector raises on
   # the first one missing. The password itself is never stored here — it is read
   # at connect time from the environment variable named by password_env, which
   # `osprey up` mints into the project's .env.
@@ -558,7 +711,11 @@ archiver:
   # what you wrote here.
   mongodb_archiver:
     host: localhost
-    port: 27017             # Optional, defaults to 27017
+    port: {{ osprey_ports.mongo }}             # Required. The build writes this
+                            # deployment's mongo layout slot; the connector
+                            # ships in its own wheel, cannot reach the layout,
+                            # and so has no fallback — deleting this line makes
+                            # the archiver raise at connect time.
     name: osprey_archiver
     collection: pv_history
     auth: admin             # Authentication database
@@ -633,17 +790,17 @@ archiver:
 
 channel_finder:
   # Active pipeline mode
-  pipeline_mode: {{ default_pipeline }}  # "in_context", "hierarchical", or "middle_layer"
+  pipeline_mode: {{ default_pipeline }}  # "in_context", "hierarchical", "middle_layer", or "graph"
 
   # osprey:panel-port channel_finder
   # CHANNELS tab: the channel-finder UI is a web server of its own, configured
   # under this section. It launches when `channel-finder` is in the panel list
   # under `web:` below AND this `channel_finder:` section exists — it does, so
-  # 8092 is bound by default. Uncomment to move or disable it. (See the
+  # {{ osprey_ports.channel_finder }} is bound by default. Uncomment to move or disable it. (See the
   # COMPANION WEB SERVERS map further down for the resolution order.)
   # web:
   #   host: "127.0.0.1"
-  #   port: 8092
+  #   port: {{ osprey_ports.channel_finder }}
   #   auto_launch: true
 
   # Descriptive names for channels that belong to no device family, generated
@@ -660,7 +817,13 @@ channel_finder:
   #     max_tokens: 1000
   #   llm_batch_size: 10
 
-  # Pipeline-specific configurations
+  # Pipeline-specific configurations. Three of the four paradigms name the
+  # database file they read, and their block appears below. The fourth,
+  # `graph`, names nothing here: it answers from the Neo4j store declared under
+  # `services.graphdb` above — the one this project deploys, or a facility-
+  # hosted one named by an explicit `uri:` there. So `pipeline_mode: graph`
+  # plus that block is the whole of its configuration, and this section renders
+  # empty in graph mode.
   pipelines:
 {% if enable_in_context %}
     # In-Context Pipeline (Semantic Search)
@@ -722,9 +885,12 @@ channel_finder:
 
   # Benchmarking configuration
   # All paradigms share a single benchmark query set, tier-resolved at build
-  # time per channel_finder_mode (in_context → tier 1, hierarchical/middle_layer
-  # → tier 3; override with `osprey set tier=N`, then rebuild).  Query file is
-  # materialized to data/benchmarks/queries.json by the scaffolder.
+  # time per channel_finder_mode (in_context → tier 1; hierarchical,
+  # middle_layer and graph → tier 3; override with `osprey set tier=N`, then
+  # rebuild).  Query file is materialized to data/benchmarks/queries.json by
+  # the scaffolder.  Graph mode takes no tier override — it ships no tiered
+  # database, so the tier selects only this query set and `osprey build`
+  # refuses an explicit one.
   benchmark:
     # Single source of truth — all paradigms read the same query set.
     dataset_path: data/benchmarks/queries.json
@@ -832,11 +998,11 @@ ariel:
   # ARIEL tab: the search UI is a web server of its own, configured under this
   # section rather than a top-level one. It launches when `ariel` is in the
   # panel list under `web:` below — this section existing is not required, so
-  # 8085 is bound by default. Uncomment to move or disable it. (See the
+  # {{ osprey_ports.ariel }} is bound by default. Uncomment to move or disable it. (See the
   # COMPANION WEB SERVERS map further down for the resolution order.)
   # web:
   #   host: "127.0.0.1"
-  #   port: 8085
+  #   port: {{ osprey_ports.ariel }}
   #   auto_launch: true
 
   # Which module answers a search that names no mode — the web interface's
@@ -845,6 +1011,61 @@ ariel:
   # than quietly answered by a different one. Unset, this resolves to `hybrid`
   # where that module is enabled and `keyword` everywhere else.
   default_search_mode: hybrid
+
+  # Facility vocabulary: the shorthand operators type ("t/s the bpm offset"),
+  # mapped to the words the logbook prose actually contains ("troubleshoot",
+  # "beam position monitor"). Stemming cannot bridge those two spellings, so
+  # without this file a search in control-room shorthand misses the entries
+  # that describe exactly what it asked about. Expansion is plain dictionary
+  # matching — no model, no network call — and every rewrite is reported back
+  # as `expanded_terms`, so a surprising hit always arrives with its reason.
+  #
+  # This project ships a twenty-concept EXAMPLE at the path below, covering
+  # what most storage-ring facilities share (the orbit and ring group is
+  # storage-ring-specific — a linac or FEL should delete it first). It is a
+  # starting point, not your vocabulary: edit it, and validate every edit
+  # with
+  #   osprey ariel vocab-check data/ariel/vocabulary.yml
+  #
+  # The file is read ONCE, when this config is parsed — not lazily on the first
+  # search — so a broken file is a startup-time failure, loudly: the ARIEL
+  # panel comes up in CONFIGURATION INVALID mode with the errors and the fix on
+  # screen and the search form disabled, search returns 503 naming
+  # `ariel.vocabulary.path`, and the MCP server refuses to start. Browse,
+  # entries, status and publishing keep working. The recovery is either switch
+  # `enabled` to false or repoint `path`, then restart — and if the file is
+  # baked into a deployed persona image, fix the source and rebuild.
+  vocabulary:
+    enabled: true
+
+    # Resolved against the project root (the deployment repo, not this
+    # rendered file's build/ directory), like every other config-relative
+    # path here (`qmd_export.mirror_path` and `facility_knowledge.bundle_path`
+    # follow the same rule).
+    path: data/ariel/vocabulary.yml
+
+    # Whether a search that expresses no preference gets expansion. Shipped
+    # explicitly rather than left to its default, because the per-request
+    # `expand_query` argument overrides it in both directions and an operator
+    # reading this file should be able to see which way the default falls.
+    expand_by_default: true
+
+    # The two direction gates, deliberately asymmetric. Matching a form and
+    # adding its canonical is always on (`bpm` finds "beam position monitor").
+    # These control the REVERSE: spelling a canonical out and also searching
+    # the short form. For an acronym that is free recall — an initialism means
+    # one thing. For ordinary words it is not: expanding "calibration" into
+    # "cal" drags in far more noise than it recovers.
+    canonical_to_acronym: true
+    canonical_to_shorthand: false
+
+    # No `expand_modes` key: unset means every enabled search module expands,
+    # which is what a facility wants until proven otherwise, and a shipped list
+    # would rot the moment a module is toggled. The key exists as one specific
+    # knob — hybrid search feeds the expanded query to the qmd sidecar's LLM
+    # reranker, so a facility whose reranked ordering degrades under expansion
+    # sets `expand_modes: [keyword, semantic]` here to drop `hybrid` alone
+    # without giving up expansion everywhere else.
 
   # Search modules (leaf-level search functions)
   # provider: references api.providers for credentials (api_key, base_url)
@@ -864,6 +1085,29 @@ ariel:
   search_modules:
     keyword:
       enabled: true
+      # These knobs MUST stay under `settings:`. The search-config loader keeps
+      # only `enabled`, `provider`, `model` and `settings` and drops every
+      # other key without a word, so a knob written as a sibling of `enabled`
+      # is silently inert — no error, no warning, just the defaults forever.
+      settings:
+        # Pattern tokens in a keyword query: `*` globs (`SR01C___BPM*`, with
+        # `?` as a single-character wildcard inside a glob) and explicit
+        # `/regex/` tokens, run as case-insensitive matches against the entry
+        # text — a glob is additionally anchored to word boundaries, an
+        # explicit `/regex/` is matched exactly as written. Both need at
+        # least 3 consecutive literal characters to be indexable; below that
+        # the token is searched as ordinary text and the search says so in
+        # its diagnostics. Set false to make `*` and `/…/` plain words again
+        # — the escape hatch for a logbook whose prose is full of literal
+        # asterisks.
+        patterns_enabled: true
+        # The wall-clock envelope a pattern search runs under. Applied only to
+        # a query that actually emitted a pattern predicate, so an ordinary
+        # keyword search is untouched by it. A pattern that cannot use the
+        # index scans the whole logbook, and this is what stops that from
+        # holding the panel open; the search returns a timeout diagnostic
+        # rather than nothing, so the agent can tell "too slow" from "no hits".
+        pattern_timeout_seconds: 10.0
     semantic:
       enabled: true      # Degrades gracefully if Ollama/pgvector unavailable
       provider: ollama    # References api.providers.ollama
@@ -886,14 +1130,20 @@ ariel:
       # other key without a word, so a knob written as a sibling of `enabled`
       # is silently inert — no error, no warning, just the defaults forever.
       settings:
-        rerank: true          # qmd's LLM reranker. Costs roughly 4x the query
-                              # latency and its cost barely grows with corpus
-                              # size, so no logbook is small enough to outrun
-                              # it. This is an agent tool with no interactive
-                              # budget to blow, so it keeps the quality path;
-                              # set false for the fast one.
-        candidate_limit: 40   # Candidates the reranker considers. Lowering it
-                              # trades recall for latency.
+        rerank: true          # qmd's LLM reranker. An LLM reviews every
+                              # candidate, so it dominates query latency, at a
+                              # cost driven by the candidate pool that grows
+                              # far more slowly than the corpus does — no
+                              # logbook is small enough to outrun it. This ONE
+                              # key governs both surfaces: the agent's
+                              # hybrid_search tool and the ARIEL search panel.
+                              # Both can override it — the tool's `rerank`
+                              # argument per call, the panel's toggle per
+                              # session until Reset — so set it false only when
+                              # you want the fast path everywhere.
+        candidate_limit: 40   # Candidates the reranker considers, for both
+                              # surfaces. Lowering it trades recall for
+                              # latency.
 
   # Enhancement modules
   # provider: references api.providers for credentials
@@ -925,14 +1175,15 @@ ariel:
     qmd_export:
       enabled: true
       settings:
-        # Resolved against the directory holding this file, like every other
-        # config-relative path here (`facility_knowledge.bundle_path` follows
-        # the same rule). It belongs under var/, the durable STATE zone: the
-        # mirror is machine-written from Postgres, is as large as the logbook,
-        # and the repo's .gitignore keeps var/ out of git — a path under data/
-        # would commit a generated corpus. The compose generator binds this
-        # same value into the sidecar read-only, so moving the mirror stays a
-        # one-place edit.
+        # Resolved against the project root (the deployment repo, not this
+        # rendered file's build/ directory), like every other config-relative
+        # path here (`facility_knowledge.bundle_path` follows the same rule).
+        # It belongs under var/, the durable STATE zone: the mirror is
+        # machine-written from Postgres, is as large as the logbook, and the
+        # repo's .gitignore keeps var/ out of git — a path under data/ would
+        # commit a generated corpus. The compose generator binds this same
+        # value into the sidecar read-only from that same root, so moving the
+        # mirror stays a one-place edit.
         mirror_path: var/ariel_mirror
 
   # Default provider for EMBEDDING modules that name none of their own. It is
@@ -964,9 +1215,10 @@ logbook:
 # ============================================================
 # OKF bundle providing deep facility knowledge (subsystems, devices,
 # procedures, physics notes, references) to the facility_knowledge
-# MCP server.  Resolved relative to this config file's directory
-# (project root).  Replace with the absolute path to your own bundle
-# once you have customised the example content.
+# MCP server.  Resolved relative to the project root (the deployment
+# repo, not this rendered file's build/ directory).  Replace with the
+# absolute path to your own bundle once you have customised the example
+# content.
 
 facility_knowledge:
   bundle_path: data/facility_knowledge
@@ -977,10 +1229,10 @@ facility_knowledge:
   # itself (the launcher passes the resolved path into the panel app), while
   # the three keys below configure that panel's web server. It launches when
   # `okf` is in the panel list under `web:` below and this section exists —
-  # which it does, so this project binds 8093 by default. Uncomment to move or
-  # disable it.
+  # which it does, so this project binds {{ osprey_ports.okf }} by default.
+  # Uncomment to move or disable it.
   # host: "127.0.0.1"
-  # port: 8093
+  # port: {{ osprey_ports.okf }}
   # auto_launch: true
 
 # ============================================================
@@ -1002,21 +1254,30 @@ agent_data:
 # Every panel tab in `osprey web` is served by its own small web server, and
 # each one takes host/port/auto_launch from its own config section. These six
 # are the complete set — artifact_server is the only one this file writes a
-# stanza for, and the other five run at their defaults, so this is the map:
+# stanza for, and the other five run at their defaults. Every default is this
+# deployment's `deployment.port_base` plus the panel's fixed offset. To move
+# one panel, edit the `port` in the section named here:
 #
-#   tab        keys live under        default port   port env var
-#   WORKSPACE  artifact_server        8086           OSPREY_ARTIFACT_SERVER_PORT
-#   ARIEL      ariel.web              8085           OSPREY_ARIEL_PORT
-#   CHANNELS   channel_finder.web     8092           OSPREY_CHANNEL_FINDER_PORT
-#   LATTICE    lattice_dashboard      8097           OSPREY_LATTICE_DASHBOARD_PORT
-#   KNOWLEDGE  facility_knowledge     8093           OSPREY_FACILITY_KNOWLEDGE_PORT
-#   SYSTEM     health.web             8094           OSPREY_HEALTH_PORT
+#   tab        keys live under
+#   WORKSPACE  artifact_server
+#   ARIEL      ariel.web
+#   CHANNELS   channel_finder.web
+#   LATTICE    lattice_dashboard
+#   KNOWLEDGE  facility_knowledge
+#   SYSTEM     health.web
 #
-# The stanza for each lives in the section named above; all six carry a
-# machine-readable marker comment so they can be found by name.
+# Each of those stanzas carries a machine-readable marker comment, so they can
+# also be found by name. For the offset, the resolved default port and the port
+# environment variable of every slot in the block — panels included — see the
+# OSPREY docs page docs/source/reference/ports.rst (Sphinx label
+# `reference-ports`). That page is slot-by-slot, and its `Override key` column
+# names the multi-user per-user family key
+# (`modules.web_terminals.<family>_base_port`), not the single-user `port` keys
+# listed above; both reach the same server.
 #
-# Resolution order in every case: the env var above wins, then this config's
-# `port`, then the built-in default. Multi-user deployments export the env var
+# Resolution order in every case: the panel's env var wins, then this config's
+# `port`, then the panel's layout slot at this deployment's
+# `deployment.port_base`. Multi-user deployments export the env var
 # per user (the per-user containers share one network namespace), which is why
 # config alone is never the last word. `host` has no env override and defaults
 # to 127.0.0.1. The launcher resolves host/port through one shared function;
@@ -1038,7 +1299,7 @@ agent_data:
 # iframe.
 artifact_server:
   host: "127.0.0.1"
-  port: 8086
+  port: {{ osprey_ports.artifact }}
   auto_launch: true
 
 # osprey:panel-port lattice_dashboard
@@ -1047,18 +1308,19 @@ artifact_server:
 # `lattice` to the panel list under `web:` below.
 # lattice_dashboard:
 #   host: "127.0.0.1"
-#   port: 8097
+#   port: {{ osprey_ports.lattice }}
 #   auto_launch: true
 
 # osprey:panel-port system_health
 # SYSTEM tab. Unlike LATTICE and KNOWLEDGE it needs no section of its own — the
 # health framework has usable defaults — so with `system-health` in the panel
-# list it binds 8094 without appearing anywhere in this file. Uncomment only to
+# list it binds {{ osprey_ports.system_health }} without appearing anywhere in
+# this file. Uncomment only to
 # move it or to switch it off.
 # health:
 #   web:
 #     host: "127.0.0.1"
-#     port: 8094
+#     port: {{ osprey_ports.system_health }}
 #     auto_launch: true
 
 # ============================================================
@@ -1124,7 +1386,7 @@ claude_code:
   # + `osprey web` produces a working, production-shaped wiring where the
   # agent emits OTLP logs + metrics to the co-deployed OpenObserve store
   # (declared in `services:` and listed in `deployed_services:` above; UI at
-  # http://localhost:5080). On by default: the underlying harness already records
+  # http://localhost:{{ osprey_ports.openobserve }}). On by default: the underlying harness already records
   # every prompt, response, and API body to disk, so this adds no new exposure —
   # it just makes that data queryable in a local store you own. To turn it off,
   # set `enabled: false`. Tracing and OTEL_LOG_TOOL_CONTENT are intentionally NOT
@@ -1134,20 +1396,25 @@ claude_code:
     backend: openobserve                 # openobserve | generic
     protocol: http/protobuf              # http/protobuf | grpc — grpc requires an explicit `endpoint:` below; it is refused against the auto-derived openobserve endpoint (HTTP only)
     # backend: openobserve auto-derives the endpoint per network context —
-    # http://localhost:5080/api/<org> on the host, http://openobserve:5080/api/<org>
-    # inside the deploy network — so `endpoint` is intentionally OMITTED here.
+    # http://localhost:{{ osprey_ports.openobserve }}/api/<org> on the host,
+    # http://openobserve:5080/api/<org> inside the deploy network (5080 there is
+    # the store's own listen port inside its container, which port_base does not
+    # move) — so `endpoint` is intentionally OMITTED here.
     # (Hardcoding localhost would make the in-container dispatch worker emit to
     # its own loopback and silently drop everything.)
     #
-    # OpenObserve auth + org routing. user/password read the OpenObserve root
-    # credentials from the project .env — the SAME values the openobserve
-    # service reads — so container and agent auth stay in sync (single source of
-    # truth). `osprey up` mints a strong ZO_ROOT_USER_PASSWORD into .env;
-    # the ${VAR:-default} fallbacks (mirroring the openobserve compose defaults)
-    # keep the agent launchable before the first deploy.
+    # OpenObserve auth + org routing. These are the store's dedicated INGEST
+    # account, not its root credentials: `osprey up` creates a service account
+    # named ZO_INGEST_USER_EMAIL and writes the token the store issues for it
+    # to the project .env as ZO_INGEST_SA_TOKEN. The store itself still
+    # initializes from ZO_ROOT_USER_* — that stays in the compose file, and the
+    # root password never reaches the agent's config.
+    # The token reference carries NO ${VAR:-default} on purpose: a literal
+    # default would be a published credential, and there is nothing to fall
+    # back to before the first deploy provisions the account.
     openobserve:
-      user: ${ZO_ROOT_USER_EMAIL:-root@example.com}
-      password: ${ZO_ROOT_USER_PASSWORD:-Complexpass#123}
+      user: ${ZO_INGEST_USER_EMAIL:-ingest@example.com}
+      password: ${ZO_INGEST_SA_TOKEN}
       org: default
     # Content gates — all default ON. This store captures full transcripts; it
     # is local and air-gapped, so full capture is the default posture. Set any
@@ -1169,7 +1436,7 @@ claude_code:
 #                        # sets it on every per-user container so nginx is the
 #                        # only off-host path — overrides both this key and
 #                        # --host, so this cannot punch through that chokepoint.
-#   port: 8087           # Likewise outranked by OSPREY_TERMINAL_WEB_PORT.
+#   port: {{ osprey_ports.web }}          # Likewise outranked by OSPREY_TERMINAL_WEB_PORT.
 #   shell: /path/to/claude
 #                        # argv spawned in every PTY. Setting it REPLACES the
 #                        # launcher, so it also defeats the
@@ -1185,10 +1452,10 @@ claude_code:
 # ============================================================
 # WEB PANEL CONFIGURATION
 # ============================================================
-# Controls the web terminal UI (osprey web): its theme and which panel tabs
-# appear. The Workspace panel is always shown; the Activity log is a separate
-# page, not a tab. Domain-specific panels are listed here — remove or disable
-# as needed.
+# Controls the web terminal UI (osprey web): its theme, its Documentation and
+# Feedback controls, and which panel tabs appear. The Workspace panel is always
+# shown; the Activity log is a separate page, not a tab. Domain-specific panels
+# are listed here — remove or disable as needed.
 
 web:
   # Default web UI theme. Two forms, and the difference matters:
@@ -1203,6 +1470,54 @@ web:
   # overrides this per user. Independent of `cli.theme` above (console-only) —
   # the two never share a value.
   # theme: main
+
+  # Target of the Documentation button in the web terminal's utility cluster.
+  # Point it at a locally hosted copy of the docs when the control room has no
+  # route to the public site.
+  docs_url: https://als-apg.github.io/osprey
+
+  # Whether the web terminal's Config panel may edit this deployment's own
+  # config.yml and .claude/ setup files. `false` withdraws the panel's whole
+  # SERVER surface, not just its tab: /api/config and /api/claude-setup refuse
+  # every verb with 403, and GET /api/panels stops advertising the panel. That
+  # is the difference that matters — these files are what the agent's
+  # permission surface is rendered from, so hiding the tab alone would leave
+  # anyone who types the URL able to re-render the agent that runs here.
+  # Leave it true for a single-user deployment: the panel is that operator's
+  # own config editor. Set it false for the read-only tiers of a multi-user
+  # deployment, where a separate admin persona owns configuration.
+  config_panel:
+    enabled: true
+
+  # Whether this deployment's Scaffold gallery may WRITE. `false` closes the
+  # gallery's whole server surface for writes — create, claim, save, reset,
+  # register and delete all answer 403 — while every read stays open, so a
+  # read-only tier can still see exactly what the agent is running. This is a
+  # privilege boundary, not a UI preference: what the gallery authors is
+  # .claude/rules, .claude/skills and .claude/agents content, which the agent
+  # loads at project scope and obeys on every turn. Hiding the buttons alone
+  # would leave anyone who types the URL able to author what the agent reads.
+  # Leave it true for a single-user deployment: the gallery is that operator's
+  # own editor. Set it false for the read-only tiers of a multi-user
+  # deployment, where a separate admin persona owns the agent's setup.
+  scaffold_gallery:
+    write_enabled: true
+
+  # Where the Feedback dialog's two outbound channels send a user. Nothing is
+  # ever posted for them: the browser opens a prefilled GitHub issue form or a
+  # prefilled mail draft, and the user decides whether to send it. Every
+  # submission is also recorded on this deployment, readable with
+  # `osprey feedback list` / `osprey feedback export`.
+  feedback:
+    # owner/repo whose new-issue form the GitHub channel prefills. Point it at
+    # the repository your users' reports should land in.
+    github_repo: als-apg/osprey
+    # Recipient of the prefilled mailto: draft the Email channel opens.
+    email: thellert@lbl.gov
+    # Ceiling in bytes on the on-disk feedback store (256 MB). Above it the
+    # OLDEST saved session contexts are deleted; the small submission headers
+    # are always kept, so the submission history stays complete.
+    max_store_bytes: 268435456
 {%- set _BUILTIN_PANELS = builtin_panels | default(["ariel", "channel-finder"]) %}
 {%- set _enabled_builtin_panels = selected_web_panels | select("in", _BUILTIN_PANELS) | list %}
 {%- if default_panel is defined and default_panel %}
@@ -1315,6 +1630,14 @@ web:
 #       per-user port families, and the user list. Per-user containers share
 #       the host network namespace, so each companion panel needs its own port
 #       family; families left unset fall back to the registry defaults.
+#   modules.web_terminals.landing.notices
+#       Markdown files shown as collapsible sections on the landing page —
+#       what operators read before opening a terminal. Each file's first
+#       heading is its section label. `data/landing/working-safely.md` ships
+#       with the multi-user presets and is yours to rewrite; add your own for
+#       local procedures or contacts. Omit the key for OSPREY's built-in
+#       safety notice, or set it to [] for none. `landing.footer` sets the
+#       line underneath.
 #
 # See docs/how-to/web-terminal/multi-user.rst for the full schema. The build
 # interview (/osprey-build-interview) fills these in when you tell it the

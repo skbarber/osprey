@@ -49,6 +49,15 @@
       persona badge on the card; when absent the card renders exactly as a plain
       `{label, url}` card (bracket-subscripting a missing key yields Jinja
       `Undefined`, which is falsy — see the `{% if item["sublabel"] %}` guard).
+      `token_login` is present on every auto-populated user card and on no other
+      item: true when that user's terminal is entered by opening their own
+      `?token=` URL rather than through a login the perimeter serves. A true card
+      renders a badge and one hint line naming `osprey users login-url <name>`,
+      the verb that mints the URL, and KEEPS its href (the token exchange leaves
+      a session cookie, so the link is a real return path). Operator-supplied
+      `landing.groups` items carry no such key, and the same `Undefined`-is-falsy
+      reading that governs `sublabel` leaves them rendering as they always did.
+
       A group whose `items` list is empty renders nothing — no heading, no empty
       section. This is the ONLY suppression rule, and it is generic to every group:
       it's what makes the 0-user case disappear cleanly (an empty/omitted `users`
@@ -132,34 +141,11 @@
       gap: 0.75rem;
       flex-wrap: wrap;
     }
-    /* The drawn wordmark. 49 columns wide, so its size is tied to the viewport
-       rather than fixed: below roughly 30rem the glyphs stop being legible at
-       any size that fits, and the text wordmark below takes over. */
-    .landing-ascii {
-      flex-basis: 100%;
-      margin: 0 0 0.35rem;
-      font-family: ui-monospace, "JetBrains Mono", monospace;
-      font-size: clamp(0.5rem, 1.9vw, 0.75rem);
-      /* Exactly 1: any leading opens a white seam between the rows of block
-         glyphs, and the wordmark reads as a grid of fragments instead of
-         letters. */
-      line-height: 1;
-      white-space: pre;
-      color: var(--color-accent);
-      overflow: hidden;
-    }
     .landing-logo {
       font-weight: 700;
       font-size: 1.35rem;
       letter-spacing: 0.06em;
       color: var(--color-accent);
-    }
-    /* One or the other, never both: the art IS the wordmark where it fits. */
-    @media (min-width: 30rem) {
-      .landing-logo { display: none; }
-    }
-    @media (max-width: 29.999rem) {
-      .landing-ascii { display: none; }
     }
     .landing-subtitle {
       font-size: 1.05rem;
@@ -294,6 +280,41 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+    /* The two marks a card carries when its terminal is entered by opening
+       that user's own `?token=` URL rather than through a login the perimeter
+       serves. Deliberately quieter than the persona chip beside it — muted
+       border and text rather than the accent — because it is a fact about how
+       the door opens, not a category the page is sorting people into. Both
+       colors are theme tokens, so the mark follows the page into either mode.
+       The card itself stays a live link and is styled as one: the `?token=`
+       exchange leaves a session cookie, so this IS the return path for anyone
+       who has opened the URL once. */
+    .landing-card-token {
+      align-self: flex-start;
+      max-width: 100%;
+      margin: 0.05rem 0 0.1rem;
+      padding: 0.12rem 0.55rem;
+      border: 1px solid var(--border-default);
+      border-radius: 999px;
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--text-secondary);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .landing-card-token-hint {
+      max-width: 100%;
+      color: var(--text-secondary);
+      font-size: 0.72rem;
+      line-height: 1.35;
+    }
+    .landing-card-token-hint code {
+      font-family: ui-monospace, "JetBrains Mono", monospace;
+      word-break: break-all;
+    }
     .landing-card-url {
       font-family: ui-monospace, "JetBrains Mono", monospace;
       font-size: 0.78rem;
@@ -302,18 +323,18 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    /* The safety guidelines, at the bottom of the page everyone passes through
-       on the way to a terminal. Collapsed, because a person who has read them
-       is opening a terminal rather than reading them again, and an expanded
-       wall of rules above the fold would train exactly the skimming it is
-       trying to prevent. Native <details>: no script on this page. */
-    .landing-safety {
+    /* Facility notices, at the bottom of the page everyone passes through on
+       the way to a terminal. Collapsed, because a person who has read them is
+       opening a terminal rather than reading them again, and an expanded wall
+       of text above the fold would train exactly the skimming it is trying to
+       prevent. Native <details>: no script on this page. */
+    .landing-notices {
       width: 100%;
       max-width: 960px;
       margin-top: 2.5rem;
       padding: 0 1.5rem;
     }
-    .landing-safety > summary {
+    .landing-notice > summary {
       cursor: pointer;
       padding: 0.7rem 0;
       border-top: 1px solid var(--border-default);
@@ -322,17 +343,18 @@
       letter-spacing: 0.04em;
       color: var(--text-secondary);
     }
-    .landing-safety > summary:hover {
+    .landing-notice > summary:hover {
       color: var(--text-primary);
     }
-    .landing-safety-body {
+    .landing-notice-body {
       padding-bottom: 0.5rem;
       font-size: 0.86rem;
       line-height: 1.55;
       color: var(--text-secondary);
       max-width: 46rem;
     }
-    .landing-safety-body h3 {
+    .landing-notice-body h2,
+    .landing-notice-body h3 {
       margin: 1.4rem 0 0.4rem;
       font-size: 0.8rem;
       font-weight: 600;
@@ -340,14 +362,14 @@
       text-transform: uppercase;
       color: var(--color-accent);
     }
-    .landing-safety-body ul {
+    .landing-notice-body ul {
       margin: 0.3rem 0;
       padding-left: 1.1rem;
     }
-    .landing-safety-body li {
+    .landing-notice-body li {
       margin: 0.25rem 0;
     }
-    .landing-safety-body strong {
+    .landing-notice-body strong {
       color: var(--text-primary);
       font-weight: 600;
     }
@@ -365,17 +387,6 @@
 
   <header class="landing-header">
     <h1 class="landing-title">
-      {#- The wordmark is drawn, so the accessible name is carried by the
-         visually-hidden span beside it and the art is hidden from assistive
-         tech: a screen reader announcing fifty box-drawing characters is worse
-         than no logo at all. The fallback span is what narrow screens show
-         instead, where the art cannot fit at a legible size. #}
-      <pre class="landing-ascii" aria-hidden="true">░█████╗░░██████╗██████╗░██████╗░███████╗██╗░░░██╗
-██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔════╝╚██╗░██╔╝
-██║░░██║╚█████╗░██████╔╝██████╔╝█████╗░░░╚████╔╝░
-██║░░██║░╚═══██╗██╔═══╝░██╔══██╗██╔══╝░░░░╚██╔╝░░
-╚█████╔╝██████╔╝██║░░░░░██║░░██║███████╗░░░██║░░░
-░╚════╝░╚═════╝░╚═╝░░░░░╚═╝░░╚═╝╚══════╝░░░╚═╝░░░</pre>
       <span class="landing-logo">OSPREY</span>
       <span class="landing-subtitle">{{ (facility_name|default("", true))|e or "Web Terminals" }}</span>
     </h1>
@@ -422,6 +433,29 @@
             {%- if item["sublabel"] %}
             <span class="landing-card-sublabel">{{ item["sublabel"]|e }}</span>
             {%- endif %}
+            {#- The card is honest about how this terminal is entered. `token_login`
+               is true for a roster user whose way in is that user's own `?token=`
+               URL, and the URL is not on this page — it carries a live credential,
+               and it is minted by `osprey users login-url <name>`, which nobody
+               guesses. Without this line the card is indistinguishable from one
+               behind a login wall, and a first-time visitor clicks it, is refused,
+               and has no idea what to do next.
+               The href STAYS: the `?token=` exchange leaves a session cookie
+               behind, so this link is the return path for a browser that has
+               opened the URL once. Naming the verb is the fix; disabling the link
+               would be a different wrong answer.
+               Only on the navigable branch — an inert card's link cannot be
+               followed at all, so a note about which door it is would be noise
+               under a card whose real problem is its scheme.
+               `item["label"]` IS the roster name (`_user_card` builds the card
+               from it), so the command names this card's own user; escaped like
+               every other user-sourced value here. A `landing.groups` link item
+               carries no `token_login` key, so the subscript is Undefined —
+               falsy — and the group renders exactly as it did before. #}
+            {%- if item["token_login"] %}
+            <span class="landing-card-token">login link</span>
+            <span class="landing-card-token-hint">entered via a login link — <code>osprey users login-url {{ item["label"]|e }}</code></span>
+            {%- endif %}
             <span class="landing-card-url">{{ safe_url|e }}</span>
           </a>
           {% else %}
@@ -440,65 +474,28 @@
     {% endfor %}
   </main>
 
-  {#- Fixed copy, not context: these are properties of running an agent against
-     a control system, not of this deployment's configuration. #}
-  <details class="landing-safety" id="safety">
-    <summary>Before you start: working safely with the agent</summary>
-    <div class="landing-safety-body">
-      <p>
-        OSPREY connects an AI agent to <strong>live control systems</strong>. Every action
-        it proposes can affect real hardware. You are the operator and the agent is a
-        tool: you are responsible for every action it takes.
-      </p>
+  {#- Facility notices. Each entry in `modules.web_terminals.landing.notices`
+     is one markdown file; its `# H1` becomes the summary label and the rest
+     becomes the panel, so a facility adds a section by adding a file. The
+     body is already HTML by the time it reaches here (rendered in
+     render.py::_render_notice) and is the ONE unescaped value on this page —
+     everything else, including the footer, still goes through `|e`. #}
+  {% if notices %}
+  <section class="landing-notices">
+    {% for notice in notices %}
+    <details class="landing-notice" id="{{ notice['id']|e }}">
+      <summary>{{ notice['title']|e }}</summary>
+      <div class="landing-notice-body">{{ notice['body_html']|safe }}</div>
+    </details>
+    {% endfor %}
+  </section>
+  {% endif %}
 
-      <h3>Never auto-approve</h3>
-      <p>
-        OSPREY asks for human approval before any hardware write. That gate is the
-        whole safety model, and automatic approval defeats it.
-      </p>
-      <ul>
-        <li>Read every proposed command in full before approving it.</li>
-        <li>Check the target channels, the values and the units.</li>
-        <li>Reject anything unfamiliar or unexpected, then find out why it was proposed.</li>
-        <li>Review a batch item by item. Approving a batch as one thing is how an
-            unread command gets through.</li>
-      </ul>
-
-      <h3>Watch the agent while it works</h3>
-      <p>
-        The agent works on its own between approval gates. Watching it is part of
-        operating it, not something to do only when it asks.
-      </p>
-      <ul>
-        <li>Keep the terminal visible while a session is running.</li>
-        <li>Stop the session if the agent starts looping or looks confused.</li>
-        <li>Read its reasoning, not only the action at the end of it.</li>
-        <li>Reads are not harmless: a wrong conclusion drawn from a read is what the
-            next write is built on.</li>
-      </ul>
-
-      <h3>Reject anything outside this deployment's scope</h3>
-      <p>
-        Every deployment is configured for a set of systems, channels and actions.
-        Requests outside that set are the highest-risk ones, because the agent does
-        not know the constraints on equipment it was not given.
-      </p>
-      <ul>
-        <li>Know your deployment's scope: which subsystems, which channels, which ranges.</li>
-        <li>Reject a request that reaches past it rather than letting the agent try.</li>
-        <li>Treat open-ended asks ("fix everything", "optimize the beam") as unsafe
-            until you have narrowed them yourself.</li>
-      </ul>
-
-      <p>
-        When in doubt, stop the session and talk to your control system team.
-      </p>
-    </div>
-  </details>
-
+  {% if footer %}
   <footer class="landing-footer">
-    OSPREY multi-user web terminal stack. Experimental system. Proceed with caution.
+    {{ footer|e }}
   </footer>
+  {% endif %}
 
 </body>
 </html>

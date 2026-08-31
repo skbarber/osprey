@@ -8,6 +8,7 @@ objects. To call the original async function in tests, use the `.fn` attribute:
     tool.fn(channels=["SR:CURRENT:RB"])
 """
 
+import asyncio
 import json
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock
@@ -25,6 +26,35 @@ from osprey.mcp_server.errors import extract_error_envelope
 from osprey.mcp_server.workspace.tools.screen_capture_backends import reset_backend
 from osprey.stores.artifact_store import reset_artifact_store
 from osprey.utils.workspace import reset_config_cache
+
+
+def hook_error_class_map() -> dict[str, str]:
+    """Read ``ERROR_CLASS_MAP`` out of the shipped error-guidance hook.
+
+    Parsed from source rather than imported: the hook is a standalone script
+    that inserts its own directory onto ``sys.path`` at import time, and a test
+    that pins its taxonomy should not have that side effect.
+
+    Returns:
+        The hook's ``error_type`` to error-class mapping.
+    """
+    import ast
+    import pathlib
+
+    import osprey
+
+    hook = (
+        pathlib.Path(osprey.__file__).parent
+        / "templates/claude_code/claude/hooks/osprey_error_guidance.py"
+    )
+    tree = ast.parse(hook.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "ERROR_CLASS_MAP"
+            for target in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"ERROR_CLASS_MAP not found in {hook}")
 
 
 def get_tool_fn(tool_or_fn):
@@ -109,6 +139,20 @@ def extract_response_dict(result) -> dict:
                 continue
         raise AssertionError(f"CallToolResult had no JSON-decodable text content: {result!r}")
     raise AssertionError(f"Unexpected tool result type: {type(result).__name__}: {result!r}")
+
+
+def registered_tool_names(mcp) -> list[str]:
+    """Tool names registered on a FastMCP server, across FastMCP versions.
+
+    ``get_tools()`` is a coroutine on newer FastMCP releases and a plain call on
+    older ones, and its result is a dict on some and a list of tools on others.
+    """
+    tools = mcp.get_tools() if hasattr(mcp, "get_tools") else mcp.list_tools()
+    if asyncio.iscoroutine(tools):
+        tools = asyncio.run(tools)
+    if isinstance(tools, dict):
+        return list(tools)
+    return [t.name for t in tools]
 
 
 @pytest.fixture(autouse=True)
@@ -231,10 +275,6 @@ def mock_config(tmp_path):
                 "control_system": {
                     "type": "mock",
                     "writes_enabled": True,
-                    "write_verification": {
-                        "default_level": "callback",
-                        "default_tolerance": 0.1,
-                    },
                     "limits_checking": {"enabled": False},
                 },
                 "archiver": {"type": "mock"},
@@ -330,28 +370,11 @@ def mock_channel_value():
         cv.metadata.description = "Test channel"
         cv.metadata.min_value = 0.0
         cv.metadata.max_value = 1000.0
+        # Not an enum channel. Spelled out because a bare MagicMock attribute is
+        # truthy, and the read tool ships these keys only when they are not None.
+        cv.metadata.enum_label = None
+        cv.metadata.enum_labels = None
         cv.metadata.raw_metadata = {}
         return cv
-
-    return _make
-
-
-@pytest.fixture
-def mock_write_result():
-    """Factory for creating mock ChannelWriteResult objects."""
-
-    def _make(channel="TEST:PV", value=1.0, success=True, error_message=None):
-        result = MagicMock()
-        result.channel_address = channel
-        result.value_written = value
-        result.success = success
-        result.error_message = error_message
-        result.verification = MagicMock()
-        result.verification.level = "callback"
-        result.verification.verified = True
-        result.verification.readback_value = value
-        result.verification.tolerance_used = 0.1
-        result.verification.notes = ""
-        return result
 
     return _make

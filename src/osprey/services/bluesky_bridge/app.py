@@ -21,7 +21,6 @@ caller nothing about where its capability went.
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import io
 import json
@@ -60,6 +59,7 @@ from .models import (
     PlanValidateRequest,
 )
 from .plan_fields import MOVABLE_ROLE, READABLE_ROLE, collect_channels
+from .plan_metadata import extract_plan_name_from_source
 from .plan_types import PlanSpec, Provenance
 from .plan_validation import hash_plan_body, validate_plan
 from .queue_backend import (
@@ -190,10 +190,12 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
       fail-OPEN refuses startup (raises) only if writes are enabled, limits
       checking is enabled, and the limits database can't be read — every other
       combination, including writes disabled entirely, starts normally. It runs
-      unconditionally here, never behind a wiring flag such as
-      `BLUESKY_EPICS_SUBSTRATE`: the posture it guards against is a property of
-      the project config, not of how the bridge happens to be wired, and a
-      gated guard leaves whole classes of deployment unchecked.
+      unconditionally here, never behind a device-wiring flag such as
+      `BLUESKY_DEVICES_FILE`: the posture it guards against is a property of
+      the project config, not of whether this deployment wires up any devices
+      at all, and a gated guard leaves whole classes of deployment unchecked.
+      Alongside it, `queue.device_page_size()` is parsed once so a malformed
+      `BLUESKY_DEVICE_PAGE_SIZE` fails the boot instead of the first request.
     - The document plane: the 0MQ proxy the queueserver's Publisher connects
       to, and the dispatcher that turns that stream into live rows.
       Unconfigured is a no-op; see `document_plane.start_from_env`.
@@ -212,6 +214,11 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # limits checking on + an unreadable limits database), before anything
     # else is brought up.
     _assert_limits_readable_if_writable()
+
+    # A malformed device page size is a boot-time refusal too: the number is
+    # read per request downstream, so parsing it once here turns a bad env var
+    # into a failed start rather than a surprise 500 on the first caller.
+    queue.device_page_size()
 
     # The document plane's 0MQ proxy — the binding element the queueserver's
     # Publisher connects to, and the RemoteDispatcher that turns that stream
@@ -280,17 +287,33 @@ async def _capability_dict() -> dict[str, Any]:
     in ``detail`` so the operator sees the real cause rather than a shrug, and
     the route still answers 200 — the container healthcheck must not go red
     over a capability probe.
+
+    The hand-built record below is the ONE capability object on the wire that
+    does not come out of ``Capability.to_dict``, so it has to carry the same
+    keys — a consumer that parses the fallback differently from every other
+    record is a consumer that breaks exactly when the bridge is already in
+    trouble. The lane identity in particular is still perfectly knowable here:
+    it comes from render-time facts (`resolve_lane_identity`, which never
+    raises), not from the probe that just failed.
     """
-    from .queue_backend import REASON_MANAGER_UNREACHABLE
+    from .queue_backend import (
+        REASON_MANAGER_UNREACHABLE,
+        resolve_lane_connector_type,
+        resolve_lane_identity,
+    )
 
     try:
         return (await get_queue_backend().capability()).to_dict()
     except Exception as exc:
         logger.warning("capability probe failed; reporting cannot-execute: %s", exc)
+        lane, lane_target = resolve_lane_identity()
         return {
             "can_execute": False,
             "reason": REASON_MANAGER_UNREACHABLE,
             "detail": f"The bridge could not determine whether plans can execute: {exc}",
+            "lane": lane,
+            "lane_target": lane_target,
+            "lane_degraded": resolve_lane_connector_type()[1],
         }
 
 
@@ -302,12 +325,20 @@ async def health() -> dict:
     route of its own, so no consumer has to learn a second endpoint to find out
     what the bridge in front of it can do:
 
-    ``{"status": "ok", "capability": {"can_execute", "reason", "detail"}}``
+    ``{"status": "ok", "capability": {"can_execute", "reason", "detail",
+    "lane", "lane_target", "lane_degraded"}}``
 
     ``can_execute`` is the answer; ``reason`` is one of the machine-readable
     ``REASON_*`` codes in `queue_backend.py`, which panels and MCP tools branch
     on; ``detail`` is the operator-facing sentence, and for a browse-only mock
-    deployment it names the exact command that flips it. ``status: "ok"`` means
+    deployment it names the exact command that flips it. ``lane`` and
+    ``lane_target`` say which plan lane answered and which control target it
+    serves — render-time facts, identical before and after a session switch,
+    which the host is what composes against the session's own target.
+    ``lane_degraded`` is null unless the lane's declared target resolves to no
+    connector type here, in which case it names what its worker was built as
+    instead.
+    ``status: "ok"`` means
     only that this process is up — it is deliberately independent of
     ``can_execute``, because a browse-only deployment is a healthy deployment.
     """
@@ -484,7 +515,11 @@ def _device_entry(name: str, description: Any) -> dict[str, Any]:
 
 
 @app.get("/devices")
-async def list_devices() -> list[dict]:
+async def list_devices(
+    prefix: str = "",
+    limit: int | None = None,
+    offset: int = 0,
+) -> dict[str, Any]:
     """Devices the queueserver worker built, by the name plans resolve them under.
 
     The companion of `GET /plans`: a plan's device parameters carry device
@@ -493,19 +528,56 @@ async def list_devices() -> list[dict]:
     fails on the run's first iteration — after an enqueue and a start — so this
     route is what turns picking a device into a lookup rather than a guess.
 
+    The response is `{"devices", "total", "offset", "limit"}`. `devices` is one
+    page, sorted by name; `total` is how many names matched *before* the page
+    was cut, so a caller can tell "that is all of them" from "there is more".
     Each entry is `{"name", ...}` plus whatever of `is_movable`/`is_readable`/
     `is_flyable` the manager reported for it, which is how a caller tells a
     drivable setpoint from a read-only readback.
+
+    `prefix` filters by literal, case-sensitive `str.startswith` — device names
+    come out of the worker's namespace verbatim, so folding case here would
+    invent matches the worker cannot resolve. A prefix nothing starts with is a
+    200 with `devices: []` and `total: 0`: an empty set is an answer, not a
+    failure to answer.
+
+    `limit` and `offset` are CLAMPED, never rejected — the same posture as
+    `runs.list_records` (`runs.py:236-241`), so a nonsensical query returns a
+    sane page instead of a 422 an agent has to learn to avoid. `limit` is
+    clamped into `1..queue.device_page_size()` (unset means the full page
+    size), `offset` up to at least 0, and both are echoed back as the
+    EFFECTIVE values used, so the caller reads the bound it actually got rather
+    than the one it asked for.
+
+    `total` is recomputed per request against the manager's current answer. A
+    `total` that changes between two pages of one walk means the worker rebuilt
+    its namespace mid-walk — the pages either side of that are from different
+    device sets, and the walk is worth restarting rather than stitching.
     """
     try:
         reply = await get_queue_backend().devices_allowed()
     except QueueBackendError as exc:
         # Same mapping as every other manager-backed read (see `list_runs`).
         raise queue._http_error(exc) from exc
+    cap = queue.device_page_size()
+    bound = max(1, min(limit if limit is not None else cap, cap))
+    start = max(0, offset)
     allowed = reply.get("devices_allowed")
     if not isinstance(allowed, dict):
-        return []
-    return [_device_entry(name, description) for name, description in sorted(allowed.items())]
+        # A manager that answered without the map has no devices to report;
+        # normalizing keeps the envelope built in exactly one place below.
+        allowed = {}
+    matches = [
+        _device_entry(name, description)
+        for name, description in sorted(allowed.items())
+        if name.startswith(prefix)
+    ]
+    return {
+        "devices": matches[start : start + bound],
+        "total": len(matches),
+        "offset": start,
+        "limit": bound,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -704,8 +776,11 @@ def delete_session_plan(name: str) -> dict:
 # Plan source rendering: backs the launch-approval hook's
 # human-legible plan excerpt — the human backstop for the plan validator's
 # documented, accepted obfuscation residual (see `plan_validation.py`'s
-# module docstring). Read-only: never execs anything, only reads file text
-# already sitting on disk.
+# module docstring). Read-only: the lookup itself never execs anything, only
+# reads file text already sitting on disk — it does consult the plan registry
+# (`plan_loader.get_facility_plans`) to break a same-name collision the way the
+# loader broke it, which is the registry the bridge builds at startup and every
+# `GET /plans` already returns, not a new execution surface.
 # ---------------------------------------------------------------------------
 
 _SOURCE_TRUNCATE_CHARS = 4000  # default: a few KB, enough for a human skim
@@ -719,41 +794,87 @@ def _find_layer_source_path(name: str) -> tuple[Any, Provenance] | None:
     """Best-effort locate the on-disk file behind a shipped/preset/facility plan.
 
     Directory-layer files are keyed by their declared ``PLAN_METADATA["name"]``,
-    not necessarily their filename — so this parses each candidate file's
-    source with ``ast`` (never execs it) purely to read the literal ``name``
-    off its ``PLAN_METADATA`` dict. Returns `None` for a plan with no backing
-    file at all, or a name this scan can't locate; the route degrades to a
-    404 either way.
-    """
-    from .plan_loader import _iter_plan_files, _resolve_plan_dir_layers
+    not necessarily their filename — so each candidate file's declared name is
+    read with `extract_plan_name_from_source`, the shared source-only reader
+    for that one key (it parses the file, never imports or execs it).
 
+    Identity, not validity: this scan asks only *which file declares this
+    name*, and so must be exactly as permissive as an import. It deliberately
+    does not use the full-contract reader
+    (`extract_plan_metadata_from_source`), because a file the loader accepts
+    and registers can still fail that stricter read — a ``PLAN_METADATA`` whose
+    ``description`` is a module-level constant rather than a literal, say — and
+    404ing on such a plan would strip the source excerpt out of the human
+    approval prompt for a plan that is registered and launchable.
+
+    A file whose declared name cannot be read at all is skipped and the scan
+    continues to the next file and the next layer — never fatal. Such a file
+    cannot be the plan being asked about under any reading of it, so skipping
+    it decides nothing; it is logged at debug level because the route reports
+    only a bare 404.
+
+    When several layers declare the same plan name, the file served has to be
+    the file that would actually run — anything else shows an operator the
+    source of a file that is not the one about to execute, which is worse at an
+    approval gate than showing nothing. For a REGISTERED name the collision is
+    resolved by the registry itself: the candidate whose tier equals the
+    registered spec's ``provenance`` wins, so this agrees with
+    `plan_loader._register_plan` by reading its decision rather than re-deriving
+    it. Re-deriving it would not be equivalent — `_register_plan` only ever sees
+    files that loaded, and this scan cannot tell a loaded file from a
+    quarantined one, so a quarantined facility file shadowing a loadable shipped
+    one would win here while losing in the registry.
+
+    For an UNREGISTERED name the scan falls back to highest trust seen, last
+    match winning. That is the quarantined-file case — nothing registered the
+    name, and an operator debugging why their facility plan never appeared needs
+    exactly that file's text — so the fallback keeps an unregistered file's
+    source reachable instead of 404ing it.
+
+    Plans supplied through the legacy ``BLUESKY_PLAN_MODULE`` contract are
+    outside this scan either way: they register at `facility` rank but live in
+    no scanned directory, so no candidate file can match them. Pre-existing, and
+    unchanged by the registry tie-break.
+
+    Returns `None` for a plan with no backing file at all, or a name this scan
+    can't locate; the route degrades to a 404 either way.
+    """
+    from .plan_loader import (
+        _TRUST_ORDER,
+        _iter_plan_files,
+        _resolve_plan_dir_layers,
+        get_facility_plans,
+    )
+
+    registered = get_facility_plans().plans.get(name)
+    registered_provenance = registered.provenance if registered is not None else None
+
+    matched: tuple[Any, Provenance] | None = None
+    found: tuple[Any, Provenance] | None = None
+    found_rank = -1
     for directory, provenance in _resolve_plan_dir_layers():
+        # The session tier is resolved by filename before this scan is reached,
+        # and must never be served as if it carried a directory tier's trust.
         if provenance == "session":
             continue
+        rank = _TRUST_ORDER[provenance]
         for path in _iter_plan_files(directory):
-            try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
-            except (OSError, SyntaxError, UnicodeDecodeError):
+            declared = extract_plan_name_from_source(path)
+            if declared is None:
+                logger.debug("plan source scan: skipping %s (no readable plan name)", path)
                 continue
-            for node in tree.body:
-                if not isinstance(node, ast.Assign):
-                    continue
-                if not any(
-                    isinstance(target, ast.Name) and target.id == "PLAN_METADATA"
-                    for target in node.targets
-                ):
-                    continue
-                if not isinstance(node.value, ast.Dict):
-                    continue
-                for key, value in zip(node.value.keys, node.value.values, strict=True):
-                    if (
-                        isinstance(key, ast.Constant)
-                        and key.value == "name"
-                        and isinstance(value, ast.Constant)
-                        and value.value == name
-                    ):
-                        return path, provenance
-    return None
+            if declared != name:
+                continue
+            if provenance == registered_provenance:
+                # Last match within the registered tier wins: same-tier
+                # directories are scanned in the loader's own order, and
+                # `_register_plan` lets the later definition win there too.
+                matched = (path, provenance)
+            # `>=`, not `>`: an equal-trust redefinition lets the later-scanned
+            # file win, which is `_register_plan`'s rule for that case too.
+            if rank >= found_rank:
+                found, found_rank = (path, provenance), rank
+    return matched if matched is not None else found
 
 
 @app.get("/plans/{name}/source")

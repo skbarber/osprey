@@ -219,8 +219,6 @@ def assert_sub_step(printed: Printed, name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-BLUESKY_VA = {"deployed_services": ["bluesky", "virtual_accelerator"]}
-
 #: A project that runs ARIEL's own store, which is what makes the staged
 #: bring-up do anything at all (see ``_ariel_store_deployed``).
 ARIEL_PROJECT = {"deployed_services": ["postgresql"], "ariel": {"database": "ariel"}}
@@ -318,23 +316,17 @@ class TestMintedSecretsAreReported:
 class TestDegradationsAreReported:
     """A deployment that will not do what it looks like it does says so."""
 
-    def test_a_mock_control_system_reports_the_browse_only_deployment(
-        self, default_altitude, printed, project
-    ):
-        container_lifecycle._ensure_bluesky_substrate_env(
-            {**BLUESKY_VA, "control_system": {"type": "mock"}}, project
-        )
-
-        assert_promoted(default_altitude, printed, "this deployment is browse-only")
-        assert "osprey set connector=virtual_accelerator" in printed.flowed
-
     def test_a_pinned_worker_image_reports_the_build_it_skipped(
         self, default_altitude, printed, monkeypatch
     ):
-        monkeypatch.setattr(container_lifecycle, "resolve_project_name", lambda config: "demo")
+        # The skipped build is named by the image axes, so the message follows
+        # the config's project name rather than a patched resolver — and an
+        # axis exported in the developer's shell would rename it.
+        monkeypatch.delenv("OSPREY_IMAGE_REGISTRY", raising=False)
+        monkeypatch.delenv("OSPREY_IMAGE_TAG", raising=False)
 
         container_lifecycle._build_project_image(
-            {"deployed_services": ["dispatch_worker"]},
+            {"project_name": "demo", "deployed_services": ["dispatch_worker"]},
             False,
             {"OSPREY_WORKER_IMAGE": "ghcr.io/example/worker:1"},
         )
@@ -354,23 +346,6 @@ class TestDegradationsAreReported:
 
 class TestAutonomousHostChangesAreReported:
     """What the deploy wrote, or decided, without being asked to."""
-
-    def test_derived_plan_devices_name_the_file_they_came_from(
-        self, default_altitude, printed, project, monkeypatch
-    ):
-        monkeypatch.setattr(
-            "osprey.services.bluesky_bridge.substrate_devices.derive_substrate_env",
-            lambda project_dir: {"BLUESKY_EPICS_SETPOINTS": "SR:C01:COR"},
-        )
-
-        container_lifecycle._ensure_bluesky_substrate_env(
-            {**BLUESKY_VA, "control_system": {"type": "virtual_accelerator"}}, project
-        )
-
-        assert_promoted(default_altitude, printed, "bluesky plan devices auto-configured")
-        output.flush_ledger()
-        assert "channel_limits.json" in printed.flowed
-        assert "BLUESKY_EPICS_SETPOINTS" in printed.flowed
 
     def test_a_local_env_override_is_reported_by_name(self, default_altitude, printed, tmp_path):
         from osprey.utils.dotenv import ENV_SHARED_FILENAME
@@ -583,19 +558,22 @@ class TestVerboseKeepsThePrimaryOutput:
     """Criterion 3, for this module: ``-v`` adds the transcript, loses nothing."""
 
     def test_a_promoted_fact_is_printed_under_verbose_too(
-        self, terminal_probe, printed, project, monkeypatch
+        self, terminal_probe, printed, tmp_path, monkeypatch
     ):
+        from osprey.utils.dotenv import ENV_SHARED_FILENAME
+
         monkeypatch.setattr("osprey.utils.config.load_project_dotenv", lambda *a, **k: None)
         assert CliRunner().invoke(cli, ["-v"]).exit_code == 0
 
-        container_lifecycle._ensure_bluesky_substrate_env(
-            {**BLUESKY_VA, "control_system": {"type": "mock"}}, project
-        )
+        (tmp_path / ENV_SHARED_FILENAME).write_text("ARIEL_DB_PASSWORD=shared\n", encoding="utf-8")
+        (tmp_path / ".env").write_text("ARIEL_DB_PASSWORD=mine\n", encoding="utf-8")
+
+        container_lifecycle._report_chain_overrides(tmp_path)
 
         # Printed by the renderer, AND painted from the record: under -v the
         # transcript is what was asked for, so the fact appears in both.
-        assert "this deployment is browse-only" in printed.flowed
-        assert "browse-only" in terminal_probe.rendered_text
+        assert "ARIEL_DB_PASSWORD" in printed.flowed
+        assert "ARIEL_DB_PASSWORD" in terminal_probe.rendered_text
 
 
 class TestPromotedCopyStyle:
@@ -674,7 +652,6 @@ def _stub_start_stack_preflights(monkeypatch: pytest.MonkeyPatch) -> None:
         "_preflight_host_ports",
         "_preflight_archiver_pymongo",
         "_preflight_stale_store_volumes",
-        "_ensure_bluesky_substrate_env",
         "_ensure_bluesky_control_plane_keys",
         "_ensure_bluesky_document_plane_certs",
         "_preflight_env_chain_drift",
@@ -749,6 +726,8 @@ def archiver_stubs(monkeypatch: pytest.MonkeyPatch) -> dict:
             [{"address": "SR:BPM1:X"}, {"address": "SR:BPM2:X"}],
             None,
             {},
+            None,
+            None,
         ),
     )
     monkeypatch.setattr(container_lifecycle, "_wait_for_archiver_store", lambda *a, **k: None)
@@ -1127,18 +1106,6 @@ class TestDemotedRowsOnTheMiscDeployPath:
         assert framework_rule.read_text(encoding="utf-8") == "# facility\n"
         assert _levels_for(caplog, "profile overrides framework rule") == {logging.DEBUG}
 
-    def test_the_kernel_template_render_is_a_debug_line(self, monkeypatch, tmp_path, caplog):
-        """Rows 40 and 41: a per-file path inside a loop, and its announcement."""
-        source_dir, out_dir = _a_kernel_template(tmp_path)
-        # The render itself is jinja's business; only what it narrates is under
-        # test, and a real render needs the loader root the pipeline sets up.
-        monkeypatch.setattr(compose_generator, "render_template", lambda *a, **k: None)
-
-        with caplog.at_level(logging.DEBUG):
-            compose_generator.render_kernel_templates(str(source_dir), {}, str(out_dir))
-
-        assert _levels_for(caplog, "Rendered kernel template") == {logging.DEBUG}
-
     def test_the_legacy_clean_narration_is_debug_lines(self, monkeypatch, tmp_path, caplog):
         """Rows 10, 38 and 39: raw argv, and a bare completion with no phase."""
         _stub_the_legacy_clean(monkeypatch, tmp_path)
@@ -1336,16 +1303,6 @@ def _rendered_project(tmp_path: Path, name: str) -> Path:
     )
 
 
-def _a_kernel_template(tmp_path: Path) -> tuple[Path, Path]:
-    """A source tree holding one kernel template, and somewhere to render it."""
-    source_dir = tmp_path / "service"
-    (source_dir / "kernels").mkdir(parents=True)
-    (source_dir / "kernels" / "kernel.json.j2").write_text("{}", encoding="utf-8")
-    out_dir = tmp_path / "out"
-    out_dir.mkdir()
-    return source_dir, out_dir
-
-
 def _stub_the_legacy_clean(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Reduce the *legacy* ``clean_deployment`` to its narration."""
     monkeypatch.setattr(compose_generator, "run_captured", lambda *a, **k: None)
@@ -1490,7 +1447,7 @@ class TestWebTerminalHostChangesAreReported:
         _stub_the_host_port_bounce(monkeypatch, tmp_path, answers=[False, True])
 
         postup_hooks.warn_if_web_stack_unreachable(
-            {"modules": {"web_terminals": {"nginx_port": 8080}}},
+            {"modules": {"web_terminals": {"enabled": True, "nginx_port": 8080}}},
             attempts=1,
             delay=0,
             web_cmd=["docker", "compose", "-f", "web.yml"],
@@ -1516,7 +1473,7 @@ class TestWebTerminalHostChangesAreReported:
         _stub_the_host_port_bounce(monkeypatch, tmp_path, answers=[False, False])
 
         postup_hooks.warn_if_web_stack_unreachable(
-            {"modules": {"web_terminals": {"nginx_port": 8080}}},
+            {"modules": {"web_terminals": {"enabled": True, "nginx_port": 8080}}},
             attempts=1,
             delay=0,
             web_cmd=["docker", "compose", "-f", "web.yml"],
@@ -1547,7 +1504,7 @@ class TestWebTerminalHostChangesAreReported:
         )
 
         postup_hooks.warn_if_web_stack_unreachable(
-            {"modules": {"web_terminals": {"nginx_port": 8080}}},
+            {"modules": {"web_terminals": {"enabled": True, "nginx_port": 8080}}},
             attempts=1,
             delay=0,
             web_cmd=["docker", "compose", "-f", "web.yml"],
@@ -1628,7 +1585,7 @@ class TestWebTerminalSubStepRows:
         printed.open_phase()
 
         postup_hooks.warn_if_web_stack_unreachable(
-            {"modules": {"web_terminals": {"nginx_port": 8080}}},
+            {"modules": {"web_terminals": {"enabled": True, "nginx_port": 8080}}},
             attempts=1,
             delay=0,
             web_cmd=["docker", "compose"],

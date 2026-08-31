@@ -45,10 +45,25 @@ import { escapeHtml } from '/design-system/js/dom.js';
  */
 
 /**
+ * @typedef {Object} VocabularyCapability
+ * @property {boolean} enabled
+ * @property {number} concepts
+ * @property {boolean} expand_by_default
+ */
+
+/**
+ * The /api/capabilities payload. `status`/`config_errors`/`remedy` are absent
+ * on a healthy panel and present only when the backend reports a degraded
+ * configuration: `configuration_invalid` means search is dead (the search form
+ * is blocked), `configuration_warning` means search still works.
  * @typedef {Object} Capabilities
  * @property {Object<string, AdvancedCategory>} categories
  * @property {AdvancedParam[]} [shared_parameters]
- * @property {string} [default_mode]
+ * @property {string|null} [default_mode]
+ * @property {'ok'|'configuration_warning'|'configuration_invalid'} [status]
+ * @property {string[]} [config_errors]
+ * @property {string|null} [remedy]
+ * @property {VocabularyCapability} [vocabulary]
  */
 
 // --- State ---
@@ -58,10 +73,19 @@ let currentMode = 'keyword';
 let isPanelOpen = false;
 /** @type {Object<string, *>} */
 let paramValues = {};
+// Names the operator actually moved this session. Key-presence in `paramValues`
+// cannot answer this: resetToDefaults() pre-seeds every non-null descriptor
+// default, so every knob looks "set" before the panel is ever opened.
+/** @type {Set<string>} */
+const touched = new Set();
 /** @type {Object<string, AdvancedParamOption[]>} */
 const dynamicOptionsCache = {};
 
 // --- Fallback ---
+// Used when /api/capabilities could not be fetched at all. The annotation is
+// deliberate: it makes tsc prove the literal still satisfies the typedef every
+// time a capabilities field is added.
+/** @type {Capabilities} */
 const FALLBACK_CAPABILITIES = {
   categories: {
     direct: {
@@ -72,6 +96,10 @@ const FALLBACK_CAPABILITIES = {
     },
   },
   shared_parameters: [],
+  status: 'ok',
+  config_errors: [],
+  remedy: null,
+  vocabulary: { enabled: false, concepts: 0, expand_by_default: false },
 };
 
 // --- Public API ---
@@ -156,7 +184,8 @@ export function getAdvancedParams() {
   /** @type {Object<string, *>} */
   const result = {};
   for (const name of allParamNames) {
-    if (name in paramValues && paramValues[name] !== undefined && paramValues[name] !== null) {
+    if (!touched.has(name)) continue;
+    if (paramValues[name] !== undefined && paramValues[name] !== null) {
       result[name] = paramValues[name];
     }
   }
@@ -169,6 +198,20 @@ export function getAdvancedParams() {
  */
 export function getAdvancedOptions() {
   return getAdvancedParams();
+}
+
+/**
+ * The value a search would actually run with for one parameter of the current
+ * mode: the operator's value when they touched it, otherwise the deployment's
+ * configured default from the mode descriptor. Callers use this to read a knob
+ * that getAdvancedParams() deliberately omits because it was never touched.
+ * @param {string} name - Parameter name
+ * @returns {*} Effective value, or undefined if the current mode has no such parameter
+ */
+export function getEffectiveParam(name) {
+  const descriptor = getModeParameters(currentMode).find(p => p.name === name);
+  if (!descriptor) return undefined;
+  return paramValues[name] ?? descriptor.default;
 }
 
 /**
@@ -298,7 +341,7 @@ function renderAdvancedPanel() {
 
   if (allParams.length === 0) {
     container.innerHTML = `
-      <div class="empty-state" style="padding: var(--ariel-space-6);">
+      <div class="empty-state" style="padding: var(--space-5);">
         <p class="empty-state-text">No advanced options for this mode.</p>
       </div>
     `;
@@ -370,21 +413,27 @@ function renderAdvancedPanel() {
  */
 function renderParameter(param) {
   const value = paramValues[param.name] ?? param.default;
+  // The description is the knob's documentation, so it is shown rather than
+  // hidden behind a hover. escapeHtml() stringifies undefined, so a descriptor
+  // without a description is skipped here instead of rendering an empty hint.
+  const hint = param.description
+    ? `<p class="param-hint">${escapeHtml(param.description)}</p>`
+    : '';
 
   switch (param.type) {
     case 'float':
     case 'int':
-      return renderSlider(param, value);
+      return renderSlider(param, value) + hint;
     case 'bool':
-      return renderToggle(param, value);
+      return renderToggle(param, value) + hint;
     case 'select':
-      return renderSelect(param, value);
+      return renderSelect(param, value) + hint;
     case 'date':
-      return renderDateInput(param, value);
+      return renderDateInput(param, value) + hint;
     case 'text':
-      return renderTextInput(param, value);
+      return renderTextInput(param, value) + hint;
     case 'dynamic_select':
-      return renderDynamicSelect(param);
+      return renderDynamicSelect(param) + hint;
     default:
       return '';
   }
@@ -401,7 +450,7 @@ function renderSlider(param, value) {
   return `
     <div class="slider-control">
       <div class="slider-header">
-        <label class="slider-label" for="param-${param.name}" title="${escapeHtml(param.description)}">${escapeHtml(param.label)}</label>
+        <label class="slider-label" for="param-${param.name}">${escapeHtml(param.label)}</label>
         <span class="slider-value" id="param-${param.name}-value">${displayValue}</span>
       </div>
       <input type="range" id="param-${param.name}" class="slider"
@@ -422,7 +471,7 @@ function renderToggle(param, value) {
   const checked = value ? 'checked' : '';
   return `
     <div class="toggle-control">
-      <label class="toggle-label" for="param-${param.name}" title="${escapeHtml(param.description)}">${escapeHtml(param.label)}</label>
+      <label class="toggle-label" for="param-${param.name}">${escapeHtml(param.label)}</label>
       <label class="toggle-switch">
         <input type="checkbox" id="param-${param.name}"
           data-param="${param.name}" data-type="bool" ${checked}>
@@ -447,7 +496,7 @@ function renderSelect(param, value) {
 
   return `
     <div class="input-group">
-      <label class="input-label" for="param-${param.name}" title="${escapeHtml(param.description)}">${escapeHtml(param.label)}</label>
+      <label class="input-label" for="param-${param.name}">${escapeHtml(param.label)}</label>
       <select id="param-${param.name}" class="select"
         data-param="${param.name}" data-type="select">
         ${optionsHtml}
@@ -466,7 +515,7 @@ function renderDateInput(param, value) {
   const val = value || '';
   return `
     <div class="input-group">
-      <label class="input-label" for="param-${param.name}" title="${escapeHtml(param.description)}">${escapeHtml(param.label)}</label>
+      <label class="input-label" for="param-${param.name}">${escapeHtml(param.label)}</label>
       <input type="date" id="param-${param.name}" class="input"
         data-param="${param.name}" data-type="date" value="${escapeHtml(val)}">
     </div>
@@ -484,7 +533,7 @@ function renderTextInput(param, value) {
   const placeholder = param.placeholder || '';
   return `
     <div class="input-group">
-      <label class="input-label" for="param-${param.name}" title="${escapeHtml(param.description)}">${escapeHtml(param.label)}</label>
+      <label class="input-label" for="param-${param.name}">${escapeHtml(param.label)}</label>
       <input type="text" id="param-${param.name}" class="input"
         data-param="${param.name}" data-type="text"
         value="${escapeHtml(val)}" placeholder="${escapeHtml(placeholder)}">
@@ -500,7 +549,7 @@ function renderTextInput(param, value) {
 function renderDynamicSelect(param) {
   return `
     <div class="input-group">
-      <label class="input-label" for="param-${param.name}" title="${escapeHtml(param.description)}">${escapeHtml(param.label)}</label>
+      <label class="input-label" for="param-${param.name}">${escapeHtml(param.label)}</label>
       <select id="param-${param.name}" class="select"
         data-param="${param.name}" data-type="dynamic_select"
         data-endpoint="${escapeHtml(param.options_endpoint || '')}">
@@ -563,6 +612,7 @@ function attachParamListeners(container) {
     slider.addEventListener('input', () => {
       const name = slider.dataset.param;
       if (!name) return;
+      touched.add(name);
       const type = slider.dataset.type;
       const val = type === 'float' ? parseFloat(slider.value) : parseInt(slider.value, 10);
       paramValues[name] = val;
@@ -583,6 +633,7 @@ function attachParamListeners(container) {
     toggle.addEventListener('change', () => {
       const name = toggle.dataset.param;
       if (!name) return;
+      touched.add(name);
       paramValues[name] = toggle.checked;
     });
   });
@@ -595,6 +646,7 @@ function attachParamListeners(container) {
     select.addEventListener('change', () => {
       const name = select.dataset.param;
       if (!name) return;
+      touched.add(name);
       paramValues[name] = select.value || null;
     });
   });
@@ -607,6 +659,7 @@ function attachParamListeners(container) {
     input.addEventListener('change', () => {
       const name = input.dataset.param;
       if (!name) return;
+      touched.add(name);
       paramValues[name] = input.value || null;
     });
   });
@@ -619,6 +672,7 @@ function attachParamListeners(container) {
     input.addEventListener('input', () => {
       const name = input.dataset.param;
       if (!name) return;
+      touched.add(name);
       paramValues[name] = input.value.trim() || null;
     });
   });
@@ -629,6 +683,7 @@ function attachParamListeners(container) {
  */
 function resetToDefaults() {
   paramValues = {};
+  touched.clear();
   const categories = capabilities?.categories || {};
 
   // Collect defaults from all modes
@@ -655,6 +710,7 @@ export default {
   getCurrentMode,
   getAdvancedParams,
   getAdvancedOptions,
+  getEffectiveParam,
   isAdvancedPanelOpen,
   closeAdvancedPanel,
 };

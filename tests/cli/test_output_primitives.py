@@ -50,6 +50,12 @@ from osprey.cli.phase_reporter import (
     install_reporter,
 )
 from osprey.cli.styles import data_table, osprey_theme, panel
+from osprey.port_layout import default_port
+
+#: The landing page's port at the default base — the URL sample these
+#: hyperlink-detection tests print. Derived rather than spelled so the sample is
+#: an address a deployment actually publishes.
+_LANDING = default_port("nginx")
 
 #: Anything Rich writes that is not text: styles, cursor moves, erases.
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
@@ -94,9 +100,10 @@ def recording_console(*, width: int = 100, terminal: bool = True) -> tuple[Conso
     """A themed terminal console that records everything written to it.
 
     ``force_terminal`` is what makes a ``Live`` real: off a terminal Rich skips
-    the repaint entirely. The theme is not optional either -- the primitives'
-    styles are semantic tokens, and a bare ``Console()`` raises ``MissingStyle``
-    on the first one.
+    the repaint entirely. Explicit color settings keep ANSI output independent
+    of ``NO_COLOR`` and ``TERM``. The theme is not optional either -- the
+    primitives' styles are semantic tokens, and a bare ``Console()`` raises
+    ``MissingStyle`` on the first one.
 
     ``width`` is for the tests that are about layout rather than about words:
     the ledger folds its values at the console's width, so pinning that fold
@@ -104,7 +111,14 @@ def recording_console(*, width: int = 100, terminal: bool = True) -> tuple[Conso
     """
     buffer = io.StringIO()
     return (
-        Console(file=buffer, theme=osprey_theme, force_terminal=terminal, width=width),
+        Console(
+            file=buffer,
+            theme=osprey_theme,
+            force_terminal=terminal,
+            color_system="standard",
+            no_color=False,
+            width=width,
+        ),
         buffer,
     )
 
@@ -1087,13 +1101,15 @@ def test_a_url_in_a_printed_line_is_a_terminal_hyperlink(capsys):
     console, buffer = recording_console(terminal=True)
     install_reporter(RecordingReporter(console))
 
-    output.report("Everything is running. Open http://127.0.0.1:9080 to start.")
+    output.report(f"Everything is running. Open http://127.0.0.1:{_LANDING} to start.")
 
     printed = buffer.getvalue()
     assert "\x1b]8;" in printed
-    assert "http://127.0.0.1:9080" in printed
+    assert f"http://127.0.0.1:{_LANDING}" in printed
     # The sentence around it is untouched.
-    assert visible(printed) == ["Everything is running. Open http://127.0.0.1:9080 to start."]
+    assert visible(printed) == [
+        f"Everything is running. Open http://127.0.0.1:{_LANDING} to start."
+    ]
 
 
 def test_a_url_in_a_section_value_is_a_terminal_hyperlink():
@@ -1102,13 +1118,13 @@ def test_a_url_in_a_section_value_is_a_terminal_hyperlink():
     console, buffer = recording_console(terminal=True)
     install_reporter(RecordingReporter(console))
 
-    output.section("endpoints", [("web terminal", "http://127.0.0.1:9080  (landing page)")])
+    output.section("endpoints", [("web terminal", f"http://127.0.0.1:{_LANDING}  (landing page)")])
 
     printed = buffer.getvalue()
     assert "\x1b]8;" in printed
     assert visible(printed) == [
         "endpoints",
-        "  web terminal   http://127.0.0.1:9080  (landing page)",
+        f"  web terminal   http://127.0.0.1:{_LANDING}  (landing page)",
     ]
 
 
@@ -1128,21 +1144,21 @@ def test_a_url_reaches_a_pipe_as_plain_text(capsys):
     sees exactly the address and nothing wrapped around it."""
     install_reporter(PhaseReporter(color=False))
 
-    output.report("Open http://127.0.0.1:9080 to start.")
+    output.report(f"Open http://127.0.0.1:{_LANDING} to start.")
 
-    assert capsys.readouterr().out == "Open http://127.0.0.1:9080 to start.\n"
+    assert capsys.readouterr().out == f"Open http://127.0.0.1:{_LANDING} to start.\n"
 
 
 def test_a_sentence_ending_in_a_url_keeps_its_full_stop_out_of_the_link(capsys):
     console, buffer = recording_console(terminal=True)
     install_reporter(RecordingReporter(console))
 
-    output.report("Open http://127.0.0.1:9080.")
+    output.report(f"Open http://127.0.0.1:{_LANDING}.")
 
     printed = buffer.getvalue()
     # The link closes on the address; the full stop is text on the far side.
-    assert "http://127.0.0.1:9080\x1b" in printed
-    assert visible(printed) == ["Open http://127.0.0.1:9080."]
+    assert f"http://127.0.0.1:{_LANDING}\x1b" in printed
+    assert visible(printed) == [f"Open http://127.0.0.1:{_LANDING}."]
 
 
 # -- warn_fact ----------------------------------------------------------------

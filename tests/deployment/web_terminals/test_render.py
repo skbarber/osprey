@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import copy
 import re
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import yaml
-from jinja2 import Template
+from jinja2 import Environment, Template
 
+from osprey.deployment.web_terminals import render as render_module
 from osprey.deployment.web_terminals.artifacts import web_artifacts_dir
 from osprey.deployment.web_terminals.auth_credentials import AUTH_ENV_FILENAME
 from osprey.deployment.web_terminals.personas import env_var_suffix
@@ -20,9 +22,17 @@ from osprey.deployment.web_terminals.ports import (
 )
 from osprey.deployment.web_terminals.render import (
     AUTH_ENV_DIGEST_LABEL,
+    TERMINAL_SECRET_HEADER,
+    TLS_LISTEN_PORT,
     _auth_tls_context,
+    _terminal_secret_artifacts,
+    clear_nginx_templates_dir,
+    deployment_external_origin,
     render_web_terminals,
+    terminal_secret_env_var,
 )
+from osprey.port_layout import DEFAULT_PORT_BASE, default_port
+from osprey.registry.web import framework_web_port_default
 
 # The sidecar's own env-var names, imported rather than spelled out: the compose
 # service and the app factory are the two ends of one contract, and a rename on
@@ -47,10 +57,42 @@ from osprey.utils.workspace import agent_data_base_dir
 # render actually allocates from also carries every registry default
 # (channel_finder, okf, ...) — resolved once here so `allocate_ports(_BASE_PORTS,
 # i)` calls throughout this module see the same full set the render does.
-_CONFIGURED_BASE_PORTS = {"web": 9091, "artifact": 9291, "ariel": 9391, "lattice": 9491}
+# A second, non-default base the explicit overrides below sit in. It MUST stay
+# distinct from the default base: that distinctness is what makes "the
+# configured value wins" a real assertion here rather than two numbers that
+# happen to agree. 20000 rather than the block immediately above the default,
+# because the next block up is the one a second deployment would actually take,
+# and a future `port_base` test on it would make these assertions vacuous. Same
+# name and value as test_lint.py's, so the two files share one convention.
+_OVERRIDE_PORT_BASE = 20000
+_CONFIGURED_BASE_PORTS = {
+    family: default_port(family, 0, base=_OVERRIDE_PORT_BASE)
+    for family in ("web", "artifact", "ariel", "lattice")
+}
+# No test config in this module sets `deployment.port_base`, so the render
+# resolves the layout's default base and the unconfigured families land on their
+# layout bands there.
 _BASE_PORTS = base_ports_from_config(
-    {f"{family}_base_port": port for family, port in _CONFIGURED_BASE_PORTS.items()}
+    {f"{family}_base_port": port for family, port in _CONFIGURED_BASE_PORTS.items()},
+    base=DEFAULT_PORT_BASE,
 )
+
+# The auth sidecar's port when `auth.port` is unset — the layout's `auth` slot at
+# the base these configs resolve, derived rather than pinned to a literal so
+# moving the slot moves the expectation with it.
+_DEFAULT_AUTH_PORT = default_port("auth", 0, base=DEFAULT_PORT_BASE)
+
+# The port a facility that MOVED the sidecar off its layout default puts it on —
+# the `auth` slot of `_OVERRIDE_PORT_BASE`'s block. Every test below that sets
+# `auth.port` explicitly uses this one value: each exists to prove the render
+# follows the configured port, so all that matters is that it differ from
+# `_DEFAULT_AUTH_PORT`, which being in another block it always will.
+_OVERRIDE_AUTH_PORT = default_port("auth", 0, base=_OVERRIDE_PORT_BASE)
+
+# The gateway port every config in this module renders nginx on — the layout's
+# `nginx` slot at the base these configs resolve. Derived for the same reason
+# `_DEFAULT_AUTH_PORT` is: the expectation moves when the slot does.
+_NGINX_PORT = default_port("nginx", 0, base=DEFAULT_PORT_BASE)
 
 
 def _config(users: list[str], groups: list[dict] | None = None) -> dict:
@@ -58,7 +100,7 @@ def _config(users: list[str], groups: list[dict] | None = None) -> dict:
     render_web_terminals() reads."""
     web_terminals: dict = {
         "enabled": True,
-        "nginx_port": 9080,
+        "nginx_port": _NGINX_PORT,
         "web_base_port": _CONFIGURED_BASE_PORTS["web"],
         "artifact_base_port": _CONFIGURED_BASE_PORTS["artifact"],
         "ariel_base_port": _CONFIGURED_BASE_PORTS["ariel"],
@@ -159,9 +201,10 @@ def test_nginx_image_custom_value_lands_on_the_nginx_service() -> None:
     assert compose["services"]["nginx"]["image"] == custom
 
 
-def test_compose_service_env_has_terminal_user_and_8087_constant_per_service() -> None:
-    """Each per-user service sets OSPREY_TERMINAL_USER, and the 8087 web-internal
-    default is referenced (in the healthcheck commentary) once per service."""
+def test_compose_service_env_has_terminal_user_and_web_slot_commentary_per_service() -> None:
+    """Each per-user service sets OSPREY_TERMINAL_USER, and the healthcheck
+    commentary names the layout's ``web`` slot — the fallback a bare
+    ``osprey web`` would take — once per service."""
     # Arrange
     config = copy.deepcopy(_MULTI_USER_CONFIG)
     users = config["modules"]["web_terminals"]["users"]
@@ -175,9 +218,12 @@ def test_compose_service_env_has_terminal_user_and_8087_constant_per_service() -
     for user in users:
         env = compose["services"][f"web-{user}"]["environment"]
         assert f"OSPREY_TERMINAL_USER={user}" in env
-    # The healthcheck commentary mentions the fixed 8087 default twice per
-    # per-user service block (docker-compose.web.yml.j2's healthcheck comment).
-    assert compose_text.count("8087") == 2 * len(users)
+    # The healthcheck commentary names the layout fallback once per per-user
+    # service block (docker-compose.web.yml.j2's healthcheck comment). Spelled
+    # as the slot, not as a number: the port this deployment actually binds is
+    # OSPREY_WEB_PORT, and the commentary exists to say so.
+    assert compose_text.count("layout's `web` slot") == len(users)
+    assert "8087" not in compose_text
 
 
 def test_compose_ports_are_non_colliding_families_matching_allocate_ports() -> None:
@@ -187,7 +233,9 @@ def test_compose_ports_are_non_colliding_families_matching_allocate_ports() -> N
     # Arrange
     config = copy.deepcopy(_MULTI_USER_CONFIG)
     users = config["modules"]["web_terminals"]["users"]
-    effective_base_ports = base_ports_from_config(config["modules"]["web_terminals"])
+    effective_base_ports = base_ports_from_config(
+        config["modules"]["web_terminals"], base=DEFAULT_PORT_BASE
+    )
 
     # Act
     artifacts = render_web_terminals(config)
@@ -380,10 +428,18 @@ def test_landing_single_user_renders_exactly_one_card() -> None:
     assert "No terminals or links are configured yet." not in landing_html
 
 
-def test_landing_escapes_html_special_characters_in_user_and_link_labels() -> None:
-    """Unsafe characters in a user name or link label must be escaped, never raw."""
+def test_landing_escapes_html_special_characters_in_link_labels() -> None:
+    """Unsafe characters in a landing label must be escaped, never raw.
+
+    Exercised through the LINK labels rather than a roster name: a group label
+    and a link label are free prose a facility authors, while a roster name can
+    no longer reach this template unescaped at all — it is the audit
+    subdirectory's name in every auth posture, so `_check_roster_audit_identities`
+    refuses anything outside the username charset before the landing page is
+    built (see the companion test below). Both halves run through the same `|e`
+    filter, so what is pinned here is the same escaping.
+    """
     # Arrange
-    unsafe_user = "<script>alert('u')</script>"
     groups = [
         {"type": "users"},
         {
@@ -392,18 +448,28 @@ def test_landing_escapes_html_special_characters_in_user_and_link_labels() -> No
             "links": [{"label": "Elog & Status", "url": "https://elog.example.org"}],
         },
     ]
-    config = copy.deepcopy(_config([unsafe_user], groups=groups))
+    config = copy.deepcopy(_config(["alice"], groups=groups))
 
     # Act
     artifacts = render_web_terminals(config)
     landing_html = artifacts["nginx/landing.html"]
 
     # Assert
-    assert unsafe_user not in landing_html
-    assert "&lt;script&gt;" in landing_html
     assert "Facility <Tools> & More" not in landing_html
     assert "Facility &lt;Tools&gt; &amp; More" in landing_html
     assert "Elog &amp; Status" in landing_html
+
+
+def test_a_roster_name_carrying_markup_never_reaches_the_landing_page() -> None:
+    """The stronger half of the escaping story: such a name is refused outright.
+
+    It would be a host directory name (`var/audit/<user>/`, bound read-write into
+    that user's container) before it were ever an HTML label, so the render stops
+    it rather than escaping it downstream.
+    """
+    # Act / Assert
+    with pytest.raises(ValueError, match="audit subdirectory"):
+        render_web_terminals(copy.deepcopy(_config(["<script>alert('u')</script>"])))
 
 
 def test_landing_transform_renders_links_group_items() -> None:
@@ -769,13 +835,27 @@ def test_render_missing_deploy_fqdn_is_fine_with_zero_users() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _tls_config(users: list[str] | None = None) -> dict:
-    """A config with TLS terminated at nginx (cert/key set, as the render demands)."""
+#: A TLS listener a rootless nginx can actually bind, for the non-default-port
+#: cases below. Deliberately outside every deployment port block (the layout's
+#: default base is 10000 and this module's second base sits above it), so a
+#: number appearing in a render can only have come from `tls.port` — and, being
+#: numerically below those bases while lexically above them, it is also what
+#: makes the perimeter deny-list's ordering assertions non-vacuous.
+_ALT_TLS_PORT = 8443
+
+
+def _tls_config(users: list[str] | None = None, *, port: int | None = None) -> dict:
+    """A config with TLS terminated at nginx (cert/key set, as the render demands).
+
+    ``port`` names a non-default ``tls.port``; left out, the stanza carries no
+    port key at all, which is the shape every default-port test above renders.
+    """
     config = copy.deepcopy(_config(users) if users is not None else _MULTI_USER_CONFIG)
     config["modules"]["web_terminals"]["tls"] = {
         "enabled": True,
         "cert": "/etc/nginx/certs/dls.crt",
         "key": "/etc/nginx/certs/dls.key",
+        **({"port": port} if port is not None else {}),
     }
     return config
 
@@ -807,7 +887,10 @@ def test_external_origin_without_tls_is_plain_http_on_the_published_nginx_port()
     contexts = _capture_render_contexts(config)
 
     # Assert
-    assert contexts["nginx.conf.j2"]["external_origin"] == "http://dls-deploy.dls.example.org:9080"
+    assert (
+        contexts["nginx.conf.j2"]["external_origin"]
+        == f"http://dls-deploy.dls.example.org:{_NGINX_PORT}"
+    )
 
 
 def test_external_origin_with_tls_is_https_with_443_left_implicit() -> None:
@@ -822,6 +905,48 @@ def test_external_origin_with_tls_is_https_with_443_left_implicit() -> None:
 
     # Assert — the nginx_port never appears in a TLS origin
     assert contexts["nginx.conf.j2"]["external_origin"] == "https://dls-deploy.dls.example.org"
+
+
+def test_external_origin_with_a_non_default_tls_port_spells_that_port_out() -> None:
+    """A `tls.port` other than 443 belongs IN the origin, unlike 443 itself.
+
+    443 is left implicit because that is what an `https://` URL with no port
+    already means; any other port is not implied by anything, and a browser that
+    reached this deployment on it sends it in the `Origin` header. An origin that
+    omitted it would be compared against a string no browser sends, and the
+    `redirect_uri` built from it would be one the IdP was never registered for.
+    """
+    # Arrange
+    config = _tls_config(port=_ALT_TLS_PORT)
+
+    # Act
+    contexts = _capture_render_contexts(config)
+
+    # Assert — one derivation, so every consumer carries the port
+    origin = f"https://dls-deploy.dls.example.org:{_ALT_TLS_PORT}"
+    assert contexts["nginx.conf.j2"]["external_origin"] == origin
+    assert contexts["docker-compose.web.yml.j2"]["external_origin"] == origin
+    assert deployment_external_origin(_tls_config(port=_ALT_TLS_PORT)) == origin
+
+
+def test_landing_url_baked_into_containers_carries_a_non_default_tls_port() -> None:
+    """The "back to landing" link has to name the port the content server is on.
+
+    It is baked in at container start and never recomputed, so an origin missing
+    the port ships every terminal a link to 443 — where this deployment listens
+    on nothing at all.
+    """
+    # Arrange
+    config = _tls_config(port=_ALT_TLS_PORT)
+
+    # Act
+    compose = yaml.safe_load(render_web_terminals(config)["docker-compose.web.yml"])
+
+    # Assert
+    assert (
+        f"OSPREY_TERMINAL_LANDING_URL=https://dls-deploy.dls.example.org:{_ALT_TLS_PORT}"
+        in compose["services"]["web-alice"]["environment"]
+    )
 
 
 def test_external_origin_is_exported_to_both_the_nginx_and_compose_contexts() -> None:
@@ -883,7 +1008,7 @@ def test_landing_url_without_tls_is_unchanged_from_today() -> None:
 
     # Assert
     assert (
-        "OSPREY_TERMINAL_LANDING_URL=http://dls-deploy.dls.example.org:9080"
+        f"OSPREY_TERMINAL_LANDING_URL=http://dls-deploy.dls.example.org:{_NGINX_PORT}"
         in compose["services"]["web-alice"]["environment"]
     )
 
@@ -902,22 +1027,27 @@ def test_external_origin_is_required_by_auth_even_with_an_empty_roster() -> None
         render_web_terminals(config)
 
 
-def test_render_missing_web_base_port_raises_value_error() -> None:
-    """A user list that can't fully resolve allocate_ports() must fail loudly, not
-    silently. Only `web` can be missing — every companion family carries a
-    registry default (see test_render_missing_companion_base_port_uses_default)."""
+def test_render_missing_web_base_port_uses_the_layout_default() -> None:
+    """`web` is a layout slot like every other family now, so a config that names
+    no terminal base port renders on the block rather than failing to allocate."""
     # Arrange
     config = copy.deepcopy(_MULTI_USER_CONFIG)
     del config["modules"]["web_terminals"]["web_base_port"]
 
-    # Act / Assert
-    with pytest.raises(ValueError, match="web"):
-        render_web_terminals(config)
+    # Act
+    artifacts = render_web_terminals(config)
+    compose = yaml.safe_load(artifacts["docker-compose.web.yml"])
+
+    # Assert — the terminal renders from its layout band for every user.
+    default_base = default_port("web", 0, base=DEFAULT_PORT_BASE)
+    for index, user in enumerate(["alice", "bob", "carol"]):
+        env = compose["services"][f"web-{user}"]["environment"]
+        assert f"OSPREY_WEB_PORT={default_base + index}" in env
 
 
-def test_render_missing_companion_base_port_uses_registry_default() -> None:
+def test_render_missing_companion_base_port_uses_layout_default() -> None:
     """A config omitting a companion family's base port (e.g. written before that
-    panel existed) must render with the registry default, not fail — the
+    panel existed) must render with the layout default, not fail — the
     zero-migration guarantee that keeps feature parity from breaking old configs."""
     # Arrange
     config = copy.deepcopy(_MULTI_USER_CONFIG)
@@ -927,13 +1057,52 @@ def test_render_missing_companion_base_port_uses_registry_default() -> None:
     artifacts = render_web_terminals(config)
     compose = yaml.safe_load(artifacts["docker-compose.web.yml"])
 
-    # Assert — lattice family renders from its registry default for every user.
-    from osprey.registry.web import FRAMEWORK_WEB_SERVERS
-
-    default_base = FRAMEWORK_WEB_SERVERS["lattice_dashboard"].multi_user_base_port
+    # Assert — lattice family renders from its layout band for every user.
+    default_base = framework_web_port_default("lattice_dashboard", base=DEFAULT_PORT_BASE)
     for index, user in enumerate(["alice", "bob", "carol"]):
         env = compose["services"][f"web-{user}"]["environment"]
         assert f"OSPREY_LATTICE_DASHBOARD_PORT={default_base + index}" in env
+
+
+def test_render_derives_every_family_from_port_base_20000() -> None:
+    """The pin: with `deployment.port_base: 20000` and a stanza naming no port at
+    all, user 0's seven families land on the 20000 block — 20100 (terminal),
+    20200 (gallery), 20300 (ARIEL), 20400 (lattice), 20500 (channel finder),
+    20600 (OKF), 20700 (system health). This is the whole feature in one
+    assertion: one knob moves the deployment, and nothing here reads a default
+    base."""
+    # Arrange — strip every base-port key, then set the block's base.
+    config = copy.deepcopy(_MULTI_USER_CONFIG)
+    web_terminals = config["modules"]["web_terminals"]
+    for family in ("web", "artifact", "ariel", "lattice"):
+        web_terminals.pop(f"{family}_base_port", None)
+    config["deployment"] = {"port_base": 20000}
+
+    # Act
+    artifacts = render_web_terminals(config)
+    compose = yaml.safe_load(artifacts["docker-compose.web.yml"])
+    env = compose["services"]["web-alice"]["environment"]
+    env_map = dict(item.split("=", 1) for item in env if "=" in item)
+
+    # Assert
+    assert int(env_map["OSPREY_WEB_PORT"]) == 20100
+    assert int(env_map[PANEL_ENV_VARS["artifact"]]) == 20200
+    assert int(env_map[PANEL_ENV_VARS["ariel"]]) == 20300
+    assert int(env_map[PANEL_ENV_VARS["lattice"]]) == 20400
+    assert int(env_map[PANEL_ENV_VARS["channel_finder"]]) == 20500
+    assert int(env_map[PANEL_ENV_VARS["okf"]]) == 20600
+    assert int(env_map[PANEL_ENV_VARS["system_health"]]) == 20700
+    # Every family accounted for — a newly registered companion cannot slip past
+    # this pin by simply not being listed above.
+    assert set(PANEL_ENV_VARS) | {"web"} == set(allocate_ports(_BASE_PORTS, 0))
+
+    # And user N is user 0 plus N, in every family, on the same block.
+    for index, user in enumerate(["alice", "bob", "carol"]):
+        user_env = compose["services"][f"web-{user}"]["environment"]
+        user_map = dict(item.split("=", 1) for item in user_env if "=" in item)
+        assert int(user_map["OSPREY_WEB_PORT"]) == 20100 + index
+        for family, env_var in PANEL_ENV_VARS.items():
+            assert int(user_map[env_var]) == default_port(family, index, base=20000)
 
 
 def test_removing_user_regenerates_without_their_service_route_and_volumes() -> None:
@@ -1412,24 +1581,28 @@ def test_persona_extra_mounts_render_as_extra_per_user_volume_lines() -> None:
     artifacts = render_web_terminals(config)
     compose = yaml.safe_load(artifacts["docker-compose.web.yml"])
 
-    # Assert — bob (gui) carries the two default mounts plus the persona's two
+    # Assert — bob (gui) carries the three default mounts plus the persona's two
     bob_volumes = compose["services"]["web-bob"]["volumes"]
     assert bob_volumes == [
         "bob-claude-config:/data/claude-config",
         "bob-agent-data:/app/dls-gui/var/agent_data",
+        "./var/audit/bob:/app/dls-gui/var/audit/bob",
         "/opt/site-data:/app/site-data:ro",
         "shared-cache:/app/cache",
     ]
-    # alice (default persona, no extra_mounts) keeps exactly the two default mounts
+    # alice (default persona, no extra_mounts) keeps exactly the framework's own
+    # three mounts — the persona's list adds to them, never reorders them.
     assert compose["services"]["web-alice"]["volumes"] == [
         "alice-claude-config:/data/claude-config",
         "alice-agent-data:/app/dls-assistant/var/agent_data",
+        "./var/audit/alice:/app/dls-assistant/var/audit/alice",
     ]
 
 
-def test_no_extra_mounts_leaves_only_the_two_default_volume_lines() -> None:
-    """A no-personas config (the zero-migration default) emits exactly the two
-    default per-user volume lines — the extra_mounts loop adds nothing."""
+def test_no_extra_mounts_leaves_only_the_default_volume_lines() -> None:
+    """A no-personas config (the zero-migration default) emits exactly the three
+    framework per-user volume lines — claude-config, agent-data and this user's
+    own audit subdirectory — and the extra_mounts loop adds nothing."""
     # Arrange
     config = copy.deepcopy(_MULTI_USER_CONFIG)
 
@@ -1442,6 +1615,7 @@ def test_no_extra_mounts_leaves_only_the_two_default_volume_lines() -> None:
         assert compose["services"][f"web-{user}"]["volumes"] == [
             f"{user}-claude-config:/data/claude-config",
             f"{user}-agent-data:/app/dls-assistant/var/agent_data",
+            f"./var/audit/{user}:/app/dls-assistant/var/audit/{user}",
         ]
 
 
@@ -1538,8 +1712,14 @@ def test_nginx_mounts_resolve_into_the_repos_build_zone(tmp_path) -> None:
     artifacts = render_web_terminals(config)
     compose = yaml.safe_load(artifacts["docker-compose.web.yml"])
 
-    # Assert
-    sources = [mount.split(":")[0] for mount in compose["services"]["nginx"]["volumes"]]
+    # Assert — bind mounts only. The envsubst output directory is a tmpfs and has
+    # no host source to resolve, so it is declared on the service's own `tmpfs:`
+    # key rather than in this list.
+    sources = [
+        mount.split(":")[0]
+        for mount in compose["services"]["nginx"]["volumes"]
+        if isinstance(mount, str)
+    ]
     resolved = [(tmp_path / source).resolve() for source in sources[:2]]
     assert resolved == [
         web_artifacts_dir(tmp_path) / "nginx" / "nginx.conf",
@@ -1554,8 +1734,9 @@ def test_nginx_mounts_resolve_into_the_repos_build_zone(tmp_path) -> None:
     assert {"nginx/nginx.conf", "nginx/landing.html"} <= set(artifacts)
 
 
-def test_auth_default_none() -> None:
-    """No `web_terminals.auth` stanza -> auth_method defaults to 'none' (v1 has no auth)."""
+def test_auth_default_token() -> None:
+    """No `web_terminals.auth` stanza -> auth_method defaults to 'token' (the magic-link
+    posture: no login wall, no sidecar, one ?token= exchange per user)."""
     # Arrange
     web_terminals = copy.deepcopy(_MULTI_USER_CONFIG)["modules"]["web_terminals"]
 
@@ -1563,10 +1744,10 @@ def test_auth_default_none() -> None:
     context = _auth_tls_context(web_terminals)
 
     # Assert
-    assert context["auth_method"] == "none"
+    assert context["auth_method"] == "token"
 
 
-def test_auth_default_none_reads_configured_method() -> None:
+def test_auth_default_token_reads_configured_method() -> None:
     """A configured `web_terminals.auth.method` is read through, not clobbered by the default."""
     # Arrange
     web_terminals = copy.deepcopy(_MULTI_USER_CONFIG)["modules"]["web_terminals"]
@@ -1579,10 +1760,10 @@ def test_auth_default_none_reads_configured_method() -> None:
     assert context["auth_method"] == "password"
 
 
-def test_auth_method_non_string_falls_back_to_none() -> None:
+def test_auth_method_non_string_falls_back_to_token() -> None:
     """A malformed (non-str) `auth.method` (well-formedness is lint's job, not this
     function's) must not leak into the rendered seam as-is — it falls back to the
-    same inert "none" default as an absent/empty method."""
+    same "token" default as an absent/empty method."""
     # Arrange
     web_terminals = copy.deepcopy(_MULTI_USER_CONFIG)["modules"]["web_terminals"]
     web_terminals["auth"] = {"method": {"nested": "not-a-string"}}
@@ -1591,7 +1772,7 @@ def test_auth_method_non_string_falls_back_to_none() -> None:
     context = _auth_tls_context(web_terminals)
 
     # Assert
-    assert context["auth_method"] == "none"
+    assert context["auth_method"] == "token"
 
 
 def test_tls_default_off() -> None:
@@ -1606,6 +1787,7 @@ def test_tls_default_off() -> None:
     assert context["tls_enabled"] is False
     assert context["tls_cert"] is None
     assert context["tls_key"] is None
+    assert context["tls_port"] == TLS_LISTEN_PORT
 
 
 def test_tls_default_off_reads_configured_stanza() -> None:
@@ -1627,6 +1809,25 @@ def test_tls_default_off_reads_configured_stanza() -> None:
     assert context["tls_key"] == "/etc/nginx/certs/dls.key"
 
 
+def test_tls_port_reads_a_configured_listener() -> None:
+    """A host that cannot bind 443 names its own TLS port; the parser reads it through,
+    and every consumer of the seam follows that value instead of the default."""
+    # Arrange
+    web_terminals = copy.deepcopy(_MULTI_USER_CONFIG)["modules"]["web_terminals"]
+    web_terminals["tls"] = {
+        "enabled": True,
+        "port": 8443,
+        "cert": "/etc/nginx/certs/dls.crt",
+        "key": "/etc/nginx/certs/dls.key",
+    }
+
+    # Act
+    context = _auth_tls_context(web_terminals)
+
+    # Assert
+    assert context["tls_port"] == 8443
+
+
 # ---------------------------------------------------------------------------
 # Task 1.2: the full auth stanza — `_auth_tls_context` is the single parser
 # ---------------------------------------------------------------------------
@@ -1644,11 +1845,11 @@ def test_auth_context_defaults_are_inert_without_an_auth_stanza() -> None:
     context = _auth_tls_context(web_terminals)
 
     # Assert
-    assert context["auth_method"] == "none"
+    assert context["auth_method"] == "token"
     assert context["auth_allow_insecure_http"] is False
     assert context["auth_image"] is None
     assert context["auth_oidc_issuer"] is None
-    assert context["auth_port"] == 9070
+    assert context["auth_port"] == _DEFAULT_AUTH_PORT
     assert context["auth_session_lifetime"] == 12 * 60 * 60
 
 
@@ -1658,7 +1859,7 @@ def test_auth_context_reads_every_configured_scalar() -> None:
     web_terminals = copy.deepcopy(_MULTI_USER_CONFIG)["modules"]["web_terminals"]
     web_terminals["auth"] = {
         "method": "password",
-        "port": 9401,
+        "port": _OVERRIDE_AUTH_PORT,
         "session_lifetime": 3600,
         "allow_insecure_http": True,
         "image": "git.dls.example.org:5050/physics/production/dls-auth:2026.8.1",
@@ -1669,7 +1870,7 @@ def test_auth_context_reads_every_configured_scalar() -> None:
 
     # Assert
     assert context["auth_method"] == "password"
-    assert context["auth_port"] == 9401
+    assert context["auth_port"] == _OVERRIDE_AUTH_PORT
     assert context["auth_session_lifetime"] == 3600
     assert context["auth_allow_insecure_http"] is True
     assert context["auth_image"].endswith("dls-auth:2026.8.1")
@@ -1755,11 +1956,34 @@ def test_auth_context_malformed_scalars_fall_back_to_defaults() -> None:
     context = _auth_tls_context(web_terminals)
 
     # Assert
-    assert context["auth_port"] == 9070
+    assert context["auth_port"] == _DEFAULT_AUTH_PORT
     assert context["auth_session_lifetime"] == 12 * 60 * 60
     assert context["auth_image"] is None
     assert context["auth_oidc_issuer"] is None
     assert context["auth_oidc_client_id_env"] == "OSPREY_AUTH_OIDC_CLIENT_ID"
+
+
+@pytest.mark.parametrize(
+    "bad_port",
+    [0, -1, 65536, 70000, True, "8443"],
+    ids=["zero", "negative", "one-past-the-top", "far-past-the-top", "bool", "string"],
+)
+def test_port_keys_outside_the_tcp_range_fall_back_to_their_defaults(bad_port: object) -> None:
+    """Both port keys read through the same bounded reader, so the whole invalid domain
+    — not an int, `bool`, zero, negative, or past 65535 — lands on the default rather
+    than reaching a `listen` directive nginx refuses at startup. That is what makes
+    lint's "the render falls back" finding true of `tls.port` and `auth.port` alike."""
+    # Arrange
+    web_terminals = copy.deepcopy(_MULTI_USER_CONFIG)["modules"]["web_terminals"]
+    web_terminals["auth"] = {"port": bad_port}
+    web_terminals["tls"] = {"enabled": True, "port": bad_port}
+
+    # Act
+    context = _auth_tls_context(web_terminals)
+
+    # Assert
+    assert context["auth_port"] == _DEFAULT_AUTH_PORT
+    assert context["tls_port"] == TLS_LISTEN_PORT
 
 
 def test_auth_context_never_reads_a_credential_out_of_config() -> None:
@@ -1850,7 +2074,7 @@ def test_render_auth_context_gate_does_not_fire_for_method_none() -> None:
     assert "auth_request" not in artifacts["nginx/nginx.conf"]
 
 
-def test_render_succeeds_with_auth_default_none_and_tls_default_off() -> None:
+def test_render_succeeds_with_auth_default_token_and_tls_default_off() -> None:
     """A config with no auth/tls stanzas at all still renders the full artifact set — 1.4 only
     establishes the config contract, it must not change Phase-1 render behavior."""
     # Arrange
@@ -1883,7 +2107,7 @@ def test_render_tolerates_non_dict_auth_and_tls_stanzas() -> None:
     context = _auth_tls_context(config["modules"]["web_terminals"])
 
     # Assert
-    assert context["auth_method"] == "none"
+    assert context["auth_method"] == "token"
     assert context["tls_enabled"] is False
     assert "docker-compose.web.yml" in artifacts
 
@@ -1977,9 +2201,9 @@ def test_nginx_seam_auth_method_set_gates_every_proxied_user_location() -> None:
     assert "return 200;" not in directives
 
 
-def test_nginx_seam_auth_none_omits_auth_request_even_with_tls_enabled() -> None:
+def test_nginx_seam_auth_token_omits_auth_request_even_with_tls_enabled() -> None:
     """The two seams are independently gated: TLS on with `auth.method` left at its
-    "none" default must still omit `auth_request` entirely."""
+    "token" default must still omit `auth_request` entirely."""
     # Arrange
     config = copy.deepcopy(_MULTI_USER_CONFIG)
     config["modules"]["web_terminals"]["tls"] = {
@@ -1995,6 +2219,35 @@ def test_nginx_seam_auth_none_omits_auth_request_even_with_tls_enabled() -> None
     # Assert
     assert "listen 443 ssl;" in nginx_conf
     assert "auth_request" not in nginx_conf
+
+
+def test_nginx_seam_open_omits_auth_request_even_with_tls_enabled() -> None:
+    """`none` is the combination worth stating separately: it is the one
+    method that renders BOTH TLS and an injected credential and still stands no
+    wall.
+
+    Encrypting the transport says nothing about who may cross it, and injecting
+    a secret is the perimeter vouching for a request rather than checking one.
+    A seam that read either as authentication would put a login wall in front
+    of a deployment whose whole posture is that the network is the perimeter.
+    """
+    # Arrange
+    config = _open_config()
+    config["modules"]["web_terminals"]["tls"] = {
+        "enabled": True,
+        "cert": "/etc/nginx/certs/dls.crt",
+        "key": "/etc/nginx/certs/dls.key",
+    }
+
+    # Act
+    nginx_conf = render_web_terminals(config)["nginx/nginx.conf"]
+
+    # Assert
+    assert "listen 443 ssl;" in nginx_conf
+    assert "auth_request" not in nginx_conf
+
+    # Assert — non-vacuous: this render really is the injecting posture.
+    assert _secret_include("alice") in _directives(nginx_conf)
 
 
 # ---------------------------------------------------------------------------
@@ -2136,6 +2389,17 @@ def _auth_config(users: list[str] | None = None, **auth: object) -> dict:
     return config
 
 
+def _open_config(users: list | None = None) -> dict:
+    """A rendering config in the open posture (`auth.method: none`).
+
+    No `allow_insecure_http`: the cleartext refusal guards a sidecar's session
+    cookies, and this posture mints none.
+    """
+    config = _config(users if users is not None else ["alice", "bob", "carol"])
+    config["modules"]["web_terminals"]["auth"] = {"method": "none"}
+    return config
+
+
 def _render_nginx(config: dict) -> str:
     return render_web_terminals(config)["nginx/nginx.conf"]
 
@@ -2204,19 +2468,19 @@ def test_auth_location_verifies_against_the_sidecar_with_a_render_time_username(
     nginx_conf = _render_nginx(_auth_config(["alice", "bob"]))
 
     # Assert
-    assert "proxy_pass http://127.0.0.1:9070/verify?user=alice;" in nginx_conf
-    assert "proxy_pass http://127.0.0.1:9070/verify?user=bob;" in nginx_conf
+    assert f"proxy_pass http://127.0.0.1:{_DEFAULT_AUTH_PORT}/verify?user=alice;" in nginx_conf
+    assert f"proxy_pass http://127.0.0.1:{_DEFAULT_AUTH_PORT}/verify?user=bob;" in nginx_conf
 
 
 def test_auth_location_follows_the_configured_auth_port() -> None:
-    """A facility that moves the sidecar off 9070 is routed to the new port —
-    the template reads `auth_port`, it never hardcodes the default."""
+    """A facility that moves the sidecar off its layout default is routed to the
+    new port — the template reads `auth_port`, it never hardcodes the default."""
     # Act
-    nginx_conf = _render_nginx(_auth_config(["alice"], port=9471))
+    nginx_conf = _render_nginx(_auth_config(["alice"], port=_OVERRIDE_AUTH_PORT))
 
     # Assert
-    assert "proxy_pass http://127.0.0.1:9471/verify?user=alice;" in nginx_conf
-    assert ":9070/verify" not in nginx_conf
+    assert f"proxy_pass http://127.0.0.1:{_OVERRIDE_AUTH_PORT}/verify?user=alice;" in nginx_conf
+    assert f":{_DEFAULT_AUTH_PORT}/verify" not in nginx_conf
 
 
 def test_auth_location_is_internal_only() -> None:
@@ -2282,13 +2546,15 @@ def test_auth_location_verify_subrequest_fails_fast() -> None:
     assert "proxy_read_timeout 3600s;" in _location_body(nginx_conf, "location /u/alice/")
 
 
-def test_auth_location_absent_when_method_is_none() -> None:
-    """`auth.method: none` renders no auth target, no `auth_request`, and no
-    reference to the sidecar's port — byte-for-byte the pre-auth output.
+def test_no_sidecar_surface_when_the_method_runs_no_sidecar() -> None:
+    """Neither method without a sidecar renders a verify target, an
+    `auth_request` or the sidecar's port — the login wall is `sidecar_active`'s
+    alone.
 
-    (The wider byte-equality guarantee is pinned by the golden fixtures in
-    test_golden_render.py; this asserts the property directly for the explicit
-    `method: none` spelling as well as the absent-stanza default.)
+    The two are no longer the same render, which is the point of `none`: the
+    absent-stanza default (`token`) injects nothing, while `none` includes each
+    non-exempt user's secret snippet. What they share is the whole sidecar
+    surface being missing, and that is what is asserted of both.
     """
     # Arrange
     default_config = copy.deepcopy(_MULTI_USER_CONFIG)
@@ -2300,10 +2566,39 @@ def test_auth_location_absent_when_method_is_none() -> None:
     explicit_conf = _render_nginx(explicit_none)
 
     # Assert
-    assert explicit_conf == default_conf
-    assert "_osprey_auth" not in default_conf
-    assert "auth_request" not in default_conf
-    assert "9070" not in default_conf
+    for conf in (default_conf, explicit_conf):
+        assert "_osprey_auth" not in conf
+        assert "auth_request" not in conf
+        assert str(_DEFAULT_AUTH_PORT) not in conf
+
+    # Assert — and the one thing that DOES separate them. Read off the
+    # directives: the template names this very include in the prose above it.
+    assert _secret_include("alice") in _directives(explicit_conf)
+    assert "include " not in _directives(default_conf)
+
+
+def test_the_absent_auth_stanza_renders_exactly_the_explicit_token_posture() -> None:
+    """An unwritten `auth:` block is not a fourth posture — it IS `token`.
+
+    Asserted across every artifact rather than on the nginx fragment alone,
+    because the default is what every deployment that never opted into
+    authentication renders: a divergence between the absent spelling and the
+    written one would change those deployments on an upgrade, silently, in
+    whichever artifact happened to read the method rather than a derived
+    boolean.
+    """
+    # Arrange
+    absent = copy.deepcopy(_MULTI_USER_CONFIG)
+    explicit = copy.deepcopy(_MULTI_USER_CONFIG)
+    explicit["modules"]["web_terminals"]["auth"] = {"method": "token"}
+
+    # Act
+    secrets = _secrets_for(["alice", "bob", "carol"])
+
+    # Assert
+    assert render_web_terminals(absent, terminal_secrets=secrets) == render_web_terminals(
+        explicit, terminal_secrets=secrets
+    )
 
 
 def test_auth_location_zero_users_renders_no_auth_targets() -> None:
@@ -2339,20 +2634,20 @@ def test_auth_public_location_proxies_the_login_surface_to_the_sidecar() -> None
 
     # Assert
     assert "    location /auth/ {" in nginx_conf
-    assert "proxy_pass http://127.0.0.1:9070/auth/;" in _location_body(
+    assert f"proxy_pass http://127.0.0.1:{_DEFAULT_AUTH_PORT}/auth/;" in _location_body(
         nginx_conf, "location /auth/"
     )
 
 
 def test_auth_public_location_follows_the_configured_auth_port() -> None:
     """The public surface and the internal verify targets are pointed at the same
-    configured sidecar port — neither hardcodes the 9070 default."""
+    configured sidecar port — neither hardcodes the layout default."""
     # Act
-    nginx_conf = _render_nginx(_auth_config(port=9471))
+    nginx_conf = _render_nginx(_auth_config(port=_OVERRIDE_AUTH_PORT))
 
     # Assert
-    assert "proxy_pass http://127.0.0.1:9471/auth/;" in nginx_conf
-    assert ":9070" not in nginx_conf
+    assert f"proxy_pass http://127.0.0.1:{_OVERRIDE_AUTH_PORT}/auth/;" in nginx_conf
+    assert f":{_DEFAULT_AUTH_PORT}" not in nginx_conf
 
 
 def test_auth_public_location_is_not_behind_auth_request() -> None:
@@ -2414,9 +2709,10 @@ def test_auth_public_location_does_not_expose_the_verify_endpoint() -> None:
     assert all("/verify?user=" in line for line in verify_lines)
 
 
-def test_auth_public_location_absent_when_method_is_none() -> None:
-    """No sidecar, no public login surface — a `none` deployment renders no
-    `/auth/` location at all."""
+def test_auth_public_location_absent_when_method_is_token() -> None:
+    """No sidecar, no public login surface — a `token` deployment renders no
+    `/auth/` location at all. (`none` is held by the open-render tests in
+    test_nginx_auth_surface.py, which rule out the bare prefix as well.)"""
     # Act
     nginx_conf = _render_nginx(copy.deepcopy(_MULTI_USER_CONFIG))
 
@@ -2471,14 +2767,29 @@ def test_cookie_strip_spares_the_sidecar_locations() -> None:
     assert "Cookie" not in _directives(_location_body(nginx_conf, "location = /_osprey_auth/alice"))
 
 
-def test_cookie_strip_absent_when_method_is_none() -> None:
-    """Without authentication there is no auth cookie to keep out of a
-    container, and the render stays byte-identical to its pre-auth self."""
+def test_cookie_strip_absent_when_method_is_token() -> None:
+    """Under `token` the cookie is not CUT — it is the only gate left.
+
+    There is no sidecar session to keep out of a container here, but there is
+    still a shared cookie jar: one origin serves every terminal, so the browser's
+    raw `Cookie` header names every OTHER user's session this browser holds. So
+    the location forwards exactly one cookie — the one this user's own app
+    issued, which under this method is the whole authorization — and nothing
+    else.
+    """
     # Act
     nginx_conf = _render_nginx(copy.deepcopy(_MULTI_USER_CONFIG))
 
     # Assert
-    assert "Cookie" not in nginx_conf
+    for index, user in enumerate(("alice", "bob", "carol")):
+        port = allocate_ports(_BASE_PORTS, index)["web"]
+        body = _directives(_location_body(nginx_conf, f"location /u/{user}/"))
+        cookie = f"osprey_terminal_session_{port}"
+        assert f'proxy_set_header Cookie "{cookie}=$cookie_{cookie}";' in body
+        # Never the blanket strip, which would leave this location with no gate
+        # at all, and never a bare forward of the whole jar.
+        assert 'proxy_set_header Cookie "";' not in body
+        assert "$http_cookie" not in body
 
 
 # ---------------------------------------------------------------------------
@@ -2612,7 +2923,7 @@ def test_negotiated_401_every_redirect_is_relative_to_the_clients_own_origin() -
     Left on, nginx rebuilds a relative redirect target into an absolute URL
     from `$host` plus its OWN listening port — wrong for the very topology
     `auth.allow_insecure_http` exists to serve: behind a facility TLS
-    terminator, `https://facility/u/alice` becomes `http://facility:9080/u/alice/`,
+    terminator, `https://facility/u/alice` becomes `http://facility:10000/u/alice/`,
     downgrading the scheme and advertising the internal port. Scoping it to the
     login handler alone would leave the `/u/<user>` bookmark 301s — a link an
     operator is far more likely to have saved — still absolute.
@@ -2643,8 +2954,8 @@ def test_negotiated_401_login_target_is_the_public_auth_prefix() -> None:
     assert "auth_request" not in _location_body(nginx_conf, "location /auth/")
 
 
-def test_negotiated_401_absent_when_method_is_none() -> None:
-    """Nothing to negotiate without authentication: no map, no `error_page`,
+def test_negotiated_401_absent_when_method_is_token() -> None:
+    """Nothing to negotiate without a wall: no map, no `error_page`,
     no handler."""
     # Act
     nginx_conf = _render_nginx(copy.deepcopy(_MULTI_USER_CONFIG))
@@ -2653,6 +2964,27 @@ def test_negotiated_401_absent_when_method_is_none() -> None:
     assert "$osprey_auth_wants_login_page" not in nginx_conf
     assert "error_page" not in nginx_conf
     assert "@osprey_auth_401" not in nginx_conf
+
+
+def test_negotiated_401_absent_when_the_method_is_open() -> None:
+    """Injecting a credential is not the same as being able to ask for one.
+
+    The negotiation exists to turn a denied subrequest into either a login page
+    or a bare 401, depending on what the client is. Under `none` no request is
+    ever denied at the perimeter, so a map, an `error_page` or the named
+    handler here would describe a login flow with no login behind it — and the
+    handler redirects to `/auth/login`, which this deployment does not serve.
+    """
+    # Act
+    nginx_conf = _render_nginx(_open_config())
+
+    # Assert
+    assert "$osprey_auth_wants_login_page" not in nginx_conf
+    assert "error_page" not in nginx_conf
+    assert "@osprey_auth_401" not in nginx_conf
+
+    # Assert — non-vacuous: this render is the injecting one, not an empty one.
+    assert _secret_include("alice") in _directives(nginx_conf)
 
 
 # ---------------------------------------------------------------------------
@@ -2680,7 +3012,7 @@ def test_tls_redirect_off_renders_exactly_one_server_block() -> None:
     # Assert
     assert len(_server_blocks(nginx_conf)) == 1
     assert "return 301 https://" not in nginx_conf
-    assert "listen 9080;" in nginx_conf
+    assert f"listen {_NGINX_PORT};" in nginx_conf
 
 
 def test_tls_redirect_splits_into_a_redirect_server_and_a_content_server() -> None:
@@ -2696,13 +3028,13 @@ def test_tls_redirect_splits_into_a_redirect_server_and_a_content_server() -> No
     # Assert
     assert len(blocks) == 2
     redirect, content = blocks
-    assert "listen 9080;" in redirect
-    assert "listen [::]:9080;" in redirect
+    assert f"listen {_NGINX_PORT};" in redirect
+    assert f"listen [::]:{_NGINX_PORT};" in redirect
     assert "listen 443 ssl;" in content
     assert "listen [::]:443 ssl;" in content
     # Neither listener answers on the other's port.
     assert "443" not in redirect
-    assert "listen 9080;" not in content
+    assert f"listen {_NGINX_PORT};" not in content
 
 
 def test_tls_redirect_server_serves_nothing_but_the_redirect() -> None:
@@ -2738,6 +3070,60 @@ def test_tls_redirect_target_is_the_requested_host_not_the_render_time_origin() 
     # Assert
     assert "https://$host$request_uri" in redirect
     assert fqdn not in redirect
+
+
+def test_tls_content_server_listens_on_a_configured_non_default_port() -> None:
+    """`tls.port` moves BOTH `listen ... ssl` lines, IPv4 and IPv6 alike.
+
+    A host that cannot bind 443 — rootless, or already carrying another
+    deployment's perimeter — names its own port. One line following it and the
+    other left at 443 would render a server that either fails to start (443 is
+    privileged) or answers on a port nothing else in the deployment knows about.
+    """
+    # Act
+    redirect, content = _server_blocks(_render_nginx(_tls_config(port=_ALT_TLS_PORT)))
+
+    # Assert — the content server is entirely on the configured port
+    assert f"listen {_ALT_TLS_PORT} ssl;" in content
+    assert f"listen [::]:{_ALT_TLS_PORT} ssl;" in content
+    assert "listen 443 ssl;" not in content
+    assert "listen [::]:443 ssl;" not in content
+    # Assert — the plain listener is untouched by the TLS port, and still only redirects
+    assert f"listen {_NGINX_PORT};" in redirect
+    assert f"listen {_ALT_TLS_PORT}" not in redirect
+
+
+def test_tls_redirect_names_a_non_default_port_in_its_bounce_target() -> None:
+    """The 301 has to carry the port as well as the scheme.
+
+    `$host` is the name the client asked for and never the port it should be
+    sent to, so a bare `https://$host` bounces every cleartext client to 443 —
+    where a deployment serving on its own `tls.port` has nothing listening, and
+    the front door becomes a redirect into a connection refusal.
+    """
+    # Act
+    redirect = _server_blocks(_render_nginx(_tls_config(port=_ALT_TLS_PORT)))[0]
+
+    # Assert
+    assert f"return 301 https://$host:{_ALT_TLS_PORT}$request_uri;" in redirect
+    assert "return 301 https://$host$request_uri;" not in redirect
+    # Still the requested host, not the render-time fqdn: only the port is fixed here.
+    assert "dls-deploy.dls.example.org" not in redirect
+
+
+def test_tls_port_left_at_the_default_keeps_the_port_out_of_the_redirect() -> None:
+    """Explicitly configuring 443 renders exactly what configuring nothing does.
+
+    The redirect names a port only when a browser would not already assume it,
+    so the default spelled out by hand must not start emitting `:443` — the same
+    value, in the canonical form, from either config.
+    """
+    # Act
+    explicit = _render_nginx(_tls_config(port=TLS_LISTEN_PORT))
+
+    # Assert
+    assert explicit == _render_nginx(_tls_config())
+    assert "return 301 https://$host$request_uri;" in _server_blocks(explicit)[0]
 
 
 def test_tls_redirect_content_server_holds_the_cert_and_every_user_route() -> None:
@@ -2820,12 +3206,27 @@ def _env_names(service: dict) -> list[str]:
     return [line.split("=", 1)[0] for line in service.get("environment", [])]
 
 
-def test_auth_sidecar_service_is_absent_for_method_none() -> None:
-    """The default posture renders the overlay it renders today: no sidecar service,
-    no auth environment, no reference to the credential file. Every deployment that
-    has not opted into authentication must be untouched by this feature."""
+@pytest.mark.parametrize(
+    "auth", [None, {"method": "token"}, {"method": "none"}], ids=["absent", "token", "open"]
+)
+def test_no_sidecar_service_is_rendered_for_a_method_that_stands_no_wall(
+    auth: dict | None,
+) -> None:
+    """Every wall-less posture renders the overlay it rendered before this
+    feature existed: no sidecar service, no auth environment, no reference to
+    the credential file.
+
+    `none` is the one worth stating rather than assuming. It DOES change the
+    nginx fragment — each non-exempt location injects that user's operator
+    secret — so it is the posture most likely to acquire a sidecar by
+    association. It must not: the whole content of `none` is that the network
+    is the perimeter, and a sidecar rendered beside it would be a login wall
+    nothing routes through, holding credentials nobody presents.
+    """
     # Arrange
     config = copy.deepcopy(_MULTI_USER_CONFIG)
+    if auth is not None:
+        config["modules"]["web_terminals"]["auth"] = auth
 
     # Act
     rendered = render_web_terminals(config)["docker-compose.web.yml"]
@@ -2841,13 +3242,18 @@ def test_auth_sidecar_service_is_absent_for_method_none() -> None:
     assert AUTH_ENV_FILENAME not in rendered
 
 
-def test_auth_sidecar_service_is_the_only_service_authentication_adds() -> None:
+@pytest.mark.parametrize("method", ["password", "oidc"])
+def test_auth_sidecar_service_is_the_only_service_authentication_adds(method: str) -> None:
     """Turning auth on adds exactly one service — `auth` — and changes nothing about
     the per-user set. The name is deliberately not `web-auth`: usernames render as
     `web-<user>`, so a roster user named "auth" would collide with that spelling but
-    cannot collide with this one."""
+    cannot collide with this one.
+
+    Both sidecar methods, because the service is what `sidecar_active` renders
+    and neither method may reach that decision on its own.
+    """
     # Act
-    services = set(_compose(_auth_config())["services"])
+    services = set(_compose(_auth_config(method=method))["services"])
 
     # Assert
     assert services == {"auth", "nginx", "web-alice", "web-bob", "web-carol"}
@@ -2863,7 +3269,7 @@ def test_auth_sidecar_service_serves_a_single_uvicorn_bound_to_loopback() -> Non
     both (a logged-out session still valid on whichever worker missed the logout).
     """
     # Act
-    auth = _compose(_auth_config(port=9411))["services"]["auth"]
+    auth = _compose(_auth_config(port=_OVERRIDE_AUTH_PORT))["services"]["auth"]
 
     # Assert
     assert auth["command"] == [
@@ -2873,7 +3279,7 @@ def test_auth_sidecar_service_serves_a_single_uvicorn_bound_to_loopback() -> Non
         "--host",
         "127.0.0.1",
         "--port",
-        "9411",
+        str(_OVERRIDE_AUTH_PORT),
     ]
     assert "--workers" not in auth["command"]
     assert auth["network_mode"] == "host"
@@ -2926,11 +3332,20 @@ def test_auth_sidecar_service_environment_is_exactly_the_non_secret_settings() -
     # Assert
     assert _env_names(auth) == [
         "TZ",
+        # The sidecar's audit identity and the directory it writes its login and
+        # denial events to. Neither is a secret: one is the fixed name
+        # `sidecar`, the other a container path.
+        "OSPREY_AUDIT_IDENTITY",
+        "OSPREY_AUTH_AUDIT_DIR",
         ENV_METHOD,
         ENV_SESSION_LIFETIME,
         ENV_TLS_ENABLED,
         ENV_EXTERNAL_ORIGIN,
         ENV_USERS,
+        # The egress passthrough, non-secret in the same sense as the rest of
+        # this block and pinned in render order. Its own shape — values, case,
+        # and what deliberately does NOT join it — is asserted below.
+        *_PROXY_NAMES,
     ]
 
 
@@ -2953,7 +3368,7 @@ def test_auth_sidecar_service_tls_flag_and_origin_follow_the_deployment() -> Non
 
     # Assert
     assert f"{ENV_TLS_ENABLED}=false" in plain_env
-    assert f"{ENV_EXTERNAL_ORIGIN}=http://dls-deploy.dls.example.org:9080" in plain_env
+    assert f"{ENV_EXTERNAL_ORIGIN}=http://dls-deploy.dls.example.org:{_NGINX_PORT}" in plain_env
     assert f"{ENV_TLS_ENABLED}=true" in secured_env
     assert f"{ENV_EXTERNAL_ORIGIN}=https://dls-deploy.dls.example.org" in secured_env
 
@@ -3090,12 +3505,12 @@ def test_auth_sidecar_service_healthcheck_probes_its_own_health_route() -> None:
     crash-looping. Probed in-image with python: `curl` is not in an OSPREY service
     image (the nginx service's curl probe runs in the nginx image)."""
     # Act
-    auth = _compose(_auth_config(port=9411))["services"]["auth"]
+    auth = _compose(_auth_config(port=_OVERRIDE_AUTH_PORT))["services"]["auth"]
 
     # Assert
     probe = auth["healthcheck"]["test"]
     assert probe[0] == "CMD-SHELL"
-    assert "http://127.0.0.1:9411/health" in probe[1]
+    assert f"http://127.0.0.1:{_OVERRIDE_AUTH_PORT}/health" in probe[1]
     assert "curl" not in probe[1]
 
 
@@ -3143,6 +3558,205 @@ def test_auth_env_isolation_no_web_service_carries_an_auth_variable() -> None:
         assert service["env_file"] == ".env.users"
         assert AUTH_ENV_FILENAME not in str(service["env_file"])
         assert not [env for env in _env_names(service) if env.startswith("OSPREY_AUTH")]
+
+
+# ---------------------------------------------------------------------------
+# Task 1.2: the sidecar's egress passthrough — the proxy settings its OIDC
+# fetches need behind a corporate proxy, and the three shapes that ruling took
+# ---------------------------------------------------------------------------
+
+# Rendered verbatim, `${VAR:-}` and all: these are compose interpolation
+# directives, not values. Spelled out rather than imported because there is
+# nothing to import — the sidecar reads none of them itself, the HTTP client
+# libraries inside it do, so the template is their only definition.
+_PROXY_ENTRIES = [
+    "HTTP_PROXY=${HTTP_PROXY:-}",
+    "HTTPS_PROXY=${HTTPS_PROXY:-}",
+    "NO_PROXY=${NO_PROXY:-}",
+]
+_PROXY_NAMES = [entry.split("=", 1)[0] for entry in _PROXY_ENTRIES]
+_LOWERCASE_PROXY_NAMES = [name.lower() for name in _PROXY_NAMES]
+# The CA-bundle family that looks like it belongs beside the proxy trio and does
+# not: nothing mounts a CA into this image, so each of these can only ever name
+# a path that is not there.
+_CA_BUNDLE_NAMES = ["SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE"]
+
+
+def _oidc_auth_config() -> dict:
+    """`_auth_config()` in the posture the egress passthrough exists for."""
+    return _auth_config(method="oidc", oidc={"issuer": "https://sso.dls.example.org"})
+
+
+@pytest.mark.parametrize(
+    "config_factory", [_auth_config, _oidc_auth_config], ids=["password", "oidc"]
+)
+def test_auth_sidecar_egress_passes_the_proxy_settings_through_verbatim(config_factory) -> None:
+    """The sidecar's OIDC discovery, token and userinfo fetches are its only
+    outbound traffic, and behind a corporate proxy they fail unless the host's
+    proxy settings reach the container. They arrive as `${VAR:-}` passthrough,
+    which is asserted by VALUE and not merely by name: the whole mechanism is the
+    interpolation directive, and an entry rendered with a baked literal — or with
+    a default other than empty — would satisfy a name-only pin while pinning the
+    deploy host's proxy into the committed compose artifact.
+
+    Rendered in both postures, not gated on `oidc`. The gate would be wrong even
+    though OIDC is the motivating traffic: a `password` sidecar behind a proxy
+    that suddenly needed an outbound fetch would fail in a way no operator could
+    read off the compose file, and an empty passthrough on a host with no proxy
+    costs nothing.
+    """
+    # Act
+    auth = _compose(config_factory())["services"]["auth"]
+
+    # Assert
+    assert [entry for entry in auth["environment"] if entry.split("=", 1)[0] in _PROXY_NAMES] == (
+        _PROXY_ENTRIES
+    )
+
+
+def test_auth_sidecar_egress_is_uppercase_only() -> None:
+    """UPPERCASE only, and the lowercase pair is not an oversight to be tidied up
+    later — adding it would BREAK the no-proxy case. httpx (Authlib's transport
+    for every fetch above, `trust_env` at its default) and requests read the
+    uppercase names. CPython's own `urllib.request.getproxies_environment` reads
+    both, lowercase last and winning, and treats a present-but-EMPTY lowercase
+    `http_proxy` as "this scheme is configured, to nothing" — popping the scheme
+    the uppercase pass just set, while an empty uppercase variable is skipped.
+    Since `${VAR:-}` renders exactly that empty value on every host without a
+    proxy, a lowercase entry here would hand every stdlib caller a cancelled
+    proxy on the common case."""
+    # Act
+    auth = _compose(_auth_config())["services"]["auth"]
+
+    # Assert
+    names = _env_names(auth)
+    assert [name for name in names if name in _PROXY_NAMES] == _PROXY_NAMES
+    assert not [
+        name
+        for name in names
+        if name not in _PROXY_NAMES and name.lower() in _LOWERCASE_PROXY_NAMES
+    ]
+
+
+def test_auth_sidecar_egress_is_proxy_only_and_carries_no_ca_bundle_variable() -> None:
+    """The egress block stops at the proxy trio. A custom CA is the other half of
+    the corporate-network story and is deliberately NOT here: nothing mounts a CA
+    into this image, so `SSL_CERT_FILE` would name a path that does not exist —
+    which crashes httpx at client construction, turning a working plain-HTTP
+    deployment into a sidecar that cannot build a client at all — and nothing in
+    the sidecar reads `REQUESTS_CA_BUNDLE`. Custom-CA support is a mount plus a
+    variable, and its own change."""
+    # Act
+    auth = _compose(_oidc_auth_config())["services"]["auth"]
+
+    # Assert
+    names = _env_names(auth)
+    assert [name for name in names if name in _PROXY_NAMES] == _PROXY_NAMES
+    assert not [name for name in names if name in _CA_BUNDLE_NAMES]
+
+
+def test_auth_sidecar_egress_adds_no_second_env_file() -> None:
+    """The passthrough travels in `environment:` and leaves the sidecar's env_file
+    chain a scalar `.env.auth`. That is the isolation rule pinned above, restated
+    from the other direction: `.env.auth` is 0600 and sidecar-only, and a second
+    env_file for the proxy settings would both widen that surface and hand the
+    values a file whose content compose does NOT interpolate — so `${HTTP_PROXY}`
+    would reach httpx as a literal seven-character string."""
+    # Act
+    auth = _compose(_auth_config())["services"]["auth"]
+
+    # Assert
+    assert auth["env_file"] == AUTH_ENV_FILENAME
+    assert [entry for entry in auth["environment"] if entry.split("=", 1)[0] in _PROXY_NAMES] == (
+        _PROXY_ENTRIES
+    )
+
+
+def test_no_other_service_carries_a_proxy_passthrough() -> None:
+    """The passthrough is the sidecar's alone. The per-user containers reach the
+    outside through the settings their own image and `.env.users` already carry;
+    injecting a second, deploy-time proxy here would silently redirect every
+    agent's provider traffic on any host that sets one, which is a change to the
+    agent tier's egress and not to the login surface's.
+
+    Every service in the rendered project is checked, with `auth` the only
+    exemption, so nginx — and whatever service the module renders next — is
+    covered without anyone having to remember to widen this test.
+    """
+    # Act
+    services = _compose(_auth_config())["services"]
+
+    # Assert
+    assert [name for name in _env_names(services["auth"]) if name in _PROXY_NAMES] == _PROXY_NAMES
+    for name, service in services.items():
+        if name == "auth":
+            continue
+        assert not [
+            env
+            for env in _env_names(service)
+            if env in _PROXY_NAMES or env in _LOWERCASE_PROXY_NAMES
+        ], f"{name} carries a proxy passthrough that belongs to the login sidecar alone"
+
+
+def _session_lifetime_config(method: str, **auth: object) -> dict:
+    """A rendering config in `method`, with any extra `auth:` keys applied.
+
+    Built here rather than through `_auth_config()` because this test spans all
+    four methods and the two wall-less ones must carry no `allow_insecure_http`:
+    that gate guards a sidecar's cookies over cleartext, and `none`/`token`
+    render no sidecar to guard.
+    """
+    config = copy.deepcopy(_MULTI_USER_CONFIG)
+    stanza: dict = {"method": method}
+    if method in {"password", "oidc"}:
+        stanza["allow_insecure_http"] = True
+    if method == "oidc":
+        stanza["oidc"] = {"issuer": "https://sso.dls.example.org"}
+    stanza.update(auth)
+    config["modules"]["web_terminals"]["auth"] = stanza
+    return config
+
+
+@pytest.mark.parametrize("method", ["none", "token", "password", "oidc"])
+def test_every_terminal_carries_the_session_lifetime_under_every_method(method: str) -> None:
+    """`auth.session_lifetime` reaches every per-user container, in every posture.
+
+    The setting governs the terminal's OWN session cookie, minted in one place:
+    this app's `?token=` exchange. Every entry enters that way under `token`,
+    and so do the `login: false` entries under `none`/`password`/`oidc` — those
+    reach their terminal by the same `?token=` URL. A non-exempt entry under
+    those three is authenticated by the injected terminal secret instead, so the
+    number is inert for that container. Which case a given container is in is an
+    entry-level fact the render cannot fold into a posture, so the value is
+    emitted to all of them: gating it on the method would starve exactly the
+    `login: false` entries the other three postures leave standing on that
+    cookie. It has to travel as environment: the persona's `config.yml` is baked
+    into the image at build time, so a deploy-time edit re-renders this overlay
+    and nothing else.
+
+    Emitted in the `OSPREY_TERMINAL_*` namespace, never `OSPREY_AUTH_*` — the
+    isolation this file pins elsewhere, re-asserted here so the two rulings
+    cannot drift apart.
+    """
+    # Arrange
+    configured = _session_lifetime_config(method, session_lifetime=3600)
+    default = _session_lifetime_config(method)
+
+    # Act
+    configured_services = _compose(configured)["services"]
+    default_services = _compose(default)["services"]
+
+    # Assert
+    terminals = [name for name in configured_services if name.startswith("web-")]
+    assert terminals == ["web-alice", "web-bob", "web-carol"]
+    for name in terminals:
+        assert "OSPREY_TERMINAL_SESSION_LIFETIME=3600" in configured_services[name]["environment"]
+        # An absent key leaves the framework default, stated once in the
+        # renderer and pinned here by value.
+        assert "OSPREY_TERMINAL_SESSION_LIFETIME=43200" in default_services[name]["environment"]
+        assert not [
+            env for env in _env_names(configured_services[name]) if env.startswith("OSPREY_AUTH")
+        ]
 
 
 def test_auth_sidecar_carries_the_env_auth_digest_as_a_label() -> None:
@@ -3199,8 +3813,8 @@ def test_auth_sidecar_digest_label_is_omitted_when_no_digest_is_supplied() -> No
     assert AUTH_ENV_DIGEST_LABEL not in (auth.get("labels") or {})
 
 
-def test_method_none_render_is_byte_identical_with_and_without_a_digest() -> None:
-    """With authentication off there is no sidecar and no env_file to track:
+def test_method_token_render_is_byte_identical_with_and_without_a_digest() -> None:
+    """With no sidecar there is no env_file to track:
     a passed digest must leave the render untouched (and must not leak into
     any other service's definition)."""
     # Act
@@ -3246,19 +3860,60 @@ def test_render_auth_on_refuses_a_roster_name_outside_the_username_charset() -> 
         render_web_terminals(uppercase)
 
 
-def test_render_auth_off_still_renders_a_roster_name_outside_the_charset() -> None:
-    """The gate is scoped to authentication being on. With `auth.method: none` the
-    username is a routing label rather than an authorization identity, and every
-    deployment rendering such a name today must keep rendering — lint still reports
-    it. Tightening this would be a silent breaking change for no security gain."""
-    # Arrange
-    config = _config(["alice", "bob.jones"])
+@pytest.mark.parametrize("name", ["../../etc", "..", ".", "a/b", "Alice", "bob.jones", "-dash"])
+def test_render_auth_off_refuses_a_roster_name_outside_the_charset(name: str) -> None:
+    """The charset now binds with `auth.method: none` too — on different grounds.
 
+    `_check_roster_charset` is still scoped to authentication, because ITS
+    reasoning (the name is an nginx location key and the auth subrequest's
+    `?user=` value) only applies behind a login wall. What applies in every
+    posture is that the name is a host DIRECTORY: the render emits
+    `./var/audit/<name>:<container>/var/audit/<name>`, so `../../etc` is a
+    read-write bind resolving outside the repo into a container that runs
+    agent-generated code, and `alice` beside `Alice` is two terminals sharing
+    one subdirectory on a case-insensitive host filesystem.
+
+    This inverts the earlier contract ("no security gain"), which the audit mount
+    invalidated: the renderer used to emit a bind the provisioning seam
+    (`compose_generator.audit_identity_dir`) refuses to create, and the renderer
+    wins — it is the artifact compose reads, and the runtime creates whatever
+    source is missing.
+    """
+    # Arrange
+    config = _config(["alice", name])
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="audit subdirectory") as exc_info:
+        render_web_terminals(config)
+    assert repr(name) in str(exc_info.value)
+
+
+def test_render_auth_off_still_renders_an_in_charset_roster_name() -> None:
+    """The new gate is the charset and nothing wider: hyphens, underscores and
+    digits are all still ordinary roster names with no authentication."""
     # Act
-    compose = yaml.safe_load(render_web_terminals(config)["docker-compose.web.yml"])
+    compose = yaml.safe_load(
+        render_web_terminals(_config(["alice", "bob_2", "carol-x"]))["docker-compose.web.yml"]
+    )
 
     # Assert
-    assert "web-bob.jones" in compose["services"]
+    assert {"web-alice", "web-bob_2", "web-carol-x"} <= set(compose["services"])
+
+
+def test_with_authentication_on_the_charset_gate_is_the_one_that_answers() -> None:
+    """Both gates refuse an out-of-charset name and both are right about it, but
+    they explain it differently — and only the audit gate applies in both
+    postures, so it is the one that would shadow the other if the two ran in the
+    wrong order. With a login wall the name is the AUTHORIZATION identity (the
+    nginx location key, the auth subrequest's `?user=` value), which is the more
+    urgent thing to say, so that gate gets first refusal. Pinned because the
+    difference is only in the message: reversing the two calls leaves every
+    other test in this file green while `_check_roster_charset` becomes
+    unreachable."""
+    # Act / Assert
+    with pytest.raises(ValueError, match="nginx location key") as exc_info:
+        render_web_terminals(_auth_config(["alice", "bob.jones"]))
+    assert "audit subdirectory" not in str(exc_info.value)
 
 
 def test_render_auth_on_charset_gate_rejects_a_trailing_newline_in_a_roster_name() -> None:
@@ -3457,15 +4112,109 @@ def test_render_without_ariel_personas_emits_no_password_line() -> None:
 _LAUNCH_TOKEN_LINE = "BLUESKY_LAUNCH_TOKEN=${BLUESKY_LAUNCH_TOKEN:-}"
 
 
+# ---------------------------------------------------------------------------
+# Archiver connector -> per-user store password
+#
+# `osprey up` mints the archiver store's password into the deploy `.env` under
+# the name the connector block reads (`archiver.<type>.password_env`, which the
+# control-assistant preset spells MONGO_ROOT_PASSWORD). The agent inside a web
+# terminal authenticates with exactly that variable, and `.env.users` excludes
+# service tokens by design -- so a container that is not handed it per-user
+# reports "Environment variable 'MONGO_ROOT_PASSWORD' is not set" on every
+# archiver read, while the single-user host path (which reads the whole `.env`)
+# works. The grant carries the configured NAME, so a facility-run store under
+# another variable is granted the same way.
+# ---------------------------------------------------------------------------
+
+_ARCHIVER_PASSWORD_LINE = "MONGO_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD:-}"
+
+
+def test_archiver_persona_gets_the_store_password() -> None:
+    """A user whose persona reads a store password gets it in its own `environment:`
+    block, interpolated from the deploy `.env` at compose time so the secret is
+    never written into a rendered artifact."""
+    # Act
+    compose = yaml.safe_load(
+        render_web_terminals(
+            _events_persona_config(),
+            archiver_password_personas={"readwrite": "MONGO_ROOT_PASSWORD"},
+        )["docker-compose.web.yml"]
+    )
+
+    # Assert
+    assert _ARCHIVER_PASSWORD_LINE in compose["services"]["web-alice"]["environment"]
+
+
+def test_archiver_grant_carries_the_configured_variable_name() -> None:
+    """A persona whose connector names another variable is handed THAT one."""
+    # Act
+    compose = yaml.safe_load(
+        render_web_terminals(
+            _events_persona_config(), archiver_password_personas={"readwrite": "FACILITY_DB_PW"}
+        )["docker-compose.web.yml"]
+    )
+
+    # Assert
+    alice_env = compose["services"]["web-alice"]["environment"]
+    assert "FACILITY_DB_PW=${FACILITY_DB_PW:-}" in alice_env
+    assert not any("MONGO_ROOT_PASSWORD" in line for line in alice_env)
+
+
+def test_persona_without_an_archiver_password_gets_none() -> None:
+    """A persona whose archiver reads no password needs no store credential."""
+    # Act
+    compose = yaml.safe_load(
+        render_web_terminals(
+            _events_persona_config(),
+            archiver_password_personas={"readwrite": "MONGO_ROOT_PASSWORD"},
+        )["docker-compose.web.yml"]
+    )
+
+    # Assert
+    bob_env = compose["services"]["web-bob"]["environment"]
+    assert not any("MONGO_ROOT_PASSWORD" in line for line in bob_env)
+
+
+def test_render_without_archiver_personas_emits_no_password_line() -> None:
+    """The no-project-root render path passes no persona map and so emits no
+    credential, exactly as it does for the other three."""
+    # Act
+    compose = yaml.safe_load(
+        render_web_terminals(_events_persona_config())["docker-compose.web.yml"]
+    )
+
+    # Assert
+    for service in ("web-alice", "web-bob"):
+        env = compose["services"][service]["environment"]
+        assert not any("MONGO_ROOT_PASSWORD" in line for line in env)
+
+
+def test_persona_less_roster_entry_is_answered_from_the_deploy_config() -> None:
+    """The zero-migration path (no personas; the web image IS the deploy project)
+    reads the grant straight from the deploy config, as the other grants do."""
+    # Arrange
+    config = copy.deepcopy(_MULTI_USER_CONFIG)
+    config["archiver"] = {
+        "type": "mongodb_archiver",
+        "mongodb_archiver": {"host": "localhost", "password_env": "MONGO_ROOT_PASSWORD"},
+    }
+
+    # Act
+    compose = yaml.safe_load(render_web_terminals(config)["docker-compose.web.yml"])
+
+    # Assert
+    assert _ARCHIVER_PASSWORD_LINE in compose["services"]["web-alice"]["environment"]
+
+
 def test_entitled_persona_gets_the_launch_token() -> None:
     """A user whose persona is entitled to arm a queue start gets the launch token
     in its own `environment:` block, interpolated from the deploy `.env` at compose
     time so the secret is never written into a rendered artifact."""
     # Act
     compose = yaml.safe_load(
-        render_web_terminals(_events_persona_config(), launch_token_personas={"readwrite"})[
-            "docker-compose.web.yml"
-        ]
+        render_web_terminals(
+            _events_persona_config(), launch_token_personas={"bluesky": {"readwrite"}}
+        )["docker-compose.web.yml"]
     )
 
     # Assert
@@ -3478,9 +4227,9 @@ def test_unentitled_persona_gets_no_launch_token() -> None:
     in the shared .env.production that every user's container reads."""
     # Act
     compose = yaml.safe_load(
-        render_web_terminals(_events_persona_config(), launch_token_personas={"readwrite"})[
-            "docker-compose.web.yml"
-        ]
+        render_web_terminals(
+            _events_persona_config(), launch_token_personas={"bluesky": {"readwrite"}}
+        )["docker-compose.web.yml"]
     )
 
     # Assert
@@ -3488,10 +4237,162 @@ def test_unentitled_persona_gets_no_launch_token() -> None:
     assert not any("BLUESKY_LAUNCH_TOKEN" in line for line in bob_env)
 
 
+# A deployment that opted into a second plan lane (`bluesky.second_lane`) renders
+# a second bridge with its own launch token, because each lane is a whole stack
+# armed separately -- one shared token would let a launch approved against one
+# machine be replayed against the other. Entitlement is therefore per lane as
+# well as per persona: a persona armed on both lanes is handed both tokens, one
+# armed on a single lane is handed that lane's alone, and the tier boundary --
+# an unentitled persona receives nothing -- is the same one throughout.
+
+_SECOND_LANE_TOKEN_LINE = "BLUESKY_LIVE_LAUNCH_TOKEN=${BLUESKY_LIVE_LAUNCH_TOKEN:-}"
+
+
+def _two_lane_persona_config() -> dict:
+    config = _events_persona_config()
+    config["services"] = {
+        "bluesky": {"port": 10080, "target": "va"},
+        "bluesky_live": {"port": default_port("bluesky_second_lane"), "target": "live"},
+    }
+    return config
+
+
+def test_entitled_persona_on_a_two_lane_deployment_gets_both_launch_tokens() -> None:
+    # Act
+    compose = yaml.safe_load(
+        render_web_terminals(
+            _two_lane_persona_config(),
+            launch_token_personas={"bluesky": {"readwrite"}, "bluesky_live": {"readwrite"}},
+        )["docker-compose.web.yml"]
+    )
+
+    # Assert
+    alice_env = compose["services"]["web-alice"]["environment"]
+    assert _LAUNCH_TOKEN_LINE in alice_env
+    assert _SECOND_LANE_TOKEN_LINE in alice_env
+
+
+def test_unentitled_persona_on_a_two_lane_deployment_gets_neither_token() -> None:
+    # Act
+    compose = yaml.safe_load(
+        render_web_terminals(
+            _two_lane_persona_config(),
+            launch_token_personas={"bluesky": {"readwrite"}, "bluesky_live": {"readwrite"}},
+        )["docker-compose.web.yml"]
+    )
+
+    # Assert
+    bob_env = compose["services"]["web-bob"]["environment"]
+    assert not any("LAUNCH_TOKEN" in line for line in bob_env)
+
+
+def test_single_lane_deployment_grants_lane_ones_token_alone() -> None:
+    """The pre-lane render exactly: one token line, the historical name."""
+    # Act
+    compose = yaml.safe_load(
+        render_web_terminals(
+            _events_persona_config(), launch_token_personas={"bluesky": {"readwrite"}}
+        )["docker-compose.web.yml"]
+    )
+
+    # Assert
+    alice_env = compose["services"]["web-alice"]["environment"]
+    assert [line for line in alice_env if "LAUNCH_TOKEN" in line] == [_LAUNCH_TOKEN_LINE]
+
+
+_VA_LANE_TOKEN_LINE = "BLUESKY_VA_LAUNCH_TOKEN=${BLUESKY_VA_LAUNCH_TOKEN:-}"
+
+
+def _va_lane_persona_config() -> dict:
+    """A deployment whose baseline is the live machine, plus an opt-in VA lane."""
+    config = _events_persona_config()
+    config["services"] = {
+        "bluesky": {"port": 10080, "target": "live"},
+        "bluesky_va": {"port": default_port("bluesky_second_lane"), "target": "va"},
+    }
+    return config
+
+
+def test_persona_armed_on_the_va_lane_alone_gets_only_that_lanes_token() -> None:
+    """Why the posture is per target: a deployment whose baseline is a live machine
+    arms writes on its virtual-accelerator lane alone, and the persona entitled
+    there must not also receive the live lane's token -- holding it would let a
+    launch approved against the simulator be replayed against the machine."""
+    # Act
+    compose = yaml.safe_load(
+        render_web_terminals(
+            _va_lane_persona_config(), launch_token_personas={"bluesky_va": {"readwrite"}}
+        )["docker-compose.web.yml"]
+    )
+
+    # Assert
+    alice_env = compose["services"]["web-alice"]["environment"]
+    assert [line for line in alice_env if "LAUNCH_TOKEN" in line] == [_VA_LANE_TOKEN_LINE]
+
+
+def test_persona_less_roster_without_a_va_lane_gets_no_va_token() -> None:
+    """A deployment that renders no `services.bluesky_va` block has no VA bridge to
+    arm, so arming writes grants lane 1's token and nothing else. The render must
+    not mint a variable for a lane this deployment does not have."""
+    # Arrange
+    config = copy.deepcopy(_config(["alice"]))
+    config["control_system"] = {"writes_enabled": True}
+    config["claude_code"] = {"servers": {"bluesky": {"enabled": True}}}
+
+    # Act
+    compose = yaml.safe_load(render_web_terminals(config)["docker-compose.web.yml"])
+
+    # Assert
+    env = compose["services"]["web-alice"]["environment"]
+    assert [line for line in env if "LAUNCH_TOKEN" in line] == [_LAUNCH_TOKEN_LINE]
+
+
+def test_persona_less_roster_with_a_va_lane_gets_that_lanes_token() -> None:
+    """The contrast that makes the test above about the LANE and not about writes:
+    the same armed config that renders a `services.bluesky_va` block does get the
+    VA lane's own token, because there is a second bridge stack to arm."""
+    # Arrange
+    config = copy.deepcopy(_config(["alice"]))
+    config["control_system"] = {"writes_enabled": True}
+    config["claude_code"] = {"servers": {"bluesky": {"enabled": True}}}
+    config["services"] = {
+        "bluesky": {"port": 10080, "target": "live"},
+        "bluesky_va": {"port": default_port("bluesky_second_lane"), "target": "va"},
+    }
+
+    # Act
+    compose = yaml.safe_load(render_web_terminals(config)["docker-compose.web.yml"])
+
+    # Assert
+    env = compose["services"]["web-alice"]["environment"]
+    assert _VA_LANE_TOKEN_LINE in env
+
+
+def test_render_emits_no_launch_token_value_anywhere() -> None:
+    """A launch token reaches a container as a compose interpolation from the deploy
+    `.env` and never as a value in a rendered artifact: the render writes neither
+    `bluesky.launch_token` nor `bluesky.lane_launch_tokens`, the two config keys a
+    literal token could travel into a persona's project under."""
+    # Act
+    compose_text = render_web_terminals(
+        _two_lane_persona_config(),
+        launch_token_personas={"bluesky": {"readwrite"}, "bluesky_live": {"readwrite"}},
+    )["docker-compose.web.yml"]
+
+    # Assert
+    assert "launch_token:" not in compose_text
+    assert "lane_launch_tokens" not in compose_text
+    assert [line.strip() for line in compose_text.splitlines() if "LAUNCH_TOKEN" in line] == [
+        f"- {_LAUNCH_TOKEN_LINE}",
+        f"- {_SECOND_LANE_TOKEN_LINE}",
+    ]
+
+
 def test_render_without_launch_token_personas_emits_no_token_line() -> None:
     """The no-project-root render path (`osprey scaffold web-terminals render`)
-    passes no persona set, so no user is armed. Harmless: every `osprey up`
-    re-renders through the artifacts seam, which resolves the set from disk."""
+    passes no per-lane map, so no user is armed on any lane. Harmless: every
+    `osprey up` re-renders through the artifacts seam, which resolves the map
+    from disk."""
     # Act
     compose = yaml.safe_load(
         render_web_terminals(_events_persona_config())["docker-compose.web.yml"]
@@ -3512,6 +4413,7 @@ def test_persona_less_roster_is_armed_from_the_config_itself() -> None:
     # Arrange
     config = copy.deepcopy(_config(["alice"]))
     config["control_system"] = {"writes_enabled": True}
+    config["claude_code"] = {"servers": {"bluesky": {"enabled": True}}}
 
     # Act
     compose = yaml.safe_load(render_web_terminals(config)["docker-compose.web.yml"])
@@ -3521,11 +4423,1287 @@ def test_persona_less_roster_is_armed_from_the_config_itself() -> None:
 
 
 def test_persona_less_roster_without_writes_is_not_armed() -> None:
-    """The same path, read-only: writes were never granted, so there is nothing to
-    arm and no token is emitted."""
+    """The same path, read-only: the bluesky server runs, so writes being ungranted
+    is the ONE thing standing between this roster and the token. Leaving the server
+    key out too would make the test pass for a second reason and stop pinning the
+    tier boundary it is named for."""
+    # Arrange
+    config = copy.deepcopy(_config(["alice"]))
+    config["claude_code"] = {"servers": {"bluesky": {"enabled": True}}}
+
+    # Act
+    compose = yaml.safe_load(render_web_terminals(config)["docker-compose.web.yml"])
+
+    # Assert
+    env = compose["services"]["web-alice"]["environment"]
+    assert not any("BLUESKY_LAUNCH_TOKEN" in line for line in env)
+
+
+# ---------------------------------------------------------------------------
+# Graph store config -> per-user Neo4j password
+#
+# `osprey up` mints a strong GRAPHDB_PASSWORD into the deploy `.env`, and Neo4j
+# initializes its volume with it. Inside a web terminal the consumer is the
+# `graph` MCP server, which resolves what to dial and with which password
+# through `resolve_graphdb_connection` -- that reads the variable from the
+# environment and otherwise falls back to the shipped default, so a container
+# that never receives it authenticates with the wrong password and every graph
+# query fails.
+#
+# Per-user, not `.env.users`, for the same reason as the credentials above: that
+# file is handed to every user alike and cannot say "the personas that configure
+# a graph store". Note this grant crosses the tier boundary on purpose -- Neo4j
+# has one write-capable account, and read-only-ness is enforced by the graph
+# server's read transactions, not by withholding the password.
+# ---------------------------------------------------------------------------
+
+_GRAPHDB_PASSWORD_LINE = "GRAPHDB_PASSWORD=${GRAPHDB_PASSWORD:-ospreygraph}"
+
+
+def test_graphdb_persona_gets_the_store_password() -> None:
+    """A user whose persona configures a graph store gets the minted Neo4j password
+    in its own `environment:` block, interpolated from the deploy `.env` at compose
+    time so the secret is never written into a rendered artifact."""
+    # Act
+    compose = yaml.safe_load(
+        render_web_terminals(_events_persona_config(), graphdb_personas={"readwrite"})[
+            "docker-compose.web.yml"
+        ]
+    )
+
+    # Assert
+    assert _GRAPHDB_PASSWORD_LINE in compose["services"]["web-alice"]["environment"]
+
+
+def test_persona_without_graphdb_gets_no_store_password() -> None:
+    """A persona that configures no graph store needs no graph-store credential."""
+    # Act
+    compose = yaml.safe_load(
+        render_web_terminals(_events_persona_config(), graphdb_personas={"readwrite"})[
+            "docker-compose.web.yml"
+        ]
+    )
+
+    # Assert
+    bob_env = compose["services"]["web-bob"]["environment"]
+    assert not any("GRAPHDB_PASSWORD" in line for line in bob_env)
+
+
+def test_render_without_graphdb_personas_emits_no_store_password_line() -> None:
+    """The no-project-root render path passes no persona set and so emits no
+    credential, exactly as it does for the dispatcher token."""
+    # Act
+    compose = yaml.safe_load(
+        render_web_terminals(_events_persona_config())["docker-compose.web.yml"]
+    )
+
+    # Assert
+    for service in ("web-alice", "web-bob"):
+        env = compose["services"][service]["environment"]
+        assert not any("GRAPHDB_PASSWORD" in line for line in env)
+
+
+def test_persona_less_roster_gets_graphdb_password_from_the_config_itself() -> None:
+    """The zero-migration path -- roster entries that name no persona, where the web
+    image IS the deploy project -- has no persona to look up, so entitlement is read
+    from this same config with no disk read."""
+    # Arrange
+    config = copy.deepcopy(_config(["alice"]))
+    config["services"] = {"graphdb": {}}
+
+    # Act
+    compose = yaml.safe_load(render_web_terminals(config)["docker-compose.web.yml"])
+
+    # Assert
+    assert _GRAPHDB_PASSWORD_LINE in compose["services"]["web-alice"]["environment"]
+
+
+def test_persona_less_roster_without_graphdb_gets_no_password() -> None:
+    """The same path with no graph store configured: nothing to dial, so nothing to
+    authenticate with."""
     # Act
     compose = yaml.safe_load(render_web_terminals(_config(["alice"]))["docker-compose.web.yml"])
 
     # Assert
     env = compose["services"]["web-alice"]["environment"]
-    assert not any("BLUESKY_LAUNCH_TOKEN" in line for line in env)
+    assert not any("GRAPHDB_PASSWORD" in line for line in env)
+
+
+# ---------------------------------------------------------------------------
+# Telemetry ingest token -> EVERY per-user container
+#
+# The one telemetry credential a web terminal must hold, and the one place it
+# can arrive. Each persona's rendered config.yml carries the ingest token
+# reference verbatim -- the build defers it, because the STORE mints the value
+# -- and the agent re-resolves it against the container's own environment at
+# spawn. `.env.users` deliberately does not carry it
+# (`env_production._build_env_production_subset`), so without this line the
+# placeholder is still a placeholder inside the container and the terminal's
+# strict startup check refuses to run: a crash-loop behind the proxy, on every
+# deploy, for every user.
+#
+# Unconditional, unlike the four credentials above: every terminal runs an
+# agent that emits telemetry as the same account, so there is no tier to
+# express -- gating it on a persona set would only produce terminals that
+# cannot start.
+# ---------------------------------------------------------------------------
+
+_INGEST_TOKEN_LINE = "ZO_INGEST_SA_TOKEN=${ZO_INGEST_SA_TOKEN:-}"
+
+
+def test_every_user_container_receives_the_telemetry_ingest_token() -> None:
+    """Both users, whatever their persona: the token is not an entitlement."""
+    # Act
+    compose = yaml.safe_load(
+        render_web_terminals(_events_persona_config())["docker-compose.web.yml"]
+    )
+
+    # Assert
+    for service in ("web-alice", "web-bob"):
+        assert _INGEST_TOKEN_LINE in compose["services"][service]["environment"]
+
+
+def test_the_ingest_token_is_emitted_without_any_persona_set() -> None:
+    """The no-project-root render path (`osprey scaffold web-terminals render`)
+    passes no persona sets at all. The four entitlement credentials are omitted
+    there; this one must not be, or that render produces a stack whose terminals
+    cannot start."""
+    # Act
+    compose = yaml.safe_load(render_web_terminals(_config(["alice"]))["docker-compose.web.yml"])
+
+    # Assert
+    assert _INGEST_TOKEN_LINE in compose["services"]["web-alice"]["environment"]
+
+
+def test_the_ingest_token_is_interpolated_never_written_into_the_artifact() -> None:
+    """The secret itself never lands in a rendered file: compose resolves the
+    reference at container-create time from the deploy `.env`, which is where
+    `osprey up` harvests the token to."""
+    # Act
+    rendered = render_web_terminals(_config(["alice"]))["docker-compose.web.yml"]
+
+    # Assert
+    assert "${ZO_INGEST_SA_TOKEN" in rendered
+
+
+def test_the_shipped_config_and_the_container_env_name_the_same_variable() -> None:
+    """The end of the chain, pinned across the two files that have to agree.
+
+    A persona's telemetry block names the variable; this compose service is the
+    only thing that puts it in the container. Repoint one without the other --
+    exactly what happened when the shipped configs moved off the store's root
+    credential -- and every web terminal starts naming a variable nothing sets.
+    """
+    # Arrange
+    import osprey
+
+    shipped_config = Path(osprey.__file__).parent / "templates" / "project" / "config.yml.j2"
+    shipped = shipped_config.read_text(encoding="utf-8")
+    declared = re.search(r"^ *password: \$\{([A-Za-z_][A-Za-z0-9_]*)\}$", shipped, re.MULTILINE)
+    assert declared, "the shipped telemetry block no longer names a bare ${VAR} password"
+
+    # Act
+    compose = yaml.safe_load(render_web_terminals(_config(["alice"]))["docker-compose.web.yml"])
+
+    # Assert
+    environment = compose["services"]["web-alice"]["environment"]
+    delivered = {entry.split("=", 1)[0] for entry in environment}
+    assert declared.group(1) in delivered
+
+
+# ---------------------------------------------------------------------------
+# Per-user operator secret carrier (PLAN Task 5.1)
+#
+# nginx is the only thing that may hold a user's operator secret: it injects it
+# as a request header on the way to that user's terminal, from a snippet whose
+# value envsubst fills in at container start. Two properties are load-bearing
+# and pinned below: NO secret value may reach a rendered artifact, and a render
+# with no secrets in hand (`osprey scaffold web-terminals render`) must be
+# byte-identical to what it produced before this carrier existed.
+# ---------------------------------------------------------------------------
+
+
+def _capture_compose_context(config: dict, **kwargs) -> dict:
+    """Render *config* and return the context handed to docker-compose.web.yml.j2.
+
+    The per-service `terminal_secret_env`/`external_origin` keys are consumed by
+    the compose template (Task 5.3), so the context is the seam where this task's
+    contract is observable. Captured by wrapping the real template's `render`,
+    so the real templates still render and the real output is still produced.
+    """
+    captured: dict = {}
+    real_get_template = Environment.get_template
+
+    def spy(self, name, *args, **kw):  # type: ignore[no-untyped-def]
+        template = real_get_template(self, name, *args, **kw)
+        if name == "docker-compose.web.yml.j2":
+            real_render = template.render
+
+            def capture(**ctx):  # type: ignore[no-untyped-def]
+                captured.update(ctx)
+                return real_render(**ctx)
+
+            template.render = capture
+        return template
+
+    with patch.object(Environment, "get_template", spy):
+        render_web_terminals(config, **kwargs)
+    assert captured, "the compose template was never rendered"
+    return captured
+
+
+def _secrets_for(users: list[str]) -> dict[str, str]:
+    """A plausible `{username: secret}` mapping, with per-user distinct values."""
+    return {user: f"s3cr3t-value-for-{user}" for user in users}
+
+
+def _secret_service(user: str) -> dict:
+    """The two keys `_terminal_secret_artifacts` reads off a resolved entry.
+
+    Lets the carrier's own four refusals be exercised on names the render's
+    roster gates refuse earlier — the carrier still has to hold them on its own,
+    because it is also called with rosters those gates never saw.
+    """
+    return {"user": user, "login_exempt": False}
+
+
+def test_render_without_terminal_secrets_returns_exactly_the_three_artifacts() -> None:
+    """The no-secrets render path emits no nginx template snippets at all."""
+    # Act
+    artifacts = render_web_terminals(copy.deepcopy(_MULTI_USER_CONFIG))
+
+    # Assert
+    assert set(artifacts) == {
+        "docker-compose.web.yml",
+        "nginx/nginx.conf",
+        "nginx/landing.html",
+    }
+
+
+def test_render_is_byte_identical_with_and_without_terminal_secrets() -> None:
+    """Handing the render the secrets changes nothing about the three artifacts:
+    the values live only in the deploy `.env`, and the snippets are additive."""
+    # Arrange — auth on, so there are snippets for the addition to be additive to
+    config = _auth_config(["alice", "bob", "carol"])
+
+    # Act
+    plain = render_web_terminals(copy.deepcopy(config))
+    with_secrets = render_web_terminals(
+        copy.deepcopy(config), terminal_secrets=_secrets_for(["alice", "bob", "carol"])
+    )
+
+    # Assert
+    for artifact in ("docker-compose.web.yml", "nginx/nginx.conf", "nginx/landing.html"):
+        assert with_secrets[artifact] == plain[artifact]
+
+
+def test_terminal_secrets_render_one_snippet_per_gated_roster_user() -> None:
+    """One `secret-<user>.conf.template` per GATED roster user, in the templates
+    directory the nginx service bind-mounts at /etc/nginx/templates."""
+    # Act
+    artifacts = render_web_terminals(
+        _auth_config(["alice", "bob", "carol"]),
+        terminal_secrets=_secrets_for(["alice", "bob", "carol"]),
+    )
+
+    # Assert
+    assert set(artifacts) == {
+        "docker-compose.web.yml",
+        "nginx/nginx.conf",
+        "nginx/landing.html",
+        "nginx/templates/secret-alice.conf.template",
+        "nginx/templates/secret-bob.conf.template",
+        "nginx/templates/secret-carol.conf.template",
+    }
+
+
+def test_no_secret_snippet_is_written_for_a_location_nothing_gates() -> None:
+    """A snippet nothing `include`s is a plaintext secret in the nginx container
+    for no reader.
+
+    nginx emits the include under exactly one predicate — `inject_secret and
+    not svc.login_exempt` — so under `token` nothing includes anything, and a
+    `login: false` entry is served ungated with the header CLEARED whatever the
+    method. Neither gets a file. The roster REFUSALS still cover everyone: each
+    user's own container reads its own secret whatever the perimeter does.
+    """
+    # Arrange
+    secrets = _secrets_for(["alice", "bob", "carol"])
+
+    # Act
+    auth_off = render_web_terminals(copy.deepcopy(_MULTI_USER_CONFIG), terminal_secrets=secrets)
+    mixed = render_web_terminals(
+        _mixed_login_config("kiosk"), terminal_secrets=_secrets_for(["alice", "kiosk"])
+    )
+
+    # Assert
+    assert [path for path in auth_off if path.startswith("nginx/templates/")] == []
+    assert [path for path in mixed if path.startswith("nginx/templates/")] == [
+        "nginx/templates/secret-alice.conf.template"
+    ]
+    # The ungated user's secret is nowhere in the render — not as a file, and not
+    # as the variable an include would have referenced.
+    for content in mixed.values():
+        assert "secret-kiosk.conf" not in content
+
+
+def test_every_secret_snippet_is_included_by_exactly_one_location() -> None:
+    """The set of snippets equals the set of includes, on a mixed roster.
+
+    Stated as an equality rather than as two containments: an include with no
+    file crash-loops nginx at start, and a file with no include is the dead
+    secret above. Both directions have to hold at once.
+    """
+    # Arrange
+    config = _mixed_login_config("kiosk")
+
+    # Act
+    artifacts = render_web_terminals(config, terminal_secrets=_secrets_for(["alice", "kiosk"]))
+
+    # Assert
+    materialized = {
+        Path(path).name.removesuffix(".template")
+        for path in artifacts
+        if path.startswith("nginx/templates/")
+    }
+    included = {
+        Path(path).name
+        for path in re.findall(
+            r"^\s*include (/etc/nginx/osprey/\S+);",
+            artifacts["nginx/nginx.conf"],
+            flags=re.MULTILINE,
+        )
+    }
+    assert materialized == included == {"secret-alice.conf"}
+
+
+def test_a_login_exempt_user_still_needs_a_minted_secret() -> None:
+    """Not writing the snippet does not relax the roster gate.
+
+    The ungated user's own container authenticates every request against that
+    secret — the `?token=` exchange is the only way into it — so a roster where
+    it is missing is still refused, snippet or no snippet.
+    """
+    # Act / Assert
+    with pytest.raises(ValueError, match="OSPREY_TERMINAL_SECRET_KIOSK"):
+        render_web_terminals(_mixed_login_config("kiosk"), terminal_secrets=_secrets_for(["alice"]))
+
+
+def test_terminal_secret_snippet_names_the_variable_never_the_value() -> None:
+    """The snippet is a single `proxy_set_header` naming the per-user variable.
+
+    envsubst substitutes it at nginx start from the deploy `.env`; the value
+    itself must not appear in ANY rendered artifact, which is the whole reason
+    the carrier is a template rather than a rendered conf.
+    """
+    # Arrange
+    secrets = _secrets_for(["alice", "bob", "carol"])
+
+    # Act
+    artifacts = render_web_terminals(
+        _auth_config(["alice", "bob", "carol"]), terminal_secrets=secrets
+    )
+
+    # Assert
+    snippet = artifacts["nginx/templates/secret-alice.conf.template"]
+    # QUOTED: a present-but-empty variable (which the compose carrier's
+    # `${VAR:-}` guarantees for a blank .env entry) then substitutes to an empty
+    # header value, which only that user's app refuses. Unquoted it would emit
+    # `proxy_set_header X-Osprey-Terminal-Secret ;`, which nginx will not parse
+    # — one blank variable taking every terminal in the deployment down.
+    assert 'proxy_set_header X-Osprey-Terminal-Secret "${OSPREY_TERMINAL_SECRET_ALICE}";' in snippet
+    for content in artifacts.values():
+        for secret in secrets.values():
+            assert secret not in content
+
+
+def test_terminal_secret_snippet_carries_only_that_users_variable() -> None:
+    """No user's snippet may name another user's variable: the whole point of a
+    per-location include is that alice's terminal never sees bob's secret."""
+    # Act
+    artifacts = render_web_terminals(
+        _auth_config(["alice", "bob", "carol"]),
+        terminal_secrets=_secrets_for(["alice", "bob", "carol"]),
+    )
+
+    # Assert
+    snippet = artifacts["nginx/templates/secret-bob.conf.template"]
+    assert "OSPREY_TERMINAL_SECRET_ALICE" not in snippet
+    assert "OSPREY_TERMINAL_SECRET_CAROL" not in snippet
+    assert snippet.count("proxy_set_header") == 1
+
+
+def test_terminal_secret_variable_follows_the_shared_env_var_suffix_mapping() -> None:
+    """The suffix comes from `env_var_suffix`, the one definition minting,
+    rendering and the sidecar's own lookup all share — never a second
+    `upper|replace` free to drift from it."""
+    # Arrange
+    config = _auth_config(["alice-b"])
+
+    # Act
+    artifacts = render_web_terminals(config, terminal_secrets=_secrets_for(["alice-b"]))
+
+    # Assert: the FILE is keyed by the username, the VARIABLE by its suffix
+    snippet = artifacts["nginx/templates/secret-alice-b.conf.template"]
+    assert f"${{OSPREY_TERMINAL_SECRET_{env_var_suffix('alice-b')}}}" in snippet
+
+
+def test_render_refuses_a_roster_user_with_no_terminal_secret() -> None:
+    """Fail closed: a user whose secret is missing would get an empty header
+    injected and a terminal that refuses every request behind the proxy."""
+    # Arrange
+    config = copy.deepcopy(_MULTI_USER_CONFIG)
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="OSPREY_TERMINAL_SECRET_BOB"):
+        render_web_terminals(config, terminal_secrets=_secrets_for(["alice", "carol"]))
+
+
+def test_render_refuses_a_blank_terminal_secret() -> None:
+    """An empty value is absence, not a secret — the same reading the app's own
+    credential holder applies to `OSPREY_TERMINAL_SECRET`."""
+    # Arrange
+    secrets = _secrets_for(["alice", "bob", "carol"]) | {"bob": "   "}
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="OSPREY_TERMINAL_SECRET_BOB"):
+        render_web_terminals(copy.deepcopy(_MULTI_USER_CONFIG), terminal_secrets=secrets)
+
+
+def test_render_ignores_secrets_for_users_no_longer_on_the_roster() -> None:
+    """A decommissioned user's secret may still sit in the deploy `.env`; the
+    roster decides who gets a snippet, so no header can be injected for them."""
+    # Arrange
+    secrets = _secrets_for(["alice", "bob", "carol", "dave"])
+
+    # Act
+    artifacts = render_web_terminals(
+        _auth_config(["alice", "bob", "carol"]), terminal_secrets=secrets
+    )
+
+    # Assert
+    assert "nginx/templates/secret-dave.conf.template" not in artifacts
+    for content in artifacts.values():
+        assert "OSPREY_TERMINAL_SECRET_DAVE" not in content
+
+
+def test_empty_terminal_secrets_on_an_empty_roster_render_no_snippets() -> None:
+    """A roster-less deployment has nothing to inject and must still render."""
+    # Act
+    artifacts = render_web_terminals(_config([]), terminal_secrets={})
+
+    # Assert
+    assert not [path for path in artifacts if path.startswith("nginx/templates/")]
+
+
+def test_each_service_names_its_own_terminal_secret_variable() -> None:
+    """The compose template (Task 5.3) puts `OSPREY_TERMINAL_SECRET` into each
+    user's container from this per-service variable name."""
+    # Act
+    context = _capture_compose_context(copy.deepcopy(_MULTI_USER_CONFIG))
+
+    # Assert
+    assert [service["terminal_secret_env"] for service in context["services"]] == [
+        f"OSPREY_TERMINAL_SECRET_{env_var_suffix(name)}" for name in ("alice", "bob", "carol")
+    ]
+
+
+def test_service_terminal_secret_variable_is_present_without_any_secrets() -> None:
+    """The variable NAME is not a secret, so it is threaded on every render —
+    the compose reference resolves to empty when the deploy `.env` has none."""
+    # Act
+    context = _capture_compose_context(_config(["alice"]))
+
+    # Assert
+    assert context["services"][0]["terminal_secret_env"] == "OSPREY_TERMINAL_SECRET_ALICE"
+
+
+def test_each_service_carries_the_deployments_external_origin() -> None:
+    """The app checks a mutating request's `Origin` against this value, so it
+    must be the origin a browser actually sends — port-full over plain HTTP."""
+    # Act
+    context = _capture_compose_context(copy.deepcopy(_MULTI_USER_CONFIG))
+
+    # Assert
+    for service in context["services"]:
+        assert service["external_origin"] == f"http://dls-deploy.dls.example.org:{_NGINX_PORT}"
+
+
+def test_service_external_origin_drops_the_port_under_tls() -> None:
+    """With TLS on, 443 is implicit — the canonical origin serialization, and
+    the one a browser sends. A port-full value would fail every Origin check."""
+    # Arrange
+    config = copy.deepcopy(_MULTI_USER_CONFIG)
+    config["modules"]["web_terminals"]["tls"] = {
+        "enabled": True,
+        "cert": "/etc/nginx/certs/site.crt",
+        "key": "/etc/nginx/certs/site.key",
+    }
+
+    # Act
+    context = _capture_compose_context(config)
+
+    # Assert
+    for service in context["services"]:
+        assert service["external_origin"] == "https://dls-deploy.dls.example.org"
+
+
+def test_service_external_origin_is_the_one_the_landing_link_uses() -> None:
+    """One origin for the whole deployment: a per-service value that differed
+    from `landing_url` would make a link off the landing page fail the app's
+    own Origin check."""
+    # Act
+    context = _capture_compose_context(copy.deepcopy(_MULTI_USER_CONFIG))
+
+    # Assert
+    assert {service["external_origin"] for service in context["services"]} == {
+        context["landing_url"]
+    }
+
+
+def test_clear_nginx_templates_dir_removes_stale_snippets(tmp_path: Path) -> None:
+    """A decommissioned user's snippet must not survive a re-render: nginx's
+    entrypoint envsubsts every file in the mounted templates directory, so a
+    leftover would keep injecting a header for a user who no longer exists."""
+    # Arrange
+    templates = tmp_path / "nginx" / "templates"
+    templates.mkdir(parents=True)
+    stale = templates / "secret-dave.conf.template"
+    stale.write_text("proxy_set_header X-Osprey-Terminal-Secret ${OSPREY_TERMINAL_SECRET_DAVE};\n")
+    sibling = tmp_path / "nginx" / "nginx.conf"
+    sibling.write_text("server {}\n")
+
+    # Act
+    removed = clear_nginx_templates_dir(tmp_path)
+
+    # Assert
+    assert removed == [stale]
+    assert not stale.exists()
+    assert sibling.exists(), "only the templates directory is cleared"
+
+
+def test_clear_nginx_templates_dir_tolerates_a_first_render(tmp_path: Path) -> None:
+    """Nothing has been written yet on a fresh checkout; that is not an error."""
+    # Act
+    removed = clear_nginx_templates_dir(tmp_path)
+
+    # Assert
+    assert removed == []
+
+
+def test_the_secret_carrier_refuses_a_roster_name_that_is_not_one_snippet_filename() -> None:
+    """The name becomes a filename and an nginx `include` argument, so a name
+    carrying a path separator would write outside the cleared templates
+    directory.
+
+    Driven at the carrier directly, not through `render_web_terminals`: the
+    roster gates now refuse this name earlier and on their own grounds (it is
+    also the audit subdirectory's name), so going through the front door would
+    pin THAT refusal and leave this one — the carrier's own last line of
+    defence, and the only one that runs when the carrier is called with a
+    roster the render did not build — unexercised.
+    """
+    # Arrange
+    services = [_secret_service("alice"), _secret_service("../../etc/nginx/conf.d/evil")]
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="cannot carry an operator secret"):
+        _terminal_secret_artifacts(
+            services,
+            {"alice": "a", "../../etc/nginx/conf.d/evil": "b"},
+            inject_secret=True,
+        )
+
+
+def test_terminal_secret_snippets_stay_inside_the_templates_directory() -> None:
+    """Every emitted path is one file directly under the directory the write
+    seam clears — nothing a re-render would leave behind somewhere else."""
+    # Act
+    artifacts = render_web_terminals(
+        _auth_config(["alice", "bob", "carol"]),
+        terminal_secrets=_secrets_for(["alice", "bob", "carol"]),
+    )
+
+    # Assert
+    snippets = [path for path in artifacts if path.startswith("nginx/templates/")]
+    assert len(snippets) == 3
+    for path in snippets:
+        assert Path(path).parent.as_posix() == "nginx/templates"
+
+
+def test_the_secret_carrier_refuses_a_dotted_name_that_derives_an_illegal_variable() -> None:
+    """`env_var_suffix` maps only '-' to '_', so a dot survives into the
+    variable. envsubst does not recognize `${OSPREY_TERMINAL_SECRET_ALICE.B}`,
+    leaves it verbatim, and nginx dies at start with `invalid variable name` —
+    an opaque crash loop the carrier refuses instead.
+
+    Driven at the carrier directly, for the same reason as the filename gate
+    above: `alice.b` is outside the username charset, so the roster gates refuse
+    it before this one is reached.
+    """
+    # Act / Assert
+    with pytest.raises(ValueError, match=r"OSPREY_TERMINAL_SECRET_ALICE\.B"):
+        _terminal_secret_artifacts(
+            [_secret_service("alice.b")], {"alice.b": "a-secret"}, inject_secret=True
+        )
+
+
+def test_render_refuses_a_dotted_roster_name_with_authentication_off() -> None:
+    """A dot is outside the username charset, and the charset now binds in every
+    auth posture: the name is the audit subdirectory's name whether or not the
+    deployment authenticates. This inverts an earlier contract, under which such
+    a name rendered as long as no operator secret was carried — the audit mount
+    is what invalidated it."""
+    # Act / Assert
+    with pytest.raises(ValueError, match="audit subdirectory") as exc_info:
+        render_web_terminals(_config(["alice.b"]))
+    assert "alice.b" in str(exc_info.value)
+
+
+def test_render_refuses_roster_names_that_collide_on_their_secret_variable() -> None:
+    """`alice-b` and `alice_b` key one variable, so both terminals would be
+    handed the SAME secret — the isolation this carrier exists to establish.
+    Refused with authentication OFF too, where the sidecar's own collision gate
+    (`_check_roster_env_var_collisions`) never runs."""
+    # Arrange
+    config = _config(["alice-b", "alice_b"])
+    secrets = _secrets_for(["alice-b", "alice_b"])
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="OSPREY_TERMINAL_SECRET_ALICE_B"):
+        render_web_terminals(config, terminal_secrets=secrets)
+
+
+def test_the_secret_carrier_refuses_case_colliding_names_too() -> None:
+    """`Alice` and `alice` are two roster entries and one variable.
+
+    At the carrier directly: an uppercase name is outside the username charset,
+    so the roster gates refuse this pair first — on the neighbouring grounds
+    that the two would also share ONE audit subdirectory on a case-insensitive
+    host filesystem.
+    """
+    # Act / Assert
+    with pytest.raises(ValueError, match="OSPREY_TERMINAL_SECRET_ALICE"):
+        _terminal_secret_artifacts(
+            [_secret_service("Alice"), _secret_service("alice")],
+            _secrets_for(["Alice", "alice"]),
+            inject_secret=True,
+        )
+
+
+def test_clear_nginx_templates_dir_removes_a_nested_stale_snippet(tmp_path: Path) -> None:
+    """nginx's entrypoint walks the mounted directory recursively, so a snippet
+    one level down is exactly as live as one at the top."""
+    # Arrange
+    nested = tmp_path / "nginx" / "templates" / "old" / "secret-dave.conf.template"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("proxy_set_header X-Osprey-Terminal-Secret ${OSPREY_TERMINAL_SECRET_DAVE};\n")
+
+    # Act
+    removed = clear_nginx_templates_dir(tmp_path)
+
+    # Assert
+    assert removed == [nested]
+    assert not nested.exists()
+    assert not nested.parent.exists()
+
+
+def test_clear_nginx_templates_dir_leaves_an_empty_directory_behind(tmp_path: Path) -> None:
+    """The nginx service bind-mounts this directory: a missing source is
+    materialized by the runtime as a root-owned directory (or refused), which is
+    a confusing failure for a deployment that simply has no snippets yet."""
+    # Act
+    clear_nginx_templates_dir(tmp_path)
+
+    # Assert
+    assert (tmp_path / "nginx" / "templates").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Task 5.2: the gate-bound operator-secret include
+# ---------------------------------------------------------------------------
+
+
+def _secret_include(user: str) -> str:
+    """The include directive one user's gated location is expected to carry."""
+    return f"include /etc/nginx/osprey/secret-{user}.conf;"
+
+
+def _mixed_login_config(exempt: str) -> dict:
+    """An auth-on roster where one entry declared `login: false`."""
+    return _auth_config(
+        [
+            {"name": "alice", "index": 0},
+            {"name": exempt, "index": 1, "login": False},
+        ]
+    )
+
+
+def _open_mixed_config(exempt: str) -> dict:
+    """The same roster in the open posture — the shape where the two ungated
+    locations differ from each other, one injected and one cleared."""
+    return _open_config(
+        [
+            {"name": "alice", "index": 0},
+            {"name": exempt, "index": 1, "login": False},
+        ]
+    )
+
+
+def test_nginx_gated_location_includes_only_its_own_users_secret_snippet() -> None:
+    """Each authenticated location pulls in that user's snippet and no other's.
+
+    The snippet is what sets the operator-secret header, so a location that
+    named a second user's file (or a second user's variable) would make one
+    terminal reachable with another terminal's credential — the isolation this
+    carrier exists to establish.
+    """
+    # Arrange
+    users = ["alice", "bob"]
+
+    # Act
+    nginx_conf = _render_nginx(_auth_config(users))
+
+    # Assert
+    for user in users:
+        body = _location_body(nginx_conf, f"location /u/{user}/")
+        assert _secret_include(user) in body
+        assert terminal_secret_env_var(user) in body
+        for other in users:
+            if other != user:
+                assert _secret_include(other) not in body
+                assert terminal_secret_env_var(other) not in body
+
+
+def test_nginx_secret_include_sits_inside_the_auth_guarded_branch() -> None:
+    """The include is emitted between the `auth_request` and the `proxy_pass`.
+
+    That ordering is the whole point of the task: the directive exists only in
+    a location that gates, and a denied subrequest ends the request before the
+    upstream connection is ever opened — so nothing that failed the gate can
+    carry the header to a terminal.
+    """
+    # Act
+    body = _directives(_location_body(_render_nginx(_auth_config(["alice"])), "location /u/alice/"))
+
+    # Assert
+    assert body.index("auth_request /_osprey_auth/alice;") < body.index(_secret_include("alice"))
+    assert body.index(_secret_include("alice")) < body.index("proxy_pass ")
+
+
+def test_nginx_secret_include_absent_when_auth_method_is_token() -> None:
+    """`token` is the one method that injects nothing: the browser reaches each
+    app through that user's own `?token=` exchange and the app's own cookie
+    session is the only gate — the posture the render had before this carrier
+    existed. `none` is NOT this case; it injects without a login wall."""
+    # Act
+    nginx_conf = _render_nginx(copy.deepcopy(_MULTI_USER_CONFIG))
+
+    # Assert
+    assert "include " not in _directives(nginx_conf)
+    assert "/etc/nginx/osprey/" not in nginx_conf
+
+
+def test_nginx_open_render_injects_the_secret_without_any_login_wall() -> None:
+    """The `none` method's whole shape, smoke-tested at the render seam.
+
+    Reaching this nginx IS the authorization, so every non-exempt location
+    carries its own user's snippet with no subrequest in front of it. An entry
+    that declared `login: false` opts out of that injection exactly as it opts
+    out of a login wall under `password`, and gets no snippet written for it.
+    """
+    # Arrange
+    config = _config([{"name": "alice", "index": 0}, {"name": "kiosk", "index": 1, "login": False}])
+    config["modules"]["web_terminals"]["auth"] = {"method": "none"}
+
+    # Act
+    artifacts = render_web_terminals(config, terminal_secrets=_secrets_for(["alice", "kiosk"]))
+    nginx_conf = artifacts["nginx/nginx.conf"]
+
+    # Assert — the non-exempt user is vouched for… (read off the directives:
+    # the template names this very include in the prose above it)
+    assert _secret_include("alice") in _directives(_location_body(nginx_conf, "location /u/alice/"))
+    # …the exempt one is not, and has the header cleared instead.
+    kiosk = _directives(_location_body(nginx_conf, "location /u/kiosk/"))
+    assert _secret_include("kiosk") not in kiosk
+    assert 'proxy_set_header X-Osprey-Terminal-Secret "";' in kiosk
+
+    # Assert — and no login wall was rendered anywhere.
+    assert "auth_request" not in nginx_conf
+    assert [path for path in artifacts if path.startswith("nginx/templates/")] == [
+        "nginx/templates/secret-alice.conf.template"
+    ]
+
+
+def test_nginx_login_exempt_location_gets_no_secret_and_keeps_its_cookie() -> None:
+    """A `login: false` entry is served ungated, so it is treated exactly like
+    an auth-off deployment: no header injected, and the cookie NOT stripped.
+
+    Stripping it there would break the only gate that entry still has — the
+    app's own token->cookie session, which cannot read a cookie nginx cut.
+    """
+    # Act
+    nginx_conf = _render_nginx(_mixed_login_config("kiosk"))
+    exempt = _location_body(nginx_conf, "location /u/kiosk/")
+    gated = _location_body(nginx_conf, "location /u/alice/")
+
+    # Assert — the exempt location carries neither half
+    assert _secret_include("kiosk") not in exempt
+    assert 'proxy_set_header Cookie "";' not in exempt
+    # Assert — its gated peer in the same render carries both
+    assert _secret_include("alice") in gated
+    assert 'proxy_set_header Cookie "";' in gated
+
+
+def test_nginx_secret_include_and_cookie_strip_share_one_predicate() -> None:
+    """Within a sidecar method the two effects move together and must never
+    diverge.
+
+    A location with the strip but no header authenticates nothing and 401s
+    every request; a location with the header but no strip lets an
+    unauthenticated request carry an operator's session cookie into a container
+    that runs agent-generated code. Asserted across every render shape rather
+    than on one, because the divergence is what a later edit would reintroduce.
+
+    `none` is deliberately outside these shapes: it injects the header and
+    still narrows (rather than cuts) the cookie, because with no sidecar there
+    is no origin-wide `osprey_auth_session` for the strip to protect. Its own
+    pairing — the include beside the one forwarded session cookie — is pinned
+    by
+    `test_nginx_auth_surface.py::test_open_render_injects_each_non_exempt_users_own_secret_with_no_gate_in_front`,
+    which would fail if that render ever acquired the strip.
+    """
+    # Arrange
+    shapes = {
+        "token": (copy.deepcopy(_MULTI_USER_CONFIG), ["alice", "bob", "carol"]),
+        "auth-on": (_auth_config(["alice", "bob"]), ["alice", "bob"]),
+        "mixed": (_mixed_login_config("kiosk"), ["alice", "kiosk"]),
+    }
+
+    # Act / Assert
+    for shape, (config, users) in shapes.items():
+        nginx_conf = _render_nginx(config)
+        for user in users:
+            body = _location_body(nginx_conf, f"location /u/{user}/")
+            has_secret = _secret_include(user) in body
+            has_strip = 'proxy_set_header Cookie "";' in body
+            assert has_secret == has_strip, f"{shape}/{user}: {has_secret=} {has_strip=}"
+
+
+def test_nginx_secret_include_target_is_outside_the_globbed_conf_d() -> None:
+    """The snippets are envsubst'ed into /etc/nginx/osprey, never conf.d.
+
+    The base image globs `conf.d/*.conf` into `http{}`, where a
+    `proxy_set_header` would apply to EVERY upstream — the auth sidecar
+    included — instead of to one user's location.
+    """
+    # Act
+    nginx_conf = _render_nginx(_auth_config(["alice"]))
+
+    # Assert
+    includes = re.findall(r"^\s*include (\S+);", nginx_conf, flags=re.MULTILINE)
+    assert includes == ["/etc/nginx/osprey/secret-alice.conf"]
+    assert "conf.d" not in includes[0]
+
+
+def test_nginx_secret_include_matches_the_filename_the_renderer_writes() -> None:
+    """The include and the snippet are two halves of one contract.
+
+    nginx refuses to start on a missing include, so a rename on either side
+    must fail here rather than as a crash-looping proxy whose error names
+    neither the user nor the roster.
+    """
+    # Arrange
+    users = ["alice", "bob"]
+    config = _auth_config(users)
+
+    # Act
+    artifacts = render_web_terminals(config, terminal_secrets=_secrets_for(users))
+    nginx_conf = artifacts["nginx/nginx.conf"]
+
+    # Assert
+    snippets = [path for path in artifacts if path.startswith("nginx/templates/")]
+    assert len(snippets) == len(users)
+    for path in snippets:
+        materialized = Path(path).name.removesuffix(".template")
+        assert f"include /etc/nginx/osprey/{materialized};" in nginx_conf
+
+
+def test_nginx_conf_never_spells_the_secret_header_itself() -> None:
+    """The header directive lives in the per-user snippet, not in this conf.
+
+    That is what keeps the secret VALUE out of every rendered artifact: the
+    snippet is an nginx *template* naming a variable, substituted at container
+    start, while this conf is mounted verbatim and would carry whatever it
+    spelled into build/, into git status, and into an image layer.
+    """
+    # Act
+    nginx_conf = _render_nginx(_auth_config(["alice"]))
+
+    # Assert
+    assert TERMINAL_SECRET_HEADER not in nginx_conf
+
+
+# ---------------------------------------------------------------------------
+# Remediation round: the perimeter's header contract, and one derivation of the
+# per-user secret variable
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_secret_env_var_is_the_minting_sides_definition() -> None:
+    """M1: the render side and the mint side derive ONE variable name.
+
+    `render.terminal_secret_env_var` is an alias of
+    `auth_credentials.terminal_secret_var`. Two independent derivations could be
+    minted one way and referenced another, and the failure is invisible until a
+    terminal refuses every request behind a healthy-looking proxy.
+    """
+    from osprey.deployment.web_terminals.auth_credentials import (
+        TERMINAL_SECRET_VAR_PREFIX,
+        terminal_secret_var,
+    )
+    from osprey.deployment.web_terminals.render import TERMINAL_SECRET_ENV_PREFIX
+
+    assert TERMINAL_SECRET_ENV_PREFIX == TERMINAL_SECRET_VAR_PREFIX
+    for name in ("alice", "alice-b", "Bob", "carol_2", "d"):
+        assert terminal_secret_env_var(name) == terminal_secret_var(name)
+
+
+def test_every_terminal_location_clears_the_authorization_header() -> None:
+    """M4: a client-supplied `Authorization` never reaches a terminal.
+
+    The app does accept an `Authorization: Bearer` — the panel token, a narrow
+    tier its own tooling uses — but that traffic is loopback inside the
+    container and never crosses nginx, so clearing the header at the perimeter
+    costs nothing and closes the one route by which a caller could present a
+    credential this proxy did not vouch for. Unconditional, unlike the cookie
+    and secret headers: it is never legitimate here in any auth mode.
+
+    "Any auth mode" is the claim, so the open posture is one of the shapes: it
+    is the one where nginx DOES stamp a credential of its own, and a location
+    that forwarded the client's `Authorization` beside it would let a caller
+    add a second one the proxy never vouched for.
+    """
+    # Arrange
+    shapes = {
+        "token": (copy.deepcopy(_MULTI_USER_CONFIG), ["alice", "bob", "carol"]),
+        "auth-on": (_auth_config(["alice", "bob"]), ["alice", "bob"]),
+        "mixed": (_mixed_login_config("kiosk"), ["alice", "kiosk"]),
+        "open": (_open_mixed_config("kiosk"), ["alice", "kiosk"]),
+    }
+
+    # Act / Assert
+    for shape, (config, users) in shapes.items():
+        nginx_conf = _render_nginx(config)
+        for user in users:
+            body = _directives(_location_body(nginx_conf, f"location /u/{user}/"))
+            assert 'proxy_set_header Authorization "";' in body, f"{shape}/{user}"
+
+
+def test_ungated_locations_clear_the_operator_secret_header() -> None:
+    """M4: where nginx injects no operator secret, it clears the header instead.
+
+    A value arriving in `X-Osprey-Terminal-Secret` on an ungated location came
+    from the client, and the app trusts that header absolutely — forwarding it
+    would let anyone who can reach the port authenticate as the operator.
+    """
+    # Arrange / Act
+    token = _render_nginx(copy.deepcopy(_MULTI_USER_CONFIG))
+    mixed = _render_nginx(_mixed_login_config("kiosk"))
+    cleared = 'proxy_set_header X-Osprey-Terminal-Secret "";'
+
+    # Assert — `token` injects nowhere, so every location clears it
+    for user in ("alice", "bob", "carol"):
+        assert cleared in _directives(_location_body(token, f"location /u/{user}/"))
+
+    # Assert — with auth on, only the exempt location does; the gated one has
+    # the include that SETS it and must not clear it afterwards.
+    assert cleared in _directives(_location_body(mixed, "location /u/kiosk/"))
+    gated = _directives(_location_body(mixed, "location /u/alice/"))
+    assert cleared not in gated
+    assert _secret_include("alice") in gated
+
+
+def test_ungated_locations_forward_only_that_users_own_session_cookie() -> None:
+    """I1: an ungated location narrows the cookie jar to one cookie.
+
+    Cookies ignore ports, so one jar serves this whole origin: the browser's raw
+    `Cookie` header names every OTHER terminal it has unlocked and, with auth
+    on, the sidecar's origin-wide `osprey_auth_session`. These containers run
+    agent-generated code. The cookie cannot be cut here — it is the only gate
+    left in front of the terminal — so exactly one is forwarded.
+    """
+    # Arrange
+    mixed = _render_nginx(_mixed_login_config("kiosk"))
+    exempt = _directives(_location_body(mixed, "location /u/kiosk/"))
+    kiosk_port = allocate_ports(_BASE_PORTS, 1)["web"]
+
+    # Assert
+    cookie = f"osprey_terminal_session_{kiosk_port}"
+    assert f'proxy_set_header Cookie "{cookie}=$cookie_{cookie}";' in exempt
+    assert "$http_cookie" not in exempt
+    # The sidecar's own origin-wide cookie is not among what travels.
+    assert "osprey_auth_session" not in exempt
+
+
+def test_forwarded_cookie_name_comes_from_the_apps_own_helper() -> None:
+    """I1: the perimeter and the app spell the cookie name from one definition.
+
+    A name assembled independently in the template would forward a cookie the
+    app does not read — a terminal that cannot hold a session, with nothing in
+    either end's config to show why.
+    """
+    from osprey.interfaces.common_middleware import session_cookie_name
+
+    # Act
+    nginx_conf = _render_nginx(copy.deepcopy(_MULTI_USER_CONFIG))
+
+    # Assert
+    for index, user in enumerate(("alice", "bob", "carol")):
+        expected = session_cookie_name(allocate_ports(_BASE_PORTS, index)["web"])
+        body = _location_body(nginx_conf, f"location /u/{user}/")
+        assert f'proxy_set_header Cookie "{expected}=$cookie_{expected}";' in body
+
+
+# ---------------------------------------------------------------------------
+# modules.web_terminals.external_origin — the front-terminator escape hatch
+# ---------------------------------------------------------------------------
+
+
+def _external_origin_of(config: dict) -> str:
+    """The origin the render bakes into every per-user container."""
+    compose = yaml.safe_load(render_web_terminals(config)["docker-compose.web.yml"])
+    values = [
+        entry.split("=", 1)[1]
+        for entry in compose["services"]["web-alice"]["environment"]
+        if entry.startswith("OSPREY_TERMINAL_EXTERNAL_ORIGIN=")
+    ]
+    assert len(values) == 1, compose["services"]["web-alice"]["environment"]
+    return values[0]
+
+
+def test_external_origin_defaults_to_the_derivation_from_deploy_fqdn() -> None:
+    """Unset, nothing changes: the origin is this nginx's own address."""
+    # Act / Assert
+    assert (
+        _external_origin_of(_config(["alice"]))
+        == f"http://dls-deploy.dls.example.org:{_NGINX_PORT}"
+    )
+
+
+def test_a_configured_external_origin_is_what_every_container_checks_against() -> None:
+    """A load balancer terminating TLS in front of this nginx is what the
+    browser actually reaches, so its address is the origin.
+
+    The browser sends `Origin: https://<facility-host>`; the derivation below
+    would have produced this nginx's own address instead, which no browser in
+    that topology ever sends — so every write, approval and chat message would
+    be refused while every page still loaded.
+    """
+    # Arrange
+    config = _config(["alice"])
+    config["modules"]["web_terminals"]["external_origin"] = "https://terminals.example.org"
+
+    # Act
+    origin = _external_origin_of(config)
+
+    # Assert — verbatim, and everywhere the deployment states an origin.
+    assert origin == "https://terminals.example.org"
+    artifacts = render_web_terminals(config)
+    assert deployment_external_origin(config) == "https://terminals.example.org"
+    compose = yaml.safe_load(artifacts["docker-compose.web.yml"])
+    landing = [
+        entry
+        for entry in compose["services"]["web-alice"]["environment"]
+        if entry.startswith("OSPREY_TERMINAL_LANDING_URL=")
+    ]
+    assert landing == ["OSPREY_TERMINAL_LANDING_URL=https://terminals.example.org"]
+
+
+def test_a_configured_external_origin_removes_the_need_for_deploy_fqdn() -> None:
+    """The override IS the origin, so the value it replaces is not required.
+
+    A facility whose browsers only ever reach the load balancer has no reason to
+    record a browser-reachable name for the deploy host itself.
+    """
+    # Arrange
+    config = _config(["alice"])
+    config["deploy"] = {"host": "dls-deploy"}
+    config["modules"]["web_terminals"]["external_origin"] = "https://terminals.example.org"
+
+    # Act / Assert
+    assert _external_origin_of(config) == "https://terminals.example.org"
+
+
+def test_the_missing_fqdn_refusal_names_the_override_as_the_other_way_out() -> None:
+    """The operator hitting this is often the one who needs the override."""
+    # Arrange
+    config = _config(["alice"])
+    config["deploy"] = {"host": "dls-deploy"}
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="external_origin"):
+        render_web_terminals(config)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://terminals.example.org/",  # trailing slash
+        "https://terminals.example.org/terminals",  # a path
+        "terminals.example.org",  # no scheme
+        "ftp://terminals.example.org",  # not a scheme this perimeter serves
+        "https://terminals.example.org?x=1",  # a query
+        "https://user:pw@terminals.example.org",  # credentials
+        "https://terminals.example.org:notaport",
+        _NGINX_PORT,  # a bare port number
+    ],
+)
+def test_render_refuses_an_external_origin_that_is_not_an_origin(value: object) -> None:
+    """Refused at render, not trusted.
+
+    The value is compared against the browser's `Origin` header as a whole
+    string, and a browser writes none of these. Anything but scheme://host[:port]
+    renders a deployment whose pages all load and whose every write answers 403 —
+    a failure with no signal outside a container log.
+    """
+    # Arrange
+    config = _config(["alice"])
+    config["modules"]["web_terminals"]["external_origin"] = value
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="external_origin"):
+        render_web_terminals(config)
+
+
+def test_a_blank_external_origin_falls_back_to_the_derivation() -> None:
+    """Absence spelled as an empty string is still absence — the same reading
+    every other optional string key in this module gets."""
+    # Arrange
+    config = _config(["alice"])
+    config["modules"]["web_terminals"]["external_origin"] = "   "
+
+    # Act / Assert
+    assert _external_origin_of(config) == f"http://dls-deploy.dls.example.org:{_NGINX_PORT}"
+
+
+def test_envsubst_output_tmpfs_is_not_world_readable() -> None:
+    """M5: the directory the operator secrets are substituted into is 0700.
+
+    A tmpfs mounted with no mode lands at 1777 — world-writable, and
+    world-READABLE around files the entrypoint writes at 0644, which are every
+    roster user's operator secret in plaintext. Root-owned 0700 still serves
+    both readers, since the entrypoint writes as root and nginx's master
+    process reads the includes as root.
+
+    The EXACT string is asserted, not a parsed mode, because the spelling is the
+    property under test. The mode has to reach the kernel as octal on both
+    compose providers OSPREY supports: the long-form `volumes:` entry spells it
+    as YAML octal, which podman-compose forwards as the decimal `mode=448` and
+    the kernel rejects. `<path>:mode=0700` on the service-level `tmpfs:` key is
+    passed through unchanged by both.
+    """
+    # Act
+    compose = yaml.safe_load(
+        render_web_terminals(copy.deepcopy(_MULTI_USER_CONFIG))["docker-compose.web.yml"]
+    )
+
+    # Assert
+    assert compose["services"]["nginx"]["tmpfs"] == ["/etc/nginx/osprey:mode=0700"]
+    # The long form is gone, so the volume list is bind mounts alone — a mapping
+    # there would carry the mode in the unportable spelling.
+    assert all(isinstance(volume, str) for volume in compose["services"]["nginx"]["volumes"]), (
+        compose["services"]["nginx"]["volumes"]
+    )
+
+
+# --- Landing cards carry each user's auth posture -----------------------------
+
+
+def _landing_cards(config: dict) -> dict[str, dict]:
+    """Every auto-populated user card `render_web_terminals` put in the landing context.
+
+    Captured off the real `_build_groups` (wrapped, not replaced) instead of
+    being rebuilt by the test, so the threading through `render_web_terminals`
+    is itself under test: the posture is a property of the deployment, and a
+    render that derived it from the wrong config would still produce
+    self-consistent cards if the test built them itself. Read from the context
+    rather than from the markup, which is a separate question with its own
+    module (`test_landing_token_badge.py` pins what the page does with the flag;
+    these two pin what the flag is).
+
+    Returns:
+        The cards of every section, keyed by label.
+    """
+    real = render_module._build_groups
+    captured: list[list[dict]] = []
+
+    def _spy(*args: object, **kwargs: object) -> list[dict]:
+        groups = real(*args, **kwargs)  # type: ignore[arg-type]
+        captured.append(groups)
+        return groups
+
+    with patch.object(render_module, "_build_groups", _spy):
+        render_web_terminals(config)
+    return {item["label"]: item for group in captured[0] for item in group["items"]}
+
+
+def test_landing_cards_mark_every_user_token_login_under_the_default_posture() -> None:
+    """With `auth.method` left at its `token` default, nginx vouches for nobody, so
+    every terminal is entered by opening its own `?token=` URL — and every card
+    says so.
+    """
+    # Act
+    cards = _landing_cards(copy.deepcopy(_MULTI_USER_CONFIG))
+
+    # Assert
+    assert {label: card["token_login"] for label, card in cards.items()} == {
+        "alice": True,
+        "bob": True,
+        "carol": True,
+    }
+
+
+def test_landing_cards_mark_a_login_exempt_user_token_login_behind_a_password_wall() -> None:
+    """Under `auth.method: password` the roster signs in — except the `login: false`
+    entry, which sits outside nginx's vouching and still reaches its terminal
+    through its `?token=` URL. The two postures coexist on one page, which is
+    exactly why the flag is per card and not per deployment.
+    """
+    # Arrange
+    config = copy.deepcopy(
+        _config([{"name": "alice", "index": 0}, {"name": "ariel", "index": 1, "login": False}])
+    )
+    config["modules"]["web_terminals"]["auth"] = {
+        "method": "password",
+        "allow_insecure_http": True,
+    }
+
+    # Act
+    cards = _landing_cards(config)
+
+    # Assert
+    assert cards["alice"]["token_login"] is False
+    assert cards["ariel"]["token_login"] is True
+
+
+def test_token_login_reaches_the_rendered_page_as_a_badge() -> None:
+    """The key is no longer inert data: landing.html.j2 now reads it.
+
+    This assertion used to pin the opposite — that no rendered byte mentioned
+    the key — which was true only while the page had no reader for it. That pin
+    existed to hand ownership to the badge, so the badge inherits it: the two
+    marks a token-login card carries must reach the page for every card the
+    context flagged, or the page is back to claiming a terminal is one click
+    away when it needs a URL nobody has.
+
+    The postures behind the flag, the hint's wording and the card's continued
+    navigability are pinned in `test_landing_token_badge.py`; what is checked
+    here is only that the threading reaches the markup at all.
+    """
+    # Act
+    landing_html = render_web_terminals(copy.deepcopy(_MULTI_USER_CONFIG))["nginx/landing.html"]
+
+    # Assert
+    assert _body(landing_html).count('class="landing-card-token"') == 3
+    assert _body(landing_html).count('class="landing-card-token-hint"') == 3
