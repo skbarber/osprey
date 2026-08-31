@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Scans and the Queue &#8212; Osprey Framework osprey-connectors-v0.1.0 documentation</title>
+    <title>Plans and the Queue &#8212; Osprey Framework dev documentation</title>
   
   
   
@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../../_static/graphviz.css?v=4ae1632d" />
     <link rel="stylesheet" type="text/css" href="../../_static/workflow-autodoc.css?v=8680bdfd" />
     <link rel="stylesheet" type="text/css" href="../../_static/sphinx-design.min.css?v=95c83b7e" />
-    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=a5f60b8d" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=1819b4a7" />
   
   <!-- So that users can add custom icons -->
   <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -43,464 +43,30 @@
   <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
 <link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
 
-    <script src="../../_static/documentation_options.js?v=8cac9ea1"></script>
+    <script src="../../_static/documentation_options.js?v=632f9628"></script>
     <script src="../../_static/doctools.js?v=fd6eb6e6"></script>
     <script src="../../_static/sphinx_highlight.js?v=6ffebe34"></script>
     <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../_static/copybutton.js?v=30646c52"></script>
     <script src="../../_static/design-tabs.js?v=f930bc37"></script>
-    <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
-    <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.8.0/dist/mermaid.esm.min.mjs";
-
-
-
-
-
-const initStyles = () => {
-    const defaultStyle = document.createElement('style');
-    defaultStyle.textContent = `pre.mermaid {
-    /* Same as .mermaid-container > pre */
-    display: block;
-    width: 100%;
-}
-
-pre.mermaid > svg {
-    /* Same as .mermaid-container > pre > svg */
-    height: auto;
-    width: 100%;
-    max-width: 100% !important;
-}`;
-    document.head.appendChild(defaultStyle);
-
-    const fullscreenStyle = document.createElement('style');
-    fullscreenStyle.textContent = `.mermaid-container {
-    display: flex;
-    flex-direction: row;
-    width: 100%;
-}
-
-.mermaid-container > pre {
-    display: block;
-    width: 100%;
-}
-
-.mermaid-container > pre > svg {
-    height: auto;
-    width: 100%;
-    max-width: 100% !important;
-}
-
-.mermaid-fullscreen-btn {
-    width: 28px;
-    height: 28px;
-    background: rgba(255, 255, 255, 0.95);
-    border: 1px solid rgba(0, 0, 0, 0.3);
-    border-radius: 4px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.2s;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
-    font-size: 14px;
-    line-height: 1;
-    padding: 0;
-    color: #333;
-}
-
-.mermaid-fullscreen-btn:hover {
-    opacity: 100% !important;
-    background: rgba(255, 255, 255, 1);
-    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
-    transform: scale(1.1);
-}
-
-.mermaid-fullscreen-btn.dark-theme {
-    background: rgba(50, 50, 50, 0.95);
-    border: 1px solid rgba(255, 255, 255, 0.3);
-    color: #e0e0e0;
-}
-
-.mermaid-fullscreen-btn.dark-theme:hover {
-    background: rgba(60, 60, 60, 1);
-    box-shadow: 0 3px 10px rgba(255, 255, 255, 0.2);
-}
-
-.mermaid-fullscreen-modal {
-    display: none;
-    position: fixed !important;
-    top: 0 !important;
-    left: 0 !important;
-    width: 95vw;
-    height: 100vh;
-    background: rgba(255, 255, 255, 0.98);
-    z-index: 9999;
-    padding: 20px;
-    overflow: auto;
-}
-
-.mermaid-fullscreen-modal.dark-theme {
-    background: rgba(0, 0, 0, 0.98);
-}
-
-.mermaid-fullscreen-modal.active {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.mermaid-container-fullscreen {
-    position: relative;
-    width: 95vw;
-    height: 90vh;
-    max-width: 95vw;
-    max-height: 90vh;
-    background: white;
-    border-radius: 8px;
-    padding: 20px;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
-    overflow: auto;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.mermaid-container-fullscreen.dark-theme {
-    background: #1a1a1a;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
-}
-
-.mermaid-container-fullscreen pre.mermaid {
-    width: 100%;
-    height: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.mermaid-container-fullscreen .mermaid svg {
-    height: 100% !important;
-    width: 100% !important;
-    cursor: grab;
-}
-
-.mermaid-fullscreen-close {
-    position: fixed !important;
-    top: 20px !important;
-    right: 20px !important;
-    width: 40px;
-    height: 40px;
-    background: rgba(255, 255, 255, 0.95);
-    border: 1px solid rgba(0, 0, 0, 0.2);
-    border-radius: 50%;
-    cursor: pointer;
-    z-index: 10000;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-    transition: all 0.2s;
-    font-size: 24px;
-    line-height: 1;
-    color: #333;
-}
-
-.mermaid-fullscreen-close:hover {
-    background: white;
-    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
-    transform: scale(1.1);
-}
-
-.mermaid-fullscreen-close.dark-theme {
-    background: rgba(50, 50, 50, 0.95);
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    color: #e0e0e0;
-}
-
-.mermaid-fullscreen-close.dark-theme:hover {
-    background: rgba(60, 60, 60, 1);
-    box-shadow: 0 6px 16px rgba(255, 255, 255, 0.2);
-}
-
-.mermaid-fullscreen-modal .mermaid-fullscreen-btn {
-    display: none !important;
-}`;
-    document.head.appendChild(fullscreenStyle);
-}
-
-// Detect if page has dark background
-const isDarkTheme = () => {
-    // We use a set of heuristics:
-    // 1. Check for common dark mode classes or attributes
-    // 2. Check computed background color brightness
-    if (document.documentElement.classList.contains('dark') ||
-        document.documentElement.getAttribute('data-theme') === 'dark' ||
-        document.body.classList.contains('dark') ||
-        document.body.getAttribute('data-theme') === 'dark') {
-        // console.log("Dark theme detected via class/attribute");
-        return true;
-    }
-    if (document.documentElement.classList.contains('light') ||
-        document.documentElement.getAttribute('data-theme') === 'light' ||
-        document.body.classList.contains('light') ||
-        document.body.getAttribute('data-theme') === 'light') {
-        // console.log("Light theme detected via class/attribute");
-        return false;
-    }
-    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
-        // console.log("Dark theme detected via prefers-color-scheme");
-        return true;
-    }
-    const bgColor = window.getComputedStyle(document.body).backgroundColor;
-    const match = bgColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)/);
-    if (match) {
-        const r = parseInt(match[1]);
-        const g = parseInt(match[2]);
-        const b = parseInt(match[3]);
-        const brightness = (r * 299 + g * 587 + b * 114) / 1000;
-        // console.log("Background color brightness:", brightness);
-        return brightness < 128;
-    }
-    // console.log("No dark or light theme detected, defaulting to light theme");
-    return false;
-};
-
-let darkTheme = isDarkTheme();
-let modal = null;
-let modalContent = null;
-let previousScrollOffset = [window.scrollX, window.scrollY];
-
-const runMermaid = async (rerun) => {
-    console.log("Running mermaid diagrams, rerun =", rerun);
-    // clear all existing mermaid charts
-    let all_mermaids = document.querySelectorAll(".mermaid");
-
-    if (rerun) {
-        all_mermaids.forEach((el) => {
-            if(!el.hasAttribute("data-original-code")) {
-                // store original code
-                // console.log(`Storing original code for first run: `, el.innerHTML);
-                el.setAttribute('data-original-code', el.innerHTML);
-            }
-            if(el.getAttribute("data-processed") === "true") {
-                // remove and restore original
-                el.removeAttribute("data-processed");
-                // console.log(`Restoring original code for re-run: `, el.getAttribute('data-original-code'));
-                el.innerHTML = el.getAttribute('data-original-code');
-            } else {
-                // store original code
-                // console.log(`Storing original code for re-run: `, el.innerHTML);
-                el.setAttribute('data-original-code', el.innerHTML);
-            }
-        });
-        await mermaid.run();
-    }
-
-    all_mermaids = document.querySelectorAll(".mermaid");
-    const mermaids_processed = document.querySelectorAll(".mermaid[data-processed='true']");
-
-    if ("False" === "True") {
-        const mermaids_to_add_zoom = -1 === -1 ? all_mermaids.length : -1;
-        if(mermaids_to_add_zoom > 0) {
-            var svgs = d3.selectAll("");
-            if(all_mermaids.length !== mermaids_processed.length) {
-                setTimeout(() => runMermaid(false), 200);
-                return;
-            } else if(svgs.size() !== mermaids_to_add_zoom) {
-                setTimeout(() => runMermaid(false), 200);
-                return;
-            } else {
-                svgs.each(function() {
-                    var svg = d3.select(this);
-                    svg.html("<g class='wrapper'>" + svg.html() + "</g>");
-                    var inner = svg.select("g");
-                    var zoom = d3.zoom().on("zoom", function(event) {
-                        inner.attr("transform", event.transform);
-                    });
-                    svg.call(zoom);
-                });
-            }
-        }
-    } else if(all_mermaids.length !== mermaids_processed.length) {
-        // Wait for mermaid to process all diagrams
-        setTimeout(() => runMermaid(false), 200);
-        return;
-    }
-
-    // Stop here if not adding fullscreen capability
-    if ("True" !== "True") return;
-
-    if (modal !== null ) {
-        // Destroy existing modal
-        modal.remove();
-        modal = null;
-        modalContent = null;
-    }
-
-    modal = document.createElement('div');
-    modal.className = 'mermaid-fullscreen-modal' + (darkTheme ? ' dark-theme' : '');
-    modal.setAttribute('role', 'dialog');
-    modal.setAttribute('aria-modal', 'true');
-    modal.setAttribute('aria-label', 'Fullscreen diagram viewer');
-    modal.innerHTML = `
-        <button class="mermaid-fullscreen-close${darkTheme ? ' dark-theme' : ''}" aria-label="Close fullscreen">✕</button>
-        <div class="mermaid-container-fullscreen${darkTheme ? ' dark-theme' : ''}"></div>
-    `;
-    document.body.appendChild(modal);
-
-    modalContent = modal.querySelector('.mermaid-container-fullscreen');
-    const closeBtn = modal.querySelector('.mermaid-fullscreen-close');
-
-    const closeModal = () => {
-        modal.classList.remove('active');
-        modalContent.innerHTML = '';
-        document.body.style.overflow = ''
-        window.scrollTo({left: previousScrollOffset[0], top: previousScrollOffset[1], behavior: 'instant'});
-    };
-
-    closeBtn.addEventListener('click', closeModal);
-    modal.addEventListener('click', (e) => {
-        if (e.target === modal) closeModal();
-    });
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && modal.classList.contains('active')) {
-            closeModal();
-        }
-    });
-
-    document.querySelectorAll('.mermaid').forEach((mermaidDiv) => {
-        if (mermaidDiv.parentNode.classList.contains('mermaid-container') ||
-            mermaidDiv.closest('.mermaid-fullscreen-modal')) {
-            // Already processed, adjust button class if needed
-            const existingBtn = mermaidDiv.parentNode.querySelector('.mermaid-fullscreen-btn');
-            if (existingBtn) {
-                existingBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
-            }
-            return;
-        }
-
-        const container = document.createElement('div');
-        container.className = 'mermaid-container';
-        mermaidDiv.parentNode.insertBefore(container, mermaidDiv);
-        container.appendChild(mermaidDiv);
-
-        const fullscreenBtn = document.createElement('button');
-        fullscreenBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
-        fullscreenBtn.setAttribute('aria-label', 'View diagram in fullscreen');
-        fullscreenBtn.textContent = '⛶';
-        fullscreenBtn.style.opacity = '50%';
-
-        // Calculate dynamic position based on diagram's margin and padding
-        const diagramStyle = window.getComputedStyle(mermaidDiv);
-        const marginTop = parseFloat(diagramStyle.marginTop) || 0;
-        const marginRight = parseFloat(diagramStyle.marginRight) || 0;
-        const paddingTop = parseFloat(diagramStyle.paddingTop) || 0;
-        const paddingRight = parseFloat(diagramStyle.paddingRight) || 0;
-        fullscreenBtn.style.top = `${marginTop + paddingTop + 4}px`;
-        fullscreenBtn.style.right = `${marginRight + paddingRight + 4}px`;
-
-        fullscreenBtn.addEventListener('click', () => {
-            previousScrollOffset = [window.scroll, window.scrollY];
-            const clone = mermaidDiv.cloneNode(true);
-            modalContent.innerHTML = '';
-            modalContent.appendChild(clone);
-
-            const svg = clone.querySelector('svg');
-            if (svg) {
-                svg.removeAttribute('width');
-                svg.removeAttribute('height');
-                svg.style.width = '100%';
-                svg.style.height = 'auto';
-                svg.style.maxWidth = '100%';
-                svg.style.sdisplay = 'block';
-
-                if ("False" === "True") {
-                    setTimeout(() => {
-                        const g = svg.querySelector('g');
-                        if (g) {
-                            var svgD3 = d3.select(svg);
-                            svgD3.html("<g class='wrapper'>" + svgD3.html() + "</g>");
-                            var inner = svgD3.select("g");
-                            var zoom = d3.zoom().on("zoom", function(event) {
-                                inner.attr("transform", event.transform);
-                            });
-                            svgD3.call(zoom);
-                        }
-                    }, 100);
-                }
-            }
-
-            modal.classList.add('active');
-            document.body.style.overflow = 'hidden';
-        });
-        container.appendChild(fullscreenBtn);
-    });
-};
-
-const load = async () => {
-    initStyles();
-
-    await runMermaid(true);
-
-    const reRunIfThemeChanges = async () => {
-        const newDarkTheme = isDarkTheme();
-        if (newDarkTheme !== darkTheme) {
-            darkTheme = newDarkTheme;
-            console.log("Theme change detected, re-running mermaid with", darkTheme ? "dark" : "default", "theme");
-            await mermaid.initialize(
-                {...JSON.parse(
-                    `{"startOnLoad": false}`
-                ),
-                ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
-                }
-            );
-            await runMermaid(true);
-        }
-    };
-
-    // Update theme classes when theme changes
-    const themeObserver = new MutationObserver(reRunIfThemeChanges);
-    themeObserver.observe(document.documentElement, {
-        attributes: true,
-        attributeFilter: ['class', 'style', 'data-theme']
-    });
-    themeObserver.observe(document.body, {
-        attributes: true,
-        attributeFilter: ['class', 'style', 'data-theme']
-    });
-};
-
-
-
-
-
-console.log("Initializing mermaid with", darkTheme ? "dark" : "default", "theme");
-mermaid.initialize(
-    {...JSON.parse(
-        `{"startOnLoad": false}`
-    ),
-    ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
-    }
-);
-
-window.addEventListener("load", load);</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'how-to/bluesky/queue';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://als-apg.github.io/osprey/_static/versions.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'osprey-connectors-v0.1.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
-            false;
+            true;
         </script>
+    <link rel="canonical" href="https://als-apg.github.io/osprey/how-to/bluesky/queue.html" />
     <link rel="icon" href="../../_static/logo.svg"/>
     <link rel="index" title="Index" href="../../genindex.html" />
     <link rel="search" title="Search" href="../../search.html" />
-    <link rel="next" title="Write Your Own Scan Plans" href="write-plans.html" />
-    <link rel="prev" title="Run Your First Scan" href="run-first-plan.html" />
+    <link rel="next" title="Write Your Own Plans" href="write-plans.html" />
+    <link rel="prev" title="Run Your First Plan" href="run-first-plan.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="" />
-    <meta name="docbuild:last-update" content="Aug 18, 2026"/>
+  <meta name="docsearch:version" content="dev" />
+    <meta name="docbuild:last-update" content="Aug 31, 2026"/>
   </head>
   
   
@@ -583,16 +149,23 @@ window.addEventListener("load", load);</script>
 </li>
 
 
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="../../architecture/index.html">
-    Architecture Overview
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="../index.html">
+    How-To Guides
   </a>
 </li>
 
 
-<li class="nav-item current active">
-  <a class="nav-link nav-internal" href="../index.html">
-    How-To Guides
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../../architecture/index.html">
+    Architecture
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../../reference/index.html">
+    Reference
   </a>
 </li>
 
@@ -719,16 +292,23 @@ window.addEventListener("load", load);</script>
 </li>
 
 
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="../../architecture/index.html">
-    Architecture Overview
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="../index.html">
+    How-To Guides
   </a>
 </li>
 
 
-<li class="nav-item current active">
-  <a class="nav-link nav-internal" href="../index.html">
-    How-To Guides
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../../architecture/index.html">
+    Architecture
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../../reference/index.html">
+    Reference
   </a>
 </li>
 
@@ -805,60 +385,73 @@ window.addEventListener("load", load);</script>
   <div class="bd-toc-item navbar-nav"><ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../build-profiles.html">Build Profiles</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../deploy-a-facility.html">Deploy a Facility</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../configure-providers.html">Configure LLM Providers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../run-open-models.html">Run Open &amp; Local Models</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../deploy-project.html">Container Deployment</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../containerize-project.html">Containerize a Project</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../deploy-project/index.html">Container Deployment</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../deploy-project/compose-templates.html">Compose Templates and Images</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deploy-project/networking.html">Network Binding and Security</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deploy-project/env-chain.html">Environment Variables (the <code class="docutils literal notranslate"><span class="pre">.env</span></code> chain)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deploy-project/project-image.html">The Project Image</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../llm-providers/index.html">LLM Providers</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../llm-providers/configure-providers.html">Configure LLM Providers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-providers/run-open-models.html">Run Open &amp; Local Models</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../web-terminal/index.html">Web Terminal</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../web-terminal/operate.html">Run the Web Terminal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../web-terminal/theming.html">Theming</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../web-terminal/panels.html">Panels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../web-terminal/send-feedback.html">Send and Retrieve Feedback</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../web-terminal/multi-user/index.html">Multi-User Support</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../web-terminal/multi-user/tiers.html">Privilege Tiers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../web-terminal/multi-user/login.html">Require a Login</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="../multi-user.html">Multi-User Support</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../use-cli-chat.html">Use the CLI Chat Interface</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../non_interactive_query.html">Non-Interactive Agent Queries</a></li>
-
-
-
-
-
-
-
-<li class="toctree-l1"><a class="reference internal" href="../event-dispatch.html">Event Dispatch</a></li>
-<li class="toctree-l1 has-children"><a class="reference internal" href="../chat-bridges/index.html">Chat Bridges</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../chat-bridges/nextcloud-talk.html">Nextcloud Talk</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../chat-bridges/google-chat.html">Google Chat</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../chat-bridges/add-a-channel.html">Add Your Own Chat Service</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="../monitor-agent.html">Monitor Your OSPREY Agent</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../configure-health-checks.html">Configure Health Checks</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../add-connector.html">Add a Connector</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../add-mcp-server.html">Add an MCP Server</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../use-python-executor.html">Python Execution Service</a></li>
-<li class="toctree-l1 has-children"><a class="reference internal" href="../use-facility-knowledge.html">Facility Knowledge</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../facility-rules.html">Facility Rules</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../okf-bundle.html">The OKF Bundle</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../agent-interfaces/index.html">Agent Interfaces</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../agent-interfaces/cli-agent.html">Run the Agent from the Command Line</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../agent-interfaces/event-dispatch.html">Event Dispatch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../agent-interfaces/add-mcp-server.html">Add an MCP Server</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../agent-interfaces/chat-bridges/index.html">Chat Bridges</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../agent-interfaces/chat-bridges/nextcloud-talk.html">Nextcloud Talk</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../agent-interfaces/chat-bridges/google-chat.html">Google Chat</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../health-and-monitoring/index.html">Health and Monitoring</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../health-and-monitoring/configure-health-checks.html">Configure Health Checks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../health-and-monitoring/monitor-agent.html">Monitor Your OSPREY Agent</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../control-systems/index.html">Control Systems</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../control-systems/use-connectors.html">Use Connectors</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../control-systems/use-virtual-accelerator.html">Use the Virtual Accelerator</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../control-systems/switch-control-target.html">Switch the Control Target at Run Time</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../use-channel-finder.html">How to Use the Channel Finder</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../facility-knowledge/index.html">Facility Knowledge</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../facility-knowledge/facility-rules.html">Facility Rules</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../facility-knowledge/okf-bundle.html">The OKF Bundle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../facility-knowledge/use-facility-graph.html">Search the Facility Graph</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../ariel/index.html">Logbook Search Service (ARIEL)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../ariel/osprey-integration.html">Osprey Integration</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../ariel/data-ingestion.html">Data Ingestion</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../ariel/search-modes.html">Search Modes</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../ariel/web-interface.html">Web Interface</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../ariel/search-sidecar.html">The Search Sidecar (<code class="docutils literal notranslate"><span class="pre">qmd</span></code>)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../ariel/standalone-deployment.html">Standalone Deployment</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="../use-virtual-accelerator.html">Use the Virtual Accelerator</a></li>
 <li class="toctree-l1 current active has-children"><a class="reference internal" href="index.html">Bluesky Plans</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
-<li class="toctree-l2"><a class="reference internal" href="run-first-plan.html">Run Your First Scan</a></li>
-<li class="toctree-l2 current active"><a class="current reference internal" href="#">Scans and the Queue</a></li>
-<li class="toctree-l2"><a class="reference internal" href="write-plans.html">Write Your Own Scan Plans</a></li>
+<li class="toctree-l2"><a class="reference internal" href="run-first-plan.html">Run Your First Plan</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">Plans and the Queue</a></li>
+<li class="toctree-l2"><a class="reference internal" href="write-plans.html">Write Your Own Plans</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="../../cli-reference/index.html">CLI Reference</a></li>
 </ul>
 </div>
 </nav></div>
@@ -905,7 +498,7 @@ window.addEventListener("load", load);</script>
     
     <li class="breadcrumb-item"><a href="index.html" class="nav-link">Bluesky Plans</a></li>
     
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Scans and the Queue</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Plans and the Queue</span></li>
   </ul>
 </nav>
 </div>
@@ -922,19 +515,51 @@ window.addEventListener("load", load);</script>
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="scans-and-the-queue">
-<h1>Scans and the Queue<a class="headerlink" href="#scans-and-the-queue" title="Link to this heading">#</a></h1>
-<p>Three sentences carry everything on this page. Scans live in a <strong>queue
+  <section id="plans-and-the-queue">
+<h1>Plans and the Queue<a class="headerlink" href="#plans-and-the-queue" title="Link to this heading">#</a></h1>
+<p>Three sentences carry everything on this page. Plans live in a <strong>queue
 server</strong> that survives restarts — not in the agent, not in the panels. Adding
 a plan to the queue and starting the queue are <strong>two separate, deliberate
 steps</strong>, and only starting is guarded. <strong>Stopping is never locked</strong> — no
 token, no switch, no state can take the stop and abort buttons away.</p>
-<pre  class="mermaid">
-        flowchart LR
-    A[&quot;Shared draft&lt;br/&gt;compose &amp; review&quot;] --&gt;|add| B[&quot;Queue&lt;br/&gt;durable, ordered&quot;]
-    B --&gt;|&quot;start (armed)&quot;| C[&quot;Machine&lt;br/&gt;one plan at a time&quot;]
-    C -.-&gt;|&quot;stop / abort — always available&quot;| B
-    </pre><p>Everything below is the same queue seen from three sides — pick the one you
+<div class="osprey-diagram">
+<svg viewBox="0 0 960 240" role="img" aria-labelledby="bluesky-queue-title bluesky-queue-desc">
+  <title id="bluesky-queue-title">Scans and the queue</title>
+  <desc id="bluesky-queue-desc">A shared draft is added to the durable, ordered queue; starting the queue is the armed, deliberate step that sends plans to the machine one at a time, while stop and abort remain available in every state.</desc>
+  <defs>
+    <marker id="bluesky-queue-arr" viewBox="0 0 8 6" refX="7" refY="3" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+      <polygon points="0,0 8,3 0,6" fill="context-stroke"/>
+    </marker>
+  </defs>
+  <line class="e" x1="272" y1="92" x2="392" y2="92" marker-end="url(#bluesky-queue-arr)"/>
+  <line class="e" x1="568" y1="92" x2="688" y2="92" marker-end="url(#bluesky-queue-arr)"/>
+  <path class="e-warn e-dash" d="M776,120 V152 Q776,160 768,160 H488 Q480,160 480,152 V120" marker-end="url(#bluesky-queue-arr)"/>
+  <rect class="mask" x="316" y="72" width="32" height="12" rx="2"/>
+  <text class="ta" x="332" y="81" text-anchor="middle">ADD</text>
+  <rect class="mask" x="588" y="72" width="80" height="12" rx="2"/>
+  <text class="ta" x="628" y="81" text-anchor="middle">START (ARMED)</text>
+  <rect class="mask" x="590" y="168" width="76" height="12" rx="2"/>
+  <text class="ta ta-warn" x="628" y="177" text-anchor="middle">STOP / ABORT</text>
+
+  <rect class="mask" x="96" y="64" width="176" height="56" rx="6"/>
+  <rect class="nb-in" x="96" y="64" width="176" height="56" rx="6"/>
+  <text class="tn" x="184" y="88" text-anchor="middle">shared draft</text>
+  <text class="ts" x="184" y="104" text-anchor="middle">compose &amp; review</text>
+  <rect class="mask" x="392" y="64" width="176" height="56" rx="6"/>
+  <rect class="nb-st" x="392" y="64" width="176" height="56" rx="6"/>
+  <text class="tn" x="480" y="88" text-anchor="middle">queue</text>
+  <text class="ts" x="480" y="104" text-anchor="middle">durable · ordered</text>
+  <rect class="mask" x="688" y="64" width="176" height="56" rx="6"/>
+  <rect class="nb" x="688" y="64" width="176" height="56" rx="6"/>
+  <text class="tn" x="776" y="88" text-anchor="middle">machine</text>
+  <text class="ts" x="776" y="104" text-anchor="middle">one plan at a time</text>
+
+  <text class="aside" x="96" y="212">always available — no state can lock it out</text>
+  <path class="lead" d="M368,208 Q440,200 512,176"/>
+  <circle cx="516" cy="172" r="2" fill="var(--od-warn)"/>
+</svg>
+</div>
+<p>Everything below is the same queue seen from three sides — pick the one you
 work in.</p>
 <section id="one-queue-three-ways-to-drive-it">
 <h2>One queue, three ways to drive it<a class="headerlink" href="#one-queue-three-ways-to-drive-it" title="Link to this heading">#</a></h2>
@@ -1052,18 +677,31 @@ add an armed one.)</p></td>
 </tbody>
 </table>
 </div>
-<p class="sd-card-text">The agent is held to a harder rule on top of this: while the project’s
-<code class="docutils literal notranslate"><span class="pre">control_system.writes_enabled</span></code> switch is off, its <code class="docutils literal notranslate"><span class="pre">queue_add</span></code> and
-<code class="docutils literal notranslate"><span class="pre">queue_start</span></code> tools are denied outright — it cannot queue or start
-anything, even on an idle queue. Its halts and its read tools are never
-taken away.</p>
+<p class="sd-card-text">The agent is held to a harder rule on top of this: where the project may
+write to no control target at all, its <code class="docutils literal notranslate"><span class="pre">queue_add</span></code> and <code class="docutils literal notranslate"><span class="pre">queue_start</span></code>
+tools are denied outright — it cannot queue or start anything, even on an
+idle queue. Its halts and its read tools are never taken away.</p>
+<p class="sd-card-text">Write posture is per control target, and each queue lane is bound at build
+time to one target, so a deployment can arm the lane that drives the
+simulator and leave the lane that drives the live machine unarmed. Nothing
+is denied up front on such a deployment — the deny list is written once,
+before a session picks a target — and <code class="docutils literal notranslate"><span class="pre">queue_add</span></code> and <code class="docutils literal notranslate"><span class="pre">queue_start</span></code>
+refuse per call instead, with <code class="docutils literal notranslate"><span class="pre">writes_disabled</span></code>, naming the lane’s machine.</p>
 <p class="sd-card-text">In a deployed control room the agent holds the launch token only where the
-deployment grants it — to a persona configured for control-system writes
-that also runs the bluesky MCP server. Where it is granted, the agent’s
+deployment grants it, and it is granted <strong>per lane</strong>: to a persona whose
+config arms writes for the machine that lane drives and that also runs the
+bluesky MCP server. A persona can hold the simulator lane’s token and none
+for the live one. Where it is granted, the agent’s
 <code class="docutils literal notranslate"><span class="pre">queue_start</span></code> arms the queue itself, and your approval of that tool call
 is the arming decision. Where it is not, <code class="docutils literal notranslate"><span class="pre">queue_start</span></code> is refused with
 <code class="docutils literal notranslate"><span class="pre">launch_token_required</span></code> and the start stays with you, from the BLUESKY
 queue panel’s own <strong>Start queue</strong> button.</p>
+<p class="sd-card-text">On a two-lane deployment the BLUESKY panel carries a <strong>lane picker</strong> in its
+status strip, labelled by the machine each lane drives. The panel is bound
+to one lane at a time — plans, shared draft, queue and results all follow
+the picked lane, and its Start queue button arms with that lane’s own
+token — so what you see and what a click starts can never belong to two
+different machines.</p>
 </div>
 </details><details class="sd-sphinx-override sd-dropdown sd-card sd-mb-3">
 <summary class="sd-summary-title sd-card-header sd-bg-info sd-bg-text-info">
@@ -1084,7 +722,7 @@ no launch token is configured at all — hand the start to the operator.</p>
 command that switches to an executing connector.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">session_plan_unvalidated</span></code></dt><dd><p class="sd-card-text">An agent-written plan must pass validation, byte for byte, before it
-runs — see <a class="reference internal" href="write-plans.html"><span class="doc">Write Your Own Scan Plans</span></a>.</p>
+runs — see <a class="reference internal" href="write-plans.html"><span class="doc">Write Your Own Plans</span></a>.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">interrupted_item_in_queue</span></code></dt><dd><p class="sd-card-text">The queue still holds a plan someone stopped — see the next dropdown.</p>
 </dd>
@@ -1101,8 +739,10 @@ history <strong>and puts a copy of the item back at the front of the queue</stro
 a human can decide what happens next. Until that copy is removed, every
 attempt to start the queue is refused — a plan someone emergency-stopped
 can never sneak back onto the machine.</p>
-<p class="sd-card-text">Removing it is the deliberate step: the ✕ on its queue row. To actually
-run it again afterwards, stage it through the draft and add it afresh.</p>
+<p class="sd-card-text">Removing it is the deliberate step: the ✕ on its queue row, or the
+assistant’s <code class="docutils literal notranslate"><span class="pre">queue_remove</span></code> tool — which asks for your approval, so the
+decision stays yours either way. To actually run it again afterwards,
+stage it through the draft and add it afresh.</p>
 </div>
 </details><details class="sd-sphinx-override sd-dropdown sd-card sd-mb-3">
 <summary class="sd-summary-title sd-card-header sd-bg-info sd-bg-text-info">
@@ -1123,46 +763,18 @@ going and its data still lands in Tiled.</p></li>
 </div>
 </details><details class="sd-sphinx-override sd-dropdown sd-card sd-mb-3">
 <summary class="sd-summary-title sd-card-header sd-bg-info sd-bg-text-info">
-<span class="sd-summary-icon"><svg version="1.1" width="1.0em" height="1.0em" class="sd-octicon sd-octicon-server" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v4c0 .372-.116.717-.314 1 .198.283.314.628.314 1v4a1.75 1.75 0 0 1-1.75 1.75H1.75A1.75 1.75 0 0 1 0 12.75v-4c0-.358.109-.707.314-1a1.739 1.739 0 0 1-.314-1v-4C0 1.784.784 1 1.75 1ZM1.5 2.75v4c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-4a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25Zm.25 5.75a.25.25 0 0 0-.25.25v4c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-4a.25.25 0 0 0-.25-.25ZM7 4.75A.75.75 0 0 1 7.75 4h4.5a.75.75 0 0 1 0 1.5h-4.5A.75.75 0 0 1 7 4.75ZM7.75 10h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5ZM3 4.75A.75.75 0 0 1 3.75 4h.5a.75.75 0 0 1 0 1.5h-.5A.75.75 0 0 1 3 4.75ZM3.75 10h.5a.75.75 0 0 1 0 1.5h-.5a.75.75 0 0 1 0-1.5Z"></path></svg></span><span class="sd-summary-text">For deployers — what is running, and the config block</span><span class="sd-summary-state-marker sd-summary-chevron-right"><svg version="1.1" width="1.5em" height="1.5em" class="sd-octicon sd-octicon-chevron-right" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.72 18.78a.75.75 0 0 1 0-1.06L14.44 12 8.72 6.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018l6.25 6.25a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0Z"></path></svg></span></summary><div class="sd-summary-content sd-card-body docutils">
+<span class="sd-summary-icon"><svg version="1.1" width="1.0em" height="1.0em" class="sd-octicon sd-octicon-server" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v4c0 .372-.116.717-.314 1 .198.283.314.628.314 1v4a1.75 1.75 0 0 1-1.75 1.75H1.75A1.75 1.75 0 0 1 0 12.75v-4c0-.358.109-.707.314-1a1.739 1.739 0 0 1-.314-1v-4C0 1.784.784 1 1.75 1ZM1.5 2.75v4c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-4a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25Zm.25 5.75a.25.25 0 0 0-.25.25v4c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-4a.25.25 0 0 0-.25-.25ZM7 4.75A.75.75 0 0 1 7.75 4h4.5a.75.75 0 0 1 0 1.5h-4.5A.75.75 0 0 1 7 4.75ZM7.75 10h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5ZM3 4.75A.75.75 0 0 1 3.75 4h.5a.75.75 0 0 1 0 1.5h-.5A.75.75 0 0 1 3 4.75ZM3.75 10h.5a.75.75 0 0 1 0 1.5h-.5a.75.75 0 0 1 0-1.5Z"></path></svg></span><span class="sd-summary-text">For deployers — what is running</span><span class="sd-summary-state-marker sd-summary-chevron-right"><svg version="1.1" width="1.5em" height="1.5em" class="sd-octicon sd-octicon-chevron-right" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.72 18.78a.75.75 0 0 1 0-1.06L14.44 12 8.72 6.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018l6.25 6.25a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0Z"></path></svg></span></summary><div class="sd-summary-content sd-card-body docutils">
 <p class="sd-card-text">A project built from the <code class="docutils literal notranslate"><span class="pre">control-assistant</span></code> preset brings the whole
 stack up with <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">up</span></code>: the <strong>bridge</strong> (the HTTP front door,
-port 8090), the <strong>queue server</strong> with its own storage, the <strong>bluesky-web</strong>
-sidecar serving the BLUESKY panel (port 8095), the <strong>Virtual Accelerator</strong> (the
+port 10080), the <strong>queue server</strong> with its own storage, the <strong>bluesky-web</strong>
+sidecar serving the BLUESKY panel (port 10071), the <strong>Virtual Accelerator</strong> (the
 preset’s default control system), and — when enabled — <strong>Tiled</strong> (port
-8091). The launch token is minted automatically at deploy time and stored
-in the project’s <code class="docutils literal notranslate"><span class="pre">.env</span></code>.</p>
-<p class="sd-card-text">The build profile’s <code class="docutils literal notranslate"><span class="pre">bluesky:</span></code> block accepts exactly five keys — a
-misspelled or unknown key <strong>fails the build</strong> and prints the valid set:</p>
-<div class="pst-scrollable-table-container"><table class="table">
-<colgroup>
-<col style="width: 30.0%" />
-<col style="width: 70.0%" />
-</colgroup>
-<thead>
-<tr class="row-odd"><th class="head"><p class="sd-card-text">Key</p></th>
-<th class="head"><p class="sd-card-text">What it does</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p class="sd-card-text"><code class="docutils literal notranslate"><span class="pre">port</span></code></p></td>
-<td><p class="sd-card-text">The bridge’s port (default 8090).</p></td>
-</tr>
-<tr class="row-odd"><td><p class="sd-card-text"><code class="docutils literal notranslate"><span class="pre">tiled_enabled</span></code></p></td>
-<td><p class="sd-card-text">Deploy the Tiled data store alongside the stack.</p></td>
-</tr>
-<tr class="row-even"><td><p class="sd-card-text"><code class="docutils literal notranslate"><span class="pre">tiled_port</span></code></p></td>
-<td><p class="sd-card-text">Tiled’s port (default 8091).</p></td>
-</tr>
-<tr class="row-odd"><td><p class="sd-card-text"><code class="docutils literal notranslate"><span class="pre">plan_dir</span></code></p></td>
-<td><p class="sd-card-text">A directory of your facility’s own plans — see
-<a class="reference internal" href="write-plans.html"><span class="doc">Write Your Own Scan Plans</span></a>.</p></td>
-</tr>
-<tr class="row-even"><td><p class="sd-card-text"><code class="docutils literal notranslate"><span class="pre">excluded_plans</span></code></p></td>
-<td><p class="sd-card-text">Plans to remove from the catalog entirely, e.g. <code class="docutils literal notranslate"><span class="pre">[orm]</span></code>.</p></td>
-</tr>
-</tbody>
-</table>
-</div>
+10070). Those are the deployment’s port layout at its default base
+(<a class="reference internal" href="../../reference/ports.html#reference-ports"><span class="std std-ref">Ports</span></a>). The launch token is minted automatically at deploy
+time and stored in the project’s <code class="docutils literal notranslate"><span class="pre">.env</span></code>.</p>
+<p class="sd-card-text">The build profile’s <code class="docutils literal notranslate"><span class="pre">bluesky:</span></code> block can pin those ports, and sets the
+Tiled store, which plans the catalog carries, and the device file plans may
+drive or record — see <a class="reference internal" href="../../reference/configuration/profile.html"><span class="doc">Build Profile — profile.yml</span></a>.</p>
 <p class="sd-card-text">Whether a deployment can execute plans at all is decided by its control
 system: <code class="docutils literal notranslate"><span class="pre">virtual_accelerator</span></code> and <code class="docutils literal notranslate"><span class="pre">epics</span></code> can, <code class="docutils literal notranslate"><span class="pre">mock</span></code> is
 browse-only. The panels and the agent both surface this as a capability
@@ -1175,16 +787,23 @@ the running stack. That switch needs a real archive behind it: a deployment
 created from the <code class="docutils literal notranslate"><span class="pre">control-assistant</span></code> preset has one and the flip just
 works; one still reading the mock archiver is refused at build time, and told
 to point <code class="docutils literal notranslate"><span class="pre">archiver.type</span></code> at a store its deployment writes first — see
-<a class="reference internal" href="../use-virtual-accelerator.html"><span class="doc">Use the Virtual Accelerator</span></a>.</p>
+<a class="reference internal" href="../control-systems/use-virtual-accelerator.html"><span class="doc">Use the Virtual Accelerator</span></a>.</p>
+<p class="sd-card-text">One timing detail worth knowing: the channel limits a plan’s writes are
+checked against come from the file
+<code class="docutils literal notranslate"><span class="pre">control_system.limits_checking.database_path</span></code> names, and <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">build</span></code>
+stages its <strong>own copy</strong> of that file for the plan lane. So widening or
+tightening a limit in your deployment repository reaches the queue server at
+the next <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">build</span></code> (and <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">up</span></code>) — not the moment you save the
+file.</p>
 </div>
 </details><div class="admonition seealso">
 <p class="admonition-title">See also</p>
 <dl class="simple">
-<dt><a class="reference internal" href="run-first-plan.html"><span class="doc">Run Your First Scan</span></a></dt><dd><p>The worked example, from asking to watching points land.</p>
+<dt><a class="reference internal" href="run-first-plan.html"><span class="doc">Run Your First Plan</span></a></dt><dd><p>The worked example, from asking to watching points land.</p>
 </dd>
-<dt><a class="reference internal" href="write-plans.html"><span class="doc">Write Your Own Scan Plans</span></a></dt><dd><p>Trust tiers and adding plans of your own.</p>
+<dt><a class="reference internal" href="write-plans.html"><span class="doc">Write Your Own Plans</span></a></dt><dd><p>Trust tiers and adding plans of your own.</p>
 </dd>
-<dt><a class="reference internal" href="../use-virtual-accelerator.html"><span class="doc">Use the Virtual Accelerator</span></a></dt><dd><p>The connector that makes a deployment able to execute.</p>
+<dt><a class="reference internal" href="../control-systems/use-virtual-accelerator.html"><span class="doc">Use the Virtual Accelerator</span></a></dt><dd><p>The connector that makes a deployment able to execute.</p>
 </dd>
 </dl>
 </div>
@@ -1207,7 +826,7 @@ to point <code class="docutils literal notranslate"><span class="pre">archiver.t
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Run Your First Scan</p>
+        <p class="prev-next-title">Run Your First Plan</p>
       </div>
     </a>
     <a class="right-next"
@@ -1215,7 +834,7 @@ to point <code class="docutils literal notranslate"><span class="pre">archiver.t
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Write Your Own Scan Plans</p>
+        <p class="prev-next-title">Write Your Own Plans</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>

@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Conceptual Tutorial &#8212; Osprey Framework osprey-connectors-v0.1.0 documentation</title>
+    <title>Conceptual Tutorial &#8212; Osprey Framework dev documentation</title>
   
   
   
@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/graphviz.css?v=4ae1632d" />
     <link rel="stylesheet" type="text/css" href="../_static/workflow-autodoc.css?v=8680bdfd" />
     <link rel="stylesheet" type="text/css" href="../_static/sphinx-design.min.css?v=95c83b7e" />
-    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=a5f60b8d" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=1819b4a7" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -43,7 +43,7 @@
   <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
 <link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
 
-    <script src="../_static/documentation_options.js?v=8cac9ea1"></script>
+    <script src="../_static/documentation_options.js?v=632f9628"></script>
     <script src="../_static/doctools.js?v=fd6eb6e6"></script>
     <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
@@ -53,10 +53,11 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://als-apg.github.io/osprey/_static/versions.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'osprey-connectors-v0.1.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
-            false;
+            true;
         </script>
+    <link rel="canonical" href="https://als-apg.github.io/osprey/getting-started/conceptual-tutorial.html" />
     <link rel="icon" href="../_static/logo.svg"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
@@ -64,8 +65,8 @@
     <link rel="prev" title="Installation &amp; Setup" href="installation.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="" />
-    <meta name="docbuild:last-update" content="Aug 18, 2026"/>
+  <meta name="docsearch:version" content="dev" />
+    <meta name="docbuild:last-update" content="Aug 31, 2026"/>
   </head>
   
   
@@ -149,15 +150,22 @@
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../architecture/index.html">
-    Architecture Overview
+  <a class="nav-link nav-internal" href="../how-to/index.html">
+    How-To Guides
   </a>
 </li>
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../how-to/index.html">
-    How-To Guides
+  <a class="nav-link nav-internal" href="../architecture/index.html">
+    Architecture
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../reference/index.html">
+    Reference
   </a>
 </li>
 
@@ -285,15 +293,22 @@
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../architecture/index.html">
-    Architecture Overview
+  <a class="nav-link nav-internal" href="../how-to/index.html">
+    How-To Guides
   </a>
 </li>
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="../how-to/index.html">
-    How-To Guides
+  <a class="nav-link nav-internal" href="../architecture/index.html">
+    Architecture
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../reference/index.html">
+    Reference
   </a>
 </li>
 
@@ -441,7 +456,7 @@ the hands-on tutorials, but it will help you understand what is
 happening under the hood.</p>
 <section id="what-is-osprey">
 <h2>What is OSPREY?<a class="headerlink" href="#what-is-osprey" title="Link to this heading">#</a></h2>
-<p>Operating a particle accelerator, beamline, or fusion experiment means
+<p>Operating a large scientific facility, such as a particle accelerator, means
 juggling dozens of tools — archivers, logbooks, channel finders, OPI
 screens — while holding operational context in your head. Every task
 requires knowing which tool to open, which PV names to use, and what
@@ -451,10 +466,11 @@ natural language — “read the beam current”, “bump the horizontal
 corrector by 0.5 A”, “what happened to the vacuum last Tuesday” —
 and the agent figures out which tools to call, which channels to query,
 and how to present the results.</p>
-<p>The catch: the agent can never write to hardware on its own. Safety
-enforcement lives in code that the agent cannot modify or bypass, not
-in the agent’s own judgment. The agent proposes actions; the safety
-system and the operator decide whether they happen.</p>
+<p>The catch: the agent cannot write to hardware on its own. Safety enforcement
+lives in the runtime — the PreToolUse hook chain and the MCP server —
+outside the agent’s reasoning, and the agent is given no credential to reach in
+and disable it. The agent proposes actions; the safety system and the
+operator decide whether they happen.</p>
 </section>
 <section id="how-the-agent-works">
 <h2>How the Agent Works<a class="headerlink" href="#how-the-agent-works" title="Link to this heading">#</a></h2>
@@ -483,12 +499,15 @@ what the user asks.</p>
 write is proposed, the operator sees the target channel and value and
 must explicitly approve before anything reaches hardware.</p>
 <p>Two automated checks run behind the scenes. The <strong>kill switch</strong>
-(<code class="docutils literal notranslate"><span class="pre">writes_enabled</span></code> in <code class="docutils literal notranslate"><span class="pre">config.yml</span></code>) blocks all writes globally when
-off — no prompt appears. The <strong>limits system</strong> validates each value
-against per-channel safe ranges and read-only flags. If either check
-fails, the write is blocked before the operator is ever asked.</p>
-<p>These checks are enforced by the runtime. The agent cannot modify,
-skip, or influence them.</p>
+(<code class="docutils literal notranslate"><span class="pre">writes_enabled</span></code> in <code class="docutils literal notranslate"><span class="pre">config.yml</span></code>) blocks writes when off — no prompt
+appears. It is set per control target, so a deployment can arm writes on its
+simulator and refuse them on the machine that has beam; a session is answered by
+the posture of whichever target it is pointed at. The <strong>limits system</strong>
+validates each value against per-channel safe ranges and read-only flags. If
+either check fails, the write is blocked before the operator is ever asked.</p>
+<p>These checks are enforced by the runtime, in a layer the agent’s tool calls
+pass through: they run whether or not the agent cooperates, and the agent holds
+no credential for the operator interfaces that could change safety settings.</p>
 </section>
 <section id="the-connector-abstraction">
 <h2>The Connector Abstraction<a class="headerlink" href="#the-connector-abstraction" title="Link to this heading">#</a></h2>
@@ -511,7 +530,7 @@ Three commands: <code class="docutils literal notranslate"><span class="pre">osp
 <dt><strong>Then scale up:</strong> <a class="reference internal" href="control-assistant.html"><span class="doc">Production Control Systems Tutorial</span></a></dt><dd><p>Add channel finding, logbook search, an archive of its own, and
 logbook and channel-finder panels in the web terminal.</p>
 </dd>
-<dt><strong>Go deeper:</strong> <a class="reference internal" href="../architecture/index.html"><span class="doc">Architecture Overview</span></a></dt><dd><p>Detailed diagrams of the safety chain, data flow, and the full MCP
+<dt><strong>Go deeper:</strong> <a class="reference internal" href="../architecture/index.html"><span class="doc">Architecture</span></a></dt><dd><p>Detailed diagrams of the safety chain, data flow, and the full MCP
 tool catalog.</p>
 </dd>
 </dl>

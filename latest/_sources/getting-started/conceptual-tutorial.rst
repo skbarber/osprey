@@ -11,7 +11,7 @@ happening under the hood.
 What is OSPREY?
 ===============
 
-Operating a particle accelerator, beamline, or fusion experiment means
+Operating a large scientific facility, such as a particle accelerator, means
 juggling dozens of tools --- archivers, logbooks, channel finders, OPI
 screens --- while holding operational context in your head. Every task
 requires knowing which tool to open, which PV names to use, and what
@@ -23,10 +23,11 @@ corrector by 0.5 A", "what happened to the vacuum last Tuesday" ---
 and the agent figures out which tools to call, which channels to query,
 and how to present the results.
 
-The catch: the agent can never write to hardware on its own. Safety
-enforcement lives in code that the agent cannot modify or bypass, not
-in the agent's own judgment. The agent proposes actions; the safety
-system and the operator decide whether they happen.
+The catch: the agent cannot write to hardware on its own. Safety enforcement
+lives in the runtime --- the PreToolUse hook chain and the MCP server ---
+outside the agent's reasoning, and the agent is given no credential to reach in
+and disable it. The agent proposes actions; the safety system and the
+operator decide whether they happen.
 
 
 How the Agent Works
@@ -63,13 +64,16 @@ write is proposed, the operator sees the target channel and value and
 must explicitly approve before anything reaches hardware.
 
 Two automated checks run behind the scenes. The **kill switch**
-(``writes_enabled`` in ``config.yml``) blocks all writes globally when
-off --- no prompt appears. The **limits system** validates each value
-against per-channel safe ranges and read-only flags. If either check
-fails, the write is blocked before the operator is ever asked.
+(``writes_enabled`` in ``config.yml``) blocks writes when off --- no prompt
+appears. It is set per control target, so a deployment can arm writes on its
+simulator and refuse them on the machine that has beam; a session is answered by
+the posture of whichever target it is pointed at. The **limits system**
+validates each value against per-channel safe ranges and read-only flags. If
+either check fails, the write is blocked before the operator is ever asked.
 
-These checks are enforced by the runtime. The agent cannot modify,
-skip, or influence them.
+These checks are enforced by the runtime, in a layer the agent's tool calls
+pass through: they run whether or not the agent cooperates, and the agent holds
+no credential for the operator interfaces that could change safety settings.
 
 
 The Connector Abstraction

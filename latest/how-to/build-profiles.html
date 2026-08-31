@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Build Profiles &#8212; Osprey Framework osprey-connectors-v0.1.0 documentation</title>
+    <title>Build Profiles &#8212; Osprey Framework dev documentation</title>
   
   
   
@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/graphviz.css?v=4ae1632d" />
     <link rel="stylesheet" type="text/css" href="../_static/workflow-autodoc.css?v=8680bdfd" />
     <link rel="stylesheet" type="text/css" href="../_static/sphinx-design.min.css?v=95c83b7e" />
-    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=a5f60b8d" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=1819b4a7" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -43,455 +43,21 @@
   <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
 <link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
 
-    <script src="../_static/documentation_options.js?v=8cac9ea1"></script>
+    <script src="../_static/documentation_options.js?v=632f9628"></script>
     <script src="../_static/doctools.js?v=fd6eb6e6"></script>
     <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=30646c52"></script>
     <script src="../_static/design-tabs.js?v=f930bc37"></script>
-    <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
-    <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.8.0/dist/mermaid.esm.min.mjs";
-
-
-
-
-
-const initStyles = () => {
-    const defaultStyle = document.createElement('style');
-    defaultStyle.textContent = `pre.mermaid {
-    /* Same as .mermaid-container > pre */
-    display: block;
-    width: 100%;
-}
-
-pre.mermaid > svg {
-    /* Same as .mermaid-container > pre > svg */
-    height: auto;
-    width: 100%;
-    max-width: 100% !important;
-}`;
-    document.head.appendChild(defaultStyle);
-
-    const fullscreenStyle = document.createElement('style');
-    fullscreenStyle.textContent = `.mermaid-container {
-    display: flex;
-    flex-direction: row;
-    width: 100%;
-}
-
-.mermaid-container > pre {
-    display: block;
-    width: 100%;
-}
-
-.mermaid-container > pre > svg {
-    height: auto;
-    width: 100%;
-    max-width: 100% !important;
-}
-
-.mermaid-fullscreen-btn {
-    width: 28px;
-    height: 28px;
-    background: rgba(255, 255, 255, 0.95);
-    border: 1px solid rgba(0, 0, 0, 0.3);
-    border-radius: 4px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.2s;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
-    font-size: 14px;
-    line-height: 1;
-    padding: 0;
-    color: #333;
-}
-
-.mermaid-fullscreen-btn:hover {
-    opacity: 100% !important;
-    background: rgba(255, 255, 255, 1);
-    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
-    transform: scale(1.1);
-}
-
-.mermaid-fullscreen-btn.dark-theme {
-    background: rgba(50, 50, 50, 0.95);
-    border: 1px solid rgba(255, 255, 255, 0.3);
-    color: #e0e0e0;
-}
-
-.mermaid-fullscreen-btn.dark-theme:hover {
-    background: rgba(60, 60, 60, 1);
-    box-shadow: 0 3px 10px rgba(255, 255, 255, 0.2);
-}
-
-.mermaid-fullscreen-modal {
-    display: none;
-    position: fixed !important;
-    top: 0 !important;
-    left: 0 !important;
-    width: 95vw;
-    height: 100vh;
-    background: rgba(255, 255, 255, 0.98);
-    z-index: 9999;
-    padding: 20px;
-    overflow: auto;
-}
-
-.mermaid-fullscreen-modal.dark-theme {
-    background: rgba(0, 0, 0, 0.98);
-}
-
-.mermaid-fullscreen-modal.active {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.mermaid-container-fullscreen {
-    position: relative;
-    width: 95vw;
-    height: 90vh;
-    max-width: 95vw;
-    max-height: 90vh;
-    background: white;
-    border-radius: 8px;
-    padding: 20px;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
-    overflow: auto;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.mermaid-container-fullscreen.dark-theme {
-    background: #1a1a1a;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
-}
-
-.mermaid-container-fullscreen pre.mermaid {
-    width: 100%;
-    height: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.mermaid-container-fullscreen .mermaid svg {
-    height: 100% !important;
-    width: 100% !important;
-    cursor: grab;
-}
-
-.mermaid-fullscreen-close {
-    position: fixed !important;
-    top: 20px !important;
-    right: 20px !important;
-    width: 40px;
-    height: 40px;
-    background: rgba(255, 255, 255, 0.95);
-    border: 1px solid rgba(0, 0, 0, 0.2);
-    border-radius: 50%;
-    cursor: pointer;
-    z-index: 10000;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-    transition: all 0.2s;
-    font-size: 24px;
-    line-height: 1;
-    color: #333;
-}
-
-.mermaid-fullscreen-close:hover {
-    background: white;
-    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
-    transform: scale(1.1);
-}
-
-.mermaid-fullscreen-close.dark-theme {
-    background: rgba(50, 50, 50, 0.95);
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    color: #e0e0e0;
-}
-
-.mermaid-fullscreen-close.dark-theme:hover {
-    background: rgba(60, 60, 60, 1);
-    box-shadow: 0 6px 16px rgba(255, 255, 255, 0.2);
-}
-
-.mermaid-fullscreen-modal .mermaid-fullscreen-btn {
-    display: none !important;
-}`;
-    document.head.appendChild(fullscreenStyle);
-}
-
-// Detect if page has dark background
-const isDarkTheme = () => {
-    // We use a set of heuristics:
-    // 1. Check for common dark mode classes or attributes
-    // 2. Check computed background color brightness
-    if (document.documentElement.classList.contains('dark') ||
-        document.documentElement.getAttribute('data-theme') === 'dark' ||
-        document.body.classList.contains('dark') ||
-        document.body.getAttribute('data-theme') === 'dark') {
-        // console.log("Dark theme detected via class/attribute");
-        return true;
-    }
-    if (document.documentElement.classList.contains('light') ||
-        document.documentElement.getAttribute('data-theme') === 'light' ||
-        document.body.classList.contains('light') ||
-        document.body.getAttribute('data-theme') === 'light') {
-        // console.log("Light theme detected via class/attribute");
-        return false;
-    }
-    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
-        // console.log("Dark theme detected via prefers-color-scheme");
-        return true;
-    }
-    const bgColor = window.getComputedStyle(document.body).backgroundColor;
-    const match = bgColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)/);
-    if (match) {
-        const r = parseInt(match[1]);
-        const g = parseInt(match[2]);
-        const b = parseInt(match[3]);
-        const brightness = (r * 299 + g * 587 + b * 114) / 1000;
-        // console.log("Background color brightness:", brightness);
-        return brightness < 128;
-    }
-    // console.log("No dark or light theme detected, defaulting to light theme");
-    return false;
-};
-
-let darkTheme = isDarkTheme();
-let modal = null;
-let modalContent = null;
-let previousScrollOffset = [window.scrollX, window.scrollY];
-
-const runMermaid = async (rerun) => {
-    console.log("Running mermaid diagrams, rerun =", rerun);
-    // clear all existing mermaid charts
-    let all_mermaids = document.querySelectorAll(".mermaid");
-
-    if (rerun) {
-        all_mermaids.forEach((el) => {
-            if(!el.hasAttribute("data-original-code")) {
-                // store original code
-                // console.log(`Storing original code for first run: `, el.innerHTML);
-                el.setAttribute('data-original-code', el.innerHTML);
-            }
-            if(el.getAttribute("data-processed") === "true") {
-                // remove and restore original
-                el.removeAttribute("data-processed");
-                // console.log(`Restoring original code for re-run: `, el.getAttribute('data-original-code'));
-                el.innerHTML = el.getAttribute('data-original-code');
-            } else {
-                // store original code
-                // console.log(`Storing original code for re-run: `, el.innerHTML);
-                el.setAttribute('data-original-code', el.innerHTML);
-            }
-        });
-        await mermaid.run();
-    }
-
-    all_mermaids = document.querySelectorAll(".mermaid");
-    const mermaids_processed = document.querySelectorAll(".mermaid[data-processed='true']");
-
-    if ("False" === "True") {
-        const mermaids_to_add_zoom = -1 === -1 ? all_mermaids.length : -1;
-        if(mermaids_to_add_zoom > 0) {
-            var svgs = d3.selectAll("");
-            if(all_mermaids.length !== mermaids_processed.length) {
-                setTimeout(() => runMermaid(false), 200);
-                return;
-            } else if(svgs.size() !== mermaids_to_add_zoom) {
-                setTimeout(() => runMermaid(false), 200);
-                return;
-            } else {
-                svgs.each(function() {
-                    var svg = d3.select(this);
-                    svg.html("<g class='wrapper'>" + svg.html() + "</g>");
-                    var inner = svg.select("g");
-                    var zoom = d3.zoom().on("zoom", function(event) {
-                        inner.attr("transform", event.transform);
-                    });
-                    svg.call(zoom);
-                });
-            }
-        }
-    } else if(all_mermaids.length !== mermaids_processed.length) {
-        // Wait for mermaid to process all diagrams
-        setTimeout(() => runMermaid(false), 200);
-        return;
-    }
-
-    // Stop here if not adding fullscreen capability
-    if ("True" !== "True") return;
-
-    if (modal !== null ) {
-        // Destroy existing modal
-        modal.remove();
-        modal = null;
-        modalContent = null;
-    }
-
-    modal = document.createElement('div');
-    modal.className = 'mermaid-fullscreen-modal' + (darkTheme ? ' dark-theme' : '');
-    modal.setAttribute('role', 'dialog');
-    modal.setAttribute('aria-modal', 'true');
-    modal.setAttribute('aria-label', 'Fullscreen diagram viewer');
-    modal.innerHTML = `
-        <button class="mermaid-fullscreen-close${darkTheme ? ' dark-theme' : ''}" aria-label="Close fullscreen">✕</button>
-        <div class="mermaid-container-fullscreen${darkTheme ? ' dark-theme' : ''}"></div>
-    `;
-    document.body.appendChild(modal);
-
-    modalContent = modal.querySelector('.mermaid-container-fullscreen');
-    const closeBtn = modal.querySelector('.mermaid-fullscreen-close');
-
-    const closeModal = () => {
-        modal.classList.remove('active');
-        modalContent.innerHTML = '';
-        document.body.style.overflow = ''
-        window.scrollTo({left: previousScrollOffset[0], top: previousScrollOffset[1], behavior: 'instant'});
-    };
-
-    closeBtn.addEventListener('click', closeModal);
-    modal.addEventListener('click', (e) => {
-        if (e.target === modal) closeModal();
-    });
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && modal.classList.contains('active')) {
-            closeModal();
-        }
-    });
-
-    document.querySelectorAll('.mermaid').forEach((mermaidDiv) => {
-        if (mermaidDiv.parentNode.classList.contains('mermaid-container') ||
-            mermaidDiv.closest('.mermaid-fullscreen-modal')) {
-            // Already processed, adjust button class if needed
-            const existingBtn = mermaidDiv.parentNode.querySelector('.mermaid-fullscreen-btn');
-            if (existingBtn) {
-                existingBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
-            }
-            return;
-        }
-
-        const container = document.createElement('div');
-        container.className = 'mermaid-container';
-        mermaidDiv.parentNode.insertBefore(container, mermaidDiv);
-        container.appendChild(mermaidDiv);
-
-        const fullscreenBtn = document.createElement('button');
-        fullscreenBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
-        fullscreenBtn.setAttribute('aria-label', 'View diagram in fullscreen');
-        fullscreenBtn.textContent = '⛶';
-        fullscreenBtn.style.opacity = '50%';
-
-        // Calculate dynamic position based on diagram's margin and padding
-        const diagramStyle = window.getComputedStyle(mermaidDiv);
-        const marginTop = parseFloat(diagramStyle.marginTop) || 0;
-        const marginRight = parseFloat(diagramStyle.marginRight) || 0;
-        const paddingTop = parseFloat(diagramStyle.paddingTop) || 0;
-        const paddingRight = parseFloat(diagramStyle.paddingRight) || 0;
-        fullscreenBtn.style.top = `${marginTop + paddingTop + 4}px`;
-        fullscreenBtn.style.right = `${marginRight + paddingRight + 4}px`;
-
-        fullscreenBtn.addEventListener('click', () => {
-            previousScrollOffset = [window.scroll, window.scrollY];
-            const clone = mermaidDiv.cloneNode(true);
-            modalContent.innerHTML = '';
-            modalContent.appendChild(clone);
-
-            const svg = clone.querySelector('svg');
-            if (svg) {
-                svg.removeAttribute('width');
-                svg.removeAttribute('height');
-                svg.style.width = '100%';
-                svg.style.height = 'auto';
-                svg.style.maxWidth = '100%';
-                svg.style.sdisplay = 'block';
-
-                if ("False" === "True") {
-                    setTimeout(() => {
-                        const g = svg.querySelector('g');
-                        if (g) {
-                            var svgD3 = d3.select(svg);
-                            svgD3.html("<g class='wrapper'>" + svgD3.html() + "</g>");
-                            var inner = svgD3.select("g");
-                            var zoom = d3.zoom().on("zoom", function(event) {
-                                inner.attr("transform", event.transform);
-                            });
-                            svgD3.call(zoom);
-                        }
-                    }, 100);
-                }
-            }
-
-            modal.classList.add('active');
-            document.body.style.overflow = 'hidden';
-        });
-        container.appendChild(fullscreenBtn);
-    });
-};
-
-const load = async () => {
-    initStyles();
-
-    await runMermaid(true);
-
-    const reRunIfThemeChanges = async () => {
-        const newDarkTheme = isDarkTheme();
-        if (newDarkTheme !== darkTheme) {
-            darkTheme = newDarkTheme;
-            console.log("Theme change detected, re-running mermaid with", darkTheme ? "dark" : "default", "theme");
-            await mermaid.initialize(
-                {...JSON.parse(
-                    `{"startOnLoad": false}`
-                ),
-                ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
-                }
-            );
-            await runMermaid(true);
-        }
-    };
-
-    // Update theme classes when theme changes
-    const themeObserver = new MutationObserver(reRunIfThemeChanges);
-    themeObserver.observe(document.documentElement, {
-        attributes: true,
-        attributeFilter: ['class', 'style', 'data-theme']
-    });
-    themeObserver.observe(document.body, {
-        attributes: true,
-        attributeFilter: ['class', 'style', 'data-theme']
-    });
-};
-
-
-
-
-
-console.log("Initializing mermaid with", darkTheme ? "dark" : "default", "theme");
-mermaid.initialize(
-    {...JSON.parse(
-        `{"startOnLoad": false}`
-    ),
-    ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
-    }
-);
-
-window.addEventListener("load", load);</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'how-to/build-profiles';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://als-apg.github.io/osprey/_static/versions.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'osprey-connectors-v0.1.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
-            false;
+            true;
         </script>
+    <link rel="canonical" href="https://als-apg.github.io/osprey/how-to/build-profiles.html" />
     <link rel="icon" href="../_static/logo.svg"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
@@ -499,8 +65,8 @@ window.addEventListener("load", load);</script>
     <link rel="prev" title="How-To Guides" href="index.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="" />
-    <meta name="docbuild:last-update" content="Aug 18, 2026"/>
+  <meta name="docsearch:version" content="dev" />
+    <meta name="docbuild:last-update" content="Aug 31, 2026"/>
   </head>
   
   
@@ -583,16 +149,23 @@ window.addEventListener("load", load);</script>
 </li>
 
 
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="../architecture/index.html">
-    Architecture Overview
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="index.html">
+    How-To Guides
   </a>
 </li>
 
 
-<li class="nav-item current active">
-  <a class="nav-link nav-internal" href="index.html">
-    How-To Guides
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../architecture/index.html">
+    Architecture
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../reference/index.html">
+    Reference
   </a>
 </li>
 
@@ -719,16 +292,23 @@ window.addEventListener("load", load);</script>
 </li>
 
 
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="../architecture/index.html">
-    Architecture Overview
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="index.html">
+    How-To Guides
   </a>
 </li>
 
 
-<li class="nav-item current active">
-  <a class="nav-link nav-internal" href="index.html">
-    How-To Guides
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../architecture/index.html">
+    Architecture
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../reference/index.html">
+    Reference
   </a>
 </li>
 
@@ -805,60 +385,73 @@ window.addEventListener("load", load);</script>
   <div class="bd-toc-item navbar-nav"><ul class="current nav bd-sidenav">
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Build Profiles</a></li>
 <li class="toctree-l1"><a class="reference internal" href="deploy-a-facility.html">Deploy a Facility</a></li>
-<li class="toctree-l1"><a class="reference internal" href="configure-providers.html">Configure LLM Providers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="run-open-models.html">Run Open &amp; Local Models</a></li>
-<li class="toctree-l1"><a class="reference internal" href="deploy-project.html">Container Deployment</a></li>
-<li class="toctree-l1"><a class="reference internal" href="containerize-project.html">Containerize a Project</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="deploy-project/index.html">Container Deployment</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="deploy-project/compose-templates.html">Compose Templates and Images</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deploy-project/networking.html">Network Binding and Security</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deploy-project/env-chain.html">Environment Variables (the <code class="docutils literal notranslate"><span class="pre">.env</span></code> chain)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deploy-project/project-image.html">The Project Image</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="llm-providers/index.html">LLM Providers</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="llm-providers/configure-providers.html">Configure LLM Providers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-providers/run-open-models.html">Run Open &amp; Local Models</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="web-terminal/index.html">Web Terminal</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="web-terminal/operate.html">Run the Web Terminal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="web-terminal/theming.html">Theming</a></li>
 <li class="toctree-l2"><a class="reference internal" href="web-terminal/panels.html">Panels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="web-terminal/send-feedback.html">Send and Retrieve Feedback</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="web-terminal/multi-user/index.html">Multi-User Support</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="web-terminal/multi-user/tiers.html">Privilege Tiers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="web-terminal/multi-user/login.html">Require a Login</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="multi-user.html">Multi-User Support</a></li>
-<li class="toctree-l1"><a class="reference internal" href="use-cli-chat.html">Use the CLI Chat Interface</a></li>
-<li class="toctree-l1"><a class="reference internal" href="non_interactive_query.html">Non-Interactive Agent Queries</a></li>
-
-
-
-
-
-
-
-<li class="toctree-l1"><a class="reference internal" href="event-dispatch.html">Event Dispatch</a></li>
-<li class="toctree-l1 has-children"><a class="reference internal" href="chat-bridges/index.html">Chat Bridges</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="chat-bridges/nextcloud-talk.html">Nextcloud Talk</a></li>
-<li class="toctree-l2"><a class="reference internal" href="chat-bridges/google-chat.html">Google Chat</a></li>
-<li class="toctree-l2"><a class="reference internal" href="chat-bridges/add-a-channel.html">Add Your Own Chat Service</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="monitor-agent.html">Monitor Your OSPREY Agent</a></li>
-<li class="toctree-l1"><a class="reference internal" href="configure-health-checks.html">Configure Health Checks</a></li>
-<li class="toctree-l1"><a class="reference internal" href="add-connector.html">Add a Connector</a></li>
-<li class="toctree-l1"><a class="reference internal" href="add-mcp-server.html">Add an MCP Server</a></li>
-<li class="toctree-l1"><a class="reference internal" href="use-python-executor.html">Python Execution Service</a></li>
-<li class="toctree-l1 has-children"><a class="reference internal" href="use-facility-knowledge.html">Facility Knowledge</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="facility-rules.html">Facility Rules</a></li>
-<li class="toctree-l2"><a class="reference internal" href="okf-bundle.html">The OKF Bundle</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="agent-interfaces/index.html">Agent Interfaces</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="agent-interfaces/cli-agent.html">Run the Agent from the Command Line</a></li>
+<li class="toctree-l2"><a class="reference internal" href="agent-interfaces/event-dispatch.html">Event Dispatch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="agent-interfaces/add-mcp-server.html">Add an MCP Server</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="agent-interfaces/chat-bridges/index.html">Chat Bridges</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="agent-interfaces/chat-bridges/nextcloud-talk.html">Nextcloud Talk</a></li>
+<li class="toctree-l3"><a class="reference internal" href="agent-interfaces/chat-bridges/google-chat.html">Google Chat</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="health-and-monitoring/index.html">Health and Monitoring</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="health-and-monitoring/configure-health-checks.html">Configure Health Checks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="health-and-monitoring/monitor-agent.html">Monitor Your OSPREY Agent</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="control-systems/index.html">Control Systems</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="control-systems/use-connectors.html">Use Connectors</a></li>
+<li class="toctree-l2"><a class="reference internal" href="control-systems/use-virtual-accelerator.html">Use the Virtual Accelerator</a></li>
+<li class="toctree-l2"><a class="reference internal" href="control-systems/switch-control-target.html">Switch the Control Target at Run Time</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="use-channel-finder.html">How to Use the Channel Finder</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="facility-knowledge/index.html">Facility Knowledge</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="facility-knowledge/facility-rules.html">Facility Rules</a></li>
+<li class="toctree-l2"><a class="reference internal" href="facility-knowledge/okf-bundle.html">The OKF Bundle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="facility-knowledge/use-facility-graph.html">Search the Facility Graph</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="ariel/index.html">Logbook Search Service (ARIEL)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="ariel/osprey-integration.html">Osprey Integration</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ariel/data-ingestion.html">Data Ingestion</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ariel/search-modes.html">Search Modes</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ariel/web-interface.html">Web Interface</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ariel/search-sidecar.html">The Search Sidecar (<code class="docutils literal notranslate"><span class="pre">qmd</span></code>)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ariel/standalone-deployment.html">Standalone Deployment</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="use-virtual-accelerator.html">Use the Virtual Accelerator</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="bluesky/index.html">Bluesky Plans</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="bluesky/run-first-plan.html">Run Your First Scan</a></li>
-<li class="toctree-l2"><a class="reference internal" href="bluesky/queue.html">Scans and the Queue</a></li>
-<li class="toctree-l2"><a class="reference internal" href="bluesky/write-plans.html">Write Your Own Scan Plans</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bluesky/run-first-plan.html">Run Your First Plan</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bluesky/queue.html">Plans and the Queue</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bluesky/write-plans.html">Write Your Own Plans</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="../cli-reference/index.html">CLI Reference</a></li>
 </ul>
 </div>
 </nav></div>
@@ -941,12 +534,44 @@ and safe to delete and rebuild at any time.</p>
 </div>
 </details><section id="preset-profile-build">
 <h2>Preset → Profile → Build<a class="headerlink" href="#preset-profile-build" title="Link to this heading">#</a></h2>
-<pre  class="mermaid">
-        flowchart LR
-   P[&quot;Preset&lt;br/&gt;(bundled with OSPREY)&quot;] -- osprey init --&gt; F[&quot;profile.yml&lt;br/&gt;(yours)&quot;]
-   F -- osprey build --&gt; J[&quot;build/&lt;br/&gt;(derived)&quot;]
-   J -- osprey up --&gt; R[&quot;Running containers&quot;]
-    </pre><ul class="simple">
+<div class="osprey-diagram">
+<svg viewBox="0 0 960 192" role="img" aria-labelledby="build-profiles-title build-profiles-desc">
+  <title id="build-profiles-title">Preset to running containers</title>
+  <desc id="build-profiles-desc">A bundled preset is copied once into your profile.yml by osprey init; osprey build renders the derived build zone from it, and osprey up starts the containers.</desc>
+  <defs>
+    <marker id="build-profiles-arr" viewBox="0 0 8 6" refX="7" refY="3" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+      <polygon points="0,0 8,3 0,6" fill="context-stroke"/>
+    </marker>
+  </defs>
+  <line class="e" x1="200" y1="92" x2="280" y2="92" marker-end="url(#build-profiles-arr)"/>
+  <line class="e" x1="440" y1="92" x2="520" y2="92" marker-end="url(#build-profiles-arr)"/>
+  <line class="e" x1="680" y1="92" x2="760" y2="92" marker-end="url(#build-profiles-arr)"/>
+  <rect class="mask" x="206" y="72" width="68" height="12" rx="2"/>
+  <text class="ta" x="240" y="81" text-anchor="middle">osprey init</text>
+  <rect class="mask" x="444" y="72" width="72" height="12" rx="2"/>
+  <text class="ta" x="480" y="81" text-anchor="middle">osprey build</text>
+  <rect class="mask" x="690" y="72" width="60" height="12" rx="2"/>
+  <text class="ta" x="720" y="81" text-anchor="middle">osprey up</text>
+
+  <rect class="mask" x="40" y="64" width="160" height="56" rx="6"/>
+  <rect class="nb-ext" x="40" y="64" width="160" height="56" rx="6"/>
+  <text class="tn" x="120" y="88" text-anchor="middle">preset</text>
+  <text class="ts" x="120" y="104" text-anchor="middle">bundled with OSPREY</text>
+  <rect class="mask" x="280" y="64" width="160" height="56" rx="6"/>
+  <rect class="nb-foc" x="280" y="64" width="160" height="56" rx="6"/>
+  <text class="tn" x="360" y="88" text-anchor="middle">profile.yml</text>
+  <text class="ts" x="360" y="104" text-anchor="middle">yours · in git</text>
+  <rect class="mask" x="520" y="64" width="160" height="56" rx="6"/>
+  <rect class="nb-st" x="520" y="64" width="160" height="56" rx="6"/>
+  <text class="tn" x="600" y="88" text-anchor="middle">build/</text>
+  <text class="ts" x="600" y="104" text-anchor="middle">derived · never edited</text>
+  <rect class="mask" x="760" y="64" width="160" height="56" rx="6"/>
+  <rect class="nb" x="760" y="64" width="160" height="56" rx="6"/>
+  <text class="tn" x="840" y="88" text-anchor="middle">containers</text>
+  <text class="ts" x="840" y="104" text-anchor="middle">the running stack</text>
+</svg>
+</div>
+<ul class="simple">
 <li><p><strong>Preset</strong> — a bundled starting point, shipped inside OSPREY
 (<code class="docutils literal notranslate"><span class="pre">src/osprey/profiles/presets/</span></code>). Examples: <code class="docutils literal notranslate"><span class="pre">hello-world</span></code>,
 <code class="docutils literal notranslate"><span class="pre">control-assistant</span></code>, <code class="docutils literal notranslate"><span class="pre">ariel-standalone</span></code>, <code class="docutils literal notranslate"><span class="pre">channel-finder-standalone</span></code>.
@@ -1072,7 +697,7 @@ name <em>is</em> the declaration, and where each one lands is fixed.</p>
 <td><p>a directory per compose service</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">project/</span></code></p></td>
-<td><p>the project root</p></td>
+<td><p>the build root (<code class="docutils literal notranslate"><span class="pre">build/</span></code>)</p></td>
 <td><p>any file, mirrored verbatim</p></td>
 </tr>
 </tbody>
@@ -1096,7 +721,7 @@ unrecognized top-level entries in a profile for exactly this reason — read
 that warning rather than wondering why an artifact never arrived.</p>
 </div>
 <section id="paths-the-profile-may-not-write">
-<h3>Paths the profile may not write<a class="headerlink" href="#paths-the-profile-may-not-write" title="Link to this heading">#</a></h3>
+<span id="profile-reserved-paths"></span><h3>Paths the profile may not write<a class="headerlink" href="#paths-the-profile-may-not-write" title="Link to this heading">#</a></h3>
 <p><code class="docutils literal notranslate"><span class="pre">project/</span></code> is the escape hatch for anything without a home in the table above.
 It cannot write paths the build already owns, because each of those has its own
 channel:</p>
@@ -1140,13 +765,102 @@ channel:</p>
 </div>
 <p>A profile that targets one of these is rejected at build time, with the owning
 channel named. The same refusal applies to a claim (below).</p>
+<p>This table is about <em>build channels</em> — which part of the profile is allowed to
+produce a file. A separate question is which files the running agent may not
+rewrite, whatever channel produced them; that is
+<a class="reference internal" href="../reference/configuration/config.html#config-protected-set"><span class="std std-ref">the protected set</span></a>, and it is neither a subset nor a
+superset of this one.</p>
 <p><code class="docutils literal notranslate"><span class="pre">hook_config.json</span></code> is the one worth understanding: the write-safety hook reads
 it to decide what counts as a hardware write. A hand-written copy would be
 treated as yours and never regenerate, quietly freezing that decision.</p>
 </section>
+<section id="the-shared-web-terminal-baseline">
+<span id="profile-context-baseline"></span><h3>The shared web-terminal baseline<a class="headerlink" href="#the-shared-web-terminal-baseline" title="Link to this heading">#</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">web-terminal-context/</span></code> is the one convention directory that accepts a loose
+file: <code class="docutils literal notranslate"><span class="pre">base.md</span></code>, the text every operator’s terminal starts from. It sits
+beside the per-operator directories and rides the same channel, landing at
+<code class="docutils literal notranslate"><span class="pre">docker/web-terminal-context/base.md</span></code>.</p>
+<p>Three layers stack, in this order:</p>
+<ul class="simple">
+<li><p><strong>the framework’s fallback.</strong> Every build installs a generic <code class="docutils literal notranslate"><span class="pre">base.md</span></code> into
+the rendered project, so a deployment always has one.</p></li>
+<li><p><strong>the profile’s own copy.</strong> A <code class="docutils literal notranslate"><span class="pre">web-terminal-context/base.md</span></code> in the profile
+is copied over that fallback. <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">init</span></code> materializes one — from the app
+template’s text where it ships its own, otherwise the framework’s — so the
+baseline is in your repository from the first minute, where you can read and
+edit it.</p></li>
+<li><p><strong>each operator’s ``extra.md``.</strong> At seed time the baseline and that user’s
+<code class="docutils literal notranslate"><span class="pre">web-terminal-context/&lt;user&gt;/extra.md</span></code> are concatenated, and the result
+becomes their <code class="docutils literal notranslate"><span class="pre">CLAUDE.md</span></code>.</p></li>
+</ul>
+<p>Unlike the per-operator directories, the baseline is <strong>not</strong> roster-derived. It
+is copied on every build, including a persona render that has no roster at all,
+and <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">init</span></code> writes it whenever the profile stands up web terminals
+(<code class="docutils literal notranslate"><span class="pre">modules.web_terminals.enabled</span></code>) — even when the roster is still empty, so a
+profile that names no operators yet still starts from text it can see. A
+profile with no web-terminal module gets no <code class="docutils literal notranslate"><span class="pre">web-terminal-context/</span></code>.</p>
+<p>A persona drops it with the ordinary convention vocabulary, qualified like any
+other profile-shipped file:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">exclude</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">web-terminal-context</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">web-terminal-context/base.md</span><span class="w">   </span><span class="c1"># the framework fallback renders instead</span>
+</pre></div>
+</div>
+<p>The baseline is the only part of this tree a persona has to exclude. A persona
+delta switches the web-terminal module off, so its render resolves an empty
+roster and copies no operator directories in the first place — naming one here
+matches nothing and is silently ignored.</p>
+<p>To keep the baseline in the deployment but leave it out of one persona’s
+terminals, set <code class="docutils literal notranslate"><span class="pre">seed_base:</span> <span class="pre">false</span></code> on that persona’s catalog entry
+(<code class="docutils literal notranslate"><span class="pre">modules.web_terminals.personas.&lt;name&gt;</span></code>): its users are seeded from their
+own <code class="docutils literal notranslate"><span class="pre">extra.md</span></code> alone.</p>
+<div class="important admonition">
+<p class="admonition-title"><code class="docutils literal notranslate"><span class="pre">base.md</span></code> is the only loose file</p>
+<p>Any other file directly in <code class="docutils literal notranslate"><span class="pre">web-terminal-context/</span></code> is refused at build
+time, and the message names both routes: move it into the directory of the
+operator it belongs to, or rename it to <code class="docutils literal notranslate"><span class="pre">base.md</span></code> if it is the text
+everyone starts from. Directory names here are matched against the resolved
+roster, so a directory invented to hold a stray file is skipped as an
+operator who has left — and nothing in it would ever be read.</p>
+</div>
+</section>
+</section>
+<section id="a-profile-is-self-contained">
+<span id="profile-self-contained"></span><h2>A profile is self-contained<a class="headerlink" href="#a-profile-is-self-contained" title="Link to this heading">#</a></h2>
+<p>Everything a profile contributes lives inside the profile directory. That is
+what keeps a build reproducible: clone the deployment repository anywhere, and
+the same project renders.</p>
+<p>The build holds the convention directories to it. An entry that is a symlink
+resolving outside the profile is refused, with the remedy — copy the target in
+instead. <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">scaffold</span> <span class="pre">claim</span></code> refuses the same shape before it moves
+anything, because a claim that carried such a link into the profile would
+report success and then break every later build.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>The check catches the mistake, not an adversary: copies dereference
+symlinks, and the scan does not descend into a symlinked directory. Read it
+as the rule the build holds you to, not as a boundary it enforces.</p>
+</div>
+<section id="the-data-tree-is-the-exception">
+<h3>The <code class="docutils literal notranslate"><span class="pre">data:</span></code> tree is the exception<a class="headerlink" href="#the-data-tree-is-the-exception" title="Link to this heading">#</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">data:</span></code> is a path the profile <em>names</em>, not material the build finds by
+convention, and it is checked differently. The path resolves against the
+profile directory, and only its existence and shape are checked — that it is
+there, and that it is a directory. Containment is never checked, so a tree may
+sit above the profile directory (<code class="docutils literal notranslate"><span class="pre">data:</span> <span class="pre">../shared-data</span></code>): a tree more than
+one profile builds from can live beside them rather than inside either.</p>
+<p>Staleness is unaffected. The resolved tree is folded into the profile hash
+wherever it sits, so editing it still reports the built project as out of date.
+The exception is about where the tree may live, not about the build losing
+sight of it.</p>
+</section>
 </section>
 <section id="taking-ownership-of-a-framework-artifact">
 <span id="profile-claim"></span><h2>Taking ownership of a framework artifact<a class="headerlink" href="#taking-ownership-of-a-framework-artifact" title="Link to this heading">#</a></h2>
+<p>Everything the build renders is framework-managed: every <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">build</span></code>
+refreshes it from the installed OSPREY version, so framework fixes reach your
+project on their own — and an edit made in place is overwritten the next time.
+Claiming is how an edit survives.</p>
 <p>To customize something OSPREY generates — a rule, an agent, a service template
 — move it into the profile:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>my-facility
@@ -1156,7 +870,9 @@ osprey<span class="w"> </span>scaffold<span class="w"> </span>claim<span class="
 </pre></div>
 </div>
 <p>The artifact is <strong>moved</strong> out of <code class="docutils literal notranslate"><span class="pre">build/</span></code> and into the matching convention
-slot of the repository’s profile. Edit it there, then rebuild:</p>
+slot of the repository’s profile — <code class="docutils literal notranslate"><span class="pre">rules/safety</span></code> lands at
+<code class="docutils literal notranslate"><span class="pre">&lt;profile&gt;/rules/safety.md</span></code>, <code class="docutils literal notranslate"><span class="pre">services/postgresql</span></code> at
+<code class="docutils literal notranslate"><span class="pre">&lt;profile&gt;/services/postgresql/</span></code>. Edit it there, then rebuild:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>osprey<span class="w"> </span>build
 </pre></div>
 </div>
@@ -1176,14 +892,17 @@ good, delete it from the profile.</p>
 <li><p>the artifact is <strong>generated</strong>, not authored — <code class="docutils literal notranslate"><span class="pre">hook_config.json</span></code>,
 <code class="docutils literal notranslate"><span class="pre">settings.json</span></code>, <code class="docutils literal notranslate"><span class="pre">.mcp.json</span></code>, <code class="docutils literal notranslate"><span class="pre">CLAUDE.md</span></code>. The message names the config
 key that <em>does</em> control it;</p></li>
-<li><p>the file is a symlink pointing outside the project (a profile must be
-self-contained to be reproducible);</p></li>
+<li><p>the artifact is a symlink, or holds one pointing outside itself — a profile
+must be <a class="reference internal" href="#profile-self-contained"><span class="std std-ref">self-contained</span></a>;</p></li>
 <li><p>the profile slot is already occupied. A claim never overwrites profile
 material.</p></li>
 </ul>
-<p>Before reaching for a claim, check whether a config key already covers your need
-— most service knobs (ports, images, credentials, retention) are configurable
-without owning the template.</p>
+<p>The web terminal offers the same move from the browser: its scaffold gallery
+overrides a framework-generated artifact by claiming it for you (see
+<a class="reference internal" href="web-terminal/operate.html"><span class="doc">Run the Web Terminal</span></a>).</p>
+<p>Before reaching for a claim, check whether a config key or an environment
+variable already covers your need — most service knobs (ports, images,
+credentials, retention) are configurable without owning the template.</p>
 </section>
 <section id="custom-hooks">
 <h2>Custom hooks<a class="headerlink" href="#custom-hooks" title="Link to this heading">#</a></h2>
@@ -1271,11 +990,13 @@ sharing the deployment. For those presets (<code class="docutils literal notrans
   personas/
     readonly.yml       # a read-only terminal
     readwrite.yml      # a write-capable terminal
+    admin.yml          # the one terminal that may edit the deployment
     ariel.yml          # the standalone ARIEL logbook terminal
 </pre></div>
 </div>
 <p>Each file holds only that persona’s <strong>differences</strong> — for the read-only persona,
-chiefly <code class="docutils literal notranslate"><span class="pre">control_system.writes_enabled:</span> <span class="pre">false</span></code>. Sitting in <code class="docutils literal notranslate"><span class="pre">personas/</span></code> beside
+chiefly <code class="docutils literal notranslate"><span class="pre">control_system.writes_enabled:</span> <span class="pre">false</span></code>; for the admin one, the
+privileges the profile below it deliberately withholds. Sitting in <code class="docutils literal notranslate"><span class="pre">personas/</span></code> beside
 <code class="docutils literal notranslate"><span class="pre">profile.yml</span></code> is what makes it a persona: the build merges it over that profile
 automatically. There is no <code class="docutils literal notranslate"><span class="pre">extends:</span></code> line to maintain, and no second data tree
 or set of convention directories — everything else comes from the profile above
@@ -1327,8 +1048,11 @@ green build as proof the exclusion took.</p>
 <p><code class="docutils literal notranslate"><span class="pre">exclude:</span></code> carves a tier by <em>removing</em> capability. When the boundary you
 want is “may not write,” prefer flipping the enforcement switch instead —
 the bundled <code class="docutils literal notranslate"><span class="pre">control-assistant-readonly</span></code> preset differs from its
-write-capable sibling only on <code class="docutils literal notranslate"><span class="pre">control_system.writes_enabled</span></code>, leaving
-the tool surface identical (see <a class="reference internal" href="multi-user.html"><span class="doc">Multi-User Support</span></a>).</p>
+write-capable sibling only on write posture, leaving the tool surface
+identical (see <a class="reference internal" href="web-terminal/multi-user/tiers.html"><span class="doc">Privilege Tiers</span></a>). Write posture is per
+control target, so that tier pins the deployment-wide
+<code class="docutils literal notranslate"><span class="pre">control_system.writes_enabled</span></code> <em>and</em> each connector type’s own key: the
+flat key is what a type inherits, not a floor over it.</p>
 </div>
 <p>To keep the bluesky server <strong>on</strong> while hiding an individual plan, set
 <code class="docutils literal notranslate"><span class="pre">bluesky.excluded_plans</span></code> instead:</p>
@@ -1338,31 +1062,83 @@ the tool surface identical (see <a class="reference internal" href="multi-user.h
 </div>
 <p>The named plan is then invisible to the agent and non-runnable. The same
 block’s <code class="docutils literal notranslate"><span class="pre">plan_dir</span></code> key does the opposite — it installs a directory of your
-facility’s own plans; see <a class="reference internal" href="bluesky/write-plans.html"><span class="doc">Write Your Own Scan Plans</span></a>.</p>
+facility’s own plans; see <a class="reference internal" href="bluesky/write-plans.html"><span class="doc">Write Your Own Plans</span></a>.</p>
+<p><code class="docutils literal notranslate"><span class="pre">bluesky.devices_file</span></code> names the third piece: the file listing the devices
+those plans may drive or record.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">bluesky</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">devices_file</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">data/bluesky_devices.yml</span>
+</pre></div>
+</div>
+<p>That default puts the file inside the project, so it is built and shipped with
+the deployment. An absolute path is yours instead — the build reads it where it
+is and never rewrites or relocates it. A malformed entry fails the build, and a
+deployment running the Virtual Accelerator with no file yet at a project path
+gets one written for it from the project’s own channel-limits database. The
+file’s format and the three cases are in <a class="reference internal" href="bluesky/write-plans.html"><span class="doc">Write Your Own Plans</span></a>.</p>
 </section>
+</section>
+<section id="one-repository-several-hosts">
+<span id="profile-host-variants"></span><h2>One repository, several hosts<a class="headerlink" href="#one-repository-several-hosts" title="Link to this heading">#</a></h2>
+<p>A test stand and a control-room machine can run the same deployment and still
+need different settings — another hostname, other ports, a different theme.
+Keeping two copies of the repository in step is the thing to avoid. Keep one
+profile instead, plus a small overlay per host:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>my-facility/
+  profile.yml            # what every host shares
+  profiles/
+    teststand.yml        # what the test stand changes
+    control-room.yml     # what the control room changes
+  .env.variant           # which of the two THIS host builds
+</pre></div>
+</div>
+<p>An overlay holds only the differences, in the same spelling <code class="docutils literal notranslate"><span class="pre">profile.yml</span></code>
+uses:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># profiles/teststand.yml</span>
+<span class="nt">config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">deploy.fqdn</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">teststand.example.org</span>
+<span class="w">  </span><span class="nt">web.theme</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">dark</span>
+</pre></div>
+</div>
+<p>Each host names the one it wants in <code class="docutils literal notranslate"><span class="pre">.env.variant</span></code> at the repository root:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">echo</span><span class="w"> </span><span class="nv">OSPREY_PROFILE_VARIANT</span><span class="o">=</span>teststand<span class="w"> </span>&gt;<span class="w"> </span>.env.variant
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">build</span></code> merges that overlay over <code class="docutils literal notranslate"><span class="pre">profile.yml</span></code> before it renders
+anything, and says which variant it used in its output. Personas are rendered
+for the same host, so a stack cannot come up half-configured for another one.</p>
+<p>The overlays are committed: which hosts a deployment has is part of what the
+deployment is. The choice between them is not — <code class="docutils literal notranslate"><span class="pre">.env.variant</span></code> is covered by
+the generated <code class="docutils literal notranslate"><span class="pre">.gitignore</span></code> along with the rest of the <code class="docutils literal notranslate"><span class="pre">.env*</span></code> family, so
+each host keeps its own answer, and a build warns if the file ever does get
+committed. There is no command-line flag for this today; the file is how a
+host chooses. If one is added later, a variant named on the command line will
+win over the file.</p>
+<p>Three cases worth knowing about:</p>
+<ul class="simple">
+<li><p><strong>No setting, or an empty one.</strong> The build renders <code class="docutils literal notranslate"><span class="pre">profile.yml</span></code> as
+tracked and the overlays sit unused. This is also what a host that has never
+heard of variants does, so adding <code class="docutils literal notranslate"><span class="pre">profiles/</span></code> to a repository changes
+nothing until a host selects something.</p></li>
+<li><p><strong>A name the repository has no file for.</strong> The build stops and lists the
+names that would work. The previous <code class="docutils literal notranslate"><span class="pre">build/</span></code> is left as it was, as with
+every other refusal.</p></li>
+<li><p><strong>Switching variants.</strong> Rebuild. <code class="docutils literal notranslate"><span class="pre">build/</span></code> is the render of one host’s
+profile, and editing the setting does not re-render anything by itself —
+but switching <code class="docutils literal notranslate"><span class="pre">.env.variant</span></code> (or editing the selected overlay) marks the
+existing <code class="docutils literal notranslate"><span class="pre">build/</span></code> out of date, so <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">up</span></code> names the stale render
+instead of starting it silently.</p></li>
+</ul>
+<p>An overlay adds and replaces; it does not subtract. Lists are merged rather
+than swapped, so use <a class="reference internal" href="#profile-exclude"><span class="std std-ref">exclude:</span></a> to take something away
+on one host — that works in an overlay like anywhere else.</p>
 </section>
 <section id="secrets">
 <span id="profile-secrets"></span><h2>Secrets<a class="headerlink" href="#secrets" title="Link to this heading">#</a></h2>
 <p>API keys and service credentials live in one file: the <code class="docutils literal notranslate"><span class="pre">.env</span></code> at the root of
-the deployment repository. That file is the deployment’s single secret store.
-A build never copies secrets into it or out of it, so a value you set once
-survives every rebuild, and wiping <code class="docutils literal notranslate"><span class="pre">build/</span></code> takes no secret with it.</p>
-<p>Three files at the repository root, and the difference matters:</p>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">.env.example</span></code> lists every variable the agent reads, with no values. It is
-safe to commit, and it is the file to read when you want to know what can be
-set.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">.env.shared</span></code> holds the settings the whole site shares — a proxy, a
-facility hostname, a port everyone uses. It <strong>is</strong> committed, so nothing
-secret belongs in it.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">.env</span></code> holds this host’s own values and every secret. The generated
-<code class="docutils literal notranslate"><span class="pre">.gitignore</span></code> keeps it out of git.</p></li>
-</ul>
-<p><code class="docutils literal notranslate"><span class="pre">.env.shared</span></code> and <code class="docutils literal notranslate"><span class="pre">.env</span></code> are read together, lowest first: a variable set in
-both takes its value from <code class="docutils literal notranslate"><span class="pre">.env</span></code>. Setting a key locally is how one host
-departs from a shared default. <a class="reference internal" href="deploy-project.html#deployment-env-chain"><span class="std std-ref">Environment Variables (the .env chain)</span></a> covers the rest —
-what a deploy reports about the pair, and the machine-written <code class="docutils literal notranslate"><span class="pre">.env*</span></code> files
-that go with them.</p>
+the deployment repository, read together with the committed <code class="docutils literal notranslate"><span class="pre">.env.shared</span></code>
+beside it. <a class="reference internal" href="deploy-project/env-chain.html#deployment-env-chain"><span class="std std-ref">Environment Variables (the .env chain)</span></a> is that pair in full — which of the two
+wins, what a deploy writes back into them, and the machine-written <code class="docutils literal notranslate"><span class="pre">.env*</span></code>
+files that go with them.</p>
 <section id="seeding-once">
 <h3>Seeding, once<a class="headerlink" href="#seeding-once" title="Link to this heading">#</a></h3>
 <p><code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">init</span></code> seeds the new repository’s <code class="docutils literal notranslate"><span class="pre">.env</span></code> from your shell, and only
@@ -1375,639 +1151,32 @@ start it yourself:</p>
 </pre></div>
 </div>
 <div class="important admonition">
-<p class="admonition-title">This is the only moment a shell export reaches the repository</p>
+<p class="admonition-title">The only moment a shell export reaches the repository unasked</p>
 <p>It happens <strong>once</strong>, at <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">init</span></code>, and what it took is written under a
 “Seeded by <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">init</span></code> from your shell” heading — so the file itself
-records where each value came from. Nothing else in the pipeline reads your
-environment for secrets, and a later build never re-reads your shell.</p>
-<p>The practical consequence: exporting a key <em>after</em> the repository exists does
-not get it in. Put it in <code class="docutils literal notranslate"><span class="pre">.env</span></code> yourself.</p>
+records where each value came from. No build reads your environment for
+secrets, and a later build never re-reads your shell. (<code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">up</span></code> will
+seed a <em>missing</em> <code class="docutils literal notranslate"><span class="pre">.env</span></code> with this deployment’s provider key, but only on an
+interactive terminal and only if you say yes at the prompt — see
+<a class="reference internal" href="deploy-project/env-chain.html#deployment-env-chain"><span class="std std-ref">Environment Variables (the .env chain)</span></a>.)</p>
+<p>The practical consequence: once the repository has a <code class="docutils literal notranslate"><span class="pre">.env</span></code>, exporting a
+key does not get it in — no writer ever overwrites a value already on file.
+Put it in <code class="docutils literal notranslate"><span class="pre">.env</span></code> yourself.</p>
 </div>
 </section>
 <section id="who-else-writes-to-env">
 <h3>Who else writes to <code class="docutils literal notranslate"><span class="pre">.env</span></code><a class="headerlink" href="#who-else-writes-to-env" title="Link to this heading">#</a></h3>
-<p>Two writers append to the file, and both follow the same rule: <strong>a value
-already on file always wins.</strong> Nothing overwrites what you put there.</p>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">up</span></code> mints the credentials only a deploy can produce — database
-passwords, service tokens — and appends them under a “Minted by deploy”
-heading. Because a minted value is then on file, a later start comes up on the
-<em>same</em> secrets instead of minting a second set the running containers do not
-trust.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">build</span></code> appends the pointers it derives from what it just rendered —
-currently the virtual accelerator’s channel manifest — under a “Derived by
-build” heading.</p></li>
-</ul>
-<p>Both write to this one file, and to <code class="docutils literal notranslate"><span class="pre">.env</span></code> rather than <code class="docutils literal notranslate"><span class="pre">.env.shared</span></code>: a
-minted credential belongs to this host, and the shared file is committed. There
-is no second copy anywhere — <code class="docutils literal notranslate"><span class="pre">build/</span></code> holds no secrets, and every service
-reads them from here — so this is the file to back up.</p>
-<p>The write-back is <strong>append-only</strong>. A key already in the profile keeps its value —
-it is pinned by the docker volume that was initialized with it, and overwriting it
-would leave the stack authenticating with something its own volumes reject — and a
-value that disagrees is reported by name (never by value) for you to resolve by hand.</p>
-<p>If the profile cannot be reached — it has moved or been deleted, or the project
-names none — the deploy still works. The secrets stay in the project <code class="docutils literal notranslate"><span class="pre">.env</span></code>, a
-warning names the path that failed, and the project records that its <code class="docutils literal notranslate"><span class="pre">.env</span></code> is
-the only copy. A later <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">build</span></code> repeats that warning before touching the
-directory.</p>
+<p><code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">up</span></code> and <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">build</span></code> both append to the file — minted credentials
+and derived pointers respectively — and both leave a value already on file
+alone; <a class="reference internal" href="deploy-project/env-chain.html#deployment-env-chain"><span class="std std-ref">Environment Variables (the .env chain)</span></a> has what each writes and why.</p>
 </section>
 </section>
 <section id="profile-yaml-reference">
 <h2>Profile YAML reference<a class="headerlink" href="#profile-yaml-reference" title="Link to this heading">#</a></h2>
-<div class="pst-scrollable-table-container"><table class="table">
-<colgroup>
-<col style="width: 22.0%" />
-<col style="width: 12.0%" />
-<col style="width: 14.0%" />
-<col style="width: 52.0%" />
-</colgroup>
-<thead>
-<tr class="row-odd"><th class="head"><p>Field</p></th>
-<th class="head"><p>Type</p></th>
-<th class="head"><p>Default</p></th>
-<th class="head"><p>Description</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">name</span></code></p></td>
-<td><p>string</p></td>
-<td><p><em>required</em></p></td>
-<td><p>Human-readable profile name.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">app_template</span></code></p></td>
-<td><p>string</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">control_assistant</span></code></p></td>
-<td><p>App template (data bundle) to render. Valid: <code class="docutils literal notranslate"><span class="pre">control_assistant</span></code>,
-<code class="docutils literal notranslate"><span class="pre">hello_world</span></code>, <code class="docutils literal notranslate"><span class="pre">ariel_standalone</span></code>.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">data</span></code></p></td>
-<td><p>string</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
-<td><p>Facility data tree, relative to the profile directory (<code class="docutils literal notranslate"><span class="pre">data</span></code> in a
-materialized profile). Replaces the bundled tree wholesale.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">provider</span></code></p></td>
-<td><p>string</p></td>
-<td><p><em>required</em></p></td>
-<td><p>LLM provider. Built-ins: <code class="docutils literal notranslate"><span class="pre">anthropic</span></code>, <code class="docutils literal notranslate"><span class="pre">cborg</span></code>, <code class="docutils literal notranslate"><span class="pre">als-apg</span></code>; any
-provider declared under <code class="docutils literal notranslate"><span class="pre">api.providers</span></code> also works. The build aborts
-if none is set.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">model</span></code></p></td>
-<td><p>string</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
-<td><p>Default model: a tier name (<code class="docutils literal notranslate"><span class="pre">haiku</span></code>, <code class="docutils literal notranslate"><span class="pre">sonnet</span></code>, <code class="docutils literal notranslate"><span class="pre">opus</span></code>) or a full
-provider model ID.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">channel_finder_mode</span></code></p></td>
-<td><p>string</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
-<td><p>Channel finder pipeline (<code class="docutils literal notranslate"><span class="pre">hierarchical</span></code>, <code class="docutils literal notranslate"><span class="pre">middle_layer</span></code>,
-<code class="docutils literal notranslate"><span class="pre">in_context</span></code>).</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tier</span></code></p></td>
-<td><p>int</p></td>
-<td><p>derived</p></td>
-<td><p>Channel-database tier (1 or 3). Defaults from the channel finder mode;
-tier 1 is <code class="docutils literal notranslate"><span class="pre">in_context</span></code>-only.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">connector</span></code></p></td>
-<td><p>string</p></td>
-<td><p><em>from preset</em></p></td>
-<td><p>Control-system connector (<code class="docutils literal notranslate"><span class="pre">mock</span></code>, <code class="docutils literal notranslate"><span class="pre">virtual_accelerator</span></code>, <code class="docutils literal notranslate"><span class="pre">epics</span></code>,
-…). Shorthand for <code class="docutils literal notranslate"><span class="pre">config:</span> <span class="pre">{control_system.type:</span> <span class="pre">...}</span></code>, so it can be
-set from the command line as <code class="docutils literal notranslate"><span class="pre">--set</span> <span class="pre">connector=epics</span></code>. Setting both
-spellings on one command line is an error rather than a silent
-last-one-wins; a custom connector is still addressed by its dotted
-module path under <code class="docutils literal notranslate"><span class="pre">config</span></code>.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">config</span></code></p></td>
-<td><p>mapping</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">{}</span></code></p></td>
-<td><p>Dot-notation overrides for the generated <code class="docutils literal notranslate"><span class="pre">config.yml</span></code>.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">exclude</span></code></p></td>
-<td><p>mapping</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">{}</span></code></p></td>
-<td><p>Entries to subtract from what this profile would otherwise bring
-(see <a class="reference internal" href="#profile-exclude"><span class="std std-ref">Removing something a profile brings</span></a>).</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">hooks</span></code> / <code class="docutils literal notranslate"><span class="pre">rules</span></code> / <code class="docutils literal notranslate"><span class="pre">skills</span></code> / <code class="docutils literal notranslate"><span class="pre">agents</span></code> / <code class="docutils literal notranslate"><span class="pre">output_styles</span></code></p></td>
-<td><p>list</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">[]</span></code></p></td>
-<td><p>Built-in artifacts to install. Your own files go in the matching
-convention directory instead.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">mcp_servers</span></code></p></td>
-<td><p>mapping</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">{}</span></code></p></td>
-<td><p>MCP server definitions to inject.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">services</span></code></p></td>
-<td><p>mapping</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">{}</span></code></p></td>
-<td><p>Container services the deployment runs (see <a class="reference internal" href="#profile-services"><span class="std std-ref">Services</span></a>).</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">va_archiver</span></code></p></td>
-<td><p>mapping</p></td>
-<td><p>absent</p></td>
-<td><p>Declares a stored archive for a simulated machine: a MongoDB store and a
-recorder the deploy stands up, seeds and records into
-(see <a class="reference internal" href="#profile-va-archiver"><span class="std std-ref">The va_archiver block</span></a>).</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">lifecycle</span></code></p></td>
-<td><p>mapping</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">{}</span></code></p></td>
-<td><p>Commands to run at build phases (<code class="docutils literal notranslate"><span class="pre">pre_build</span></code>, <code class="docutils literal notranslate"><span class="pre">post_build</span></code>,
-<code class="docutils literal notranslate"><span class="pre">validate</span></code>).</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">env</span></code></p></td>
-<td><p>mapping</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">{}</span></code></p></td>
-<td><p>Variables the deployment needs: <code class="docutils literal notranslate"><span class="pre">required</span></code>, <code class="docutils literal notranslate"><span class="pre">defaults</span></code>, <code class="docutils literal notranslate"><span class="pre">file</span></code>.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dependencies</span></code></p></td>
-<td><p>list</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">[]</span></code></p></td>
-<td><p>Python packages to install into the project venv.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">environment</span></code></p></td>
-<td><p>mapping</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">{}</span></code></p></td>
-<td><p>Base interpreter the project environment is built from
-(see <a class="reference internal" href="#profile-environment"><span class="std std-ref">The execution environment</span></a>).</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">requires_osprey_version</span></code></p></td>
-<td><p>string</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
-<td><p>PEP 440 specifier (e.g. <code class="docutils literal notranslate"><span class="pre">&gt;=2026.5.0</span></code>). The build aborts if unsatisfied.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">osprey_install</span></code></p></td>
-<td><p>string</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">local</span></code></p></td>
-<td><p>How to install OSPREY in the project venv: <code class="docutils literal notranslate"><span class="pre">local</span></code>, <code class="docutils literal notranslate"><span class="pre">pip</span></code>, or a
-PEP 508 spec.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">python_env</span></code></p></td>
-<td><p>string</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">project</span></code></p></td>
-<td><p>Python used by MCP servers: <code class="docutils literal notranslate"><span class="pre">project</span></code>, <code class="docutils literal notranslate"><span class="pre">build</span></code>, or an absolute path.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">provenance</span></code></p></td>
-<td><p>mapping</p></td>
-<td><p><em>written</em></p></td>
-<td><p>Which preset this profile was materialized from, and that preset’s hash.
-Written by the materialization; do not edit it.</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-</section>
-<section id="configuration-overrides">
-<h2>Configuration overrides<a class="headerlink" href="#configuration-overrides" title="Link to this heading">#</a></h2>
-<p>The <code class="docutils literal notranslate"><span class="pre">config:</span></code> section uses <strong>dot notation</strong> to override any key in the
-generated <code class="docutils literal notranslate"><span class="pre">config.yml</span></code>. The base keys are in
-<code class="docutils literal notranslate"><span class="pre">src/osprey/templates/project/config.yml.j2</span></code>; app data bundles add further
-sections in their own <code class="docutils literal notranslate"><span class="pre">config.yml.j2</span></code>.</p>
-<div class="admonition warning">
-<p class="admonition-title">Warning</p>
-<p>Always write overrides as <strong>dotted keys</strong>, one per line — never as nested
-YAML. A nested block counts as <em>one</em> override whose value replaces the entire
-subtree. <code class="docutils literal notranslate"><span class="pre">config:</span> <span class="pre">{claude_code:</span> <span class="pre">{model:</span> <span class="pre">opus}}</span></code> wipes out everything else
-under <code class="docutils literal notranslate"><span class="pre">claude_code</span></code> (servers, permissions, …), silently. The dotted form
-<code class="docutils literal notranslate"><span class="pre">claude_code.model:</span> <span class="pre">opus</span></code> changes just that setting.</p>
-</div>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">config</span><span class="p">:</span>
-<span class="w">  </span><span class="c1"># Control system</span>
-<span class="w">  </span><span class="nt">control_system.type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">epics</span>
-<span class="w">  </span><span class="nt">control_system.writes_enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="w">  </span><span class="nt">control_system.limits_checking.enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-
-<span class="w">  </span><span class="c1"># Archiver</span>
-<span class="w">  </span><span class="nt">archiver.type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">epics_archiver</span>
-<span class="w">  </span><span class="nt">archiver.epics_archiver.url</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">https://archiver.facility.org</span>
-
-<span class="w">  </span><span class="c1"># Set your real facility zone: it governs how the agent reads operator</span>
-<span class="w">  </span><span class="c1"># times (parsed as facility-local) and renders every timestamp — not</span>
-<span class="w">  </span><span class="c1"># just a display label.</span>
-<span class="w">  </span><span class="nt">system.timezone</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">America/Los_Angeles</span>
-
-<span class="w">  </span><span class="c1"># Channel finder</span>
-<span class="w">  </span><span class="nt">channel_finder.pipeline_mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">middle_layer</span>
-
-<span class="w">  </span><span class="c1"># Approval policy</span>
-<span class="w">  </span><span class="nt">approval.default_policy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">always</span>
-</pre></div>
-</div>
-</section>
-<section id="mcp-server-injection">
-<h2>MCP server injection<a class="headerlink" href="#mcp-server-injection" title="Link to this heading">#</a></h2>
-<p>Custom MCP servers are recorded in the project’s <code class="docutils literal notranslate"><span class="pre">config.yml</span></code> (under
-<code class="docutils literal notranslate"><span class="pre">claude_code.servers</span></code>) and rendered from there into <code class="docutils literal notranslate"><span class="pre">.mcp.json</span></code> (server
-configuration) and <code class="docutils literal notranslate"><span class="pre">.claude/settings.json</span></code> (tool permissions) — so a later
-<code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">build</span></code> re-renders them instead of losing them.</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">mcp_servers</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">my_server</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">command</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">python</span>
-<span class="w">    </span><span class="nt">args</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;-m&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;my_server&quot;</span><span class="p p-Indicator">]</span>
-<span class="w">    </span><span class="nt">env</span><span class="p">:</span>
-<span class="w">      </span><span class="nt">CONFIG</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;{project_root}/config.yml&quot;</span>
-<span class="w">      </span><span class="nt">API_KEY</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;${MY_API_KEY}&quot;</span>
-<span class="w">    </span><span class="nt">permissions</span><span class="p">:</span>
-<span class="w">      </span><span class="nt">allow</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;safe_tool&quot;</span><span class="p p-Indicator">]</span>
-<span class="w">      </span><span class="nt">ask</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;write_tool&quot;</span><span class="p p-Indicator">]</span>
-</pre></div>
-</div>
-<p>Remote servers declare a <code class="docutils literal notranslate"><span class="pre">url</span></code> instead of a <code class="docutils literal notranslate"><span class="pre">command</span></code>, plus an optional
-<code class="docutils literal notranslate"><span class="pre">transport</span></code> — <code class="docutils literal notranslate"><span class="pre">http</span></code> (streamable-HTTP, the default) or <code class="docutils literal notranslate"><span class="pre">sse</span></code> (legacy
-Server-Sent Events):</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">mcp_servers</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">matlab</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">transport</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">http</span>
-<span class="w">    </span><span class="nt">url</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;http://localhost:8008/mcp&quot;</span>
-<span class="w">    </span><span class="nt">permissions</span><span class="p">:</span>
-<span class="w">      </span><span class="nt">allow</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;mml_search&quot;</span><span class="p p-Indicator">]</span>
-</pre></div>
-</div>
-<p><code class="docutils literal notranslate"><span class="pre">command</span></code> and <code class="docutils literal notranslate"><span class="pre">url</span></code> are mutually exclusive, and stdio servers must not set
-<code class="docutils literal notranslate"><span class="pre">transport</span></code> (launching via <code class="docutils literal notranslate"><span class="pre">command</span></code> <em>is</em> the transport).</p>
-<p><strong>Placeholders:</strong> <code class="docutils literal notranslate"><span class="pre">{project_root}</span></code> resolves at build time to the absolute
-project path; <code class="docutils literal notranslate"><span class="pre">${ENV_VAR}</span></code> is preserved for the container or shell to resolve
-at runtime.</p>
-<p><strong>Permission wiring:</strong> for a server named <code class="docutils literal notranslate"><span class="pre">my_server</span></code> with
-<code class="docutils literal notranslate"><span class="pre">allow:</span> <span class="pre">[&quot;safe_tool&quot;]</span></code>, the build adds <code class="docutils literal notranslate"><span class="pre">mcp__my_server__safe_tool</span></code> to the
-allow list.</p>
-<section id="shipping-the-server-s-code">
-<h3>Shipping the server’s code<a class="headerlink" href="#shipping-the-server-s-code" title="Link to this heading">#</a></h3>
-<p>Put the package in the profile’s <code class="docutils literal notranslate"><span class="pre">mcp_servers/</span></code> directory — one directory per
-server. The build copies it to <code class="docutils literal notranslate"><span class="pre">_mcp_servers/</span></code> in the project, so the launch
-command finds it:</p>
-<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>my-facility/
-  mcp_servers/
-    phoebus/
-      __init__.py
-      __main__.py
-      server.py
-</pre></div>
-</div>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">mcp_servers</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">phoebus</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">command</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">python</span>
-<span class="w">    </span><span class="nt">args</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;-m&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;phoebus&quot;</span><span class="p p-Indicator">]</span>
-<span class="w">    </span><span class="nt">env</span><span class="p">:</span>
-<span class="w">      </span><span class="nt">OSPREY_CONFIG</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;{project_root}/config.yml&quot;</span>
-<span class="w">      </span><span class="nt">PYTHONPATH</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;{project_root}/_mcp_servers&quot;</span>
-<span class="w">    </span><span class="nt">permissions</span><span class="p">:</span>
-<span class="w">      </span><span class="nt">allow</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;phoebus_launch&quot;</span><span class="p p-Indicator">]</span>
-</pre></div>
-</div>
-<p>The directory name and the <code class="docutils literal notranslate"><span class="pre">mcp_servers:</span></code> key are independent: the directory
-delivers the code, the key launches it.</p>
-</section>
-</section>
-<section id="tool-permissions">
-<span id="profile-tool-permissions"></span><h2>Tool permissions<a class="headerlink" href="#tool-permissions" title="Link to this heading">#</a></h2>
-<p>By default OSPREY blocks a handful of general-purpose tools — <code class="docutils literal notranslate"><span class="pre">Bash</span></code>,
-<code class="docutils literal notranslate"><span class="pre">Edit</span></code>, <code class="docutils literal notranslate"><span class="pre">WebFetch</span></code>, <code class="docutils literal notranslate"><span class="pre">WebSearch</span></code>, and the Playwright/Context7 plugins — so a
-stock control-operator agent cannot shell out or browse the web. These defaults
-are overridable per facility from <code class="docutils literal notranslate"><span class="pre">config:</span></code>, using dotted keys:</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">claude_code.permissions.remove_deny</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;Bash&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;WebSearch&quot;</span><span class="p p-Indicator">]</span><span class="w">  </span><span class="c1"># drop from the deny list</span>
-<span class="w">  </span><span class="nt">claude_code.permissions.allow</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;WebSearch&quot;</span><span class="p p-Indicator">]</span><span class="w">                </span><span class="c1"># then allow outright</span>
-<span class="w">  </span><span class="nt">claude_code.permissions.ask</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;Bash&quot;</span><span class="p p-Indicator">]</span><span class="w">                       </span><span class="c1"># or route to human approval</span>
-</pre></div>
-</div>
-<div class="pst-scrollable-table-container"><table class="table">
-<colgroup>
-<col style="width: 20.0%" />
-<col style="width: 80.0%" />
-</colgroup>
-<thead>
-<tr class="row-odd"><th class="head"><p>Key</p></th>
-<th class="head"><p>Effect</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">remove_deny</span></code></p></td>
-<td><p>Remove entries from the built-in deny defaults</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">deny</span></code></p></td>
-<td><p>Add facility-specific deny entries</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">allow</span></code></p></td>
-<td><p>Add allow entries (no approval prompt)</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ask</span></code></p></td>
-<td><p>Add entries that route through human approval</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">remove_ask</span></code></p></td>
-<td><p>Remove entries from the ask list</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<div class="important admonition">
-<p class="admonition-title">Deny wins, and it wins at runtime too</p>
-<p>Permissions resolve as <strong>deny &gt; ask &gt; allow</strong>, and a static <code class="docutils literal notranslate"><span class="pre">deny</span></code> entry
-cannot be overridden during a session — an in-session “allow once” will not
-unblock it. Use <code class="docutils literal notranslate"><span class="pre">ask</span></code> for tools you want gated but still reachable.</p>
-</div>
-</section>
-<section id="services">
-<span id="profile-services"></span><h2>Services<a class="headerlink" href="#services" title="Link to this heading">#</a></h2>
-<p>The <code class="docutils literal notranslate"><span class="pre">services</span></code> section defines facility containers the deployment runs
-alongside OSPREY’s built-in ones.</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">services</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">typesense</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">template</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services/typesense</span><span class="w">     </span><span class="c1"># relative to the profile directory</span>
-<span class="w">    </span><span class="nt">config</span><span class="p">:</span>
-<span class="w">      </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8108</span>
-<span class="w">      </span><span class="nt">api_key</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;${TYPESENSE_API_KEY}&quot;</span>
-</pre></div>
-</div>
-<p>The <code class="docutils literal notranslate"><span class="pre">template</span></code> directory must contain at least <code class="docutils literal notranslate"><span class="pre">docker-compose.yml.j2</span></code>. It is
-copied into the project’s <code class="docutils literal notranslate"><span class="pre">services/</span></code> tree, and the service is registered in
-<code class="docutils literal notranslate"><span class="pre">config.yml</span></code>. Optional <code class="docutils literal notranslate"><span class="pre">config</span></code> values land under <code class="docutils literal notranslate"><span class="pre">services.&lt;name&gt;</span></code>.</p>
-<p>A service directory placed in the profile’s <code class="docutils literal notranslate"><span class="pre">services/</span></code> convention directory is
-carried across the same way and marked as yours — that is what
-<code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">scaffold</span> <span class="pre">claim</span> <span class="pre">services/&lt;name&gt;</span></code> produces.</p>
-<p>One <code class="docutils literal notranslate"><span class="pre">config</span></code> key is read by the build itself: <code class="docutils literal notranslate"><span class="pre">network</span></code>, which is either
-<code class="docutils literal notranslate"><span class="pre">bridge</span></code> (the default — the service joins the compose network and publishes
-the ports it wants reachable) or <code class="docutils literal notranslate"><span class="pre">host</span></code> (it shares the host’s network
-namespace, which is what a service needs to see broadcast traffic or reach
-ports other software publishes on the machine). Your template has to render the
-setting for it to mean anything, and <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">build</span></code> refuses a service that
-declares <code class="docutils literal notranslate"><span class="pre">network:</span> <span class="pre">host</span></code> whose render does not carry it. See
-<a class="reference internal" href="deploy-project.html#deployment-network-attachment"><span class="std std-ref">Network attachment: bridge or host</span></a> for what host mode changes and for
-<code class="docutils literal notranslate"><span class="pre">dispatch.network</span></code>, the single knob that covers the event dispatcher and its
-workers.</p>
-</section>
-<section id="the-va-archiver-block">
-<span id="profile-va-archiver"></span><h2>The <code class="docutils literal notranslate"><span class="pre">va_archiver</span></code> block<a class="headerlink" href="#the-va-archiver-block" title="Link to this heading">#</a></h2>
-<p>A deployment that serves simulated channels still needs somewhere to keep what
-those channels did. Declaring <code class="docutils literal notranslate"><span class="pre">va_archiver:</span></code> is what gives it one: the build
-adds a MongoDB store and a recorder to the service stack, <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">up</span></code>
-seeds the store with history and then records the running machine into it, and
-the <code class="docutils literal notranslate"><span class="pre">mongodb_archiver</span></code> connector reads it back.</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">va_archiver</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">host</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">localhost</span>
-<span class="w">  </span><span class="nt">retention_days</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">30</span>
-<span class="w">  </span><span class="nt">hot_span_hours</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">48</span>
-<span class="w">  </span><span class="nt">hot_cadence_sec</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10</span>
-<span class="w">  </span><span class="nt">tail_cadence_sec</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">60</span>
-<span class="w">  </span><span class="nt">freshness_channel</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">SR:DIAG:DCCT:01:CURRENT:RB</span>
-</pre></div>
-</div>
-<p>Every key is optional and the defaults describe a working archive; the block’s
-presence is the decision, not its contents.</p>
-<div class="pst-scrollable-table-container"><table class="table">
-<colgroup>
-<col style="width: 30.0%" />
-<col style="width: 12.0%" />
-<col style="width: 58.0%" />
-</colgroup>
-<thead>
-<tr class="row-odd"><th class="head"><p>Key</p></th>
-<th class="head"><p>Default</p></th>
-<th class="head"><p>Meaning</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">retention_days</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">30</span></code></p></td>
-<td><p>How far back the archive reaches — both what a fresh deployment holds
-and what a running one keeps.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">hot_span_hours</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">48</span></code></p></td>
-<td><p>How much of the recent end is kept at the dense cadence. May not exceed
-<code class="docutils literal notranslate"><span class="pre">retention_days</span></code>.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">hot_cadence_sec</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">10</span></code></p></td>
-<td><p>Seconds between samples inside the hot span.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tail_cadence_sec</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">60</span></code></p></td>
-<td><p>Seconds between samples outside it. Must be a whole multiple of
-<code class="docutils literal notranslate"><span class="pre">hot_cadence_sec</span></code> — the sparse tier is a subset of the dense grid, so a
-cadence that does not divide would put the two on timestamps that never
-coincide.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">recorder_cadence_sec</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">10</span></code></p></td>
-<td><p>How often the recorder samples the live machine.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">recorder_tail_cadence_sec</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">60</span></code></p></td>
-<td><p>How often one of those samples is additionally kept for the full
-retention span, so recorded history survives as the dense copy ages out.
-Same whole-multiple rule.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">recorder_poll_sec</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">30</span></code></p></td>
-<td><p>How often the recorder re-reads the deployment’s config to decide whether
-to record at all. It records only for a <code class="docutils literal notranslate"><span class="pre">virtual_accelerator</span></code> control
-system, and this is what lets that flip take effect without a restart.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">freshness_channel</span></code></p></td>
-<td><p>unset</p></td>
-<td><p>Canary channel for a derived <code class="docutils literal notranslate"><span class="pre">archiver_freshness</span></code> health check. Unset
-derives no check (see <a class="reference internal" href="configure-health-checks.html"><span class="doc">Configure Health Checks</span></a>).</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">host</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">localhost</span></code></p></td>
-<td><p>Where the store is. <strong>Required</strong> when <code class="docutils literal notranslate"><span class="pre">deploy_services</span></code> is false: an
-attached project deploys no store of its own, so it has to name the host
-whose archive it reads.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">port_host</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">27017</span></code></p></td>
-<td><p>Host port the store publishes on — or, for an attached project, the port
-the other host published.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">database</span></code> / <code class="docutils literal notranslate"><span class="pre">collection</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">osprey_archiver</span></code> / <code class="docutils literal notranslate"><span class="pre">pv_history</span></code></p></td>
-<td><p>Where the samples live inside the store.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">compression</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">zstd</span></code></p></td>
-<td><p>Block compressor for the collection: <code class="docutils literal notranslate"><span class="pre">zstd</span></code>, <code class="docutils literal notranslate"><span class="pre">snappy</span></code>, <code class="docutils literal notranslate"><span class="pre">zlib</span></code> or
-<code class="docutils literal notranslate"><span class="pre">none</span></code>.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">username</span></code> / <code class="docutils literal notranslate"><span class="pre">auth_database</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">osprey</span></code> / <code class="docutils literal notranslate"><span class="pre">admin</span></code></p></td>
-<td><p>The database user the deployment creates and the agent connects as, and
-the database it authenticates against.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">password_env</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">MONGO_ROOT_PASSWORD</span></code></p></td>
-<td><p><strong>Name</strong> of the variable holding that password. The value is minted into
-the deployment’s <code class="docutils literal notranslate"><span class="pre">.env</span></code>; it is never a profile field.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">timeout_sec</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">5</span></code></p></td>
-<td><p>How long the connector waits to reach the store.</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<section id="one-fact-one-home">
-<h3>One fact, one home<a class="headerlink" href="#one-fact-one-home" title="Link to this heading">#</a></h3>
-<p>The block is where the archive is described, and the build writes the rest from
-it. Do <strong>not</strong> also spell these in <code class="docutils literal notranslate"><span class="pre">config:</span></code> — a profile that does is refused,
-by name, rather than silently having one copy win:</p>
-<ul class="simple">
-<li><p>the connector’s eight connection keys —
-<code class="docutils literal notranslate"><span class="pre">archiver.mongodb_archiver.host</span></code>, <code class="docutils literal notranslate"><span class="pre">.port</span></code>, <code class="docutils literal notranslate"><span class="pre">.name</span></code>, <code class="docutils literal notranslate"><span class="pre">.collection</span></code>,
-<code class="docutils literal notranslate"><span class="pre">.auth</span></code>, <code class="docutils literal notranslate"><span class="pre">.username</span></code>, <code class="docutils literal notranslate"><span class="pre">.password_env</span></code>, <code class="docutils literal notranslate"><span class="pre">.timeout</span></code> — all derived from
-the keys above;</p></li>
-<li><p>the shape knobs, written to <code class="docutils literal notranslate"><span class="pre">va_archiver.*</span></code> in the rendered <code class="docutils literal notranslate"><span class="pre">config.yml</span></code>
-for the seeder and the recorder to read;</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">health.categories.archiver</span></code>, when <code class="docutils literal notranslate"><span class="pre">freshness_channel</span></code> is set.</p></li>
-</ul>
-<p>Two homes for one fact are free to disagree, and the disagreement is the
-dangerous case: a stale <code class="docutils literal notranslate"><span class="pre">collection</span></code> or <code class="docutils literal notranslate"><span class="pre">host</span></code> in <code class="docutils literal notranslate"><span class="pre">config:</span></code> points the
-agent at an archive nothing is writing, which reads as empty rather than as
-broken.</p>
-<p>What the block does <em>not</em> do is select the archiver. Declaring where an archive
-lives and choosing it as the deployment’s archiver are separate decisions, so
-the block never flips <code class="docutils literal notranslate"><span class="pre">archiver.type</span></code> out from under you — set
-<code class="docutils literal notranslate"><span class="pre">config:</span> <span class="pre">{archiver.type:</span> <span class="pre">mongodb_archiver}</span></code> yourself, or the project deploys a
-store and then reads something else beside it.</p>
-<div class="admonition warning">
-<p class="admonition-title">Warning</p>
-<p><code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">build</span></code> <strong>refuses</strong> a profile that pairs a <code class="docutils literal notranslate"><span class="pre">virtual_accelerator</span></code>
-control system with the mock archiver, or with no <code class="docutils literal notranslate"><span class="pre">archiver.type</span></code> at all
-(which resolves to the mock): a simulated machine whose history is
-synthesized at read time reports a past that never happened, and nothing can
-catch it. The error names the fix — declare this block and select
-<code class="docutils literal notranslate"><span class="pre">mongodb_archiver</span></code>, point the archiver at a store you run yourself, or set
-the control system to <code class="docutils literal notranslate"><span class="pre">mock</span></code> for an honestly storeless project. See
-<a class="reference internal" href="use-virtual-accelerator.html"><span class="doc">Use the Virtual Accelerator</span></a>.</p>
-</div>
-</section>
-</section>
-<section id="lifecycle-commands">
-<h2>Lifecycle commands<a class="headerlink" href="#lifecycle-commands" title="Link to this heading">#</a></h2>
-<p>Lifecycle commands run shell commands at three phases of the build:</p>
-<ul class="simple">
-<li><p><strong>pre_build</strong> — before rendering (cwd: profile directory)</p></li>
-<li><p><strong>post_build</strong> — after git init (cwd: project directory)</p></li>
-<li><p><strong>validate</strong> — advisory checks that warn but don’t abort (cwd: project directory)</p></li>
-</ul>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">lifecycle</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">pre_build</span><span class="p">:</span>
-<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Check</span><span class="nv"> </span><span class="s">dependencies&quot;</span>
-<span class="w">      </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;pip</span><span class="nv"> </span><span class="s">check&quot;</span>
-<span class="w">  </span><span class="nt">post_build</span><span class="p">:</span>
-<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Build</span><span class="nv"> </span><span class="s">search</span><span class="nv"> </span><span class="s">index&quot;</span>
-<span class="w">      </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;python</span><span class="nv"> </span><span class="s">scripts/build_index.py&quot;</span>
-<span class="w">      </span><span class="nt">cwd</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;data&quot;</span>
-<span class="w">      </span><span class="nt">timeout</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">300</span>
-<span class="w">      </span><span class="nt">stream</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-</pre></div>
-</div>
-<p>Each step requires <code class="docutils literal notranslate"><span class="pre">name</span></code> and <code class="docutils literal notranslate"><span class="pre">run</span></code>. Optional: <code class="docutils literal notranslate"><span class="pre">cwd</span></code> (relative to the phase
-default), <code class="docutils literal notranslate"><span class="pre">timeout</span></code> (seconds, default 120), and <code class="docutils literal notranslate"><span class="pre">stream</span></code> (print output live;
-also available for all steps via <code class="docutils literal notranslate"><span class="pre">--stream</span></code>).</p>
-<p><code class="docutils literal notranslate"><span class="pre">{project_root}</span></code> is replaced with the built project’s absolute path. The
-project venv’s <code class="docutils literal notranslate"><span class="pre">bin/</span></code> is prepended to <code class="docutils literal notranslate"><span class="pre">PATH</span></code>, so <code class="docutils literal notranslate"><span class="pre">python</span></code> and <code class="docutils literal notranslate"><span class="pre">pytest</span></code>
-resolve to the project’s own Python.</p>
-</section>
-<section id="environment-variables">
-<h2>Environment variables<a class="headerlink" href="#environment-variables" title="Link to this heading">#</a></h2>
-<p>The <code class="docutils literal notranslate"><span class="pre">env</span></code> section declares what the deployment needs. <code class="docutils literal notranslate"><span class="pre">required</span></code> documents
-variables the operator must supply; secrets live in the repository’s <code class="docutils literal notranslate"><span class="pre">.env</span></code>
-and never in the profile (see <a class="reference internal" href="#profile-secrets"><span class="std std-ref">Secrets</span></a>).</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">env</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">required</span><span class="p">:</span>
-<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">API_KEY</span>
-<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">DB_HOST</span>
-<span class="w">  </span><span class="nt">defaults</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">LOG_LEVEL</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">info</span>
-</pre></div>
-</div>
-<p>Both lists are rendered into the repository’s <code class="docutils literal notranslate"><span class="pre">.env.example</span></code>, so an operator
-opening that file sees them alongside every other variable. Required names must
-match <code class="docutils literal notranslate"><span class="pre">^[A-Z_][A-Z0-9_]*$</span></code>.</p>
-<p><code class="docutils literal notranslate"><span class="pre">defaults</span></code> values are additionally seeded into the repository’s <code class="docutils literal notranslate"><span class="pre">.env</span></code> by
-<code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">init</span></code>, under their own section banner, so a deployment created from
-the profile starts with them in force. Seeding is append-only: a value already
-in the file — set by the operator, or minted by a deploy — always wins, and
-later <code class="docutils literal notranslate"><span class="pre">init</span></code> runs never rewrite one. Declare a default only for a value the
-profile’s author can honestly choose for every deployment (the
-<code class="docutils literal notranslate"><span class="pre">control-assistant</span></code> preset’s demo login passwords, say); values a <em>site</em>
-should share across hosts belong in <code class="docutils literal notranslate"><span class="pre">.env.shared</span></code>, which is committed with
-the repository and read by every host (see <a class="reference internal" href="deploy-project.html#deployment-env-chain"><span class="std std-ref">Environment Variables (the .env chain)</span></a>).</p>
-</section>
-<section id="dependencies">
-<h2>Dependencies<a class="headerlink" href="#dependencies" title="Link to this heading">#</a></h2>
-<p><code class="docutils literal notranslate"><span class="pre">dependencies</span></code> adds Python package specifiers to the built project. They are
-installed into the project venv and recorded in its generated <code class="docutils literal notranslate"><span class="pre">pyproject.toml</span></code>:</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">dependencies</span><span class="p">:</span>
-<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">numpy&gt;=1.24</span>
-<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pandas</span>
-<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">scipy~=1.11</span>
-</pre></div>
-</div>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>my-project
-uv<span class="w"> </span>run<span class="w"> </span>osprey<span class="w"> </span>web<span class="w">     </span><span class="c1"># uses my-project/.venv</span>
-uv<span class="w"> </span>sync<span class="w">               </span><span class="c1"># rebuilds it from pyproject.toml</span>
-</pre></div>
-</div>
-<p>Builds run with <code class="docutils literal notranslate"><span class="pre">--skip-deps</span></code> create no environment and no <code class="docutils literal notranslate"><span class="pre">pyproject.toml</span></code>;
-install dependencies yourself in that mode.</p>
-<section id="the-execution-environment">
-<span id="profile-environment"></span><h3>The execution environment<a class="headerlink" href="#the-execution-environment" title="Link to this heading">#</a></h3>
-<p><code class="docutils literal notranslate"><span class="pre">dependencies</span></code> says what <em>else</em> to install. The <code class="docutils literal notranslate"><span class="pre">environment:</span></code> block says
-what the project environment is built <em>on top of</em> — which interpreter it starts
-from, and, when that interpreter belongs to a virtual environment your facility
-already maintains, which of its packages to carry over.</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">environment</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">python</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/opt/facility/analysis-env/bin/python</span><span class="w">   </span><span class="c1"># base interpreter</span>
-<span class="w">  </span><span class="nt">packages</span><span class="p">:</span><span class="w">                                       </span><span class="c1"># installed on top</span>
-<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">lmfit&gt;=1.3</span>
-<span class="w">  </span><span class="nt">inherit_exclude</span><span class="p">:</span><span class="w">                                </span><span class="c1"># left out of the freeze</span>
-<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">facility-inhouse-tools</span>
-</pre></div>
-</div>
-<p>All three keys are optional; the block as a whole can be omitted.</p>
-<dl class="simple">
-<dt><code class="docutils literal notranslate"><span class="pre">python</span></code></dt><dd><p>The base interpreter, as an absolute path. It may be a plain interpreter
-(<code class="docutils literal notranslate"><span class="pre">/usr/bin/python3.12</span></code>) or the interpreter inside a virtual environment —
-the syntax is the same. The build aborts if the path does not exist or is not
-executable.</p>
-</dd>
-<dt><code class="docutils literal notranslate"><span class="pre">packages</span></code></dt><dd><p>Extra requirements installed into the project environment. Resolved in the
-same install as <code class="docutils literal notranslate"><span class="pre">dependencies</span></code>, so the two cannot disagree; where both name
-the same distribution, a pinned version wins over a bare name, and between two
-pins <code class="docutils literal notranslate"><span class="pre">packages</span></code> wins.</p>
-</dd>
-<dt><code class="docutils literal notranslate"><span class="pre">inherit_exclude</span></code></dt><dd><p>Distribution names to leave out of the freeze described below. Only meaningful
-with a virtual environment base; declaring it otherwise is rejected at
-validation time rather than silently ignored.</p>
-</dd>
-</dl>
-<p><strong>Carrying a virtual environment’s packages over.</strong> Basing a project on a virtual
-environment’s <em>interpreter</em> does not inherit its <em>packages</em>. What carries them
-over is a <strong>freeze</strong>: when <code class="docutils literal notranslate"><span class="pre">environment.python</span></code> names a virtual environment’s
-interpreter, the build records that environment’s installed distributions as
-exact <code class="docutils literal notranslate"><span class="pre">name==version</span></code> requirements in the project’s <code class="docutils literal notranslate"><span class="pre">pyproject.toml</span></code>. The
-project venv — and any container image built from it — installs that same set.</p>
-<p>A pin in <code class="docutils literal notranslate"><span class="pre">dependencies</span></code> or <code class="docutils literal notranslate"><span class="pre">packages</span></code> overrides the version the base
-happened to carry.</p>
-<p>The freeze runs <strong>only when a base interpreter is declared</strong>. Without
-<code class="docutils literal notranslate"><span class="pre">environment.python</span></code> the base is whatever interpreter OSPREY itself was
-installed into — an accident, not a curated environment — and its packages are
-deliberately not carried over.</p>
-<p><strong>The build stops if a package cannot be reproduced.</strong> Two cases are refused: a
-distribution with no package-index coordinate (installed from a local path, a
-VCS checkout, or a bare archive URL), and a version outside OSPREY’s own
-requirement for that package. Every offending package is named in a single
-message, along with the <code class="docutils literal notranslate"><span class="pre">inherit_exclude</span></code> block that clears all of them.</p>
-</section>
+<p>Every key <code class="docutils literal notranslate"><span class="pre">profile.yml</span></code> accepts — the field table, <code class="docutils literal notranslate"><span class="pre">config:</span></code> overrides, MCP
+servers, tool permissions, <code class="docutils literal notranslate"><span class="pre">services</span></code>, <code class="docutils literal notranslate"><span class="pre">va_archiver</span></code>, lifecycle commands,
+<code class="docutils literal notranslate"><span class="pre">env</span></code>, dependencies and the execution environment — is in
+<a class="reference internal" href="../reference/configuration/profile.html"><span class="doc">Build Profile — profile.yml</span></a>.</p>
 </section>
 <section id="regenerating-a-channel-database">
 <h2>Regenerating a channel database<a class="headerlink" href="#regenerating-a-channel-database" title="Link to this heading">#</a></h2>
@@ -2125,7 +1294,7 @@ profile at runtime.</p>
 </section>
 <section id="what-gets-generated">
 <h2>What gets generated<a class="headerlink" href="#what-gets-generated" title="Link to this heading">#</a></h2>
-<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>my-project/
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>my-project/build/
 ├── .claude/
 │   ├── agents/           # built-ins, plus anything from the profile&#39;s agents/
 │   ├── rules/            # built-ins, plus the profile&#39;s rules/
@@ -2155,7 +1324,12 @@ different project name so it gets a profile of its own.</p>
 <p><strong>“Profile convention directories are invalid”</strong> — a convention directory has
 the wrong shape: a <code class="docutils literal notranslate"><span class="pre">.md</span></code> directory holding something else, a skill that is a
 file rather than a directory, or a symlink pointing outside the profile. Every
-problem is listed at once.</p>
+problem is listed at once. The symlink case is the self-containment rule; copy
+the target in (see <a class="reference internal" href="#profile-self-contained"><span class="std std-ref">A profile is self-contained</span></a>).</p>
+<p><strong>“web-terminal-context/&lt;name&gt; is a file”</strong> — that directory holds one
+directory per operator, plus the shared <code class="docutils literal notranslate"><span class="pre">base.md</span></code>. Move the file into the
+directory of the operator it belongs to, or rename it to <code class="docutils literal notranslate"><span class="pre">base.md</span></code> if it is
+the text everyone starts from (see <a class="reference internal" href="#profile-context-baseline"><span class="std std-ref">The shared web-terminal baseline</span></a>).</p>
 <p><strong>“project/ mirror writes N build-owned path(s)”</strong> — the mirror targets a path
 another channel owns. The message names the channel, and the exact move where
 one exists.</p>
@@ -2181,11 +1355,11 @@ relax the constraint in the profile.</p>
 <div class="admonition seealso">
 <p class="admonition-title">See also</p>
 <dl class="simple">
-<dt><a class="reference internal" href="../cli-reference/index.html"><span class="doc">CLI Reference</span></a></dt><dd><p>Complete CLI command reference</p>
+<dt><a class="reference internal" href="../reference/cli.html"><span class="doc">CLI Reference</span></a></dt><dd><p>Complete CLI command reference</p>
 </dd>
-<dt><a class="reference internal" href="add-mcp-server.html"><span class="doc">Add an MCP Server</span></a></dt><dd><p>How to build custom MCP servers for OSPREY</p>
+<dt><a class="reference internal" href="agent-interfaces/add-mcp-server.html"><span class="doc">Add an MCP Server</span></a></dt><dd><p>How to build custom MCP servers for OSPREY</p>
 </dd>
-<dt><a class="reference internal" href="deploy-project.html"><span class="doc">Container Deployment</span></a></dt><dd><p>Container deployment after building</p>
+<dt><a class="reference internal" href="deploy-project/index.html"><span class="doc">Container Deployment</span></a></dt><dd><p>Container deployment after building</p>
 </dd>
 </dl>
 </div>
@@ -2246,6 +1420,11 @@ relax the constraint in the profile.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#convention-directories">Convention directories</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#paths-the-profile-may-not-write">Paths the profile may not write</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#the-shared-web-terminal-baseline">The shared web-terminal baseline</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#a-profile-is-self-contained">A profile is self-contained</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#the-data-tree-is-the-exception">The <code class="docutils literal notranslate"><span class="pre">data:</span></code> tree is the exception</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#taking-ownership-of-a-framework-artifact">Taking ownership of a framework artifact</a></li>
@@ -2258,29 +1437,13 @@ relax the constraint in the profile.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#removing-something-a-profile-brings">Removing something a profile brings</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#one-repository-several-hosts">One repository, several hosts</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#secrets">Secrets</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#seeding-once">Seeding, once</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#who-else-writes-to-env">Who else writes to <code class="docutils literal notranslate"><span class="pre">.env</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#profile-yaml-reference">Profile YAML reference</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#configuration-overrides">Configuration overrides</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mcp-server-injection">MCP server injection</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#shipping-the-server-s-code">Shipping the server’s code</a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tool-permissions">Tool permissions</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#services">Services</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#the-va-archiver-block">The <code class="docutils literal notranslate"><span class="pre">va_archiver</span></code> block</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#one-fact-one-home">One fact, one home</a></li>
-</ul>
-</li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#lifecycle-commands">Lifecycle commands</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#environment-variables">Environment variables</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#dependencies">Dependencies</a><ul class="visible nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#the-execution-environment">The execution environment</a></li>
-</ul>
-</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#regenerating-a-channel-database">Regenerating a channel database</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#building">Building</a><ul class="visible nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#checking-a-profile-without-building">Checking a profile without building</a></li>

@@ -36,20 +36,21 @@ Claude Code requires `Node.js <https://nodejs.org/>`_ 18+.
 
       .. code-block:: bash
 
-         # Ubuntu/Debian
-         curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-         sudo apt-get install -y nodejs
+         # Debian/Ubuntu — npm is a separate package here, and Claude Code needs it
+         sudo apt-get install -y nodejs npm
 
-         # Or use your distribution's package manager
+      Your distribution's own packages are the simplest route and the one the
+      OSPREY container images take. Check what yours ships (``node --version``):
+      a few older releases package a Node below the 18 floor, and there the
+      cleanest fix is a current Node from `nvm <https://github.com/nvm-sh/nvm>`_.
 
    .. tab-item:: Windows (WSL2)
 
-      Install Node.js inside your WSL2 environment:
+      Install Node.js inside your WSL2 environment, the same way as on Linux:
 
       .. code-block:: bash
 
-         curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-         sudo apt-get install -y nodejs
+         sudo apt-get install -y nodejs npm
 
 Verify:
 
@@ -64,7 +65,11 @@ Step 2: Install Claude Code
 
 .. code-block:: bash
 
-   npm install -g @anthropic-ai/claude-code
+   npm install -g @anthropic-ai/claude-code@2.1.146
+
+The pinned version is the one OSPREY's generated projects run. Installing it
+exactly — rather than whatever was published most recently — means a brand-new
+CLI release can't change your setup the day it comes out.
 
 Verify:
 
@@ -76,14 +81,17 @@ Verify:
 Pinning the Claude Code CLI version
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Anthropic ships breaking changes to the Claude Code CLI from time to time. To
-insulate a project from upstream releases, pin a specific version in the
-project's ``config.yml``:
+Anthropic ships breaking changes to the Claude Code CLI from time to time.
+The install command above already pins your global ``claude`` binary; to pin
+what a specific project launches — independently of what is installed
+globally — set a version under ``config:`` in ``profile.yml`` and run
+``osprey build``:
 
 .. code-block:: yaml
 
-   claude_code:
-     cli_version: "2.1.146"   # exact version, no semver ranges
+   config:
+     claude_code:
+       cli_version: "2.1.146"   # exact version, no semver ranges
 
 When set, ``osprey chat`` and the web terminal launch the pinned
 version via ``npx -y @anthropic-ai/claude-code@<version>`` instead of the
@@ -166,7 +174,7 @@ project you build. Its durable home comes later — see the note below.
          # Google
          export GOOGLE_API_KEY="..."
 
-      See :doc:`/how-to/configure-providers` for the full list.
+      See :doc:`/how-to/llm-providers/configure-providers` for the full list.
 
 .. note::
    Using ``bash`` instead of ``zsh``? Replace ``~/.zshrc`` with ``~/.bashrc``.
@@ -302,12 +310,12 @@ OSPREY is installed and ready to use. Here's what to do next:
 
    **Deploying Services**
 
-   See :doc:`/how-to/deploy-project` for setting up containerized services like Jupyter
+   See :doc:`/how-to/deploy-project/index` for setting up containerized services like Jupyter
    notebooks, databases, or simulation IOCs.
 
    **Detailed Configuration**
 
-   See :doc:`/how-to/configure-providers` for provider setup and
+   See :doc:`/how-to/llm-providers/configure-providers` for provider setup and
    :doc:`/how-to/build-profiles` for the full build profile YAML reference.
 
 
@@ -319,7 +327,7 @@ Troubleshooting
    :icon: alert
 
    **"claude: command not found"**
-      Install Claude Code: ``npm install -g @anthropic-ai/claude-code``
+      Install Claude Code: ``npm install -g @anthropic-ai/claude-code@2.1.146``
 
    **"osprey: command not found"**
       If you installed via ``uv tool install osprey-framework``, make sure uv's

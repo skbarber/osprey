@@ -76,7 +76,7 @@ accelerator. Growing this project into a production deployment is, quite
 literally, uncommenting one block at a time and rebuilding.
 
 The parts that *are* set are short. The agent's capabilities are lists of
-named artifacts from the OSPREY library — ten hooks (three of which form the
+named artifacts from the OSPREY library — eleven hooks (three of which form the
 write-safety chain), three rules, and one output style:
 
 .. code-block:: yaml
@@ -142,9 +142,12 @@ Step 4: Launch the Web Terminal
 
    osprey web
 
-This starts the OSPREY Web Terminal on http://127.0.0.1:8087 — a browser
+This starts the OSPREY Web Terminal on http://127.0.0.1:10100 — a browser
 interface with the agent in a terminal pane on the left and a live workspace
 viewer on the right, where plots and other artifacts the agent produces appear.
+The command prints a login URL (``http://127.0.0.1:10100/?token=…``) once, at
+startup; opening it sets a session cookie and redirects to the clean address.
+The token is the server's own secret, so treat that URL like a password.
 No containers are involved; it is a local process serving your ``build/``.
 It refuses to start if there is no build yet, so run ``osprey build`` first.
 
@@ -157,8 +160,8 @@ Useful variations: ``osprey web --port 9000`` picks another port,
 
    Prefer to stay in your terminal? ``osprey chat`` starts the same agent
    against the same build as a plain CLI session — see
-   :doc:`../how-to/use-cli-chat`. Everything below works identically there;
-   this tutorial assumes the web terminal.
+   :doc:`/how-to/agent-interfaces/cli-agent`. The remaining steps work
+   identically there; this tutorial assumes the web terminal.
 
 Step 5: Read Some Channels
 ---------------------------
@@ -292,12 +295,16 @@ shipped file looks like this (comments abridged):
    {
      "defaults": {
        "writable": true,
-       "verification": {"level": "callback"}
+       "confirm": true
      },
      "SR:MAG:QF:01:CURRENT:SP": {"min_value": 0.0, "max_value": 300.0},
      "SR:MAG:QD:01:CURRENT:SP": {"min_value": 0.0, "max_value": 250.0},
      "SR:BEAM:CURRENT": {"writable": false}
    }
+
+``confirm: true`` means every write is checked: the connector reads the
+channel back once and compares what it finds with the value that was sent, so a
+write that did not land is reported rather than assumed.
 
 Channels not listed here are still writable — the preset sets
 ``allow_unlisted_channels: true`` so the mock's invented channels stay usable;
@@ -326,7 +333,7 @@ This needs a container runtime (Docker or Podman) and starts **OpenObserve**, a
 local telemetry store bound to localhost, with its UI at
 http://localhost:5080. The agent already emits its logs and metrics there, so
 ``osprey up`` plus ``osprey web`` gives you a queryable record of every
-session out of the box — see :doc:`../how-to/monitor-agent`. Stop the stack
+session out of the box — see :doc:`/how-to/health-and-monitoring/monitor-agent`. Stop the stack
 with ``osprey down``; the agent itself keeps working without it.
 
 The commands you now know are the complete lifecycle, and they are the same
@@ -346,6 +353,13 @@ commented blocks map everything it can become.
 - **How it works**: :doc:`conceptual-tutorial` explains the MCP server
   architecture, the connector system, and the safety mechanisms in depth.
 - **The profile format**: :doc:`../how-to/build-profiles` documents every key
-  those 13 commented blocks can hold.
-- **CLI reference**: :doc:`../cli-reference/index` covers all ``osprey``
+  those 12 commented blocks can hold.
+- **CLI reference**: :doc:`/reference/cli` covers all ``osprey``
   commands.
+
+The deployment repo that ``osprey init`` created also contains
+``mcp_servers/example_server/``, a small working MCP server; its
+``example_status`` tool is one the agent already has. Copying that directory
+is the quickest way to start your own. The repo's ``README.md`` has a
+"Common questions" section that explains how to add your own server, panel,
+or volume.

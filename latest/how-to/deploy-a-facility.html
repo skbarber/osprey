@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Deploy a Facility &#8212; Osprey Framework osprey-connectors-v0.1.0 documentation</title>
+    <title>Deploy a Facility &#8212; Osprey Framework dev documentation</title>
   
   
   
@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/graphviz.css?v=4ae1632d" />
     <link rel="stylesheet" type="text/css" href="../_static/workflow-autodoc.css?v=8680bdfd" />
     <link rel="stylesheet" type="text/css" href="../_static/sphinx-design.min.css?v=95c83b7e" />
-    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=a5f60b8d" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=1819b4a7" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -43,7 +43,7 @@
   <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
 <link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
 
-    <script src="../_static/documentation_options.js?v=8cac9ea1"></script>
+    <script src="../_static/documentation_options.js?v=632f9628"></script>
     <script src="../_static/doctools.js?v=fd6eb6e6"></script>
     <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
@@ -53,19 +53,20 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = 'https://als-apg.github.io/osprey/_static/versions.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'osprey-connectors-v0.1.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = 'dev';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
-            false;
+            true;
         </script>
+    <link rel="canonical" href="https://als-apg.github.io/osprey/how-to/deploy-a-facility.html" />
     <link rel="icon" href="../_static/logo.svg"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Configure LLM Providers" href="configure-providers.html" />
+    <link rel="next" title="Container Deployment" href="deploy-project/index.html" />
     <link rel="prev" title="Build Profiles" href="build-profiles.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="" />
-    <meta name="docbuild:last-update" content="Aug 18, 2026"/>
+  <meta name="docsearch:version" content="dev" />
+    <meta name="docbuild:last-update" content="Aug 31, 2026"/>
   </head>
   
   
@@ -148,16 +149,23 @@
 </li>
 
 
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="../architecture/index.html">
-    Architecture Overview
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="index.html">
+    How-To Guides
   </a>
 </li>
 
 
-<li class="nav-item current active">
-  <a class="nav-link nav-internal" href="index.html">
-    How-To Guides
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../architecture/index.html">
+    Architecture
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../reference/index.html">
+    Reference
   </a>
 </li>
 
@@ -284,16 +292,23 @@
 </li>
 
 
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="../architecture/index.html">
-    Architecture Overview
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="index.html">
+    How-To Guides
   </a>
 </li>
 
 
-<li class="nav-item current active">
-  <a class="nav-link nav-internal" href="index.html">
-    How-To Guides
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../architecture/index.html">
+    Architecture
+  </a>
+</li>
+
+
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../reference/index.html">
+    Reference
   </a>
 </li>
 
@@ -370,60 +385,73 @@
   <div class="bd-toc-item navbar-nav"><ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="build-profiles.html">Build Profiles</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Deploy a Facility</a></li>
-<li class="toctree-l1"><a class="reference internal" href="configure-providers.html">Configure LLM Providers</a></li>
-<li class="toctree-l1"><a class="reference internal" href="run-open-models.html">Run Open &amp; Local Models</a></li>
-<li class="toctree-l1"><a class="reference internal" href="deploy-project.html">Container Deployment</a></li>
-<li class="toctree-l1"><a class="reference internal" href="containerize-project.html">Containerize a Project</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="deploy-project/index.html">Container Deployment</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="deploy-project/compose-templates.html">Compose Templates and Images</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deploy-project/networking.html">Network Binding and Security</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deploy-project/env-chain.html">Environment Variables (the <code class="docutils literal notranslate"><span class="pre">.env</span></code> chain)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deploy-project/project-image.html">The Project Image</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="llm-providers/index.html">LLM Providers</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="llm-providers/configure-providers.html">Configure LLM Providers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-providers/run-open-models.html">Run Open &amp; Local Models</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="web-terminal/index.html">Web Terminal</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="web-terminal/operate.html">Run the Web Terminal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="web-terminal/theming.html">Theming</a></li>
 <li class="toctree-l2"><a class="reference internal" href="web-terminal/panels.html">Panels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="web-terminal/send-feedback.html">Send and Retrieve Feedback</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="web-terminal/multi-user/index.html">Multi-User Support</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="web-terminal/multi-user/tiers.html">Privilege Tiers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="web-terminal/multi-user/login.html">Require a Login</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="multi-user.html">Multi-User Support</a></li>
-<li class="toctree-l1"><a class="reference internal" href="use-cli-chat.html">Use the CLI Chat Interface</a></li>
-<li class="toctree-l1"><a class="reference internal" href="non_interactive_query.html">Non-Interactive Agent Queries</a></li>
-
-
-
-
-
-
-
-<li class="toctree-l1"><a class="reference internal" href="event-dispatch.html">Event Dispatch</a></li>
-<li class="toctree-l1 has-children"><a class="reference internal" href="chat-bridges/index.html">Chat Bridges</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="chat-bridges/nextcloud-talk.html">Nextcloud Talk</a></li>
-<li class="toctree-l2"><a class="reference internal" href="chat-bridges/google-chat.html">Google Chat</a></li>
-<li class="toctree-l2"><a class="reference internal" href="chat-bridges/add-a-channel.html">Add Your Own Chat Service</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="monitor-agent.html">Monitor Your OSPREY Agent</a></li>
-<li class="toctree-l1"><a class="reference internal" href="configure-health-checks.html">Configure Health Checks</a></li>
-<li class="toctree-l1"><a class="reference internal" href="add-connector.html">Add a Connector</a></li>
-<li class="toctree-l1"><a class="reference internal" href="add-mcp-server.html">Add an MCP Server</a></li>
-<li class="toctree-l1"><a class="reference internal" href="use-python-executor.html">Python Execution Service</a></li>
-<li class="toctree-l1 has-children"><a class="reference internal" href="use-facility-knowledge.html">Facility Knowledge</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="facility-rules.html">Facility Rules</a></li>
-<li class="toctree-l2"><a class="reference internal" href="okf-bundle.html">The OKF Bundle</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="agent-interfaces/index.html">Agent Interfaces</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="agent-interfaces/cli-agent.html">Run the Agent from the Command Line</a></li>
+<li class="toctree-l2"><a class="reference internal" href="agent-interfaces/event-dispatch.html">Event Dispatch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="agent-interfaces/add-mcp-server.html">Add an MCP Server</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="agent-interfaces/chat-bridges/index.html">Chat Bridges</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="agent-interfaces/chat-bridges/nextcloud-talk.html">Nextcloud Talk</a></li>
+<li class="toctree-l3"><a class="reference internal" href="agent-interfaces/chat-bridges/google-chat.html">Google Chat</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="health-and-monitoring/index.html">Health and Monitoring</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="health-and-monitoring/configure-health-checks.html">Configure Health Checks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="health-and-monitoring/monitor-agent.html">Monitor Your OSPREY Agent</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="control-systems/index.html">Control Systems</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="control-systems/use-connectors.html">Use Connectors</a></li>
+<li class="toctree-l2"><a class="reference internal" href="control-systems/use-virtual-accelerator.html">Use the Virtual Accelerator</a></li>
+<li class="toctree-l2"><a class="reference internal" href="control-systems/switch-control-target.html">Switch the Control Target at Run Time</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="use-channel-finder.html">How to Use the Channel Finder</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="facility-knowledge/index.html">Facility Knowledge</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="facility-knowledge/facility-rules.html">Facility Rules</a></li>
+<li class="toctree-l2"><a class="reference internal" href="facility-knowledge/okf-bundle.html">The OKF Bundle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="facility-knowledge/use-facility-graph.html">Search the Facility Graph</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="ariel/index.html">Logbook Search Service (ARIEL)</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="ariel/osprey-integration.html">Osprey Integration</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ariel/data-ingestion.html">Data Ingestion</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ariel/search-modes.html">Search Modes</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ariel/web-interface.html">Web Interface</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ariel/search-sidecar.html">The Search Sidecar (<code class="docutils literal notranslate"><span class="pre">qmd</span></code>)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="ariel/standalone-deployment.html">Standalone Deployment</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="use-virtual-accelerator.html">Use the Virtual Accelerator</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="bluesky/index.html">Bluesky Plans</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="bluesky/run-first-plan.html">Run Your First Scan</a></li>
-<li class="toctree-l2"><a class="reference internal" href="bluesky/queue.html">Scans and the Queue</a></li>
-<li class="toctree-l2"><a class="reference internal" href="bluesky/write-plans.html">Write Your Own Scan Plans</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bluesky/run-first-plan.html">Run Your First Plan</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bluesky/queue.html">Plans and the Queue</a></li>
+<li class="toctree-l2"><a class="reference internal" href="bluesky/write-plans.html">Write Your Own Plans</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="../cli-reference/index.html">CLI Reference</a></li>
 </ul>
 </div>
 </nav></div>
@@ -501,6 +529,7 @@ facility writes itself.</p>
 <li><p class="sd-card-text">Adding a container the facility owns, with its own image-build job</p></li>
 <li><p class="sd-card-text">Emitting the CI pipeline and the health check with <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">scaffold</span> <span class="pre">ci</span></code></p></li>
 <li><p class="sd-card-text">Rendering the build and bringing the stack up</p></li>
+<li><p class="sd-card-text">Making the deployment come back by itself after a reboot</p></li>
 </ul>
 <p class="sd-card-text"><strong>Prerequisites:</strong> A working OSPREY installation, <code class="docutils literal notranslate"><span class="pre">git</span></code>, and Docker or
 Podman running locally.</p>
@@ -550,12 +579,13 @@ scaffolding that goes with it:</p>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">virtual_accelerator</span></code></p></td>
 <td><p>packaged</p></td>
-<td><p>A PyAT soft-IOC serving EPICS Channel Access on port 5064, standing in
-for the real machine.</p></td>
+<td><p>A containerized simulator with LUME-backed physics
+(<a class="reference internal" href="../architecture/virtual-accelerator.html"><span class="doc">Virtual Accelerator</span></a>), serving EPICS Channel Access
+on port 5064 and standing in for the real machine.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">facility-mcp</span></code></p></td>
 <td><p>this profile</p></td>
-<td><p>The facility’s own MCP server on port 8200, built from a Dockerfile that
+<td><p>The facility’s own MCP server on port 10900, built from a Dockerfile that
 lives in the profile.</p></td>
 </tr>
 </tbody>
@@ -589,7 +619,8 @@ stack than Demo Facility runs, so the first edit is subtraction. Delete:</p>
 <li><p>the top-level <code class="docutils literal notranslate"><span class="pre">bluesky:</span></code>, <code class="docutils literal notranslate"><span class="pre">bluesky_web:</span></code> and <code class="docutils literal notranslate"><span class="pre">dispatch:</span></code> blocks. Each
 of these is a trigger: leaving one in place adds its service to the
 deployment, whatever else you write below.</p></li>
-<li><p>from <code class="docutils literal notranslate"><span class="pre">skills:</span></code> — <code class="docutils literal notranslate"><span class="pre">writing-bluesky-plans</span></code> and <code class="docutils literal notranslate"><span class="pre">operating-bluesky-plans</span></code>.</p></li>
+<li><p>from <code class="docutils literal notranslate"><span class="pre">skills:</span></code> — <code class="docutils literal notranslate"><span class="pre">writing-bluesky-plans</span></code>, <code class="docutils literal notranslate"><span class="pre">operating-bluesky-plans</span></code>
+and <code class="docutils literal notranslate"><span class="pre">bluesky-plans</span></code>.</p></li>
 <li><p>from <code class="docutils literal notranslate"><span class="pre">agents:</span></code> — <code class="docutils literal notranslate"><span class="pre">logbook-search</span></code> and <code class="docutils literal notranslate"><span class="pre">logbook-deep-research</span></code>. Both
 query a logbook database at runtime, and this facility does not deploy one.</p></li>
 <li><p>for the same reason, the <code class="docutils literal notranslate"><span class="pre">ariel</span></code> entries under <code class="docutils literal notranslate"><span class="pre">modules.web_terminals</span></code>
@@ -602,8 +633,8 @@ this facility does not run.</p></li>
 <code class="docutils literal notranslate"><span class="pre">web.panels.events.*</span></code> and <code class="docutils literal notranslate"><span class="pre">web.panels.bluesky.*</span></code> override. The panels they
 configure no longer exist.</p></li>
 </ul>
-<p>Keep the <code class="docutils literal notranslate"><span class="pre">virtual_accelerator:</span></code> block. It is the trigger for the soft-IOC this
-facility drives.</p>
+<p>Keep the <code class="docutils literal notranslate"><span class="pre">virtual_accelerator:</span></code> block. It is the trigger for the Virtual
+Accelerator this facility drives.</p>
 </section>
 <section id="step-3-name-the-facility-and-pin-its-services">
 <h2>Step 3 — Name the facility and pin its services<a class="headerlink" href="#step-3-name-the-facility-and-pin-its-services" title="Link to this heading">#</a></h2>
@@ -620,7 +651,7 @@ are already present with a different value; some ship commented out.</p>
 </pre></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">control_system.type:</span> <span class="pre">virtual_accelerator</span></code> points the agent at the deployed
-soft-IOC, so correctors move and BPMs read through exactly the approval and
+simulator, so correctors move and BPMs read through exactly the approval and
 limit layers a live machine would use. The preset ships <code class="docutils literal notranslate"><span class="pre">mock</span></code>, which touches
 nothing.</p>
 <p><code class="docutils literal notranslate"><span class="pre">deployed_services</span></code> looks too short, and is not. The <code class="docutils literal notranslate"><span class="pre">virtual_accelerator:</span></code>
@@ -637,7 +668,7 @@ that <code class="docutils literal notranslate"><span class="pre">osprey</span> 
 (<code class="docutils literal notranslate"><span class="pre">alice</span></code>/<code class="docutils literal notranslate"><span class="pre">alice</span></code>, <code class="docutils literal notranslate"><span class="pre">bob</span></code>/<code class="docutils literal notranslate"><span class="pre">bob</span></code>) and <code class="docutils literal notranslate"><span class="pre">allow_insecure_http:</span> <span class="pre">true</span></code>
 keeping the login flow on plain HTTP. That is a demo posture. For a facility
 host, set real passwords in <code class="docutils literal notranslate"><span class="pre">.env</span></code> (or rotate with <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">users</span> <span class="pre">passwd</span></code>)
-and serve TLS — <a class="reference internal" href="multi-user.html"><span class="doc">Multi-User Support</span></a> walks through both, and through single
+and serve TLS — <a class="reference internal" href="web-terminal/multi-user/login.html"><span class="doc">Require a Login</span></a> walks through both, and through single
 sign-on if your site runs one.</p>
 <p>Then confirm the persona catalog, further down the same <code class="docutils literal notranslate"><span class="pre">config:</span></code> block
 under <code class="docutils literal notranslate"><span class="pre">modules.web_terminals:</span></code>. <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">init</span></code> derived these names from the
@@ -670,11 +701,11 @@ line and the commented <code class="docutils literal notranslate"><span class="p
 <span class="w">  </span><span class="nt">facility-mcp</span><span class="p">:</span>
 <span class="w">    </span><span class="nt">template</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services/facility-mcp</span>
 <span class="w">    </span><span class="nt">config</span><span class="p">:</span>
-<span class="w">      </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8200</span>
+<span class="w">      </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10900</span>
 
 <span class="nt">mcp_servers</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">facility</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8200</span>
+<span class="w">    </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10900</span>
 <span class="w">    </span><span class="nt">transport</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">http</span>
 <span class="w">    </span><span class="nt">permissions</span><span class="p">:</span>
 <span class="w">      </span><span class="nt">allow</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">machine_status</span><span class="p p-Indicator">]</span>
@@ -682,7 +713,10 @@ line and the commented <code class="docutils literal notranslate"><span class="p
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">template:</span></code> is profile-relative, so the next thing to do is write that
 directory. The port appears twice because it is the same fact told to two
-parties: the container publishes it, and the agent dials it.</p>
+parties: the container publishes it, and the agent dials it. <code class="docutils literal notranslate"><span class="pre">10900</span></code> is the
+first port of the facility band, the hundred ports the framework publishes
+nothing in so that a facility’s own services can claim them without ever
+colliding — see <a class="reference internal" href="../reference/ports.html#reference-ports-facility"><span class="std std-ref">The facility band</span></a>.</p>
 <p>Now create <code class="docutils literal notranslate"><span class="pre">services/facility-mcp/</span></code> with four files.</p>
 <p><code class="docutils literal notranslate"><span class="pre">requirements.txt</span></code>:</p>
 <div class="highlight-text notranslate"><div class="highlight"><pre><span></span>mcp==1.9.4
@@ -703,7 +737,7 @@ be installed alongside it.</p>
 
 <span class="n">STATUS_FILE</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;FACILITY_STATUS_FILE&quot;</span><span class="p">,</span> <span class="s2">&quot;/data/machine-status.json&quot;</span><span class="p">))</span>
 
-<span class="n">mcp</span> <span class="o">=</span> <span class="n">FastMCP</span><span class="p">(</span><span class="s2">&quot;demo-facility&quot;</span><span class="p">,</span> <span class="n">host</span><span class="o">=</span><span class="s2">&quot;0.0.0.0&quot;</span><span class="p">,</span> <span class="n">port</span><span class="o">=</span><span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;PORT&quot;</span><span class="p">,</span> <span class="s2">&quot;8200&quot;</span><span class="p">)))</span>
+<span class="n">mcp</span> <span class="o">=</span> <span class="n">FastMCP</span><span class="p">(</span><span class="s2">&quot;demo-facility&quot;</span><span class="p">,</span> <span class="n">host</span><span class="o">=</span><span class="s2">&quot;0.0.0.0&quot;</span><span class="p">,</span> <span class="n">port</span><span class="o">=</span><span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;PORT&quot;</span><span class="p">,</span> <span class="s2">&quot;10900&quot;</span><span class="p">)))</span>
 
 
 <span class="nd">@mcp</span><span class="o">.</span><span class="n">tool</span><span class="p">()</span>
@@ -738,7 +772,7 @@ job in the pipeline:</p>
 <span class="c"># Unbuffered so container logs appear as the server writes them rather than</span>
 <span class="c"># when the process exits.</span>
 <span class="k">ENV</span><span class="w"> </span><span class="nv">PYTHONUNBUFFERED</span><span class="o">=</span><span class="m">1</span>
-<span class="k">EXPOSE</span><span class="w"> </span><span class="s">8200</span>
+<span class="k">EXPOSE</span><span class="w"> </span><span class="s">10900</span>
 
 <span class="k">CMD</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;python&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;server.py&quot;</span><span class="p">]</span>
 </pre></div>
@@ -759,17 +793,23 @@ compose template per service directory, rendered by the build.</p>
 <span class="x">    container_name: </span><span class="cp">{{</span> <span class="nv">osprey_labels.project_name</span> <span class="cp">}}</span><span class="x">-facility-mcp</span>
 <span class="x">    labels:</span>
 <span class="x">      osprey.project.name: &quot;</span><span class="cp">{{</span> <span class="nv">osprey_labels.project_name</span> <span class="cp">}}</span><span class="x">&quot;</span>
+<span class="x">      # Which deployment repo this container belongs to. A facility service</span>
+<span class="x">      # carries it for the same reason every packaged one does: the preflight</span>
+<span class="x">      # reads it to tell &quot;a port of ours, already up&quot; from &quot;somebody else&#39;s</span>
+<span class="x">      # process on our port&quot;, and an unlabelled container can only be guessed</span>
+<span class="x">      # at from the compose project name.</span>
+<span class="x">      com.osprey.repo-id: &quot;</span><span class="cp">{{</span> <span class="nv">osprey_labels.repo_id</span> <span class="cp">}}</span><span class="x">&quot;</span>
 <span class="x">      osprey.project.root: &quot;</span><span class="cp">{{</span> <span class="nv">osprey_labels.project_root</span> <span class="cp">}}</span><span class="x">&quot;</span>
 <span class="x">      # Content hashes of the env chain and the rendered config this service</span>
 <span class="x">      # reads. They are what makes an edit to either file restart this</span>
-<span class="x">      # container; see the service-template section of deploy-project.</span>
+<span class="x">      # container; see the deploy-project compose-templates page.</span>
 <span class="x">      osprey.env.digest: &quot;${OSPREY_ENV_DIGEST:-}&quot;</span>
 <span class="x">      osprey.config.digest: &quot;${OSPREY_CONFIG_DIGEST:-}&quot;</span>
 <span class="x">    restart: unless-stopped</span>
 <span class="x">    ports:</span>
-<span class="x">      - &quot;</span><span class="cp">{{</span> <span class="nv">deployment.bind_address</span> <span class="o">|</span> <span class="nf">default</span><span class="o">(</span><span class="s1">&#39;127.0.0.1&#39;</span><span class="o">)</span> <span class="cp">}}</span><span class="x">:</span><span class="cp">{{</span> <span class="o">(</span><span class="nv">services</span><span class="o">[</span><span class="s1">&#39;facility-mcp&#39;</span><span class="o">]</span> <span class="o">|</span> <span class="nf">default</span><span class="o">({}))</span><span class="nv">.port</span> <span class="o">|</span> <span class="nf">default</span><span class="o">(</span><span class="m">8200</span><span class="o">)</span> <span class="cp">}}</span><span class="x">:8200/tcp&quot;</span>
+<span class="x">      - &quot;</span><span class="cp">{{</span> <span class="nv">deployment.bind_address</span> <span class="o">|</span> <span class="nf">default</span><span class="o">(</span><span class="s1">&#39;127.0.0.1&#39;</span><span class="o">)</span> <span class="cp">}}</span><span class="x">:</span><span class="cp">{{</span> <span class="o">(</span><span class="nv">services</span><span class="o">[</span><span class="s1">&#39;facility-mcp&#39;</span><span class="o">]</span> <span class="o">|</span> <span class="nf">default</span><span class="o">({}))</span><span class="nv">.port</span> <span class="o">|</span> <span class="nf">default</span><span class="o">(</span><span class="m">10900</span><span class="o">)</span> <span class="cp">}}</span><span class="x">:10900/tcp&quot;</span>
 <span class="x">    environment:</span>
-<span class="x">      PORT: &quot;8200&quot;</span>
+<span class="x">      PORT: &quot;10900&quot;</span>
 <span class="x">      FACILITY_STATUS_FILE: /data/machine-status.json</span>
 <span class="x">      TZ: </span><span class="cp">{{</span> <span class="nv">system.timezone</span> <span class="cp">}}</span>
 <span class="x">    volumes:</span>
@@ -777,7 +817,7 @@ compose template per service directory, rendered by the build.</p>
 <span class="x">    networks:</span>
 <span class="x">      - osprey-network</span>
 <span class="x">    healthcheck:</span>
-<span class="x">      test: [&quot;CMD-SHELL&quot;, &quot;python -c \&quot;import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(0 if s.connect_ex((&#39;localhost&#39;, 8200)) == 0 else 1)\&quot;&quot;]</span>
+<span class="x">      test: [&quot;CMD-SHELL&quot;, &quot;python -c \&quot;import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(0 if s.connect_ex((&#39;localhost&#39;, 10900)) == 0 else 1)\&quot;&quot;]</span>
 <span class="x">      interval: 10s</span>
 <span class="x">      timeout: 5s</span>
 <span class="x">      retries: 5</span>
@@ -793,8 +833,11 @@ compose template per service directory, rendered by the build.</p>
 <p>The image reference follows the framework convention — environment variable,
 then config key, then a local tag. A laptop deploy builds the image from the
 sources beside the template; the deploy host selects the pipeline’s pushed image
-by setting <code class="docutils literal notranslate"><span class="pre">OSPREY_FACILITY_MCP_IMAGE</span></code>. <a class="reference internal" href="deploy-project.html"><span class="doc">Container Deployment</span></a> covers the
-template variables in full.</p>
+by setting <code class="docutils literal notranslate"><span class="pre">OSPREY_FACILITY_MCP_IMAGE</span></code>. The last layer is this template’s own
+literal, so the stack-wide registry and tag axes do not reach it: to have a
+facility-owned image follow them, write the default with the same shape they
+produce. <a class="reference internal" href="deploy-project/index.html"><span class="doc">Container Deployment</span></a> covers the template variables, the image chain,
+and those axes in full.</p>
 </section>
 <section id="step-5-fill-in-the-deployment-coordinates">
 <h2>Step 5 — Fill in the deployment coordinates<a class="headerlink" href="#step-5-fill-in-the-deployment-coordinates" title="Link to this heading">#</a></h2>
@@ -921,7 +964,7 @@ Watch for these lines in the output:</p>
 <p>Running OSPREY from a <strong>source checkout</strong> rather than a released install?
 Add <code class="docutils literal notranslate"><span class="pre">--dev</span></code> — <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">up</span></code> otherwise refuses, because a container built
 from PyPI would run different code than your checkout, and <code class="docutils literal notranslate"><span class="pre">--dev</span></code> builds
-the image from the checkout instead; see <a class="reference internal" href="deploy-project.html"><span class="doc">Container Deployment</span></a> for that
+the image from the checkout instead; see <a class="reference internal" href="deploy-project/index.html"><span class="doc">Container Deployment</span></a> for that
 workflow.</p>
 </div>
 <p>The first run is slow: the virtual accelerator and the facility’s own image are
@@ -979,6 +1022,8 @@ the file at mode <code class="docutils literal notranslate"><span class="pre">06
 <p>The loop is always the same: edit the profile, rebuild, redeploy. Run it
 anywhere inside the repository:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>osprey<span class="w"> </span><span class="nb">set</span><span class="w"> </span><span class="nv">connector</span><span class="o">=</span>epics<span class="w">          </span><span class="c1"># or edit profile.yml by hand</span>
+osprey<span class="w"> </span><span class="nb">set</span><span class="w"> </span>config.archiver.type<span class="o">=</span>epics_archiver
+osprey<span class="w"> </span><span class="nb">set</span><span class="w"> </span><span class="nv">va_archiver</span><span class="o">=</span>null<span class="w">         </span><span class="c1"># the recorded archive goes with the stand-in</span>
 osprey<span class="w"> </span>build
 osprey<span class="w"> </span>up<span class="w"> </span>-d
 </pre></div>
@@ -1006,24 +1051,168 @@ something looks wrong. It also says whether <code class="docutils literal notran
 <p>When the answer is not obvious from those, run them inside an OSPREY agent
 session in the repository: the agent reads the same output you do, and it has
 the deployment’s configuration and rendered files at hand.</p>
+</section>
+<section id="starting-it-again-after-a-reboot">
+<h2>Starting it again after a reboot<a class="headerlink" href="#starting-it-again-after-a-reboot" title="Link to this heading">#</a></h2>
+<p>Nothing so far survives the host restarting: the containers come back only when
+somebody runs <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">up</span> <span class="pre">-d</span></code> again. <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">scaffold</span> <span class="pre">systemd</span></code> writes a
+systemd user unit that does it for you.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>osprey<span class="w"> </span>scaffold<span class="w"> </span>systemd
+</pre></div>
+</div>
+<p>It writes <code class="docutils literal notranslate"><span class="pre">osprey.service</span></code> at the repository root — and, beside it,
+<code class="docutils literal notranslate"><span class="pre">scripts/osprey-boot-hook.sh</span></code>, covered below — and prints the commands that
+install the unit on this machine:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cp<span class="w"> </span>/path/to/repo/osprey.service<span class="w"> </span>~/.config/systemd/user/
+systemctl<span class="w"> </span>--user<span class="w"> </span>daemon-reload
+systemctl<span class="w"> </span>--user<span class="w"> </span><span class="nb">enable</span><span class="w"> </span>--now<span class="w"> </span>osprey.service
+</pre></div>
+</div>
+<p>Run the scaffold verb <strong>on the machine that will run the deployment</strong>. Both the
+repository directory and the <code class="docutils literal notranslate"><span class="pre">osprey</span></code> program are written into the unit as
+full paths, because systemd starts a unit with no working directory and a short
+<code class="docutils literal notranslate"><span class="pre">PATH</span></code> — a unit generated on your laptop would name paths the host does not
+have. Run it again after the repository moves or OSPREY is reinstalled
+somewhere else. Re-running is otherwise safe: a unit whose content already
+matches is left untouched, stamp included, so an OSPREY upgrade alone produces
+no diff, and a file the scaffolder did not write is reported and left alone
+unless you pass <code class="docutils literal notranslate"><span class="pre">--force</span></code>.</p>
+<p>If no <code class="docutils literal notranslate"><span class="pre">osprey</span></code> program can be found to name, the command refuses rather than
+writing a unit that points at nothing. Check that <code class="docutils literal notranslate"><span class="pre">command</span> <span class="pre">-v</span> <span class="pre">osprey</span></code> answers
+in the same shell — if OSPREY lives in a virtual environment, activate it and
+re-run.</p>
+<p>One more step, and it is the one people miss:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>loginctl<span class="w"> </span>enable-linger<span class="w"> </span><span class="nv">$USER</span>
+</pre></div>
+</div>
+<p>A user unit runs inside that account’s own <code class="docutils literal notranslate"><span class="pre">systemd</span> <span class="pre">--user</span></code> instance, which
+logind starts at login and tears down when the account’s last session ends.
+Without linger there is no user instance at boot, so the unit never runs, and it
+stops again the moment you log out. <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">up</span></code> already enables linger by
+itself for a rootless-podman deployment running web terminals — rootless podman
+puts the containers themselves under that same user instance, so they need it
+too — but every other deployment needs the command run once by hand. On Docker
+hosts the containers run under the Docker daemon and are unaffected by linger;
+the unit that starts them is still a user unit, so it still needs it.</p>
+<p>Check it the way you would check any unit:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>systemctl<span class="w"> </span>--user<span class="w"> </span>status<span class="w"> </span>osprey.service
+journalctl<span class="w"> </span>--user<span class="w"> </span>-u<span class="w"> </span>osprey.service<span class="w"> </span>-b
+</pre></div>
+</div>
+<section id="when-the-home-directory-is-on-a-network-mount">
+<h3>When the home directory is on a network mount<a class="headerlink" href="#when-the-home-directory-is-on-a-network-mount" title="Link to this heading">#</a></h3>
+<p>Linger is not enough when <code class="docutils literal notranslate"><span class="pre">$HOME</span></code> is on NFS or autofs, and the scaffold verb
+says so: it reads the home directory’s filesystem type with <code class="docutils literal notranslate"><span class="pre">findmnt</span></code> and
+prints a warning beside the install commands. The lingering user manager starts
+at boot before that mount is there. It resolves its unit search path once,
+finds nothing, and does not look again — so after every host reboot the unit
+reads as <code class="docutils literal notranslate"><span class="pre">not-found</span></code>, and <code class="docutils literal notranslate"><span class="pre">podman.socket</span></code> with it, until somebody runs
+<code class="docutils literal notranslate"><span class="pre">systemctl</span> <span class="pre">--user</span> <span class="pre">daemon-reload</span></code> by hand. It looks like a broken unit and it
+is a mount-ordering problem.</p>
+<p>When systemd manages the mount itself — an fstab entry, or a <code class="docutils literal notranslate"><span class="pre">.mount</span></code> or
+<code class="docutils literal notranslate"><span class="pre">.automount</span></code> unit — ordering the user manager after it is a drop-in on
+<code class="docutils literal notranslate"><span class="pre">user&#64;&lt;uid&gt;.service</span></code>, which OSPREY cannot install for you because it needs
+root:</p>
+<div class="highlight-ini notranslate"><div class="highlight"><pre><span></span><span class="c1"># /etc/systemd/system/user@&lt;uid&gt;.service.d/network-home.conf</span>
+<span class="k">[Unit]</span>
+<span class="na">RequiresMountsFor</span><span class="o">=</span><span class="s">/home/&lt;account&gt;</span>
+<span class="na">After</span><span class="o">=</span><span class="s">remote-fs.target autofs.service</span>
+</pre></div>
+</div>
+<p>Followed by <code class="docutils literal notranslate"><span class="pre">sudo</span> <span class="pre">systemctl</span> <span class="pre">daemon-reload</span></code>. The command prints that file with
+your own uid and home directory already filled in, ready to hand to whoever
+administers the host. On a local home — or on a host with no <code class="docutils literal notranslate"><span class="pre">findmnt</span></code>, where
+there is no way to tell — it prints nothing extra.</p>
+<p>That drop-in does nothing for a home served by the autofs daemon
+(<code class="docutils literal notranslate"><span class="pre">automount(8)</span></code>): there is no systemd mount unit for <code class="docutils literal notranslate"><span class="pre">RequiresMountsFor</span></code> to
+order against, so the manager starts exactly as before. <code class="docutils literal notranslate"><span class="pre">findmnt</span></code> reports
+<code class="docutils literal notranslate"><span class="pre">autofs</span></code> for a systemd automount as well, so the command cannot tell the two
+apart — check <code class="docutils literal notranslate"><span class="pre">systemctl</span> <span class="pre">list-units</span> <span class="pre">-t</span> <span class="pre">mount,automount</span></code> for your home to know
+which you have. For a daemon-managed home, and for any host where nobody with
+root is available, the same run has already written the other route:
+<code class="docutils literal notranslate"><span class="pre">scripts/osprey-boot-hook.sh</span></code>, beside the unit. It waits for the home, the
+deployment and the user manager to appear, then reloads the unit files and
+starts the unit — the script an affected site otherwise ends up writing by
+hand. Wire it into the account’s own crontab with the lines the command
+prints, all of them, pasted whole:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>crontab<span class="w"> </span>-e
+<span class="nv">SHELL</span><span class="o">=</span>/bin/sh
+<span class="nv">HOME</span><span class="o">=</span>/
+@reboot<span class="w"> </span><span class="nv">d</span><span class="o">=</span>/tmp/osprey-boot-hook.<span class="k">$(</span>id<span class="w"> </span>-u<span class="k">)</span><span class="p">;</span><span class="w"> </span>mkdir<span class="w"> </span>-m<span class="w"> </span><span class="m">700</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$d</span><span class="s2">&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="p">;</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="o">[</span><span class="w"> </span>-d<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$d</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">]</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="o">[</span><span class="w"> </span>!<span class="w"> </span>-L<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$d</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">]</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="o">[</span><span class="w"> </span>-O<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$d</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span><span class="w"> </span><span class="nv">log</span><span class="o">=</span>/tmp/osprey-boot-hook.<span class="k">$(</span>id<span class="w"> </span>-u<span class="k">)</span>/boot.log<span class="p">;</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="nv">log</span><span class="o">=</span>/dev/null<span class="p">;</span><span class="w"> </span><span class="k">fi</span><span class="p">;</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="k">$(</span>date<span class="k">)</span><span class="s2"> osprey-boot-hook: cron fired&quot;</span><span class="w"> </span>&gt;&gt;<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$log</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="nv">n</span><span class="o">=</span><span class="m">0</span><span class="p">;</span><span class="w"> </span><span class="k">until</span><span class="w"> </span><span class="o">[</span><span class="w"> </span>-x<span class="w"> </span>/path/to/repo/scripts/osprey-boot-hook.sh<span class="w"> </span><span class="o">]</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="o">[</span><span class="w"> </span><span class="nv">$n</span><span class="w"> </span>-ge<span class="w"> </span><span class="m">120</span><span class="w"> </span><span class="o">]</span><span class="p">;</span><span class="w"> </span><span class="k">do</span><span class="w"> </span>sleep<span class="w"> </span><span class="m">5</span><span class="p">;</span><span class="w"> </span><span class="nv">n</span><span class="o">=</span><span class="k">$((</span><span class="nv">n</span><span class="o">+</span><span class="m">1</span><span class="k">))</span><span class="p">;</span><span class="w"> </span><span class="k">done</span><span class="p">;</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="o">[</span><span class="w"> </span>-x<span class="w"> </span>/path/to/repo/scripts/osprey-boot-hook.sh<span class="w"> </span><span class="o">]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span><span class="w"> </span><span class="nb">exec</span><span class="w"> </span>/path/to/repo/scripts/osprey-boot-hook.sh<span class="p">;</span><span class="w"> </span><span class="k">fi</span><span class="p">;</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="k">$(</span>date<span class="k">)</span><span class="s2"> osprey-boot-hook: gave up, /path/to/repo/scripts/osprey-boot-hook.sh never appeared&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>tee<span class="w"> </span>-a<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$log</span><span class="s2">&quot;</span>
+</pre></div>
+</div>
+<p>The job is deliberately not a bare <code class="docutils literal notranslate"><span class="pre">&#64;reboot</span></code> with the script’s path, because
+two things happen before a cron job’s command runs and each one kills the job
+silently on this kind of host. cron changes into the crontab’s <code class="docutils literal notranslate"><span class="pre">HOME</span></code> first
+and dies, with no mail, when that directory is not there yet — <code class="docutils literal notranslate"><span class="pre">HOME=/</span></code>
+gives it one that is, <code class="docutils literal notranslate"><span class="pre">SHELL=/bin/sh</span></code> names the shell the job is written
+for whatever an existing crontab set above, and the script restores the real
+home as its first act. Then <code class="docutils literal notranslate"><span class="pre">sh</span></code> has to read the script, which sits on the same late mount; so the
+job, which lives in the crontab on the local disk, notes that cron fired it in
+<code class="docutils literal notranslate"><span class="pre">/tmp/osprey-boot-hook.&lt;uid&gt;/boot.log</span></code> and waits for the script to become
+readable before running it. That log is the first place to look after a boot
+that did not come back: it splits “cron never fired” from “still waiting for
+the home” from “the hook ran and said why”. Put the lines last in the
+crontab: every job below them runs from <code class="docutils literal notranslate"><span class="pre">/</span></code> and sees <code class="docutils literal notranslate"><span class="pre">HOME=/</span></code> in its
+environment, so a job body that expands <code class="docutils literal notranslate"><span class="pre">$HOME</span></code> breaks silently unless it
+starts with its own <code class="docutils literal notranslate"><span class="pre">export</span> <span class="pre">HOME=&lt;the</span> <span class="pre">real</span> <span class="pre">home&gt;</span></code>.</p>
+<p>Where the drop-in applies, the hook repairs each boot after the fact rather
+than ordering the manager correctly in the first place, so there it is a
+fallback, not a replacement.</p>
+<p><code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">health</span></code> reports this condition too: the <code class="docutils literal notranslate"><span class="pre">systemd_unit</span></code> category
+is <code class="docutils literal notranslate"><span class="pre">error</span></code> when the unit is installed but the user manager reports it
+<code class="docutils literal notranslate"><span class="pre">not-found</span></code>, <code class="docutils literal notranslate"><span class="pre">warning</span></code> when it was scaffolded but never installed, and
+a skip on any host without a scaffolded unit or a user manager.</p>
+</section>
+<section id="why-the-unit-runs-osprey-and-not-compose">
+<h3>Why the unit runs <code class="docutils literal notranslate"><span class="pre">osprey</span></code> and not compose<a class="headerlink" href="#why-the-unit-runs-osprey-and-not-compose" title="Link to this heading">#</a></h3>
+<p>The unit’s <code class="docutils literal notranslate"><span class="pre">ExecStart</span></code> is <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">up</span> <span class="pre">-d</span></code> and its <code class="docutils literal notranslate"><span class="pre">ExecStop</span></code> is <code class="docutils literal notranslate"><span class="pre">osprey</span>
+<span class="pre">down</span></code> — not a compose command against the rendered files in <code class="docutils literal notranslate"><span class="pre">build/</span></code>. That is
+deliberate. A compose invocation started by systemd would have to reproduce, by
+hand and correctly, everything <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">up</span></code> assembles around compose:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">COMPOSE_PROJECT_NAME</span></code>, pinned to the project name in the configuration
+rather than left to compose’s own fallback of the current directory’s name.
+It decides which containers, networks and volumes the command addresses; get
+it wrong at boot and the host quietly grows a second copy of the stack beside
+the one your volumes belong to.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">OSPREY_ENV_DIGEST</span></code>, a hash of the <code class="docutils literal notranslate"><span class="pre">.env</span></code> chain that the rendered files
+carry as a container label. It is what makes an edit to <code class="docutils literal notranslate"><span class="pre">.env</span></code> reach a
+running container. A compose run that left it unset would look like a changed
+document on every boot and recreate the whole stack for no reason.</p></li>
+<li><p>The <code class="docutils literal notranslate"><span class="pre">.env</span></code> chain itself — <code class="docutils literal notranslate"><span class="pre">.env.shared</span></code> then <code class="docutils literal notranslate"><span class="pre">.env</span></code> — collapsed in the
+right order, and the repository pinned as compose’s project directory so it
+resolves those files at all.</p></li>
+<li><p>The container runtime, which <code class="docutils literal notranslate"><span class="pre">osprey</span> <span class="pre">up</span></code> detects (or reads from the
+configuration) and then probes for the compose provider behind it; the
+supported providers do not take the same command line.</p></li>
+<li><p>Everything that is not compose: the host-port check that refuses before it
+touches a container, the drift check that refuses when <code class="docutils literal notranslate"><span class="pre">build/</span></code> no longer
+matches <code class="docutils literal notranslate"><span class="pre">profile.yml</span></code>, minting any missing service credentials into
+<code class="docutils literal notranslate"><span class="pre">.env</span></code>, the second compose invocation a multi-user deployment needs for its
+web tier, and <code class="docutils literal notranslate"><span class="pre">scripts/verify.sh</span></code> afterwards.</p></li>
+</ul>
+<p>Wrapping the verb keeps all of that in one place: the unit is two commands, and
+a boot does exactly what you do by hand.</p>
 <div class="admonition seealso">
 <p class="admonition-title">See also</p>
 <dl class="simple">
 <dt><a class="reference internal" href="build-profiles.html"><span class="doc">Build Profiles</span></a></dt><dd><p>What lives in a profile, the convention directories, and taking ownership
 of a framework artifact.</p>
 </dd>
-<dt><a class="reference internal" href="deploy-project.html"><span class="doc">Container Deployment</span></a></dt><dd><p>The container-deployment reference: service configuration, compose template
+<dt><a class="reference internal" href="deploy-project/index.html"><span class="doc">Container Deployment</span></a></dt><dd><p>The container-deployment reference: service configuration, compose template
 variables, image overrides, and the <code class="docutils literal notranslate"><span class="pre">--dev</span></code> workflow.</p>
 </dd>
-<dt><a class="reference internal" href="multi-user.html"><span class="doc">Multi-User Support</span></a></dt><dd><p>The web tier this facility deploys — the landing page and one
+<dt><a class="reference internal" href="web-terminal/multi-user/index.html"><span class="doc">Multi-User Support</span></a></dt><dd><p>The web tier this facility deploys — the landing page and one
 containerized terminal per operator.</p>
 </dd>
-<dt><a class="reference internal" href="use-virtual-accelerator.html"><span class="doc">Use the Virtual Accelerator</span></a></dt><dd><p>The PyAT soft-IOC, and driving it from the agent.</p>
+<dt><a class="reference internal" href="control-systems/use-virtual-accelerator.html"><span class="doc">Use the Virtual Accelerator</span></a></dt><dd><p>Running the simulator, and driving it from the agent.</p>
 </dd>
-<dt><a class="reference internal" href="../cli-reference/index.html"><span class="doc">CLI Reference</span></a></dt><dd><p>Every <code class="docutils literal notranslate"><span class="pre">osprey</span></code> command and flag.</p>
+<dt><a class="reference internal" href="../reference/cli.html"><span class="doc">CLI Reference</span></a></dt><dd><p>Every <code class="docutils literal notranslate"><span class="pre">osprey</span></code> command and flag.</p>
 </dd>
 </dl>
 </div>
+</section>
 </section>
 </section>
 
@@ -1047,11 +1236,11 @@ containerized terminal per operator.</p>
       </div>
     </a>
     <a class="right-next"
-       href="configure-providers.html"
+       href="deploy-project/index.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Configure LLM Providers</p>
+        <p class="prev-next-title">Container Deployment</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -1087,6 +1276,11 @@ containerized terminal per operator.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-the-pipeline-does">What the pipeline does</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#changing-something-later">Changing something later</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#operating-it">Operating it</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#starting-it-again-after-a-reboot">Starting it again after a reboot</a><ul class="visible nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#when-the-home-directory-is-on-a-network-mount">When the home directory is on a network mount</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#why-the-unit-runs-osprey-and-not-compose">Why the unit runs <code class="docutils literal notranslate"><span class="pre">osprey</span></code> and not compose</a></li>
+</ul>
+</li>
 </ul>
   </nav></div>
 

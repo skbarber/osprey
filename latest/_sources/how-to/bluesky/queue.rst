@@ -1,19 +1,15 @@
 ===================
-Scans and the Queue
+Plans and the Queue
 ===================
 
-Three sentences carry everything on this page. Scans live in a **queue
+Three sentences carry everything on this page. Plans live in a **queue
 server** that survives restarts — not in the agent, not in the panels. Adding
 a plan to the queue and starting the queue are **two separate, deliberate
 steps**, and only starting is guarded. **Stopping is never locked** — no
 token, no switch, no state can take the stop and abort buttons away.
 
-.. mermaid::
-
-   flowchart LR
-       A["Shared draft<br/>compose & review"] -->|add| B["Queue<br/>durable, ordered"]
-       B -->|"start (armed)"| C["Machine<br/>one plan at a time"]
-       C -.->|"stop / abort — always available"| B
+.. raw:: html
+   :file: ../../_diagrams/bluesky-queue.html
 
 Everything below is the same queue seen from three sides — pick the one you
 work in.
@@ -123,19 +119,34 @@ quirks worth knowing:
       * - Withdraw a pending stop
         - The launch token — it lets the queue keep draining.
 
-   The agent is held to a harder rule on top of this: while the project's
-   ``control_system.writes_enabled`` switch is off, its ``queue_add`` and
-   ``queue_start`` tools are denied outright — it cannot queue or start
-   anything, even on an idle queue. Its halts and its read tools are never
-   taken away.
+   The agent is held to a harder rule on top of this: where the project may
+   write to no control target at all, its ``queue_add`` and ``queue_start``
+   tools are denied outright — it cannot queue or start anything, even on an
+   idle queue. Its halts and its read tools are never taken away.
+
+   Write posture is per control target, and each queue lane is bound at build
+   time to one target, so a deployment can arm the lane that drives the
+   simulator and leave the lane that drives the live machine unarmed. Nothing
+   is denied up front on such a deployment — the deny list is written once,
+   before a session picks a target — and ``queue_add`` and ``queue_start``
+   refuse per call instead, with ``writes_disabled``, naming the lane's machine.
 
    In a deployed control room the agent holds the launch token only where the
-   deployment grants it — to a persona configured for control-system writes
-   that also runs the bluesky MCP server. Where it is granted, the agent's
+   deployment grants it, and it is granted **per lane**: to a persona whose
+   config arms writes for the machine that lane drives and that also runs the
+   bluesky MCP server. A persona can hold the simulator lane's token and none
+   for the live one. Where it is granted, the agent's
    ``queue_start`` arms the queue itself, and your approval of that tool call
    is the arming decision. Where it is not, ``queue_start`` is refused with
    ``launch_token_required`` and the start stays with you, from the BLUESKY
    queue panel's own **Start queue** button.
+
+   On a two-lane deployment the BLUESKY panel carries a **lane picker** in its
+   status strip, labelled by the machine each lane drives. The panel is bound
+   to one lane at a time — plans, shared draft, queue and results all follow
+   the picked lane, and its Start queue button arms with that lane's own
+   token — so what you see and what a click starts can never belong to two
+   different machines.
 
 .. dropdown:: When something is refused
    :color: info
@@ -180,8 +191,10 @@ quirks worth knowing:
    attempt to start the queue is refused — a plan someone emergency-stopped
    can never sneak back onto the machine.
 
-   Removing it is the deliberate step: the ✕ on its queue row. To actually
-   run it again afterwards, stage it through the draft and add it afresh.
+   Removing it is the deliberate step: the ✕ on its queue row, or the
+   assistant's ``queue_remove`` tool — which asks for your approval, so the
+   decision stays yours either way. To actually run it again afterwards,
+   stage it through the draft and add it afresh.
 
 .. dropdown:: Where the data lives
    :color: info
@@ -199,38 +212,22 @@ quirks worth knowing:
      from the live view until the next run starts — the run itself keeps
      going and its data still lands in Tiled.
 
-.. dropdown:: For deployers — what is running, and the config block
+.. dropdown:: For deployers — what is running
    :color: info
    :icon: server
 
    A project built from the ``control-assistant`` preset brings the whole
    stack up with ``osprey up``: the **bridge** (the HTTP front door,
-   port 8090), the **queue server** with its own storage, the **bluesky-web**
-   sidecar serving the BLUESKY panel (port 8095), the **Virtual Accelerator** (the
+   port 10080), the **queue server** with its own storage, the **bluesky-web**
+   sidecar serving the BLUESKY panel (port 10071), the **Virtual Accelerator** (the
    preset's default control system), and — when enabled — **Tiled** (port
-   8091). The launch token is minted automatically at deploy time and stored
-   in the project's ``.env``.
+   10070). Those are the deployment's port layout at its default base
+   (:ref:`reference-ports`). The launch token is minted automatically at deploy
+   time and stored in the project's ``.env``.
 
-   The build profile's ``bluesky:`` block accepts exactly five keys — a
-   misspelled or unknown key **fails the build** and prints the valid set:
-
-   .. list-table::
-      :header-rows: 1
-      :widths: 30 70
-
-      * - Key
-        - What it does
-      * - ``port``
-        - The bridge's port (default 8090).
-      * - ``tiled_enabled``
-        - Deploy the Tiled data store alongside the stack.
-      * - ``tiled_port``
-        - Tiled's port (default 8091).
-      * - ``plan_dir``
-        - A directory of your facility's own plans — see
-          :doc:`write-plans`.
-      * - ``excluded_plans``
-        - Plans to remove from the catalog entirely, e.g. ``[orm]``.
+   The build profile's ``bluesky:`` block can pin those ports, and sets the
+   Tiled store, which plans the catalog carries, and the device file plans may
+   drive or record — see :doc:`/reference/configuration/profile`.
 
    Whether a deployment can execute plans at all is decided by its control
    system: ``virtual_accelerator`` and ``epics`` can, ``mock`` is
@@ -246,7 +243,15 @@ quirks worth knowing:
    created from the ``control-assistant`` preset has one and the flip just
    works; one still reading the mock archiver is refused at build time, and told
    to point ``archiver.type`` at a store its deployment writes first — see
-   :doc:`../use-virtual-accelerator`.
+   :doc:`../control-systems/use-virtual-accelerator`.
+
+   One timing detail worth knowing: the channel limits a plan's writes are
+   checked against come from the file
+   ``control_system.limits_checking.database_path`` names, and ``osprey build``
+   stages its **own copy** of that file for the plan lane. So widening or
+   tightening a limit in your deployment repository reaches the queue server at
+   the next ``osprey build`` (and ``osprey up``) — not the moment you save the
+   file.
 
 .. seealso::
 
@@ -256,5 +261,5 @@ quirks worth knowing:
    :doc:`write-plans`
       Trust tiers and adding plans of your own.
 
-   :doc:`/how-to/use-virtual-accelerator`
+   :doc:`/how-to/control-systems/use-virtual-accelerator`
       The connector that makes a deployment able to execute.
